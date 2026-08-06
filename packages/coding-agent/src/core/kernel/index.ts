@@ -62,7 +62,10 @@ export const HOST_COMM_TARGET = "host.request";
  * This legacy unary compatibility alias remains the dispatcher and registration
  * contract while context-aware handlers are staged separately below.
  */
-export type HostRequestHandler = (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
+export type HostRequestHandler = (
+	payload: Record<string, unknown>,
+	signal?: AbortSignal,
+) => Promise<Record<string, unknown>>;
 
 /**
  * Per-call authority supplied by the host-request dispatcher.
@@ -593,6 +596,7 @@ export class KernelManager {
 	private readonly session = uuid();
 	private readonly commTargets = new Map<string, string>();
 	private readonly handledHostRequestCommIds = new Set<string>();
+	private readonly hostRequestAbortControllers = new Map<string, AbortController>();
 	private kernel?: ChildProcess;
 	// Set instead of `kernel` when the kernel was forked from the forkserver: it is
 	// not a direct child, so it has no ChildProcess handle and is killed by pid.
@@ -1271,6 +1275,8 @@ export class KernelManager {
 		}
 
 		if (msgType === "comm_close") {
+			this.hostRequestAbortControllers.get(commId)?.abort();
+			this.hostRequestAbortControllers.delete(commId);
 			this.commTargets.delete(commId);
 			this.handledHostRequestCommIds.delete(commId);
 			return;
@@ -1283,26 +1289,41 @@ export class KernelManager {
 			}
 			this.commTargets.set(commId, targetName);
 			if (targetName === HOST_COMM_TARGET) {
-				this.startHostRequestFromComm(commId, content.data);
+				this.startHostRequestFromComm(
+					commId,
+					content.data,
+					typeof incoming.parent_header.msg_id === "string" ? incoming.parent_header.msg_id : undefined,
+				);
 			}
 			return;
 		}
 
 		const targetName = this.commTargets.get(commId);
 		if (msgType === "comm_msg" && targetName === HOST_COMM_TARGET) {
-			this.startHostRequestFromComm(commId, content.data);
+			this.startHostRequestFromComm(
+				commId,
+				content.data,
+				typeof incoming.parent_header.msg_id === "string" ? incoming.parent_header.msg_id : undefined,
+			);
 		}
 	}
 
-	private startHostRequestFromComm(commId: string, data: unknown): void {
+	private startHostRequestFromComm(commId: string, data: unknown, parentMessageId?: string): void {
 		if (this.handledHostRequestCommIds.has(commId)) {
 			return;
 		}
 		this.handledHostRequestCommIds.add(commId);
+		const controller = new AbortController();
+		this.hostRequestAbortControllers.set(commId, controller);
+		const execution = this.activeExecution;
+		const executionSignal =
+			execution && execution.requestMsgId === parentMessageId ? execution.opts.signal : undefined;
+		const abortFromExecution = () => controller.abort();
+		executionSignal?.addEventListener("abort", abortFromExecution, { once: true });
 
 		const task = (async () => {
 			try {
-				const result = await this.handleHostRequest(data);
+				const result = await this.handleHostRequest(data, controller.signal);
 				try {
 					await this.sendCommMessage(commId, { status: "ok", ...result });
 				} catch (replyError) {
@@ -1324,10 +1345,14 @@ export class KernelManager {
 		this.inFlightHostRequests.add(task);
 		void task.finally(() => {
 			this.inFlightHostRequests.delete(task);
+			executionSignal?.removeEventListener("abort", abortFromExecution);
+			if (this.hostRequestAbortControllers.get(commId) === controller) {
+				this.hostRequestAbortControllers.delete(commId);
+			}
 		});
 	}
 
-	private async handleHostRequest(data: unknown): Promise<Record<string, unknown>> {
+	private async handleHostRequest(data: unknown, signal?: AbortSignal): Promise<Record<string, unknown>> {
 		if (!isRecord(data)) {
 			throw new Error("host request payload must be an object");
 		}
@@ -1343,7 +1368,7 @@ export class KernelManager {
 		// the in-flight execution; detached spawns (asyncio.create_task) fire after
 		// the scheduling cell goes idle, so fall back to that last cell's source.
 		const cellSourceCode = this.activeExecution?.code ?? this.lastCellCode;
-		return handler({ ...data, cellSourceCode });
+		return handler({ ...data, cellSourceCode }, signal);
 	}
 
 	private async sendCommMessage(commId: string, data: Record<string, unknown>): Promise<void> {
@@ -1401,6 +1426,11 @@ export class KernelManager {
 		this.startPromise = undefined;
 	}
 
+	private abortHostRequests(): void {
+		for (const controller of this.hostRequestAbortControllers.values()) controller.abort();
+		this.hostRequestAbortControllers.clear();
+	}
+
 	private async waitForHostRequestsToSettle(tasks: Promise<void>[], timeoutMs: number): Promise<void> {
 		let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
 		const timeoutPromise = new Promise<"timeout">((resolve) => {
@@ -1434,6 +1464,7 @@ export class KernelManager {
 		}
 		this.state = "shutdown";
 		liveKernels.delete(this);
+		this.abortHostRequests();
 
 		try {
 			if (this.control && this.connection) {
@@ -1470,6 +1501,7 @@ export class KernelManager {
 
 	async kill(): Promise<void> {
 		this.state = "shutdown";
+		this.abortHostRequests();
 		liveKernels.delete(this);
 		this.cleanupResources("SIGKILL");
 	}
@@ -1579,6 +1611,7 @@ export class KernelManager {
 			await this.flushSnapshotForDispose();
 			this.state = "shutdown";
 			liveKernels.delete(this);
+			this.abortHostRequests();
 			const inFlightHostRequests = [...this.inFlightHostRequests];
 			// TODO: plumb AbortSignal through AgentSession.prompt so disposal can cancel long-running child loops.
 			try {
@@ -1594,6 +1627,7 @@ export class KernelManager {
 	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */
 	disposeSync(): void {
 		this.state = "shutdown";
+		this.abortHostRequests();
 		liveKernels.delete(this);
 		// TODO: replace this best-effort hard-exit path if Node exposes an awaitable process-exit cleanup hook.
 		this.cleanupResources();

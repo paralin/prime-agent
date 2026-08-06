@@ -63,22 +63,14 @@ describe("Prime Inference models", () => {
 		expect(getModel("prime-inference", "openai/gpt-4o").featured).toBeUndefined();
 	});
 
-	it("registers Kimi K3 on Prime Inference and OpenRouter", () => {
+	it("registers Kimi K3 with standard reasoning effort levels", () => {
 		for (const provider of ["prime-inference", "openrouter"] as const) {
 			const model = getModel(provider, "moonshotai/kimi-k3");
 
 			expect(model.api).toBe("openai-completions");
 			expect(model.reasoning).toBe(true);
-			expect(model.thinkingLevelMap).toEqual({
-				off: null,
-				minimal: null,
-				low: null,
-				medium: null,
-				high: null,
-				xhigh: null,
-				max: "max",
-			});
-			expect(getSupportedThinkingLevels(model)).toEqual(["max"]);
+			expect(model.thinkingLevelMap).toBeUndefined();
+			expect(getSupportedThinkingLevels(model)).toEqual(["off", "minimal", "low", "medium", "high"]);
 			expect(model.input).toEqual(["text", "image"]);
 			expect(model.contextWindow).toBe(1048576);
 			expect(model.maxTokens).toBe(1048576);

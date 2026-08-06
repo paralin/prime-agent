@@ -15,6 +15,7 @@ import {
 import { homedir } from "os";
 import { basename, dirname, join, resolve, sep, win32 } from "path";
 import { fileURLToPath } from "url";
+import { resolveSettingsFile } from "./settings-files.js";
 import { shouldUseWindowsShell } from "./utils/child-process.js";
 
 // =============================================================================
@@ -606,9 +607,9 @@ export function getAuthPath(): string {
 	return join(getAgentDir(), "auth.json");
 }
 
-/** Get path to settings.json */
+/** Get the active global settings path, defaulting to settings.json when none exists. */
 export function getSettingsPath(): string {
-	return join(getAgentDir(), "settings.json");
+	return resolveSettingsFile(getAgentDir()).path;
 }
 
 /** Get path to cron jobs store */

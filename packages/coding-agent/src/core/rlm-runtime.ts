@@ -234,6 +234,12 @@ export interface RlmSubagentRuntime {
 	session: AgentSession;
 }
 
+/** Ordered native model candidate retained by an RLM child for provider fallback. */
+export interface RlmNativeModelCandidate {
+	model: Model<Api>;
+	thinkingLevel?: ThinkingLevel;
+}
+
 export interface CreateRlmSubagentRuntimeOptions {
 	parentSession: AgentSession;
 	id: string;
@@ -242,6 +248,7 @@ export interface CreateRlmSubagentRuntimeOptions {
 	sessionDir: string;
 	model: Model<any>;
 	thinkingLevel: ThinkingLevel;
+	modelCandidates?: RlmNativeModelCandidate[];
 	serviceTier: ServiceTier;
 	scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	activeToolNames: string[];

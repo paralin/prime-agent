@@ -56,8 +56,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 11 adds immediate get/set commands for active-session RLM max depth.
 // Revision 12 publishes idle-residency metadata on session summary rows.
 // Revision 13 narrows agent-origin reach and roster wire shapes to the nuclear family.
-export const DAEMON_SCHEMA_REVISION = 13;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-13-816309b1cd50";
+// Revision 14 adds capability-gated durable family mailbox commands and receipt metadata.
+export const DAEMON_SCHEMA_REVISION = 15;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-15-09a6bc7091f1";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -95,7 +96,8 @@ export type DaemonServerCapability =
 	// identity). Clients must check before sending.
 	| "transient_bash"
 	| "session_input_admission"
-	| "prompt_admission_cancellation";
+	| "prompt_admission_cancellation"
+	| "family_mailbox";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -133,6 +135,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"transient_bash",
 	"session_input_admission",
 	"prompt_admission_cancellation",
+	"family_mailbox",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -398,6 +401,7 @@ export type DaemonCommand =
 			source?: InputSource;
 			agentMessageId?: string;
 			customMessage?: CustomMessage;
+			internalPrompt?: boolean;
 			/** Unique only when the caller needs cancellable pre-ownership admission. */
 			admissionId?: string;
 	  }
@@ -418,6 +422,8 @@ export type DaemonCommand =
 			queueIfBusy?: boolean;
 			expandPromptTemplates?: boolean;
 			source?: InputSource;
+			customMessage?: CustomMessage;
+			internalPrompt?: boolean;
 			/** Unique only when the caller needs cancellable pre-ownership admission. */
 			admissionId?: string;
 	  }
@@ -465,6 +471,25 @@ export type DaemonCommand =
 			/** Internal worker-origin marker; public clients remain unrestricted. */
 			agentOrigin?: boolean;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
+			messageId?: string;
+			replyTo?: string;
+	  }
+	| {
+			id?: string;
+			type: "agent_message_inbox";
+			activeSessionId: string;
+			limit?: number;
+			consume?: boolean;
+			sender?: string;
+			replyTo?: string;
+	  }
+	| {
+			id?: string;
+			type: "agent_message_wait";
+			activeSessionId: string;
+			timeoutMs?: number;
+			sender?: string;
+			replyTo?: string;
 	  }
 	| { id?: string; type: "agent_messages_status"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_pause"; activeSessionId?: string }
@@ -626,6 +651,11 @@ const CLIENT_OWNED_DAEMON_COMMAND = {
 	minProtocol: 7,
 	capability: "client_owned_sessions",
 } as const;
+const FAMILY_MAILBOX_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 14,
+	capability: "family_mailbox",
+} as const;
 const DELETE_RLM_SUBAGENT_COMMAND = {
 	minProtocol: 7,
 	capability: "delete_rlm_subagent",
@@ -654,6 +684,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	append_custom_message: LEGACY_DAEMON_COMMAND,
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
 	send_message: LEGACY_DAEMON_COMMAND,
+	agent_message_inbox: FAMILY_MAILBOX_COMMAND,
+	agent_message_wait: FAMILY_MAILBOX_COMMAND,
 	agent_messages_status: LEGACY_DAEMON_COMMAND,
 	agent_messages_pause: LEGACY_DAEMON_COMMAND,
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,

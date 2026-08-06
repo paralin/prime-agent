@@ -139,6 +139,7 @@
 - Changed agent-message acceptance to persist hidden mailbox state before returning a receipt. Model-visible prompt delivery remains separate from retained mailbox state.
 - Changed a lone `.` interactive submission to resume the prior intent through a hidden host continuation instead of adding a visible user message.
 - Changed explicit RLM model-role effort suffixes to pass their exact value to the provider even when model capability metadata marks that effort unsupported.
+- Changed file-backed settings to hot-reload global and project JSON or YAML edits, including `modelRoles`, while retaining runtime overrides.
 - Changed Ctrl+C to clear non-empty editor text before applying its existing interrupt and exit behavior to an empty editor.
 - Fixed an empty OpenAI Codex discovery catalog blocking configured RLM child models that remain usable through interactive selection. Nonempty catalogs still restrict child admission to the models they list.
 - Fixed Python `rlm.find_models` results discarding the availability state of configured model roles.

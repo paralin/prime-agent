@@ -32,6 +32,11 @@ type SessionWithCompactionInternals = {
 		message: string,
 	) => void;
 	_handleAgentEvent: (event: AgentEvent) => void;
+	_notifyKernelStateAfterCompaction: () => Promise<void>;
+	_ipythonKernelProvisioner?: {
+		hasRunningKernel: boolean;
+		listNamespaceNames(signal?: AbortSignal): Promise<string[] | null>;
+	};
 };
 
 function createUsage(totalTokens: number) {
@@ -159,6 +164,33 @@ describe("AgentSession compaction characterization", () => {
 		await harness.session.prompt("two");
 
 		const result = await harness.session.compact();
+		const internals = harness.session as unknown as SessionWithCompactionInternals;
+		const stablePrefix = [...harness.session.messages];
+		const stableProviderPayload = structuredClone(
+			(harness.session.messages[0] as { providerPayload?: unknown }).providerPayload,
+		);
+		internals._ipythonKernelProvisioner = {
+			hasRunningKernel: true,
+			async listNamespaceNames() {
+				return [
+					"zeta",
+					"name-12",
+					"name-11",
+					"name-10",
+					"name-09",
+					"name-08",
+					"name-07",
+					"name-06",
+					"name-05",
+					"name-04",
+					"name-03",
+					"name-02",
+					"name-01",
+					"alpha",
+				];
+			},
+		};
+		await internals._notifyKernelStateAfterCompaction();
 		const entry = harness.sessionManager.getEntries().find((candidate) => candidate.type === "compaction");
 
 		expect(nativeCompact).toHaveBeenCalledOnce();
@@ -179,6 +211,22 @@ describe("AgentSession compaction characterization", () => {
 				items: [{ type: "compaction", encrypted_content: "opaque-state" }],
 			},
 		});
+		expect(harness.session.messages.slice(0, stablePrefix.length)).toEqual(stablePrefix);
+		for (const [index, message] of stablePrefix.entries()) {
+			expect(harness.session.messages[index]).toBe(message);
+		}
+		expect((harness.session.messages[0] as { providerPayload?: unknown }).providerPayload).toEqual(
+			stableProviderPayload,
+		);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "custom",
+			customType: "ipython_state",
+			display: false,
+		});
+		expect(getMessageText(harness.session.messages.at(-1)!)).toContain(
+			"These names are still defined: alpha, name-01, name-02, name-03, name-04, name-05, name-06, name-07, name-08, name-09, name-10, name-11 (+2 more).",
+		);
+		expect(getMessageText(harness.session.messages.at(-1)!)).not.toContain("zeta");
 		const reloaded = SessionManager.open(harness.session.sessionFile!);
 		expect(reloaded.buildSessionContext().messages[0]).toMatchObject({
 			role: "compactionSummary",
@@ -421,6 +469,34 @@ describe("AgentSession compaction characterization", () => {
 		expect(nativeCompact).toHaveBeenCalledOnce();
 		expect(result.providerNativeCompaction).toBeUndefined();
 		expect(result.summary).toContain("local summary");
+	});
+
+	it("retains the native failure and skips an oversized local fallback request", async () => {
+		const nativeCompact = vi.fn(async () => {
+			throw new Error("native endpoint unavailable");
+		});
+		const harness = await createHarness({
+			models: [{ id: "small-context", contextWindow: 4096, maxTokens: 512 }],
+			settings: { compaction: { enabled: false, keepRecentTokens: 1, reserveTokens: 512 } },
+			nativeCompact,
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("local summary must remain unused"),
+		]);
+		await harness.session.prompt("界".repeat(5000));
+		await harness.session.prompt("two");
+		harness.settingsManager.applyOverrides({ compaction: { enabled: true } });
+
+		await expect(harness.session.compact()).rejects.toThrow(
+			/Provider-native compaction failed: native endpoint unavailable.*Local fallback failed: Local compaction requires approximately \d+ tokens, exceeding the 4096-token context window/,
+		);
+
+		expect(nativeCompact).toHaveBeenCalledOnce();
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(0);
 	});
 
 	it("uses local summarization when native compaction is disabled", async () => {

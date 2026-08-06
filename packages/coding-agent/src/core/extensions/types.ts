@@ -719,7 +719,12 @@ export interface ToolExecutionEndEvent {
 	result: any;
 	isError: boolean;
 }
-export type ModelSelectSource = "set" | "cycle" | "restore";
+
+// ============================================================================
+// Model Events
+// ============================================================================
+
+export type ModelSelectSource = "set" | "cycle" | "restore" | "fallback";
 
 /** Fired when a new model is selected */
 export interface ModelSelectEvent {

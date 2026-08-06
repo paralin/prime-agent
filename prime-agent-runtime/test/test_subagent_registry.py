@@ -102,7 +102,9 @@ class RlmSubagentRegistryTest(unittest.TestCase):
                         "provider": "anthropic",
                         "id": "claude-opus-4-7",
                         "name": "Claude Opus 4.7",
-                        "selector": "anthropic/claude-opus-4-7",
+                        "selector": "@opus",
+                        "concreteSelector": "anthropic/claude-opus-4-7",
+                        "available": False,
                     }
                 ]
             }
@@ -114,7 +116,9 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         self.assertEqual(models[0].provider, "anthropic")
         self.assertEqual(models[0].id, "claude-opus-4-7")
         self.assertEqual(models[0].name, "Claude Opus 4.7")
-        self.assertEqual(models[0].selector, "anthropic/claude-opus-4-7")
+        self.assertEqual(models[0].selector, "@opus")
+        self.assertEqual(models[0].concrete_selector, "anthropic/claude-opus-4-7")
+        self.assertIs(models[0].available, False)
         host_request.assert_awaited_once_with(
             "rlm.find_models",
             {"query": "opus", "limit": 3},
@@ -127,6 +131,23 @@ class RlmSubagentRegistryTest(unittest.TestCase):
             asyncio.run(rlm_module.find_models("opus", limit="3"))
 
         host_request = AsyncMock(return_value={"models": [{"provider": "anthropic"}]})
+        with patch.object(rlm_module, "host_request", host_request):
+            with self.assertRaisesRegex(RuntimeError, "invalid model entry"):
+                asyncio.run(rlm_module.find_models("opus"))
+
+        host_request = AsyncMock(
+            return_value={
+                "models": [
+                    {
+                        "provider": "anthropic",
+                        "id": "claude-opus-4-7",
+                        "name": "Claude Opus 4.7",
+                        "selector": "@opus",
+                        "available": "yes",
+                    }
+                ]
+            }
+        )
         with patch.object(rlm_module, "host_request", host_request):
             with self.assertRaisesRegex(RuntimeError, "invalid model entry"):
                 asyncio.run(rlm_module.find_models("opus"))

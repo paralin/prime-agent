@@ -24,14 +24,24 @@ import {
 } from "../../config.js";
 import {
 	AGENT_FAMILY_REACH_ERROR,
+	AGENT_MESSAGE_ACCEPTED_CUSTOM_TYPE,
+	AGENT_MESSAGE_CONSUMED_CUSTOM_TYPE,
+	AGENT_MESSAGE_HANDOFF_CUSTOM_TYPE,
 	AGENT_MESSAGE_SOURCE,
 	type AgentFamilyCatalogEntry,
 	type AgentFamilyRelationship,
 	type AgentFamilyRosterResult,
+	type AgentSessionMailboxEnvelope,
+	type AgentSessionMailboxFilter,
+	type AgentSessionMailboxInboxInput,
+	type AgentSessionMailboxInboxResult,
+	type AgentSessionMailboxWaitInput,
+	type AgentSessionMailboxWaitResult,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageDeliveryStatus,
 	type AgentSessionMessageEndpoint,
+	type AgentSessionMessageHandoff,
 	type AgentSessionMessageListResult,
 	type AgentSessionMessagePayload,
 	AgentSessionMessageRateLimiter,
@@ -49,8 +59,11 @@ import {
 	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY,
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS,
+	findAgentSessionMailboxAcceptance,
+	findAgentSessionMailboxHandoff,
 	formatAgentSessionNameUnavailable,
 	normalizeAgentSessionMessage,
+	projectAgentSessionMailbox,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
 import {
@@ -2488,6 +2501,7 @@ export class AgentDaemon {
 				sessionOptions: {
 					model: options.model,
 					thinkingLevel: options.thinkingLevel,
+					rlmModelCandidates: options.modelCandidates,
 					serviceTier: options.serviceTier,
 					scopedModels: options.scopedModels,
 					initialActiveToolNames: options.activeToolNames,
@@ -3008,6 +3022,55 @@ export class AgentDaemon {
 		}
 	}
 
+	private async sendExternalChildAgentMessage(
+		parentState: ActiveSessionState,
+		input: {
+			childId: string;
+			childSessionId?: string;
+			childName: string;
+			target: string;
+			message: string;
+			id?: string;
+			replyTo?: string;
+		},
+	): Promise<AgentSessionMessageReceipt> {
+		const child = (await parentState.runtime.session.listRlmSubagents()).subagents.find(
+			(candidate) => candidate.rlm_child_id === input.childId && candidate.session_name === input.childName,
+		);
+		if (!child) throw new Error("Claude Code sender is not a live direct child of this parent");
+		const roster = await this.createAgentFamilyRoster(parentState);
+		const parentMatch =
+			input.target === roster.current.id ||
+			input.target === roster.current.name ||
+			input.target === parentState.activeSessionId ||
+			input.target === parentState.runtime.session.sessionId;
+		const siblingMatches = roster.entries.filter(
+			(entry) =>
+				entry.relationship === "child" &&
+				(entry.id === input.target || entry.name === input.target) &&
+				entry.id !== input.childId,
+		);
+		if (!parentMatch && siblingMatches.length !== 1) {
+			throw new Error(AGENT_FAMILY_REACH_ERROR);
+		}
+		const targetSelector = parentMatch ? parentState.activeSessionId : siblingMatches[0]!.id;
+		const fromRelationship: AgentFamilyRelationship = parentMatch ? "child" : "sibling";
+		return this.sendAgentSessionMessage({
+			targetSelector,
+			message: input.message,
+			sender: {
+				activeSessionId: input.childId,
+				sessionId: input.childSessionId ?? input.childId,
+				sessionName: input.childName,
+			},
+			senderKey: `claude-code:${input.childId}`,
+			fromRelationship,
+			origin: "agent",
+			id: input.id,
+			replyTo: input.replyTo,
+		});
+	}
+
 	private createAgentMessageController(
 		getCurrentState: () => ActiveSessionState | undefined,
 	): AgentSessionMessageController {
@@ -3029,7 +3092,12 @@ export class AgentDaemon {
 					message: input.message,
 					fromState: requireCurrentState(),
 					origin: "agent",
+					id: input.id,
+					replyTo: input.replyTo,
 				}),
+			sendExternalChildAgentMessage: (input) => this.sendExternalChildAgentMessage(requireCurrentState(), input),
+			inboxAgentMessages: (input) => this.readAgentSessionMailbox(requireCurrentState(), input),
+			waitForAgentMessage: (input, signal) => this.waitForAgentSessionMailbox(requireCurrentState(), input, signal),
 		};
 	}
 
@@ -4136,6 +4204,8 @@ export class AgentDaemon {
 					expandPromptTemplates: command.expandPromptTemplates,
 					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
 					source: command.source,
+					customMessage: command.customMessage,
+					internalPrompt: command.internalPrompt,
 					...(admission?.controller
 						? {
 								signal: admission.controller.signal,
@@ -4286,9 +4356,32 @@ export class AgentDaemon {
 					fromState,
 					clientId: client.id,
 					senderKey: this.createCliAgentMessageSenderKey(),
+					id: command.messageId,
+					replyTo: command.replyTo,
 					origin: command.agentOrigin === true ? "agent" : "cli",
 				});
 				return success(command.id, "send_message", receipt);
+			}
+
+			case "agent_message_inbox": {
+				const state = this.getSessionState(command.activeSessionId);
+				const result = await this.readAgentSessionMailbox(state, {
+					limit: normalizeAgentMessageInboxLimit(command.limit),
+					consume: command.consume === true,
+					sender: command.sender,
+					replyTo: command.replyTo,
+				});
+				return success(command.id, "agent_message_inbox", result);
+			}
+
+			case "agent_message_wait": {
+				const state = this.getSessionState(command.activeSessionId);
+				const result = await this.waitForAgentSessionMailbox(state, {
+					timeoutMs: normalizeAgentMessageWaitTimeout(command.timeoutMs),
+					sender: command.sender,
+					replyTo: command.replyTo,
+				});
+				return success(command.id, "agent_message_wait", result);
 			}
 
 			case "agent_messages_status": {
@@ -5800,6 +5893,9 @@ export class AgentDaemon {
 		sender?: AgentSessionMessageSender;
 		clientId?: string;
 		senderKey?: string;
+		id?: string;
+		replyTo?: string;
+		fromRelationship?: AgentFamilyRelationship;
 		origin: "agent" | "cli";
 	}): Promise<AgentSessionMessageReceipt> {
 		if (this.agentMessagesPaused) {
@@ -5842,7 +5938,15 @@ export class AgentDaemon {
 						} else if (this.options.worker && options.fromState) {
 							// The supervisor can resolve and wake a saved worker even when it is no longer
 							// present in this worker's resident peer snapshot.
-							return this.sendRemoteAgentSessionMessage(options.fromState, targetSelector, message);
+							return options.id || options.replyTo
+								? this.sendRemoteAgentSessionMessage(
+										options.fromState,
+										targetSelector,
+										message,
+										options.id,
+										options.replyTo,
+									)
+								: this.sendRemoteAgentSessionMessage(options.fromState, targetSelector, message);
 						} else {
 							throw error;
 						}
@@ -5863,16 +5967,6 @@ export class AgentDaemon {
 		if (!rateLimit.ok) {
 			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
 		}
-		const payload: AgentSessionMessagePayload = {
-			id: createAgentSessionMessageId(),
-			source: AGENT_MESSAGE_SOURCE,
-			message,
-			from:
-				options.sender ??
-				this.createAgentSessionMessageSender(options.fromState, options.clientId ?? options.origin),
-			fromRelationship: this.agentMessageRelationship(options.fromState, targetState),
-			target: this.createAgentSessionMessageEndpoint(targetState),
-		};
 		try {
 			const { status } = await this.acceptAgentSessionMessage(targetState, payload);
 			return createAgentSessionMessageReceipt(payload, status);
@@ -5886,6 +5980,8 @@ export class AgentDaemon {
 		fromState: ActiveSessionState,
 		targetSelector: string,
 		message: string,
+		messageId?: string,
+		replyTo?: string,
 	): Promise<AgentSessionMessageReceipt> {
 		const supervisorSocketPath = this.supervisorSocketPathFromEnv();
 		if (!supervisorSocketPath) {
@@ -5918,6 +6014,8 @@ export class AgentDaemon {
 					message,
 					fromActiveSessionId: fromState.activeSessionId,
 					agentOrigin: true,
+					messageId,
+					replyTo,
 				},
 				30_000,
 			);
@@ -5968,6 +6066,139 @@ export class AgentDaemon {
 			throw new Error("Agent message was not accepted");
 		}
 		return { status: preflightQueued ? "queued" : "delivered" };
+	}
+
+	private appendAgentMessageHandoff(
+		state: ActiveSessionState,
+		envelope: AgentSessionMailboxEnvelope,
+		handoff: Exclude<AgentSessionMessageHandoff, "retry">,
+		deliveryStatus: AgentSessionMessageDeliveryStatus,
+	): void {
+		state.runtime.session.sessionManager.appendCustomMessageEntryWithRollback(
+			AGENT_MESSAGE_HANDOFF_CUSTOM_TYPE,
+			"",
+			false,
+			{
+				messageId: envelope.id,
+				targetSessionId: envelope.target.sessionId,
+				handoff,
+				deliveryStatus,
+				handedOffAt: new Date().toISOString(),
+			},
+		);
+	}
+
+	private appendAgentMessageConsumption(state: ActiveSessionState, envelope: AgentSessionMailboxEnvelope): void {
+		state.runtime.session.sessionManager.appendCustomMessageEntryWithRollback(
+			AGENT_MESSAGE_CONSUMED_CUSTOM_TYPE,
+			"",
+			false,
+			{
+				messageId: envelope.id,
+				targetSessionId: envelope.target.sessionId,
+				sequence: envelope.sequence,
+				consumedAt: new Date().toISOString(),
+			},
+		);
+	}
+
+	private async readAgentSessionMailbox(
+		state: ActiveSessionState,
+		input: AgentSessionMailboxInboxInput,
+	): Promise<AgentSessionMailboxInboxResult> {
+		return this.withAgentMessageTargetLock(state.activeSessionId, async () => {
+			const messages = projectAgentSessionMailbox(
+				state.runtime.session.sessionManager.getEntries(),
+				state.runtime.session.sessionId,
+			)
+				.filter((message) => matchesAgentSessionMailboxFilter(message, input))
+				.slice(0, input.limit);
+			if (input.consume) for (const message of messages) this.appendAgentMessageConsumption(state, message);
+			return { messages };
+		});
+	}
+
+	private waitForAgentSessionMailbox(
+		state: ActiveSessionState,
+		input: AgentSessionMailboxWaitInput,
+		signal?: AbortSignal,
+	): Promise<AgentSessionMailboxWaitResult> {
+		if (signal?.aborted) return Promise.reject(new Error("Agent message wait cancelled"));
+		return new Promise<AgentSessionMailboxWaitResult>((resolveWait, rejectWait) => {
+			let timer: NodeJS.Timeout | undefined;
+			let waiter:
+				| {
+						filter: AgentSessionMailboxFilter;
+						resolve: (result: AgentSessionMailboxWaitResult) => void;
+						reject: (error: Error) => void;
+				  }
+				| undefined;
+			let settled = false;
+			const finish = (result?: AgentSessionMailboxWaitResult, error?: Error) => {
+				if (settled) return;
+				settled = true;
+				if (timer) clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+				if (waiter) {
+					const waiters = this.agentMessageWaiters.get(state.activeSessionId);
+					const index = waiters?.indexOf(waiter) ?? -1;
+					if (index >= 0) waiters!.splice(index, 1);
+					if (waiters?.length === 0) this.agentMessageWaiters.delete(state.activeSessionId);
+				}
+				if (error) rejectWait(error);
+				else resolveWait(result ?? {});
+			};
+			const onAbort = () => finish(undefined, new Error("Agent message wait cancelled"));
+			signal?.addEventListener("abort", onAbort, { once: true });
+			void this.withAgentMessageTargetLock(state.activeSessionId, async () => {
+				if (
+					settled ||
+					this.sessions.get(state.activeSessionId) !== state ||
+					this.closingSessions.has(state.activeSessionId)
+				) {
+					throw new Error("Agent message wait cancelled because the target session is closing");
+				}
+				const retained = projectAgentSessionMailbox(
+					state.runtime.session.sessionManager.getEntries(),
+					state.runtime.session.sessionId,
+				).find((message) => matchesAgentSessionMailboxFilter(message, input));
+				if (retained) {
+					this.appendAgentMessageConsumption(state, retained);
+					finish({ message: retained });
+					return;
+				}
+				waiter = {
+					filter: input,
+					resolve: (result) => finish(result),
+					reject: (error) => finish(undefined, error),
+				};
+				const waiters = this.agentMessageWaiters.get(state.activeSessionId) ?? [];
+				waiters.push(waiter);
+				this.agentMessageWaiters.set(state.activeSessionId, waiters);
+				timer = setTimeout(() => finish({}), input.timeoutMs);
+				timer.unref();
+			}).catch((error) => finish(undefined, error instanceof Error ? error : new Error(String(error))));
+		});
+	}
+
+	private claimAgentMessageWaiter(
+		state: ActiveSessionState,
+		envelope: AgentSessionMailboxEnvelope,
+	): (() => void) | undefined {
+		const waiters = this.agentMessageWaiters.get(state.activeSessionId);
+		const index = waiters?.findIndex((waiter) => matchesAgentSessionMailboxFilter(envelope, waiter.filter)) ?? -1;
+		if (!waiters || index < 0) return undefined;
+		const [waiter] = waiters.splice(index, 1);
+		if (waiters.length === 0) this.agentMessageWaiters.delete(state.activeSessionId);
+		this.appendAgentMessageConsumption(state, envelope);
+		return () => waiter!.resolve({ message: envelope });
+	}
+
+	private cancelAgentMessageWaiters(activeSessionId: string, reason: string): void {
+		const waiters = this.agentMessageWaiters.get(activeSessionId);
+		if (!waiters) return;
+		this.agentMessageWaiters.delete(activeSessionId);
+		for (const waiter of waiters) waiter.reject(new Error(reason));
 	}
 
 	private detachClientFromSession(client: DaemonSocketClient, state: ActiveSessionState): void {
@@ -6339,6 +6570,10 @@ export class AgentDaemon {
 		descendantCollector?: Set<ActiveSessionState>,
 	): Promise<void> {
 		this.abortWaitingPromptAdmissionsForSession(state.activeSessionId);
+		this.cancelAgentMessageWaiters(
+			state.activeSessionId,
+			"Agent message wait cancelled because the target session is closing",
+		);
 		for (const client of state.clients) {
 			this.abortSideQuestionsFor(client, state.activeSessionId);
 		}

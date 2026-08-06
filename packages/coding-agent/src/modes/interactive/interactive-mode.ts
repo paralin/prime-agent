@@ -102,11 +102,14 @@ import {
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
 	createHeartbeatPromptMessage,
+	createManualContinueMessage,
+	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	isCompactionOutcomeMessage,
 	isRefinementOutcomeMessage,
 	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
+	MANUAL_CONTINUE_PROMPT,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
@@ -5008,7 +5011,8 @@ export class InteractiveMode {
 				this.clearSideQuestion({ abort: true });
 				this.flushPendingBashComponents();
 				const images = this.collectImagesFor(text);
-				this.editor.addToHistory?.(text);
+				const manualContinue = text === "." && (images?.length ?? 0) === 0;
+				if (!manualContinue) this.editor.addToHistory?.(text);
 				this.editor.setText("");
 				const promptStashAfterClear = this.promptStash;
 				submissionOutcome = (await this.admitPendingStartupPrompts?.()) ?? "admitted";
@@ -5035,10 +5039,11 @@ export class InteractiveMode {
 					return;
 				}
 				try {
-					await this.agentConnection.prompt(text, {
+					await this.agentConnection.prompt(manualContinue ? MANUAL_CONTINUE_PROMPT : text, {
 						streamingBehavior,
 						queueIfBusy: true,
 						images,
+						...(manualContinue ? { customMessage: createManualContinueMessage(), internalPrompt: true } : {}),
 					});
 				} catch (error) {
 					// Generation guards editor ownership, not draft durability: a stale
@@ -6720,6 +6725,10 @@ export class InteractiveMode {
 	}
 
 	private handleCtrlC(): void {
+		if (this.editor.getText().length > 0) {
+			this.clearInputBar();
+			return;
+		}
 		this.clearEscapeRepeat();
 		if (this.isCtrlCExitHintVisible()) {
 			void this.shutdown();

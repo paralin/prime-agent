@@ -14,6 +14,7 @@ import type { AgentObserveController } from "../../src/core/agent-observe.js";
 import { AgentSession, type AgentSessionEvent, type AutoRefineReviewer } from "../../src/core/agent-session.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
 import type { AgentAutonomousConfig } from "../../src/core/autonomous.js";
+import type { StartClaudeCodeQuery } from "../../src/core/claude-code-sdk.js";
 import type { ExtensionRunner } from "../../src/core/extensions/index.js";
 import { convertToLlm } from "../../src/core/messages.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
@@ -72,6 +73,7 @@ export interface HarnessOptions {
 	agentObserveController?: AgentObserveController;
 	agentMessageController?: AgentSessionMessageController;
 	subagentRuntimeHost?: SubagentRuntimeHost;
+	startClaudeCodeQuery?: StartClaudeCodeQuery;
 	persistSession?: boolean;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
@@ -138,6 +140,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 				name: registeredModel.name,
 				api: registeredModel.api,
 				reasoning: registeredModel.reasoning,
+				thinkingLevelMap: registeredModel.thinkingLevelMap,
 				input: registeredModel.input,
 				cost: registeredModel.cost,
 				contextWindow: registeredModel.contextWindow,
@@ -195,6 +198,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		agentObserveController: options.agentObserveController,
 		agentMessageController: options.agentMessageController,
 		subagentRuntimeHost: options.subagentRuntimeHost,
+		startClaudeCodeQuery: options.startClaudeCodeQuery,
 		baseToolsOverride: toolMap,
 		extensionRunnerRef,
 		rlmDepth: options.rlmDepth,

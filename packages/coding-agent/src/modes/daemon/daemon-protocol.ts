@@ -118,7 +118,8 @@ export type DaemonServerCapability =
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
-	| "direct_peer_transport";
+	| "direct_peer_transport"
+	| "family_mailbox";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -163,6 +164,8 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"rlm_quiescence_barrier",
 	"session_input_pause",
 	"acp_mcp_servers",
+	"direct_peer_transport",
+	"family_mailbox",
 ];
 
 /** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
@@ -449,6 +452,7 @@ export type DaemonCommand =
 			source?: InputSource;
 			agentMessageId?: string;
 			customMessage?: CustomMessage;
+			internalPrompt?: boolean;
 			/** Unique only when the caller needs cancellable pre-ownership admission. */
 			admissionId?: string;
 	  }
@@ -471,6 +475,8 @@ export type DaemonCommand =
 			queueIfBusy?: boolean;
 			expandPromptTemplates?: boolean;
 			source?: InputSource;
+			customMessage?: CustomMessage;
+			internalPrompt?: boolean;
 			/** Unique only when the caller needs cancellable pre-ownership admission. */
 			admissionId?: string;
 	  }
@@ -518,6 +524,25 @@ export type DaemonCommand =
 			/** Internal worker-origin marker; public clients remain unrestricted. */
 			agentOrigin?: boolean;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
+			messageId?: string;
+			replyTo?: string;
+	  }
+	| {
+			id?: string;
+			type: "agent_message_inbox";
+			activeSessionId: string;
+			limit?: number;
+			consume?: boolean;
+			sender?: string;
+			replyTo?: string;
+	  }
+	| {
+			id?: string;
+			type: "agent_message_wait";
+			activeSessionId: string;
+			timeoutMs?: number;
+			sender?: string;
+			replyTo?: string;
 	  }
 	| { id?: string; type: "agent_messages_status"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_pause"; activeSessionId?: string }
@@ -708,6 +733,11 @@ const CLIENT_OWNED_DAEMON_COMMAND = {
 	minProtocol: 7,
 	capability: "client_owned_sessions",
 } as const;
+const FAMILY_MAILBOX_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 16,
+	capability: "family_mailbox",
+} as const;
 const DELETE_RLM_SUBAGENT_COMMAND = {
 	minProtocol: 7,
 	capability: "delete_rlm_subagent",
@@ -765,6 +795,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	append_custom_message: LEGACY_DAEMON_COMMAND,
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
 	send_message: LEGACY_DAEMON_COMMAND,
+	agent_message_inbox: FAMILY_MAILBOX_COMMAND,
+	agent_message_wait: FAMILY_MAILBOX_COMMAND,
 	agent_messages_status: LEGACY_DAEMON_COMMAND,
 	agent_messages_pause: LEGACY_DAEMON_COMMAND,
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,

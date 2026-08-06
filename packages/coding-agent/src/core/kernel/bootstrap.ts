@@ -11,8 +11,9 @@ import { fileURLToPath } from "node:url";
 import { getPackageDir } from "../../config.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 
-const BOOTSTRAP_SCHEMA = 9;
+const BOOTSTRAP_SCHEMA = 8;
 const PYTHON_VERSION = "3.11";
+const IPYKERNEL_REQUIREMENT = "ipykernel";
 const RUNTIME_REQUIREMENT = "prime-agent-runtime";
 // Serializes the kernel's user namespace so it can be revived across session
 // resume. Internal-only; intentionally not surfaced to the model as an import.
@@ -75,6 +76,7 @@ interface BootstrapPythonSkill {
 
 interface BootstrapVersion {
 	schema: number;
+	ipykernel?: string;
 	runtime?: string;
 	snapshot?: string;
 	extraUvArgs?: string[];
@@ -363,7 +365,7 @@ async function resolveWritableKernelVenvDir(): Promise<string> {
 			return fallback;
 		} catch (fallbackError) {
 			throw new Error(
-				`couldn't create kernel venv directory at ${primary} or ${fallback}; set PRIME_AGENT_KERNEL_PYTHON to a python with a current prime-agent-runtime installed. ${errorMessage(fallbackError)}`,
+				`couldn't create kernel venv directory at ${primary} or ${fallback}; set PRIME_AGENT_KERNEL_PYTHON to a python with ipykernel installed. ${errorMessage(fallbackError)}`,
 			);
 		}
 	}
@@ -394,6 +396,10 @@ async function pythonImports(python: string, moduleName: string): Promise<boolea
 	} catch {
 		return false;
 	}
+}
+
+async function hasIpykernel(python: string): Promise<boolean> {
+	return pythonImports(python, "ipykernel");
 }
 
 async function hasPrimeAgentRuntime(python: string): Promise<boolean> {
@@ -580,6 +586,7 @@ async function readBootstrapVersion(venv: string): Promise<BootstrapVersion | nu
 		}
 		return {
 			schema: parsed.schema,
+			ipykernel: typeof parsed.ipykernel === "string" ? parsed.ipykernel : undefined,
 			runtime: typeof parsed.runtime === "string" ? parsed.runtime : undefined,
 			snapshot: typeof parsed.snapshot === "string" ? parsed.snapshot : undefined,
 			extraUvArgs,
@@ -626,6 +633,7 @@ function bootstrapVersionCurrent(
 function bootstrapBaseVersionCurrent(version: BootstrapVersion | null, runtimeIdentity: string): boolean {
 	return (
 		version?.schema === BOOTSTRAP_SCHEMA &&
+		version.ipykernel === IPYKERNEL_REQUIREMENT &&
 		version.runtime === runtimeIdentity &&
 		version.snapshot === STATE_SNAPSHOT_REQUIREMENT &&
 		extraUvArgsMatch(version.extraUvArgs, DEFAULT_RLM_EXTRA_UV_ARGS)
@@ -639,6 +647,7 @@ async function writeBootstrapVersion(
 ): Promise<void> {
 	const version: BootstrapVersion = {
 		schema: BOOTSTRAP_SCHEMA,
+		ipykernel: IPYKERNEL_REQUIREMENT,
 		runtime: runtimeIdentity,
 		snapshot: STATE_SNAPSHOT_REQUIREMENT,
 		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -728,6 +737,7 @@ async function bootstrapVenv(
 		"install",
 		"--python",
 		python,
+		IPYKERNEL_REQUIREMENT,
 		runtimeRequirement,
 		STATE_SNAPSHOT_REQUIREMENT,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -815,6 +825,7 @@ async function syncPythonSkills(
 
 async function kernelBaseReady(python: string, venv: string, runtimeIdentity: string): Promise<boolean> {
 	return (
+		(await hasIpykernel(python)) &&
 		(await hasPrimeAgentRuntime(python)) &&
 		bootstrapBaseVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity)
 	);
@@ -827,6 +838,7 @@ async function kernelReady(
 	pythonSkills: readonly BootstrapPythonSkill[],
 ): Promise<boolean> {
 	return (
+		(await hasIpykernel(python)) &&
 		(await hasPrimeAgentRuntime(python)) &&
 		bootstrapVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity, pythonSkills)
 	);
@@ -835,8 +847,8 @@ async function kernelReady(
 function formatBootstrapFailure(error: unknown): Error {
 	return new Error(
 		`Failed to set up the Python kernel runtime. ${errorMessage(error)}\n` +
-			"First-time setup needs internet to install uv, Python, prime-agent-runtime, and default Python packages; once set up, prime-agent runs offline. " +
-			"Set PRIME_AGENT_KERNEL_PYTHON to a Python with a current prime-agent-runtime and default Python packages installed to skip auto-bootstrap.",
+			"First-time setup needs internet to install uv, Python, ipykernel, prime-agent-runtime, and default Python packages; once set up, prime-agent runs offline. " +
+			"Set PRIME_AGENT_KERNEL_PYTHON to a Python with ipykernel, a current prime-agent-runtime, and default Python packages installed to skip auto-bootstrap.",
 	);
 }
 
@@ -848,6 +860,7 @@ async function ensureKernelPythonUncached(
 	if (override) {
 		const python = path.resolve(expandHome(override));
 		const missing: string[] = [];
+		if (!(await hasIpykernel(python))) missing.push("ipykernel");
 		if (!(await hasPrimeAgentRuntime(python))) {
 			missing.push(
 				"a current prime-agent-runtime with callable rlm.run, rlm.host_request, and explicit harness CRUD methods",

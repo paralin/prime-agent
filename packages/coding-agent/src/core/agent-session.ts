@@ -401,6 +401,21 @@ type UserBashEndDetails = {
 
 export class CompactionSkippedError extends Error {}
 
+function describeCompactionFailure(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function combineCompactionFailures(nativeError: unknown, localError: unknown): AggregateError {
+	return new AggregateError(
+		[nativeError, localError],
+		`Provider-native compaction failed: ${describeCompactionFailure(nativeError)}. Local fallback failed: ${describeCompactionFailure(localError)}`,
+	);
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -7170,6 +7185,7 @@ export class AgentSession {
 		}
 
 		let coreCompaction: CompactionResult | undefined;
+		let nativeCompactionError: unknown;
 		if (!extensionCompaction && nativePreparation) {
 			try {
 				coreCompaction = await compactNative(
@@ -7183,21 +7199,31 @@ export class AgentSession {
 				);
 			} catch (error) {
 				if (signal.aborted) throw error;
+				nativeCompactionError = error;
 			}
 		}
 		if (!extensionCompaction && !coreCompaction) {
 			if (!portablePreparation) {
-				throw new CompactionSkippedError("Session is too short to compact — try again once it grows");
+				const localError = new CompactionSkippedError("Session is too short to compact — try again once it grows");
+				if (nativeCompactionError !== undefined) {
+					throw combineCompactionFailures(nativeCompactionError, localError);
+				}
+				throw localError;
 			}
-			coreCompaction = await compact(
-				portablePreparation,
-				model,
-				apiKey,
-				headers,
-				customInstructions,
-				signal,
-				this.thinkingLevel,
-			);
+			try {
+				coreCompaction = await compact(
+					portablePreparation,
+					model,
+					apiKey,
+					headers,
+					customInstructions,
+					signal,
+					this.thinkingLevel,
+				);
+			} catch (error) {
+				if (signal.aborted || nativeCompactionError === undefined) throw error;
+				throw combineCompactionFailures(nativeCompactionError, error);
+			}
 		}
 		const selectedCompaction = extensionCompaction ?? coreCompaction;
 		if (!selectedCompaction) {

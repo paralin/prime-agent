@@ -27,6 +27,7 @@ import type {
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
+	getApiProvider,
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	modelsAreEqual,
@@ -108,6 +109,7 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	compactNative,
 	estimateContextTokens,
 	generateBranchSummary,
 	prepareCompaction,
@@ -1042,6 +1044,8 @@ export class AgentSession {
 		followUps: [],
 	};
 	private _agentEventQueue: Promise<void> = Promise.resolve();
+	private _pendingAgentEventCount = 0;
+	private _processingAgentEnd = false;
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
 	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
@@ -1104,6 +1108,7 @@ export class AgentSession {
 	private _modelSelectEmitQueue: Promise<void> = Promise.resolve();
 	private _modelSelectEmitQueueIdle = true;
 	private _modelSelectEmitContext = new AsyncLocalStorage<boolean>();
+	private _pendingModelContextRebuild = false;
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -3369,10 +3374,24 @@ export class AgentSession {
 				}
 			}
 		}
-		this._agentEventQueue = this._agentEventQueue.then(
-			() => this._processAgentEvent(event),
-			() => this._processAgentEvent(event),
-		);
+		this._pendingAgentEventCount++;
+		const processEvent = async () => {
+			if (event.type === "agent_end") this._processingAgentEnd = true;
+			try {
+				await this._processAgentEvent(event);
+			} finally {
+				this._processingAgentEnd = false;
+				this._pendingAgentEventCount--;
+				if (
+					this._pendingAgentEventCount === 0 &&
+					this._pendingModelContextRebuild &&
+					(!this.agent.state.isStreaming || event.type === "agent_end")
+				) {
+					this._restoreMessagesAfterModelChange();
+				}
+			}
+		};
+		this._agentEventQueue = this._agentEventQueue.then(processEvent, processEvent);
 		this._agentEventQueue.catch(() => {});
 	};
 
@@ -4104,7 +4123,7 @@ export class AgentSession {
 	}
 
 	buildSessionContext(): SessionContext {
-		const context = this.sessionManager.buildSessionContext();
+		const context = this.sessionManager.buildSessionContext(this.model?.provider);
 		for (const message of context.messages) {
 			this._applyLateIpythonSentAgentMessages(message);
 		}
@@ -6633,6 +6652,28 @@ export class AgentSession {
 		return promise;
 	}
 
+	private _applySessionModelChange(model: Model<any>): void {
+		this.agent.state.model = model;
+		this.sessionManager.appendModelChange(model.provider, model.id);
+		if ((this.agent.state.isStreaming || this._pendingAgentEventCount > 0) && !this._processingAgentEnd) {
+			this._pendingModelContextRebuild = true;
+			return;
+		}
+		this._restoreMessagesAfterModelChange();
+	}
+
+	private _restoreMessagesAfterModelChange(): void {
+		// Rebuild against the new provider so provider-bound compaction history is
+		// either replayed intact or replaced with its original append-only entries.
+		this.agent.state.messages = this.buildSessionContext().messages;
+		this._pendingModelContextRebuild = false;
+	}
+
+	/**
+	 * Set model directly.
+	 * Validates that the model is available, saves to session and settings.
+	 * @throws Error if the model is not available
+	 */
 	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
 		if (!this._modelRegistry.hasConfiguredAuth(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
@@ -6644,8 +6685,7 @@ export class AgentSession {
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
-		this.agent.state.model = model;
-		this.sessionManager.appendModelChange(model.provider, model.id);
+		this._applySessionModelChange(model);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -6711,8 +6751,8 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.thinkingLevel);
 		const serviceTier = this._getServiceTierForModelSwitch();
 
-		this.agent.state.model = next.model;
-		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+		// Apply model
+		this._applySessionModelChange(next.model);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -6750,8 +6790,7 @@ export class AgentSession {
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
-		this.agent.state.model = nextModel;
-		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+		this._applySessionModelChange(nextModel);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -7059,9 +7098,14 @@ export class AgentSession {
 		const { model, apiKey, headers, customInstructions, signal } = options;
 		const pathEntries = this.sessionManager.getBranch();
 		const settings = this.settingsManager.getCompactionSettings();
+		const supportsNativeCompaction = settings.native && getApiProvider(model.api)?.compact !== undefined;
+		const portablePreparation = prepareCompaction(pathEntries, settings);
+		const nativePreparation = supportsNativeCompaction
+			? prepareCompaction(pathEntries, settings, model.provider)
+			: undefined;
+		const hookPreparation = portablePreparation ?? nativePreparation;
 
-		const preparation = prepareCompaction(pathEntries, settings);
-		if (!preparation) {
+		if (!hookPreparation) {
 			const lastEntry = pathEntries[pathEntries.length - 1];
 			if (lastEntry?.type === "compaction") {
 				throw new CompactionSkippedError("Already compacted");
@@ -7075,7 +7119,7 @@ export class AgentSession {
 		if (this._extensionRunner.hasHandlers("session_before_compact")) {
 			const result = (await this._extensionRunner.emit({
 				type: "session_before_compact",
-				preparation,
+				preparation: hookPreparation,
 				branchEntries: pathEntries,
 				customInstructions,
 				signal,
@@ -7091,30 +7135,62 @@ export class AgentSession {
 			}
 		}
 
-		const { summary, firstKeptEntryId, tokensBefore, details } =
-			extensionCompaction ??
-			(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel));
+		let coreCompaction: CompactionResult | undefined;
+		if (!extensionCompaction && nativePreparation) {
+			try {
+				coreCompaction = await compactNative(
+					nativePreparation,
+					model,
+					apiKey,
+					headers,
+					customInstructions,
+					signal,
+					this.sessionId,
+				);
+			} catch (error) {
+				if (signal.aborted) throw error;
+			}
+		}
+		if (!extensionCompaction && !coreCompaction) {
+			if (!portablePreparation) {
+				throw new CompactionSkippedError("Session is too short to compact — try again once it grows");
+			}
+			coreCompaction = await compact(
+				portablePreparation,
+				model,
+				apiKey,
+				headers,
+				customInstructions,
+				signal,
+				this.thinkingLevel,
+			);
+		}
+		const selectedCompaction = extensionCompaction ?? coreCompaction;
+		if (!selectedCompaction) {
+			throw new Error("Compaction produced no result");
+		}
+		const { summary, firstKeptEntryId, tokensBefore, details, providerNativeCompaction } = selectedCompaction;
 
 		if (signal.aborted) {
 			throw new Error("Compaction cancelled");
 		}
 
-		this.sessionManager.appendCompaction(
+		const savedCompactionEntryId = this.sessionManager.appendCompaction(
 			summary,
 			firstKeptEntryId,
 			tokensBefore,
 			details,
 			fromExtension,
 			customInstructions,
+			providerNativeCompaction,
 		);
 		const newEntries = this.sessionManager.getEntries();
-		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
-		this._mergeUnpersistedCompactionOutcomes(this.agent.state.messages);
-		this._restoreLateIpythonSentAgentMessages();
+		this.agent.state.messages = this.buildSessionContext().messages;
 
-		const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
-			| CompactionEntry
-			| undefined;
+		// Get the saved compaction entry for the extension event
+		const savedCompactionEntry = newEntries.find(
+			(entry): entry is CompactionEntry => entry.type === "compaction" && entry.id === savedCompactionEntryId,
+		);
 		if (savedCompactionEntry) {
 			await this._extensionRunner.emit({
 				type: "session_compact",
@@ -7125,7 +7201,7 @@ export class AgentSession {
 		await this._syncKernelStateAfterCompaction();
 		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
 
-		return { summary, firstKeptEntryId, tokensBefore, details };
+		return { summary, firstKeptEntryId, tokensBefore, details, providerNativeCompaction };
 	}
 
 	private async _reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void> {
@@ -11215,10 +11291,9 @@ export class AgentSession {
 				this.sessionManager.appendLabelChange(targetId, label);
 			}
 
-			const sessionContext = this.sessionManager.buildSessionContext();
+			// Update agent state
+			const sessionContext = this.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
-			this._mergeUnpersistedCompactionOutcomes(this.agent.state.messages);
-			this._restoreLateIpythonSentAgentMessages();
 			this._reloadGoalStateFromBranch();
 			this._reloadRlmMaxDepthFromBranch();
 			this._invalidateQueuedPromptPreparation();

@@ -90,16 +90,6 @@ const DEEPSEEK_V4_THINKING_LEVEL_MAP = {
 	xhigh: "max",
 } as const;
 
-const KIMI_K3_THINKING_LEVEL_MAP = {
-	off: null,
-	minimal: null,
-	low: null,
-	medium: null,
-	high: null,
-	xhigh: null,
-	max: "max",
-} as const;
-
 const DEEPSEEK_V4_COMPAT: OpenAICompletionsCompat = {
 	requiresReasoningContentOnAssistantMessages: true,
 	thinkingFormat: "deepseek",
@@ -321,10 +311,6 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	}
 	if (model.api === "openai-completions" && model.id.includes("deepseek-v4")) {
 		mergeThinkingLevelMap(model, DEEPSEEK_V4_THINKING_LEVEL_MAP);
-	}
-	const kimiK3Id = model.id.toLowerCase();
-	if (/^k3(-|$)/.test(kimiK3Id) || /(^|\/)kimi-k3(-|$)/.test(kimiK3Id)) {
-		mergeThinkingLevelMap(model, KIMI_K3_THINKING_LEVEL_MAP);
 	}
 	if (isGoogleThinkingApi(model) && isGemini3ProModel(model.id)) {
 		mergeThinkingLevelMap(model, { off: null, minimal: null, low: "LOW", medium: null, high: "HIGH" });

@@ -1015,6 +1015,17 @@ const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 function noopRlmChildAbort(): void {}
 function noopRlmChildEventUnsubscribe(): void {}
 
+function withExplicitRlmThinkingLevel(model: Model<Api>, thinkingLevel: ThinkingLevel | undefined): Model<Api> {
+	if (thinkingLevel === undefined) return model;
+	return {
+		...model,
+		thinkingLevelMap: {
+			...model.thinkingLevelMap,
+			[thinkingLevel]: thinkingLevel,
+		},
+	};
+}
+
 function autoRefineInstructions(reason: AutoRefineReason, review: AutoRefineReview): string {
 	const detail = review.instructions
 		? `
@@ -9905,10 +9916,11 @@ export class AgentSession {
 			}
 			const executableModels = await this._authenticatedRlmModels();
 			for (const [index, candidate] of candidates.entries()) {
-				const model = findExactModelReferenceMatch(candidate.modelReference, executableModels);
-				if (!model) continue;
-				const auth = await this._modelRegistry.getApiKeyAndHeaders(model);
+				const registeredModel = findExactModelReferenceMatch(candidate.modelReference, executableModels);
+				if (!registeredModel) continue;
+				const auth = await this._modelRegistry.getApiKeyAndHeaders(registeredModel);
 				if (!auth.ok) continue;
+				const model = withExplicitRlmThinkingLevel(registeredModel, candidate.thinkingLevel);
 				const modelCandidates: RlmNativeModelCandidate[] = [
 					{ model, thinkingLevel: candidate.thinkingLevel },
 					...candidates.slice(index + 1).flatMap((fallback) => {
@@ -9916,7 +9928,14 @@ export class AgentSession {
 							fallback.modelReference,
 							this._modelRegistry.getAll(),
 						);
-						return fallbackModel ? [{ model: fallbackModel, thinkingLevel: fallback.thinkingLevel }] : [];
+						return fallbackModel
+							? [
+									{
+										model: withExplicitRlmThinkingLevel(fallbackModel, fallback.thinkingLevel),
+										thinkingLevel: fallback.thinkingLevel,
+									},
+								]
+							: [];
 					}),
 				];
 				return { runtime: "native", model, thinkingLevel: candidate.thinkingLevel, modelCandidates };

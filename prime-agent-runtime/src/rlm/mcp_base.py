@@ -17,6 +17,7 @@ and re-reads. Interactive login runs host-side, never here.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import time
@@ -26,7 +27,13 @@ from typing import Any
 
 from . import host_request
 
-__all__ = ["AcpMcpIntegration", "McpIntegration", "McpToolError", "NotEnabled"]
+__all__ = [
+    "AcpMcpIntegration",
+    "McpIntegration",
+    "McpToolError",
+    "NotEnabled",
+    "make_acp_mcp_skill",
+]
 
 # Stored access tokens are treated as expired this many seconds early so a token
 # never dies mid-request. Mirrors the host's refresh buffer.
@@ -373,6 +380,79 @@ class AcpMcpIntegration(McpIntegration):
         raise ValueError(
             f"ACP MCP server {self.server!r} uses unsupported transport {transport!r}"
         )
+
+
+_JSON_TO_PYTHON = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def _mcp_tool_signature(schema: dict[str, Any]) -> inspect.Signature:
+    """Build the keyword-only Python signature used by rlm-harness MCP skills."""
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    if not isinstance(properties, dict):
+        properties = {}
+    parameters = []
+    for name, raw_property in properties.items():
+        if not isinstance(name, str) or not name.isidentifier():
+            continue
+        property_schema = raw_property if isinstance(raw_property, dict) else {}
+        parameters.append(
+            inspect.Parameter(
+                name,
+                inspect.Parameter.KEYWORD_ONLY,
+                default=(
+                    inspect.Parameter.empty if name in required else None
+                ),
+                annotation=_JSON_TO_PYTHON.get(
+                    property_schema.get("type"), inspect.Parameter.empty
+                ),
+            )
+        )
+    parameters.sort(
+        key=lambda parameter: parameter.default is not inspect.Parameter.empty
+    )
+    return inspect.Signature(parameters)
+
+
+def make_acp_mcp_skill(
+    server: str,
+    config: dict[str, Any],
+    tool: dict[str, Any],
+):
+    """Create one eagerly-discovered, callable ACP MCP skill.
+
+    The generated package assigns this function to ``run``. Prime Agent then
+    pre-imports and wraps the module, matching rlm-harness's
+    ``await <server>_<tool>(...)`` contract.
+    """
+    tool_name = tool.get("name")
+    if not isinstance(tool_name, str) or not tool_name:
+        raise ValueError("ACP MCP tool metadata has no non-empty name")
+    description = tool.get("description")
+    schema = tool.get("inputSchema")
+    if not isinstance(schema, dict):
+        schema = {}
+    integration = AcpMcpIntegration(server, config)
+
+    async def run(**kwargs: Any) -> Any:
+        return await integration.call_tool(tool_name, kwargs)
+
+    run.__name__ = tool_name
+    run.__qualname__ = tool_name
+    run.__signature__ = _mcp_tool_signature(schema)  # type: ignore[attr-defined]
+    run.__doc__ = (
+        description
+        if isinstance(description, str) and description
+        else f"MCP tool {tool_name!r} from server {server!r}."
+    )
+    return run
 
 
 def _parse_result(result: Any) -> Any:

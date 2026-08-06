@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Added session-scoped HTTP and stdio MCP servers to ACP mode as IPython-backed integrations.
+- Added session-scoped HTTP and stdio MCP servers to ACP mode as eagerly discovered, pre-imported IPython skills.
 
 ## [0.7.0] - 2026-08-05
 

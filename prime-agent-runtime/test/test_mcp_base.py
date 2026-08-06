@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import tempfile
 import time
@@ -10,7 +11,13 @@ from pathlib import Path
 from unittest import mock
 
 from rlm import mcp_base
-from rlm.mcp_base import AcpMcpIntegration, McpIntegration, McpToolError, NotEnabled
+from rlm.mcp_base import (
+    AcpMcpIntegration,
+    McpIntegration,
+    McpToolError,
+    NotEnabled,
+    make_acp_mcp_skill,
+)
 
 
 def _run(coro):
@@ -349,6 +356,40 @@ class McpIntegrationTest(unittest.TestCase):
         integration = AcpMcpIntegration("task-tools", {"type": "sse"})
         with self.assertRaisesRegex(ValueError, "unsupported transport"):
             _run(integration._open_session(AsyncExitStack()))
+
+    def test_acp_generated_skill_has_rlm_signature_and_fixed_tool(self):
+        tool = {
+            "name": "lookup",
+            "description": "Look up a task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "not-valid": {"type": "boolean"},
+                },
+                "required": ["query"],
+            },
+        }
+        run = make_acp_mcp_skill(
+            "task-tools",
+            {"type": "http", "url": "https://tools.example/mcp", "headers": {}},
+            tool,
+        )
+        self.assertEqual(
+            str(inspect.signature(run)), "(*, query: str, limit: int = None)"
+        )
+        self.assertEqual(run.__doc__, "Look up a task.")
+
+        with mock.patch.object(
+            AcpMcpIntegration,
+            "call_tool",
+            mock.AsyncMock(return_value={"ok": True}),
+        ) as call_tool:
+            result = _run(run(query="ACP", limit=2))
+
+        self.assertEqual(result, {"ok": True})
+        call_tool.assert_awaited_once_with("lookup", {"query": "ACP", "limit": 2})
 
 
 if __name__ == "__main__":

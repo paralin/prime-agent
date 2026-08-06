@@ -330,13 +330,20 @@ __all__ = [
     "harness",
     "host_request",
     "list_subagents",
+    "make_acp_mcp_skill",
     "rlm",
     "run",
 ]
 
 # Lazily re-export the MCP base class. Kept lazy so `import rlm` never requires
 # the optional `mcp` SDK — only integration packages that subclass it do.
-_LAZY_MCP = {"AcpMcpIntegration", "McpIntegration", "McpToolError", "NotEnabled"}
+_LAZY_MCP = {
+    "AcpMcpIntegration",
+    "McpIntegration",
+    "McpToolError",
+    "NotEnabled",
+    "make_acp_mcp_skill",
+}
 
 
 def __getattr__(name: str) -> Any:  # noqa: D401 - module-level lazy attr hook

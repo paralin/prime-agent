@@ -32,15 +32,13 @@ Likewise `session/prompt` refuses a concurrent turn while one is running, and th
 
 Prime Agent accepts streamable HTTP and stdio MCP servers from `session/new`. They are available only to that ACP process and are not written to user settings.
 
-Consistent with Prime Agent's IPython-only tool design, the servers are exposed through a temporary Python skill named `acp_mcp`:
+Consistent with Prime Agent's IPython-only tool design, Prime Agent discovers every server's tools while creating the session and exposes each tool as a temporary, pre-imported Python skill. Names follow the same `<server>_<tool>` normalization as `rlm-harness`:
 
 ```python
-acp_mcp.list_servers()
-await acp_mcp.list_tools("task-tools")
-await acp_mcp.call_tool("task-tools", "lookup", {"query": "ACP"})
+await task_tools_lookup(query="ACP")
 ```
 
-For server names that are valid Python identifiers, dynamic methods are also available, such as `await acp_mcp.github.search(query="ACP")`. The agent discovers tool names and schemas with `list_tools()` before calling them. HTTP headers and stdio arguments and environment variables are scoped to the client-provided server configuration.
+Each callable module has a keyword-only signature derived from the MCP tool's input schema and a docstring derived from its description, so `help(task_tools_lookup)` and `inspect.signature(task_tools_lookup)` expose the API before it is called. Session creation fails if a server cannot be reached or if two tools normalize to the same Python name. HTTP headers and stdio arguments and environment variables are scoped to the client-provided server configuration.
 
 ## Streamed updates
 

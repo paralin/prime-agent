@@ -89,7 +89,7 @@ export interface AcpModeOptions {
 	/** Bind headless extensions once the connection is live (in-process mode). */
 	bindHeadlessExtensions?: () => Promise<void>;
 	/** Install the MCP servers supplied when the ACP session is created. */
-	configureMcpServers?: (servers: readonly acp.McpServer[]) => Promise<void> | void;
+	configureMcpServers?: (servers: readonly acp.McpServer[], cwd: string) => Promise<void> | void;
 	/**
 	 * Transport override. Defaults to NDJSON over stdio; tests supply an
 	 * in-memory stream pair so the protocol runs without a subprocess.
@@ -248,9 +248,11 @@ export async function runAcpModeWithConnection(
 	const mcp = connection.extendTemporarySkills
 		? new AcpMcpSkillInstaller({
 				extendTemporarySkills: (skillPaths, source) => connection.extendTemporarySkills!(skillPaths, source),
+				getSkillNames: async () => (await connection.getResourceSnapshot()).skills.map((skill) => skill.name),
 			})
 		: undefined;
-	const configureMcpServers = options.configureMcpServers ?? (mcp ? (servers) => mcp.configure(servers) : undefined);
+	const configureMcpServers =
+		options.configureMcpServers ?? (mcp ? (servers, cwd) => mcp.configure(servers, cwd) : undefined);
 
 	// One ACP connection drives one AgentConnection, whose newSession() replaces
 	// the live session rather than creating a parallel one. Tracking a single
@@ -293,25 +295,23 @@ export async function runAcpModeWithConnection(
 				await options.bindHeadlessExtensions?.();
 				bound = true;
 			}
-			if (params.mcpServers.length > 0) {
-				if (!configureMcpServers) {
-					throw acp.RequestError.invalidParams({ reason: "MCP servers are unavailable in this ACP host" });
-				}
-				await configureMcpServers(params.mcpServers);
+			const requestedCwd = params.cwd;
+			const actualCwd = await connection
+				.getState()
+				.then((state) => state.cwd)
+				.catch(() => undefined);
+			if (params.mcpServers.length > 0 && !configureMcpServers) {
+				throw acp.RequestError.invalidParams({ reason: "MCP servers are unavailable in this ACP host" });
 			}
+			await configureMcpServers?.(params.mcpServers, actualCwd ?? requestedCwd);
 			// prime-agent's cwd is fixed at startup by the session it was launched
 			// with, so a client-supplied cwd cannot be adopted after the fact.
 			// Report the real cwd back in `_meta` rather than failing the request or
 			// letting the client assume a directory the agent is not using.
-			const requestedCwd = params.cwd;
 			let cwdMismatch: { requested: string; actual: string } | undefined;
 			if (typeof requestedCwd === "string" && requestedCwd.length > 0) {
-				const actual = await connection
-					.getState()
-					.then((state) => state.cwd)
-					.catch(() => undefined);
-				if (actual && !sameCwd(requestedCwd, actual)) {
-					cwdMismatch = { requested: requestedCwd, actual };
+				if (actualCwd && !sameCwd(requestedCwd, actualCwd)) {
+					cwdMismatch = { requested: requestedCwd, actual: actualCwd };
 				}
 			}
 			const sessionId = randomUUID();

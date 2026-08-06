@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed Kimi K3 reasoning levels being restricted to max.
+
 ## [0.7.1] - 2026-08-07
 
 ## [0.7.0] - 2026-08-05

@@ -253,6 +253,7 @@ import {
 	type RlmDeleteSubagentResult,
 	type RlmFindModelsResult,
 	type RlmListSubagentsResult,
+	type RlmNativeModelCandidate,
 	type RlmSpawnHandle,
 	type RlmSubagentRegistryEntry,
 	type RlmSubagentRuntime,
@@ -495,6 +496,8 @@ export interface AgentSessionConfig {
 	rlmParentNodeId?: string;
 	/** Parent agent name/id shown in child communication doctrine. */
 	rlmParentAgent?: string;
+	/** Ordered native candidates retained by a named-role child for provider fallback. */
+	rlmModelCandidates?: RlmNativeModelCandidate[];
 	/** Host responsible for creating native RLM subagent runtimes. */
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	/** Test/embedding seam for the external Claude Code SDK query. */
@@ -985,7 +988,12 @@ interface RlmChildRun {
 }
 
 type RlmSubagentModelSelection =
-	| { runtime: "native"; model: Model<Api>; thinkingLevel?: ThinkingLevel }
+	| {
+			runtime: "native";
+			model: Model<Api>;
+			thinkingLevel?: ThinkingLevel;
+			modelCandidates?: RlmNativeModelCandidate[];
+	  }
 	| {
 			runtime: "claude-code";
 			model: string;
@@ -1186,6 +1194,7 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	private _retryAttemptOnCurrentModel = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
 	private _retryAuthFailureSources: AuthSourceToken[] = [];
@@ -1249,6 +1258,8 @@ export class AgentSession {
 	private _rlmSessionDir?: string;
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
+	private readonly _rlmModelCandidates: RlmNativeModelCandidate[];
+	private _rlmModelCandidateIndex = 0;
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
@@ -1363,6 +1374,7 @@ export class AgentSession {
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
+		this._rlmModelCandidates = [...(config.rlmModelCandidates ?? [])];
 		this._startClaudeCodeQuery = config.startClaudeCodeQuery;
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
@@ -3612,6 +3624,7 @@ export class AgentSession {
 						attempt: this._retryAttempt,
 					});
 					this._retryAttempt = 0;
+					this._retryAttemptOnCurrentModel = 0;
 					this._retryAuthFailureSources = [];
 				}
 				if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
@@ -6661,7 +6674,7 @@ export class AgentSession {
 	private async _emitModelSelect(
 		nextModel: Model<any>,
 		previousModel: Model<any> | undefined,
-		source: "set" | "cycle" | "restore",
+		source: "set" | "cycle" | "restore" | "fallback",
 	): Promise<void> {
 		if (modelsAreEqual(previousModel, nextModel)) return;
 		await this._extensionRunner.emit({
@@ -6675,7 +6688,7 @@ export class AgentSession {
 	private _queueModelSelectEmit(
 		nextModel: Model<any>,
 		previousModel: Model<any> | undefined,
-		source: "set" | "cycle" | "restore",
+		source: "set" | "cycle" | "restore" | "fallback",
 	): Promise<void> {
 		const emit = () =>
 			this._modelSelectEmitContext.run(true, () => this._emitModelSelect(nextModel, previousModel, source));
@@ -6737,6 +6750,16 @@ export class AgentSession {
 		} else {
 			this._trackModelSelectEmitError(emitPromise);
 		}
+	}
+
+	private async _setRlmFallbackModel(candidate: RlmNativeModelCandidate): Promise<void> {
+		const previousModel = this.model;
+		const thinkingLevel = this._getThinkingLevelForModelSwitch(candidate.thinkingLevel);
+		const serviceTier = this._getServiceTierForModelSwitch();
+		this._applySessionModelChange(candidate.model);
+		this._applyThinkingLevel(thinkingLevel, false);
+		this._clampServiceTierForModel(serviceTier);
+		await this._queueModelSelectEmit(candidate.model, previousModel, "fallback");
 	}
 
 	private _trackModelSelectEmitError(emitPromise: Promise<void>): void {
@@ -6872,27 +6895,26 @@ export class AgentSession {
 	 * Saves to session and settings only if the level actually changes.
 	 */
 	setThinkingLevel(level: ThinkingLevel): void {
+		this._applyThinkingLevel(level, true);
+	}
+
+	private _applyThinkingLevel(level: ThinkingLevel, persistDefault: boolean): void {
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
-
-		// Only persist if actually changing
 		const previousLevel = this.agent.state.thinkingLevel;
-		const isChanging = effectiveLevel !== previousLevel;
+		if (effectiveLevel === previousLevel) return;
 
 		this.agent.state.thinkingLevel = effectiveLevel;
-
-		if (isChanging) {
-			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (this.supportsThinking() || effectiveLevel !== "off") {
-				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
-			}
-			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
-			void this._extensionRunner.emit({
-				type: "thinking_level_select",
-				level: effectiveLevel,
-				previousLevel,
-			});
+		this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+		if (persistDefault && (this.supportsThinking() || effectiveLevel !== "off")) {
+			this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
 		}
+		this._emit({ type: "thinking_level_changed", level: effectiveLevel });
+		void this._extensionRunner.emit({
+			type: "thinking_level_select",
+			level: effectiveLevel,
+			previousLevel,
+		});
 	}
 
 	setServiceTier(serviceTier: ServiceTier): void {
@@ -9082,6 +9104,7 @@ export class AgentSession {
 		sessionDir: string;
 		model: Model<any>;
 		thinkingLevel?: ThinkingLevel;
+		modelCandidates?: RlmNativeModelCandidate[];
 	}): CreateRlmSubagentRuntimeOptions {
 		return {
 			parentSession: this,
@@ -9092,6 +9115,7 @@ export class AgentSession {
 			sessionDir: options.sessionDir,
 			model: options.model,
 			thinkingLevel: clampThinkingLevel(options.model, options.thinkingLevel ?? this.thinkingLevel) as ThinkingLevel,
+			modelCandidates: options.modelCandidates,
 			serviceTier:
 				this.serviceTier === "priority" && !supportsFastMode(options.model) ? "default" : this.serviceTier,
 			scopedModels: [...this._scopedModels],
@@ -9168,6 +9192,7 @@ export class AgentSession {
 			rlmSessionDir: options.sessionDir,
 			rlmParentNodeId: options.rlmParentNodeId,
 			rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
+			rlmModelCandidates: options.modelCandidates,
 			sessionStartEvent: { type: "session_start", reason: "startup" },
 		});
 		if (child.sessionName !== options.sessionName) {
@@ -9859,12 +9884,22 @@ export class AgentSession {
 				};
 			}
 			const executableModels = await this._authenticatedRlmModels();
-			for (const candidate of candidates) {
+			for (const [index, candidate] of candidates.entries()) {
 				const model = findExactModelReferenceMatch(candidate.modelReference, executableModels);
 				if (!model) continue;
 				const auth = await this._modelRegistry.getApiKeyAndHeaders(model);
 				if (!auth.ok) continue;
-				return { runtime: "native", model, thinkingLevel: candidate.thinkingLevel };
+				const modelCandidates: RlmNativeModelCandidate[] = [
+					{ model, thinkingLevel: candidate.thinkingLevel },
+					...candidates.slice(index + 1).flatMap((fallback) => {
+						const fallbackModel = findExactModelReferenceMatch(
+							fallback.modelReference,
+							this._modelRegistry.getAll(),
+						);
+						return fallbackModel ? [{ model: fallbackModel, thinkingLevel: fallback.thinkingLevel }] : [];
+					}),
+				];
+				return { runtime: "native", model, thinkingLevel: candidate.thinkingLevel, modelCandidates };
 			}
 			throw new Error(`RLM model role "@${role}" has no executable candidates`);
 		}
@@ -10331,6 +10366,7 @@ export class AgentSession {
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
 				thinkingLevel: modelSelection.thinkingLevel,
+				modelCandidates: modelSelection.modelCandidates,
 			}),
 			onSessionPublished: publishChildSession,
 		};
@@ -10460,6 +10496,10 @@ export class AgentSession {
 					customMessage: spawnMessage,
 				});
 				if (run.error) throw new Error(run.error);
+				const terminalAssistant = child._findLastAssistantMessage();
+				if (terminalAssistant?.stopReason === "error") {
+					throw new Error(terminalAssistant.errorMessage ?? "RLM child provider request failed");
+				}
 				run.status = "done";
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
@@ -10646,8 +10686,48 @@ export class AgentSession {
 		return kind === "auth" || kind === "invalid_request" || kind === "refusal";
 	}
 
+	private _hasReplayUnsafeProviderFailureOutput(message: AssistantMessage): boolean {
+		return message.content.some(
+			(content) =>
+				content.type === "toolCall" ||
+				(content.type === "text" && content.text.trim().length > 0) ||
+				(content.type === "thinking" && content.thinking.trim().length > 0),
+		);
+	}
+
+	private async _tryRlmProviderFallback(message: AssistantMessage): Promise<boolean> {
+		if (this._rlmModelCandidates.length <= 1 || this._hasReplayUnsafeProviderFailureOutput(message)) {
+			return false;
+		}
+		const currentModel = this.model;
+		if (!currentModel || message.provider !== currentModel.provider || message.model !== currentModel.id) {
+			return false;
+		}
+		const kind = this._getProviderStreamFailureKind(message);
+		if (kind === "refusal" || kind === "safety" || kind === "invalid_request") {
+			return false;
+		}
+		const concreteAuthFailure = this._isConcreteProviderAuthFailure(message);
+		if (concreteAuthFailure) {
+			this._markProviderAuthStale(message, this._retryAuthFailureSources);
+		}
+
+		for (let index = this._rlmModelCandidateIndex + 1; index < this._rlmModelCandidates.length; index++) {
+			const candidate = this._rlmModelCandidates[index]!;
+			if (modelsAreEqual(candidate.model, currentModel)) continue;
+			if (!(await this._modelRegistry.canUseModel(candidate.model))) continue;
+			const auth = await this._modelRegistry.getApiKeyAndHeaders(candidate.model);
+			if (!auth.ok) continue;
+			this._rlmModelCandidateIndex = index;
+			await this._setRlmFallbackModel(candidate);
+			if (concreteAuthFailure) this._retryAuthFailureSources = [];
+			return true;
+		}
+		return false;
+	}
+
 	private _isStructuredPermanentProviderRetryExhausted(message: AssistantMessage): boolean {
-		return this._retryAttempt > 0 && this._isStructuredPermanentProviderFailure(message);
+		return this._retryAttemptOnCurrentModel > 0 && this._isStructuredPermanentProviderFailure(message);
 	}
 
 	private _getProviderStreamFailureAuthStatus(message: AssistantMessage): number | undefined {
@@ -10762,6 +10842,7 @@ export class AgentSession {
 			finalError: message.errorMessage,
 		});
 		this._retryAttempt = 0;
+		this._retryAttemptOnCurrentModel = 0;
 		this._retryAuthFailureSources = [];
 	}
 
@@ -10793,8 +10874,13 @@ export class AgentSession {
 		}
 
 		this._retryAttempt++;
+		this._retryAttemptOnCurrentModel++;
+		const switchedModel = await this._tryRlmProviderFallback(message);
+		if (switchedModel) {
+			this._retryAttemptOnCurrentModel = 0;
+		}
 
-		if (this._retryAttempt > settings.maxRetries) {
+		if (!switchedModel && this._retryAttemptOnCurrentModel > settings.maxRetries) {
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			// Max retries exceeded, emit final failure and reset
 			this._emit({
@@ -10804,17 +10890,18 @@ export class AgentSession {
 				finalError: message.errorMessage,
 			});
 			this._retryAttempt = 0;
+			this._retryAttemptOnCurrentModel = 0;
 			this._retryAuthFailureSources = [];
 			this._resolveRetry(); // Resolve so waitForRetry() completes
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		const delayMs = switchedModel ? 0 : settings.baseDelayMs * 2 ** (this._retryAttemptOnCurrentModel - 1);
 
 		this._emit({
 			type: "auto_retry_start",
 			attempt: this._retryAttempt,
-			maxAttempts: settings.maxRetries,
+			maxAttempts: settings.maxRetries + Math.max(0, this._rlmModelCandidates.length - 1),
 			delayMs,
 			errorMessage: message.errorMessage || "Unknown error",
 		});
@@ -10834,6 +10921,7 @@ export class AgentSession {
 			const attempt = this._retryAttempt;
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			this._retryAttempt = 0;
+			this._retryAttemptOnCurrentModel = 0;
 			this._retryAbortController = undefined;
 			this._emit({
 				type: "auto_retry_end",
@@ -10875,6 +10963,7 @@ export class AgentSession {
 				finalError: "Retry cancelled",
 			});
 			this._retryAttempt = 0;
+			this._retryAttemptOnCurrentModel = 0;
 		}
 		this._retryAuthFailureSources = [];
 		this._resolveRetry();

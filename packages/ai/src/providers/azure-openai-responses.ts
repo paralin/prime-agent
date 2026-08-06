@@ -146,7 +146,11 @@ export const streamSimpleAzureOpenAIResponses: StreamFunction<"azure-openai-resp
 	}
 
 	const base = buildBaseOptions(model, options, apiKey);
-	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+	const clampedReasoning = options?.reasoning
+		? options.forceThinkingLevel
+			? options.reasoning
+			: clampThinkingLevel(model, options.reasoning)
+		: undefined;
 	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
 
 	return streamAzureOpenAIResponses(model, context, {

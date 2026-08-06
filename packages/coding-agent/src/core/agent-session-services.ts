@@ -57,6 +57,7 @@ export interface CreateAgentSessionServicesOptions {
 export interface AgentSessionCreationOptions {
 	model?: Model<any>;
 	thinkingLevel?: ThinkingLevel;
+	forceThinkingLevel?: boolean;
 	/** Provider service tier. Fast mode uses "priority". */
 	serviceTier?: ServiceTier;
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;

@@ -1,4 +1,10 @@
-import { type AssistantMessage, fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	fauxAssistantMessage,
+	fauxThinking,
+	fauxToolCall,
+	type SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.js";
 import { createHarness, getMessageText, type Harness } from "./harness.js";
@@ -51,6 +57,8 @@ describe("native RLM named-role provider fallback", () => {
 	it("advances immediately through ordered candidates without changing global defaults", async () => {
 		const provider = "role-fallback";
 		const modelCalls: string[] = [];
+		const requestReasoning: Array<SimpleStreamOptions["reasoning"]> = [];
+		const forcedThinkingLevels: Array<boolean | undefined> = [];
 		let releaseFailure = () => {};
 		const failureGate = new Promise<void>((resolve) => {
 			releaseFailure = resolve;
@@ -62,7 +70,7 @@ describe("native RLM named-role provider fallback", () => {
 			provider,
 			models: [
 				{ id: "primary", reasoning: true },
-				{ id: "fallback", reasoning: true },
+				{ id: "fallback", reasoning: true, thinkingLevelMap: { high: null, max: "max" } },
 			],
 			settings: {
 				modelRoles: { task: [`${provider}/primary:low`, `${provider}/fallback:high`] },
@@ -83,13 +91,17 @@ describe("native RLM named-role provider fallback", () => {
 			thinking: harness.settingsManager.getDefaultThinkingLevel(),
 		};
 		harness.setResponses([
-			async (_context, _options, _state, model) => {
+			async (_context, options, _state, model) => {
 				modelCalls.push(model.id);
+				requestReasoning.push((options as SimpleStreamOptions).reasoning);
+				forcedThinkingLevels.push((options as SimpleStreamOptions).forceThinkingLevel);
 				await failureGate;
 				return providerFailure("server_error");
 			},
-			(_context, _options, _state, model) => {
+			(_context, options, _state, model) => {
 				modelCalls.push(model.id);
+				requestReasoning.push((options as SimpleStreamOptions).reasoning);
+				forcedThinkingLevels.push((options as SimpleStreamOptions).forceThinkingLevel);
 				return fauxAssistantMessage("recovered");
 			},
 		]);
@@ -105,6 +117,8 @@ describe("native RLM named-role provider fallback", () => {
 
 		expect(handle.model).toBe(`${provider}/primary`);
 		expect(modelCalls).toEqual(["primary", "fallback"]);
+		expect(requestReasoning).toEqual(["low", "high"]);
+		expect(forcedThinkingLevels).toEqual([true, true]);
 		expect(retryDelays).toEqual([0]);
 		expect(child.model?.id).toBe("fallback");
 		expect(child.thinkingLevel).toBe("high");
@@ -120,6 +134,46 @@ describe("native RLM named-role provider fallback", () => {
 				.filter((entry) => entry.type === "model_change")
 				.map((entry) => entry.modelId),
 		).toEqual(["primary", "fallback"]);
+	});
+
+	it("sends an explicit role effort even when the registered model marks it unsupported", async () => {
+		const provider = "role-explicit-effort";
+		let requestReasoning: SimpleStreamOptions["reasoning"];
+		let forceThinkingLevel: boolean | undefined;
+		let requestMapping: string | null | undefined;
+		const harness = await createHarness({
+			rlmDepth: 0,
+			rlmMaxDepth: 1,
+			provider,
+			models: [
+				{
+					id: "restricted",
+					reasoning: true,
+					thinkingLevelMap: { high: null, max: "max" },
+				},
+			],
+			settings: { modelRoles: { task: `${provider}/restricted:high` } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			(_context, options, _state, model) => {
+				const simpleOptions = options as SimpleStreamOptions;
+				requestReasoning = simpleOptions.reasoning;
+				forceThinkingLevel = simpleOptions.forceThinkingLevel;
+				requestMapping = model.thinkingLevelMap?.high;
+				return fauxAssistantMessage("done");
+			},
+		]);
+
+		const handle = await harness.session.runRlmChild("use explicit effort");
+		const child = await waitForChild(harness, handle.rlm_child_id);
+		await waitForChildStatus(harness, handle.rlm_child_id, "completed");
+
+		expect(child.thinkingLevel).toBe("high");
+		expect(requestReasoning).toBe("high");
+		expect(forceThinkingLevel).toBe(true);
+		expect(requestMapping).toBeNull();
+		expect(harness.getModel("restricted")?.thinkingLevelMap?.high).toBeNull();
 	});
 
 	it("re-expands provider-native history before a cross-provider fallback request", async () => {

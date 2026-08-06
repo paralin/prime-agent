@@ -6757,7 +6757,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(candidate.thinkingLevel);
 		const serviceTier = this._getServiceTierForModelSwitch();
 		this._applySessionModelChange(candidate.model);
-		this._applyThinkingLevel(thinkingLevel, false);
+		this._applyThinkingLevel(thinkingLevel, false, candidate.thinkingLevel !== undefined);
 		this._clampServiceTierForModel(serviceTier);
 		await this._queueModelSelectEmit(candidate.model, previousModel, "fallback");
 	}
@@ -6898,11 +6898,16 @@ export class AgentSession {
 		this._applyThinkingLevel(level, true);
 	}
 
-	private _applyThinkingLevel(level: ThinkingLevel, persistDefault: boolean): void {
+	private _applyThinkingLevel(level: ThinkingLevel, persistDefault: boolean, forceThinkingLevel = false): void {
 		const availableLevels = this.getAvailableThinkingLevels();
-		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
+		const effectiveLevel =
+			forceThinkingLevel || availableLevels.includes(level)
+				? level
+				: this._clampThinkingLevel(level, availableLevels);
 		const previousLevel = this.agent.state.thinkingLevel;
-		if (effectiveLevel === previousLevel) return;
+		const thinkingLevelChanged = effectiveLevel !== previousLevel;
+		this.agent.state.forceThinkingLevel = forceThinkingLevel;
+		if (!thinkingLevelChanged) return;
 
 		this.agent.state.thinkingLevel = effectiveLevel;
 		this.sessionManager.appendThinkingLevelChange(effectiveLevel);
@@ -9114,7 +9119,9 @@ export class AgentSession {
 			spawnCode: options.spawnCode,
 			sessionDir: options.sessionDir,
 			model: options.model,
-			thinkingLevel: clampThinkingLevel(options.model, options.thinkingLevel ?? this.thinkingLevel) as ThinkingLevel,
+			thinkingLevel:
+				options.thinkingLevel ?? (clampThinkingLevel(options.model, this.thinkingLevel) as ThinkingLevel),
+			forceThinkingLevel: options.thinkingLevel !== undefined,
 			modelCandidates: options.modelCandidates,
 			serviceTier:
 				this.serviceTier === "priority" && !supportsFastMode(options.model) ? "default" : this.serviceTier,
@@ -9155,6 +9162,7 @@ export class AgentSession {
 				systemPrompt: "",
 				model: options.model,
 				thinkingLevel: options.thinkingLevel,
+				forceThinkingLevel: options.forceThinkingLevel,
 				serviceTier: options.serviceTier,
 				tools: [],
 			},

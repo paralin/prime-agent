@@ -70,6 +70,32 @@ describe("openai-completions tool_choice", () => {
 		mockState.chunks = undefined;
 	});
 
+	it("sends a forced OpenRouter effort without capability clamping", async () => {
+		const model = {
+			...getModel("openrouter", "ai21/jamba-large-1.7")!,
+			reasoning: true,
+			thinkingLevelMap: { high: null, max: "max" },
+		} as const;
+		const context = {
+			messages: [{ role: "user" as const, content: "Hello", timestamp: Date.now() }],
+		};
+		const efforts: string[] = [];
+
+		for (const forceThinkingLevel of [false, true]) {
+			await streamSimple(model, context, {
+				apiKey: "test",
+				reasoning: "high",
+				forceThinkingLevel,
+				onPayload: (payload: unknown) => {
+					const params = payload as { reasoning?: { effort?: string } };
+					efforts.push(params.reasoning?.effort ?? "missing");
+				},
+			}).result();
+		}
+
+		expect(efforts).toEqual(["max", "high"]);
+	});
+
 	it("forwards toolChoice from simple options to payload", async () => {
 		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
 		const model = { ...baseModel, api: "openai-completions" } as const;

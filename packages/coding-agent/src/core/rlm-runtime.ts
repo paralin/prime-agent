@@ -248,6 +248,7 @@ export interface CreateRlmSubagentRuntimeOptions {
 	sessionDir: string;
 	model: Model<any>;
 	thinkingLevel: ThinkingLevel;
+	forceThinkingLevel?: boolean;
 	modelCandidates?: RlmNativeModelCandidate[];
 	serviceTier: ServiceTier;
 	scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;

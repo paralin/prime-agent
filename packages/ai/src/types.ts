@@ -176,6 +176,8 @@ export type ProviderNativeCompactionFunction<
 // Unified options with reasoning passed to streamSimple() and completeSimple()
 export interface SimpleStreamOptions extends StreamOptions {
 	reasoning?: ThinkingLevel;
+	/** Send the requested reasoning level without clamping it to model capability metadata. */
+	forceThinkingLevel?: boolean;
 	/** Custom token budgets for thinking levels (token-based providers only) */
 	thinkingBudgets?: ThinkingBudgets;
 }

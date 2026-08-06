@@ -776,11 +776,9 @@ function supportsAdaptiveThinking(modelId: string): boolean {
 function mapThinkingLevelToEffort(
 	model: Model<"anthropic-messages">,
 	level: SimpleStreamOptions["reasoning"],
+	forceThinkingLevel = false,
 ): AnthropicEffort {
-	// Clamp to what the model actually supports so callers that bypass
-	// clampThinkingLevel (e.g. passing reasoning: "xhigh" directly) can't send an
-	// effort the model lacks — xhigh on a max-only model resolves to max, not xhigh.
-	const effective = level ? clampThinkingLevel(model, level) : undefined;
+	const effective = level ? (forceThinkingLevel ? level : clampThinkingLevel(model, level)) : undefined;
 	const mapped = effective ? model.thinkingLevelMap?.[effective] : undefined;
 	if (typeof mapped === "string") return mapped as AnthropicEffort;
 
@@ -819,7 +817,7 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 	// For Opus 4.6 and Sonnet 4.6: use adaptive thinking with effort level
 	// For older models: use budget-based thinking
 	if (supportsAdaptiveThinking(model.id)) {
-		const effort = mapThinkingLevelToEffort(model, options.reasoning);
+		const effort = mapThinkingLevelToEffort(model, options.reasoning, options.forceThinkingLevel);
 		return streamAnthropic(model, context, {
 			...base,
 			thinkingEnabled: true,

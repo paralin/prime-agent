@@ -57,6 +57,7 @@ export interface BedrockOptions extends StreamOptions {
 	reasoning?: ThinkingLevel;
 	/* Custom token budgets per thinking level. Overrides default budgets. */
 	thinkingBudgets?: ThinkingBudgets;
+	forceThinkingLevel?: boolean;
 	/* Only supported by Claude 4.x models, see https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-extended-thinking.html#claude-messages-extended-thinking-tool-use-interleaved */
 	interleavedThinking?: boolean;
 	/**
@@ -330,6 +331,7 @@ export const streamSimpleBedrock: StreamFunction<"bedrock-converse-stream", Simp
 			return streamBedrock(model, context, {
 				...base,
 				reasoning: options.reasoning,
+				forceThinkingLevel: options.forceThinkingLevel,
 				thinkingBudgets: options.thinkingBudgets,
 			} satisfies BedrockOptions);
 		}
@@ -523,11 +525,9 @@ function supportsAlwaysOnAdaptiveThinking(modelId: string, modelName?: string): 
 function mapThinkingLevelToEffort(
 	model: Model<"bedrock-converse-stream">,
 	level: SimpleStreamOptions["reasoning"],
+	forceThinkingLevel = false,
 ): "low" | "medium" | "high" | "xhigh" | "max" {
-	// Clamp to what the model actually supports so callers that bypass
-	// clampThinkingLevel (e.g. passing reasoning: "xhigh" directly) can't send an
-	// effort the model lacks — xhigh on a max-only model resolves to max, not xhigh.
-	const effective = level ? clampThinkingLevel(model, level) : undefined;
+	const effective = level ? (forceThinkingLevel ? level : clampThinkingLevel(model, level)) : undefined;
 	const mapped = effective ? model.thinkingLevelMap?.[effective] : undefined;
 	if (typeof mapped === "string") return mapped as "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -919,7 +919,9 @@ function buildAdditionalModelRequestFields(
 		const result: Record<string, any> = supportsAdaptiveThinking(model.id, model.name)
 			? {
 					thinking: { type: "adaptive", ...(display !== undefined ? { display } : {}) },
-					output_config: { effort: mapThinkingLevelToEffort(model, options.reasoning) },
+					output_config: {
+						effort: mapThinkingLevelToEffort(model, options.reasoning, options.forceThinkingLevel),
+					},
 				}
 			: (() => {
 					const defaultBudgets: Record<ThinkingLevel, number> = {

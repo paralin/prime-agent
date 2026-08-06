@@ -322,6 +322,8 @@ export interface AgentState {
 	model: Model<any>;
 	/** Requested reasoning level for future turns. */
 	thinkingLevel: ThinkingLevel;
+	/** Send the requested reasoning level without model capability clamping. */
+	forceThinkingLevel: boolean;
 	/** Requested provider service tier for future turns. */
 	serviceTier: ServiceTier;
 	/** Available tools. Assigning a new array copies the top-level array. */

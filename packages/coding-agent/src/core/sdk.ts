@@ -33,7 +33,7 @@ export interface CreateAgentSessionOptions extends AgentSessionCreationOptions {
 
 	/** Model to use. Default: from settings, else first available */
 	model?: Model<any>;
-	/** Thinking level. Default: from settings, else 'medium' (clamped to model capabilities) */
+	/** Thinking level. Default: from settings, else 'medium' (clamped to model capabilities). */
 	thinkingLevel?: ThinkingLevel;
 	/** Models available for cycling (Ctrl+P in interactive mode) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
@@ -235,10 +235,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
 	}
 
-	// Clamp to model capabilities
+	// Clamp to model capabilities unless the caller supplied an exact provider effort.
 	if (!model) {
 		thinkingLevel = "off";
-	} else {
+	} else if (!options.forceThinkingLevel) {
 		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
 	}
 
@@ -299,6 +299,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			systemPrompt: "",
 			model,
 			thinkingLevel,
+			forceThinkingLevel: options.forceThinkingLevel,
 			serviceTier,
 			tools: [],
 		},

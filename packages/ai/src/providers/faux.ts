@@ -6,6 +6,7 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ProviderNativeCompactionFunction,
 	SimpleStreamOptions,
 	StreamFunction,
 	StreamOptions,
@@ -108,6 +109,7 @@ export interface RegisterFauxProviderOptions {
 	api?: string;
 	provider?: string;
 	models?: FauxModelDefinition[];
+	compact?: ProviderNativeCompactionFunction<string>;
 	tokensPerSecond?: number;
 	tokenSize?: {
 		min?: number;
@@ -470,7 +472,7 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 	const streamSimple: StreamFunction<string, SimpleStreamOptions> = (streamModel, context, streamOptions) =>
 		stream(streamModel, context, streamOptions);
 
-	registerApiProvider({ api, stream, streamSimple }, sourceId);
+	registerApiProvider({ api, stream, streamSimple, compact: options.compact }, sourceId);
 
 	function getModel(): Model<string>;
 	function getModel(requestedModelId: string): Model<string> | undefined;

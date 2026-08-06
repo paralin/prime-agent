@@ -110,6 +110,87 @@ describe("ENG-4649 subagent model selection", () => {
 		}
 	});
 
+	it("uses configured Codex models when discovery returns an empty catalog", async () => {
+		const codexProvider = "openai-codex";
+		const harness = await createHarness({
+			provider: codexProvider,
+			models: [
+				{ id: "parent-model", reasoning: true },
+				{ id: "spark-model", reasoning: true },
+			],
+			settings: { modelRoles: { spark: `${codexProvider}/spark-model:high` } },
+		});
+		const fetchModels = vi.fn(
+			async () =>
+				new Response(JSON.stringify({ models: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		vi.stubGlobal("fetch", fetchModels);
+		try {
+			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
+
+			await expect(harness.session.findRlmModels("spark", 8)).resolves.toMatchObject({
+				models: [
+					{
+						selector: "@spark",
+						concreteSelector: `${codexProvider}/spark-model`,
+						available: true,
+					},
+					{ selector: `${codexProvider}/spark-model` },
+				],
+			});
+
+			harness.setResponses([fauxAssistantMessage("exact child answer"), fauxAssistantMessage("role child answer")]);
+			const exact = await harness.session.runRlmChild("use exact Spark", {
+				model: `${codexProvider}/spark-model`,
+			});
+			const role = await harness.session.runRlmChild("use the Spark role", { model: "@spark" });
+
+			expect(exact.model).toBe(`${codexProvider}/spark-model`);
+			expect(role.model).toBe(`${codexProvider}/spark-model`);
+			expect(fetchModels).toHaveBeenCalledOnce();
+		} finally {
+			vi.unstubAllGlobals();
+			harness.cleanup();
+		}
+	});
+
+	it("does not trust a malformed nonempty Codex catalog", async () => {
+		const codexProvider = "openai-codex";
+		const harness = await createHarness({
+			provider: codexProvider,
+			models: [{ id: "parent-model" }, { id: "spark-model" }],
+			settings: { modelRoles: { spark: `${codexProvider}/spark-model:high` } },
+		});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(
+				async () =>
+					new Response(JSON.stringify({ models: [{}] }), {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					}),
+			),
+		);
+		try {
+			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
+
+			await expect(harness.session.findRlmModels("spark", 8)).resolves.toMatchObject({
+				models: [{ selector: "@spark", available: false }],
+			});
+			await expect(
+				harness.session.runRlmChild("reject malformed discovery", {
+					model: `${codexProvider}/spark-model`,
+				}),
+			).rejects.toThrow("is unavailable, unauthenticated, or expired");
+		} finally {
+			vi.unstubAllGlobals();
+			harness.cleanup();
+		}
+	});
+
 	it("includes private Prime models authorized for the selected team", async () => {
 		const harness = await createHarness({ provider, models: [{ id: "parent-model" }] });
 		const fetchModels = vi.fn(
@@ -452,6 +533,124 @@ describe("ENG-4649 subagent model selection", () => {
 			).rejects.toThrow("failed authentication preflight");
 			authPreflight.mockRestore();
 
+			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("resolves ordered named roles with effort and returns the concrete selector", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [
+				{ id: "parent-model", reasoning: true },
+				{ id: "child/model", reasoning: true },
+			],
+			settings: {
+				modelRoles: {
+					deepseek: [`${provider}/missing/model:low`, `${provider}/child/model:high`],
+				},
+			},
+		});
+		try {
+			harness.setResponses([fauxAssistantMessage("role child answer")]);
+			const result = await harness.session.runRlmChild("use the configured role", { model: "@deepseek" });
+
+			expect(result.model).toBe(`${provider}/child/model`);
+			await vi.waitFor(async () => {
+				const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
+				const child = harness.session.getRlmChildSession(childEntry!.rlm_child_id);
+				expect(child?.thinkingLevel).toBe("high");
+			});
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("uses the active parent model for a newly loaded role when discovery omits it", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [{ id: "parent-model", reasoning: true }],
+		});
+		try {
+			harness.settingsManager.applyOverrides({ modelRoles: { sol: `${provider}/parent-model:high` } });
+			vi.spyOn(harness.session.modelRegistry, "getExecutableModels").mockResolvedValue([]);
+
+			await expect(harness.session.findRlmModels("sol", 8)).resolves.toEqual({
+				models: [
+					{
+						provider,
+						id: "parent-model",
+						name: `@sol → ${provider}/parent-model`,
+						selector: "@sol",
+						role: "sol",
+						concreteSelector: `${provider}/parent-model`,
+						runtime: "native",
+						available: true,
+						effort: "high",
+					},
+				],
+			});
+
+			harness.setResponses([fauxAssistantMessage("role child answer")]);
+			const result = await harness.session.runRlmChild("use the newly loaded role", { model: "@sol" });
+			expect(result.model).toBe(`${provider}/parent-model`);
+			await vi.waitFor(async () => {
+				const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
+				expect(harness.session.getRlmChildSession(childEntry!.rlm_child_id)?.thinkingLevel).toBe("high");
+			});
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("uses a configured task role only when the model argument is omitted", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [{ id: "parent-model" }, { id: "task-model", reasoning: true }],
+			settings: { modelRoles: { task: `${provider}/task-model:high` } },
+		});
+		try {
+			harness.setResponses([fauxAssistantMessage("task child answer")]);
+			const result = await harness.session.runRlmChild("use task policy");
+			expect(result.model).toBe(`${provider}/task-model`);
+			await vi.waitFor(async () => {
+				const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
+				expect(harness.session.getRlmChildSession(childEntry!.rlm_child_id)?.thinkingLevel).toBe("high");
+			});
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("discovers configured roles and reports an unconfigured Claude executable as unavailable", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [{ id: "parent-model" }],
+			settings: { modelRoles: { claude: "claude-code/claude-opus-4-7:high" } },
+		});
+		try {
+			await expect(harness.session.findRlmModels("claude", 8)).resolves.toEqual({
+				models: [
+					{
+						provider: "claude-code",
+						id: "claude-opus-4-7",
+						name: "@claude → claude-code/claude-opus-4-7",
+						selector: "@claude",
+						role: "claude",
+						concreteSelector: "claude-code/claude-opus-4-7",
+						runtime: "claude-code",
+						available: false,
+						effort: "high",
+					},
+				],
+			});
+			await expect(harness.session.runRlmChild("do not start Claude", { model: "@claude" })).rejects.toThrow(
+				"has no available Claude Code executable",
+			);
+			await expect(
+				harness.session.runRlmChild("do not start direct Claude", { model: "claude-code/claude-opus-4-7" }),
+			).rejects.toThrow("has no configured Claude Code executable");
 			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
 		} finally {
 			harness.cleanup();

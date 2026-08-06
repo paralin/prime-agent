@@ -11,6 +11,7 @@ import type {
 	StreamOptions,
 	TextContent,
 	ThinkingContent,
+	ThinkingLevelMap,
 	ToolCall,
 	ToolResultMessage,
 	Usage,
@@ -38,6 +39,7 @@ export interface FauxModelDefinition {
 	id: string;
 	name?: string;
 	reasoning?: boolean;
+	thinkingLevelMap?: ThinkingLevelMap;
 	input?: ("text" | "image")[];
 	cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	contextWindow?: number;
@@ -422,6 +424,7 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 		provider,
 		baseUrl: DEFAULT_BASE_URL,
 		reasoning: definition.reasoning ?? false,
+		thinkingLevelMap: definition.thinkingLevelMap,
 		input: definition.input ?? ["text", "image"],
 		cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: definition.contextWindow ?? 128000,

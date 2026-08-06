@@ -16,6 +16,7 @@ import type { ReplayBuiltInToolName } from "../../core/extensions/index.js";
 import type { InputSource } from "../../core/extensions/types.js";
 import type { GoalState } from "../../core/goals.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
+import type { CustomMessage } from "../../core/messages.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { RlmMaxDepthStatus, SetRlmMaxDepthResult } from "../../core/rlm-max-depth.js";
 import type { SessionActionSnapshot } from "../../core/session-action-store.js";
@@ -449,6 +450,10 @@ export interface AgentConnectionPromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	queueIfBusy?: boolean;
 	source?: InputSource;
+	/** Host-authored message to persist instead of a visible user message. */
+	customMessage?: CustomMessage;
+	/** Bypass user input expansion and handlers for a host-authored prompt. */
+	internalPrompt?: boolean;
 	/** Cancel admission while it is still waiting; accepted prompts remain session-owned. */
 	signal?: AbortSignal;
 }

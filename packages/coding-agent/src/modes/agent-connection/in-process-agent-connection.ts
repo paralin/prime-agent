@@ -315,6 +315,8 @@ export class InProcessAgentConnection implements AgentConnection {
 				...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
 				...(options?.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
 				...(options?.source ? { source: options.source } : {}),
+				...(options?.customMessage ? { customMessage: options.customMessage } : {}),
+				...(options?.internalPrompt !== undefined ? { internalPrompt: options.internalPrompt } : {}),
 				...(options?.signal ? { signal: options.signal } : {}),
 				preflightResult: (success) => {
 					if (success) {
@@ -336,6 +338,8 @@ export class InProcessAgentConnection implements AgentConnection {
 			...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
 			...(options?.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
 			...(options?.source ? { source: options.source } : {}),
+			...(options?.customMessage ? { customMessage: options.customMessage } : {}),
+			...(options?.internalPrompt !== undefined ? { internalPrompt: options.internalPrompt } : {}),
 			...(options?.signal ? { signal: options.signal } : {}),
 		});
 	}

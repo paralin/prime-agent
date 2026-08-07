@@ -87,6 +87,11 @@ export interface ClaudeCodeSettings {
 	executable?: string;
 }
 
+export interface OpenRouterSettings {
+	/** Prefer the stateless Responses API for OpenRouter requests. Default: false. */
+	responses?: boolean;
+}
+
 export type TransportSetting = Transport;
 export type ModelRoleSelector = string | string[];
 
@@ -146,6 +151,7 @@ export interface Settings {
 	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 1
 	modelRoles?: Record<string, ModelRoleSelector>;
 	claudeCode?: ClaudeCodeSettings;
+	openRouter?: OpenRouterSettings;
 	idleEvictionMinutes?: number | "off"; // global daemon policy; default: 90
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
@@ -864,6 +870,10 @@ export class SettingsManager {
 	getClaudeCodeExecutable(): string | undefined {
 		const executable = this.settings.claudeCode?.executable?.trim();
 		return executable || undefined;
+	}
+
+	getOpenRouterResponses(): boolean {
+		return this.settings.openRouter?.responses ?? false;
 	}
 
 	setModelRoles(modelRoles: Record<string, ModelRoleSelector>): void {

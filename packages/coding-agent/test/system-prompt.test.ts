@@ -1,4 +1,5 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import { actCancellationPromptBoundary } from "../src/core/act-cancellation.js";
 import { DEFAULT_RLM_EXTRA_IMPORT_LABELS } from "../src/core/kernel/bootstrap.js";
 import { buildRlmPrompt } from "../src/core/prompts/index.js";
 import type { HarnessState } from "../src/core/refinement/index.js";
@@ -82,6 +83,11 @@ describe("buildRlmPrompt", () => {
 				"",
 				"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through an available messaging capability or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
 				"",
+				"Use `rlm.act()` for one inspectable action expected to take roughly 30 seconds to 5 minutes; prefer shorter actions. You remain responsible for architecture, synthesis, decomposition, and acceptance. After every Act result, regain control and inspect decisive source, diff, or test evidence before choosing the next bounded action. Bad: `await rlm.act('Implement every phase of the migration plan, verify everything, and ship it')`. Good: `result = await rlm.act('Inspect the parser owner, fix the delimiter advance, run parser.test.ts, and return the diff and test result')`.",
+				"Set up a retained Act lane once with stable context: working directory, editing or verification authority, return contract, and the expectation that later calls are a sequence of bounded actions. The lane keeps its transcript, so later calls should be terse deltas: first `await rlm.act('In /repo, you may edit parser files and run focused tests. Return the inspected diff and raw test result. First inspect the parser owner.')`; then `await rlm.act('Now run the StarPC baseline')`; then `await rlm.act('Now fix the failing delimiter case and rerun its focused test')`. Restate any changed or ambiguous constraint, for example `await rlm.act('Now verify only; do not edit. Work from /repo/wt/review and return raw test output')`. Inspect every returned result yourself.",
+				"Omit `model` only when `rlmActDefaultModel` configures a default, or pass an ordinary named-role or concrete native selector. One retained lane runs serialized full cells in this live IPython namespace and finishes with `rlm.done(value)`. Assign the result to preserve its exact in-kernel object without displaying its representation. Act shares this root session's authority, is distinct from asynchronous isolated `rlm(...)` children, and only one Act may run at a time.",
+				actCancellationPromptBoundary(),
+				"",
 				"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. It returns immediately and runs when the current turn ends, so continue working normally after calling it. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
 			].join("\n"),
 		);
@@ -98,6 +104,47 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain("A callable `rlm` is already in your global namespace");
 		expect(prompt).toContain("IPython is the agent's long-lived notebook");
 		expect(prompt).toContain("Each `%%bash` cell runs in a throw-away subshell");
+	});
+
+	test("offers Act only to the root IPython actor", () => {
+		const root = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/session.jsonl",
+			activeTools: ["ipython"],
+			depth: 0,
+		});
+		const child = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/child.jsonl",
+			activeTools: ["ipython"],
+			depth: 1,
+		});
+
+		expect(root).toContain("one inspectable action expected to take roughly 30 seconds to 5 minutes");
+		expect(root).toContain("Implement every phase of the migration plan");
+		expect(root).toContain("Now run the StarPC baseline");
+		expect(root).toContain("Now verify only; do not edit");
+		expect(root).toContain("finishes with `rlm.done(value)`");
+		expect(root).toContain(actCancellationPromptBoundary());
+		expect(child).not.toContain("rlm.act(prompt)");
+	});
+
+	test("publishes the native Windows Act cancellation boundary", () => {
+		const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+		try {
+			const prompt = buildRlmPrompt({
+				cwd: "C:\\repo",
+				messagesPath: "C:\\repo\\session.jsonl",
+				activeTools: ["ipython"],
+				depth: 0,
+			});
+			expect(prompt).toContain(
+				"On native Windows, synchronous Python and blocking shell work have no prompt-stop guarantee",
+			);
+			expect(prompt).toContain("do not claim they stopped until they return");
+		} finally {
+			platform.mockRestore();
+		}
 	});
 
 	test("discovers requested models through a bounded authenticated host search", () => {

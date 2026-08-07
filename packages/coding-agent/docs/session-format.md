@@ -279,6 +279,37 @@ interface ChildUsageAttributionEntry extends SessionEntryBase {
 
 Reload applies `aggregateUsage` to the target assistant message. Context-tree accounting can then subtract `childUsage` when reporting the parent node's own usage.
 
+### ActStartEntry and ActTerminalEntry
+
+A persisted root records each retained Act depth without placing private lane messages in the root model context:
+
+```typescript
+interface ActStartEntry extends SessionEntryBase {
+  type: "act_start";
+  actId: string;
+  depth?: number;         // Explicit on new entries; absent historical entries mean 1
+  parentActId?: string;   // Immediate calling Act, absent for depth 1
+  sessionKey?: string;    // Retained resolved-model session for new entries
+  usageBaseline: Usage;   // Cumulative usage for this depth lane before this Act
+}
+
+interface ActTerminalEntry extends SessionEntryBase {
+  type: "act_terminal";
+  actId: string;
+  depth?: number;
+  parentActId?: string;
+  sessionKey?: string;
+  status: "done" | "cancelled" | "error" | "interrupted";
+  usage: Usage;           // Selected model delta for this Act depth
+  model?: { provider: string; id: string };
+  error?: string;         // Bounded host/provider description
+}
+```
+
+New writers always include positive `depth` and the normalized resolved-model `sessionKey`; readers normalize absent historical depth to 1 and absent session keys to the compatible base transcript. A depth-N start and terminal repeat the same `parentActId` and `sessionKey`, while depth 1 omits only the parent. The terminal never contains the returned Python object. On resume, every current-branch start without a terminal is closed once as `interrupted` from its own depth transcript; the baseline recovers persisted usage without provider, request, or cell replay. These fields remain additive v3 bookkeeping, so the session version does not change.
+
+The first model at depth 1 keeps the compatible private path `session-artifacts/<root-session-id>/act/session.jsonl`; the first model at a deeper depth uses `act-depth-N/session.jsonl`. A different resolved model at the same depth uses a stable model-qualified sibling directory. Repeating a selector that resolves to the same model resumes only its ordinary private session, so a model change never inherits another model's conversation. Legacy base transcripts without selector markers are claimed by their persisted concrete model on first reuse. Root totals add every correlated terminal exactly once, leaving Sol's assistant usage and context-window measurement unchanged.
+
 ### CustomMessageEntry
 
 Extension-injected messages that DO participate in LLM context.
@@ -350,7 +381,7 @@ Entries form a tree:
    - Then messages after compaction
 4. Converts `BranchSummaryEntry` and `CustomMessageEntry` to appropriate message formats
 
-Bookkeeping entries such as child usage attribution, session lifecycle, agent status, and git state are ignored when building model context.
+Bookkeeping entries such as child usage attribution, Act lifecycle, session lifecycle, agent status, and git state are ignored when building model context.
 
 ## Parsing Example
 

@@ -156,6 +156,10 @@ export interface Settings {
 	defaultServiceTier?: ServiceTier;
 	/** Service tiers that rlm(...) may request explicitly; defaults to defaultServiceTier. */
 	rlmAllowedServiceTiers?: ServiceTier[];
+	/** Maximum synchronous Act depth; Sol is depth 0 and the default is 1. */
+	rlmActMaxDepth?: number;
+	/** Native model selector for Act depth 1, or ordered selectors indexed by Act depth. */
+	rlmActDefaultModel?: string | string[];
 	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 1
 	modelRoles?: Record<string, ModelRoleSelector>;
 	claudeCode?: ClaudeCodeSettings;
@@ -881,6 +885,35 @@ export class SettingsManager {
 		return this.settings.rlmAllowedServiceTiers
 			? [...this.settings.rlmAllowedServiceTiers]
 			: [this.getDefaultServiceTier()];
+	}
+
+	getRlmActMaxDepth(): number {
+		const maxDepth = this.settings.rlmActMaxDepth ?? 1;
+		if (!Number.isSafeInteger(maxDepth) || maxDepth < 1) {
+			throw new Error("rlmActMaxDepth must be a positive integer");
+		}
+		return maxDepth;
+	}
+
+	getRlmActDefaultModel(depth = 1): string | undefined {
+		if (!Number.isSafeInteger(depth) || depth < 1) {
+			throw new Error("Act depth must be a positive integer");
+		}
+		const configured = this.settings.rlmActDefaultModel;
+		if (configured === undefined) return undefined;
+		if (typeof configured === "string") {
+			return depth === 1 ? configured.trim() || undefined : undefined;
+		}
+		if (!Array.isArray(configured)) {
+			throw new Error("rlmActDefaultModel must be a string or array of strings");
+		}
+		const models = configured.map((model) => {
+			if (typeof model !== "string" || !model.trim()) {
+				throw new Error("rlmActDefaultModel entries must be non-empty strings");
+			}
+			return model.trim();
+		});
+		return models[depth - 1];
 	}
 
 	getRlmMaxDepth(): number | undefined {

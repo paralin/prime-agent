@@ -8,7 +8,7 @@ import type {
 	CacheRetention,
 	Context,
 	Model,
-	OpenAIResponsesCompat,
+	OpenRouterRouting,
 	SimpleStreamOptions,
 	StreamFunction,
 	StreamOptions,
@@ -16,6 +16,7 @@ import type {
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
+import { getOpenRouterHeaders } from "../utils/openrouter-headers.js";
 import {
 	formatStreamFailureMessage,
 	recordStreamFailure,
@@ -26,7 +27,7 @@ import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copi
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
 import { buildBaseOptions } from "./simple-options.js";
 
-const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
+const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode", "openrouter"]);
 
 /**
  * Resolve cache retention preference.
@@ -42,15 +43,22 @@ function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention 
 	return "short";
 }
 
-function getCompat(model: Model<"openai-responses">): Required<OpenAIResponsesCompat> {
+interface ResolvedOpenAIResponsesCompat {
+	sendSessionIdHeader: boolean;
+	supportsLongCacheRetention: boolean;
+	openRouterRouting?: OpenRouterRouting;
+}
+
+function getCompat(model: Model<"openai-responses">): ResolvedOpenAIResponsesCompat {
 	return {
 		sendSessionIdHeader: model.compat?.sendSessionIdHeader ?? true,
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
+		openRouterRouting: model.compat?.openRouterRouting,
 	};
 }
 
 function getPromptCacheRetention(
-	compat: Required<OpenAIResponsesCompat>,
+	compat: ResolvedOpenAIResponsesCompat,
 	cacheRetention: CacheRetention,
 ): "24h" | undefined {
 	return cacheRetention === "long" && compat.supportsLongCacheRetention ? "24h" : undefined;
@@ -178,6 +186,9 @@ function createClient(
 
 	const compat = getCompat(model);
 	const headers = { ...model.headers };
+	if (model.provider === "openrouter") {
+		Object.assign(headers, getOpenRouterHeaders());
+	}
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
 		const copilotHeaders = buildCopilotDynamicHeaders({
@@ -220,12 +231,17 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 	const compat = getCompat(model);
-	const params: ResponseCreateParamsStreaming = {
+	const params: ResponseCreateParamsStreaming & {
+		session_id?: string;
+		provider?: OpenRouterRouting;
+	} = {
 		model: model.id,
 		input: messages,
 		stream: true,
 		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
 		prompt_cache_retention: getPromptCacheRetention(compat, cacheRetention),
+		session_id: model.provider === "openrouter" ? options?.sessionId : undefined,
+		provider: model.provider === "openrouter" ? compat.openRouterRouting : undefined,
 		store: false,
 	};
 

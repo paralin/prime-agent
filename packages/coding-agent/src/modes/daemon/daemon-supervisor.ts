@@ -538,6 +538,13 @@ function normalizeCapabilities(
 	return normalized;
 }
 
+function daemonClientCapabilitiesForSession(
+	client: DaemonSocketClient,
+	activeSessionId: string,
+): ReadonlySet<DaemonClientCapability> {
+	return client.capabilitiesByActiveSessionId?.get(activeSessionId) ?? client.capabilities;
+}
+
 function mergeSessionLists(active: readonly SessionSummary[], saved: readonly SessionInfo[]): SessionSummary[] {
 	const activeByFile = new Map<string, SessionSummary>();
 	for (const summary of active) {
@@ -1051,7 +1058,8 @@ export class DaemonSupervisor {
 			this.cancelWaitingPromptAdmissionsForClient(client);
 			for (const activeSessionId of [...client.attachedActiveSessionIds]) {
 				client.attachedActiveSessionIds.delete(activeSessionId);
-				void this.syncWorkerExtensionUi(activeSessionId);
+				client.capabilitiesByActiveSessionId?.delete(activeSessionId);
+				void this.syncWorkerClientCapabilities(activeSessionId);
 			}
 			this.scheduleOwnedWorkerCleanupForClient(this.protocolClientId(client));
 		};
@@ -2353,20 +2361,42 @@ export class DaemonSupervisor {
 		throw new Error(`Timed out connecting to daemon session worker: ${String(lastError)}`);
 	}
 
-	private async subscribeWorker(worker: ResidentWorker, activeSessionId: string): Promise<void> {
+	private workerSubscriptionCapabilities(
+		activeSessionId: string,
+		incomingCapabilities?: ReadonlySet<DaemonClientCapability>,
+	): { capabilities: DaemonClientCapability[]; supportsExtensionUi: boolean } {
+		const attachedCapabilities = [...this.clients]
+			.filter((client) => client.attachedActiveSessionIds.has(activeSessionId))
+			.map((client) => daemonClientCapabilitiesForSession(client, activeSessionId));
+		if (incomingCapabilities) attachedCapabilities.push(incomingCapabilities);
+		const supportsExtensionUi = attachedCapabilities.some((capabilities) => capabilities.has("extension_ui"));
+		const supportsActStream = attachedCapabilities.some((capabilities) => capabilities.has("rlm_act_stream"));
+		return {
+			capabilities: [
+				"attach_snapshot",
+				"event_sequence",
+				...(supportsExtensionUi ? (["extension_ui"] as const) : []),
+				"slim_attach",
+				"chunked_snapshot",
+				...(supportsActStream ? (["rlm_act_stream"] as const) : []),
+			],
+			supportsExtensionUi,
+		};
+	}
+
+	private async subscribeWorker(
+		worker: ResidentWorker,
+		activeSessionId: string,
+		incomingCapabilities?: ReadonlySet<DaemonClientCapability>,
+	): Promise<void> {
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
-		const supportsExtensionUi = [...this.clients].some(
-			(client) => client.attachedActiveSessionIds.has(activeSessionId) && client.supportsExtensionUi,
-		);
+		const subscription = this.workerSubscriptionCapabilities(activeSessionId, incomingCapabilities);
 		const response = await worker.client.requestWorker({
 			type: "worker_subscribe",
 			activeSessionId,
-			capabilities: supportsExtensionUi
-				? ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"]
-				: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
-			supportsExtensionUi,
+			...subscription,
 		});
 		if (!response.success) {
 			throw new Error(response.error);
@@ -3286,19 +3316,20 @@ export class DaemonSupervisor {
 		if (command.clientId) {
 			client.id = command.clientId;
 		}
-		client.capabilities = normalizeCapabilities(command.capabilities, command.supportsExtensionUi);
-		client.supportsExtensionUi = client.capabilities.has("extension_ui");
+		const capabilities = normalizeCapabilities(command.capabilities, command.supportsExtensionUi);
+		client.capabilities = capabilities;
+		client.supportsExtensionUi = capabilities.has("extension_ui");
 
 		let result = match.worker.snapshotCache.get(activeSessionId);
 		if (
 			result &&
-			!client.capabilities.has("chunked_snapshot") &&
+			!capabilities.has("chunked_snapshot") &&
 			result.snapshot.messages.length < result.snapshot.summary.messageCount
 		) {
 			result = undefined;
 		}
 		if (!result) {
-			const snapshotLoadKey = `${activeSessionId}:${client.capabilities.has("chunked_snapshot") ? "chunked" : "full"}`;
+			const snapshotLoadKey = `${activeSessionId}:${capabilities.has("chunked_snapshot") ? "chunked" : "full"}`;
 			let retryInvalidatedLoad = true;
 			while (!result) {
 				let loading = match.worker.snapshotLoads.get(snapshotLoadKey);
@@ -3310,13 +3341,14 @@ export class DaemonSupervisor {
 						if (!match.worker.client) {
 							throw new Error("Session worker is not connected");
 						}
+						const workerSubscription = this.workerSubscriptionCapabilities(activeSessionId, capabilities);
 						const response = await match.worker.client.request({
 							type: "attach",
 							activeSessionId,
-							capabilities: client.capabilities.has("chunked_snapshot")
-								? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
-								: ["attach_snapshot", "event_sequence", "slim_attach"],
-							supportsExtensionUi: false,
+							capabilities: workerSubscription.capabilities.filter(
+								(capability) => capability !== "chunked_snapshot" || capabilities.has("chunked_snapshot"),
+							),
+							supportsExtensionUi: workerSubscription.supportsExtensionUi,
 							env: command.env ?? collectDaemonClientEnv(),
 						});
 						const loaded = attachResultFromResponse(response);
@@ -3369,7 +3401,7 @@ export class DaemonSupervisor {
 		}
 		const wasAttached = client.attachedActiveSessionIds.has(activeSessionId);
 		let transcript: SnapshotTranscriptCache | undefined;
-		if (client.capabilities.has("chunked_snapshot")) {
+		if (capabilities.has("chunked_snapshot")) {
 			while (true) {
 				const validation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
 				if (validation) {
@@ -3382,8 +3414,12 @@ export class DaemonSupervisor {
 			}
 		}
 		const releaseTranscript = transcript?.retain();
+		const previousSessionCapabilities = client.capabilitiesByActiveSessionId?.get(activeSessionId);
 		client.attachedActiveSessionIds.add(activeSessionId);
+		client.capabilitiesByActiveSessionId ??= new Map();
+		client.capabilitiesByActiveSessionId.set(activeSessionId, capabilities);
 		try {
+			if (match.worker.client) await this.subscribeWorker(match.worker, activeSessionId);
 			const publicSummary = this.publicSummary(match.worker, result.snapshot.summary);
 			if (publicSummary.streamingMessage?.role === "assistant") {
 				this.streamReconstructor.seed(activeSessionId, publicSummary.streamingMessage);
@@ -3400,7 +3436,7 @@ export class DaemonSupervisor {
 				...result,
 				state: result.state ? publicSummary : undefined,
 				snapshot: { ...result.snapshot, summary: publicSummary },
-				client: { id: client.id, capabilities: [...client.capabilities] },
+				client: { id: client.id, capabilities: [...capabilities] },
 			};
 			if (publicResult.state && publicResult.messages) {
 				this.write(client, {
@@ -3413,13 +3449,15 @@ export class DaemonSupervisor {
 					lastEventSequence: publicResult.lastEventSequence,
 				});
 			}
-			void this.syncWorkerExtensionUi(activeSessionId);
 			return { result: publicResult, worker: match.worker, transcript, releaseTranscript };
 		} catch (error) {
 			releaseTranscript?.();
-			if (!wasAttached) {
-				client.attachedActiveSessionIds.delete(activeSessionId);
+			if (previousSessionCapabilities) {
+				client.capabilitiesByActiveSessionId?.set(activeSessionId, previousSessionCapabilities);
+			} else {
+				client.capabilitiesByActiveSessionId?.delete(activeSessionId);
 			}
+			if (!wasAttached) client.attachedActiveSessionIds.delete(activeSessionId);
 			throw error;
 		}
 	}
@@ -3698,12 +3736,13 @@ export class DaemonSupervisor {
 			}
 			client.catchupActiveSessionIds?.delete(resolvedId);
 			client.catchupPurposes?.delete(resolvedId);
+			client.capabilitiesByActiveSessionId?.delete(resolvedId);
 			this.write(client, { type: "session_detached", activeSessionId: resolvedId });
-			void this.syncWorkerExtensionUi(resolvedId);
+			void this.syncWorkerClientCapabilities(resolvedId);
 		}
 	}
 
-	private async syncWorkerExtensionUi(activeSessionId: string): Promise<void> {
+	private async syncWorkerClientCapabilities(activeSessionId: string): Promise<void> {
 		const match = this.matchWorkers(activeSessionId)[0];
 		if (!match?.worker.client) {
 			return;
@@ -4097,10 +4136,23 @@ export class DaemonSupervisor {
 			if (!client.attachedActiveSessionIds.has(activeSessionId)) {
 				continue;
 			}
-			if (replacementSnapshotFollows && !client.capabilities.has("chunked_snapshot")) {
+			if (
+				replacementSnapshotFollows &&
+				!daemonClientCapabilitiesForSession(client, activeSessionId).has("chunked_snapshot")
+			) {
 				continue;
 			}
-			if (outboundType === "extension_ui_request" && !client.supportsExtensionUi) {
+			if (
+				outboundType === "extension_ui_request" &&
+				!daemonClientCapabilitiesForSession(client, activeSessionId).has("extension_ui")
+			) {
+				continue;
+			}
+			if (
+				outboundType === "session_event" &&
+				sessionEventType === "act_event" &&
+				!daemonClientCapabilitiesForSession(client, activeSessionId).has("rlm_act_stream")
+			) {
 				continue;
 			}
 			if (client.snapshotActiveSessionIds?.has(activeSessionId)) {
@@ -4223,16 +4275,17 @@ export class DaemonSupervisor {
 		client.catchupPurposes?.clear();
 		for (let index = 0; index < pending.length; index++) {
 			const { activeSessionId, purpose } = pending[index]!;
+			const sessionCapabilities = daemonClientCapabilitiesForSession(client, activeSessionId);
 			let releaseTranscript: (() => void) | undefined;
 			try {
 				const attached = await this.attachClient(client, {
 					type: "attach",
 					activeSessionId,
-					capabilities: [...client.capabilities],
-					supportsExtensionUi: client.supportsExtensionUi,
+					capabilities: [...sessionCapabilities],
+					supportsExtensionUi: sessionCapabilities.has("extension_ui"),
 				});
 				releaseTranscript = attached.releaseTranscript;
-				if (client.capabilities.has("chunked_snapshot")) {
+				if (sessionCapabilities.has("chunked_snapshot")) {
 					const transcript = attached.transcript;
 					if (!transcript) {
 						throw new Error("Session worker did not provide a snapshot transcript");

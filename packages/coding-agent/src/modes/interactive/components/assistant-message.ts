@@ -8,6 +8,7 @@ import {
 	shouldCollapseErrorDetails,
 	summarizeErrorDetails,
 } from "./collapsible-error.js";
+import { createThinkingMarkdown } from "./thinking-markdown.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
@@ -17,24 +18,6 @@ const LOGIN_RECOVERY_SUFFIX = `\n\n${LOGIN_RECOVERY_MESSAGE}`;
 export interface AssistantMessageComponentOptions {
 	expanded?: boolean;
 	precededByToolActivity?: boolean;
-}
-
-function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
-	const quiet = (text: string) => theme.fg("thinkingText", text);
-	return {
-		...baseTheme,
-		heading: quiet,
-		link: quiet,
-		linkUrl: quiet,
-		code: quiet,
-		codeBlock: quiet,
-		codeBlockBorder: quiet,
-		quote: quiet,
-		quoteBorder: quiet,
-		hr: quiet,
-		listBullet: quiet,
-		highlightCode: (code: string) => code.split("\n").map((line) => quiet(line)),
-	};
 }
 
 function formatInlineLoginRecoveryMessage(message: string): string | undefined {
@@ -234,15 +217,7 @@ export class AssistantMessageComponent extends Container {
 					}
 				} else {
 					// Thinking traces keep Markdown structure but stay visually quiet.
-					const markdown = new Markdown(
-						content.thinking.trim(),
-						1,
-						0,
-						getThinkingMarkdownTheme(this.markdownTheme),
-						{
-							color: (text: string) => theme.fg("thinkingText", text),
-						},
-					);
+					const markdown = createThinkingMarkdown(content.thinking, this.markdownTheme);
 					this.blockMarkdowns.set(i, markdown);
 					this.lastBlockTexts.set(i, content.thinking.trim());
 					this.contentContainer.addChild(markdown);

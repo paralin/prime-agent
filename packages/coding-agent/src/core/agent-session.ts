@@ -52,6 +52,15 @@ import {
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
+import { actCancellationCapability, actContextLabel } from "./act-cancellation.js";
+import {
+	ACT_EVENT_CELL_TEXT_MAX_CHARS,
+	ACT_EVENT_ERROR_MAX_CHARS,
+	ACT_EVENT_PROMPT_MAX_CHARS,
+	type ActProjectionEvent,
+	truncateActEventText,
+} from "./act-events.js";
+import { ActLane, type ActLaneProgress, createActResourceLoader } from "./act-lane.js";
 import {
 	AGENT_MESSAGE_CUSTOM_TYPE,
 	AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL,
@@ -186,7 +195,7 @@ import {
 	validateGoalObjective,
 	validateGoalPauseReason,
 } from "./goals.js";
-import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
+import type { HostRequestChannel, HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
@@ -261,6 +270,7 @@ import {
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
+import { RootForegroundLease } from "./root-foreground-lease.js";
 import {
 	ActionStore,
 	type ActionTicket,
@@ -275,7 +285,14 @@ import {
 	transitionSessionAction,
 	type WakePolicy,
 } from "./session-action-store.js";
-import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
+import type {
+	ActStartEntry,
+	ActTerminalStatus,
+	BranchSummaryEntry,
+	CompactionEntry,
+	SessionContext,
+	SessionMessageEntry,
+} from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
@@ -298,7 +315,7 @@ import { type BashOperations, createLocalBashOperations } from "./tools/bash.js"
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
-import { addAssistantUsage, emptyUsage } from "./usage.js";
+import { addAssistantUsage, cloneUsage, emptyUsage, subtractAssistantUsage } from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
 export type { GoalState, GoalStatus } from "./goals.js";
@@ -343,6 +360,7 @@ export type CompactionReason = "manual" | "threshold" | "overflow" | "requested"
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
 	| AgentEvent
+	| ActProjectionEvent
 	| {
 			type: "ipython_sent_agent_message";
 			toolCallId: string;
@@ -1014,6 +1032,8 @@ type RlmSubagentModelSelection =
 			thinkingLevel?: ThinkingLevel;
 	  };
 
+type NativeRlmSubagentModelSelection = Extract<RlmSubagentModelSelection, { runtime: "native" }>;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -1024,6 +1044,18 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 /** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
+const ACT_SESSION_DIRNAME = "act";
+const ACT_SESSION_FILENAME = "session.jsonl";
+
+function actUsageDelta(after: Usage, before: Usage): Usage {
+	const delta = cloneUsage(after);
+	subtractAssistantUsage(delta, before);
+	return delta;
+}
+
+function actErrorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
 
 function noopRlmChildAbort(): void {}
 function noopRlmChildEventUnsubscribe(): void {}
@@ -1268,7 +1300,9 @@ export class AgentSession {
 	// Set at the start of async teardown so a child finishing mid-disposeAsync doesn't
 	// re-populate the retained map after it's been cleared.
 	private _disposing = false;
+	private _disposalAdmissionClosed = false;
 	private _disposeAsyncPromise?: Promise<void>;
+	private _kernelDisposePromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
 	private _ipythonKernelSnapshotDir?: string;
@@ -1287,6 +1321,13 @@ export class AgentSession {
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
+	private readonly _rootForeground = new RootForegroundLease(() => {
+		this._notifySessionInputCheckpointChange();
+		this._scheduleSessionInputPump();
+	});
+	private _actLane?: ActLane;
+	private _activeActCompletion?: Promise<void>;
+	private _actTeardownPromise?: Promise<void>;
 	private readonly _startClaudeCodeQuery?: StartClaudeCodeQuery;
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
 	private _pendingRlmSubagentSessionNames = new Set<string>();
@@ -1399,6 +1440,7 @@ export class AgentSession {
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
 		this._rlmModelCandidates = [...(config.rlmModelCandidates ?? [])];
+		if (this._rlmDepth === 0) this._recoverInterruptedActs();
 		this._startClaudeCodeQuery = config.startClaudeCodeQuery;
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
@@ -3914,24 +3956,27 @@ export class AgentSession {
 	 * the latest state reaches disk instead of racing process exit.
 	 */
 	async disposeAsync(): Promise<void> {
-		if (this._disposed) {
-			return;
-		}
-		// Concurrent callers await the same in-flight teardown so none resolves before
-		// the kernel snapshot flush finishes.
-		if (this._disposeAsyncPromise) {
-			return this._disposeAsyncPromise;
-		}
+		// Concurrent synchronous or asynchronous callers share one bounded cleanup.
+		if (this._disposeAsyncPromise) return this._disposeAsyncPromise;
+		if (this._disposed) return this._kernelDisposePromise;
+		const actTeardown = this._beginActTeardown();
+		this._closeDisposalAdmission();
 		this._disposeAsyncPromise = (async () => {
-			// Drain before marking _disposing so a refine triggered at the final
-			// agent_end completes instead of being aborted by dispose().
-			await this._drainPendingRefinementForDisposal();
-			if (this._disposed) {
-				return;
+			let drainError: unknown;
+			try {
+				// Preserve the established final-refinement drain after closing new admission.
+				await this._drainPendingRefinementForDisposal();
+			} catch (error) {
+				drainError = error;
 			}
-			this._disposing = true;
-			this._sessionActionCommitDisposeAbortController.abort();
-			await this._disposeAsyncOnce();
+			if (this._disposed) {
+				if (actTeardown) await actTeardown;
+				await this._disposeKernelOnce();
+			} else {
+				this._disposing = true;
+				await this._disposeAsyncOnce(actTeardown);
+			}
+			if (drainError) throw drainError;
 		})();
 		return this._disposeAsyncPromise;
 	}
@@ -4067,7 +4112,8 @@ export class AgentSession {
 		}
 	}
 
-	private async _disposeAsyncOnce(): Promise<void> {
+	private async _disposeAsyncOnce(actTeardown: Promise<void> | undefined): Promise<void> {
+		if (actTeardown) await actTeardown;
 		// Flush kernels/traces for both still-running and retained children; the sync
 		// dispose() below only tears them down synchronously.
 		for (const run of this._activeRlmChildRuns.values()) {
@@ -4086,7 +4132,7 @@ export class AgentSession {
 		this._rlmChildCleanupFailures.clear();
 		this._deletedRlmChildIds.clear();
 		try {
-			await this._ipythonKernelProvisioner?.dispose();
+			await this._disposeKernelOnce();
 		} catch {
 			// a failed kernel startup already cleaned up after itself
 		}
@@ -4094,11 +4140,22 @@ export class AgentSession {
 	}
 
 	dispose(): void {
-		if (this._disposed) {
-			return;
+		if (this._disposed) return;
+		const actTeardown = this._beginActTeardown();
+		this._closeDisposalAdmission();
+		if (!this._disposeAsyncPromise) {
+			const childSessions = new Set([
+				...[...this._activeRlmChildRuns.values()].flatMap((run) => (run.session ? [run.session] : [])),
+				...this._rlmChildSessions.values(),
+			]);
+			this._disposeAsyncPromise = (async () => {
+				if (actTeardown) await actTeardown;
+				await Promise.allSettled([...childSessions].map((session) => session.disposeAsync()));
+				await this._disposeKernelOnce();
+			})();
+			void this._disposeAsyncPromise.catch(() => undefined);
 		}
 		this._disposed = true;
-		this._sessionActionCommitDisposeAbortController.abort();
 		try {
 			// Invalidate scheduled timers and abort any in-flight review so a late
 			// resolution cannot write harness state or re-subscribe handlers.
@@ -4113,6 +4170,9 @@ export class AgentSession {
 			this._pendingRequestedRefine = undefined;
 			this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
 			this._autoRefineBranchVersion++;
+			this._actLane?.dispose();
+			this._actLane = undefined;
+			this._rootForeground.dispose(new Error("Session disposed before foreground admission."));
 			this._cancelActiveRlmChildRuns("Parent session disposed");
 			this._disposeExternalRlmChildRuntimes();
 			for (const unsubscribe of this._rlmChildUnsubscribes.values()) {
@@ -4553,6 +4613,7 @@ export class AgentSession {
 
 	private _canStartSessionActionImmediately(): boolean {
 		return (
+			!this._rootForeground.blocksCurrentContext &&
 			!this.isStreaming &&
 			!this.isCompacting &&
 			!this.isRetrying &&
@@ -4817,10 +4878,11 @@ export class AgentSession {
 					return;
 				}
 
-				const queueForStreaming = this.isStreaming;
+				const queueForForegroundAct = this._rootForeground.actActive && this._rootForeground.blocksCurrentContext;
+				const queueForStreaming = this.isStreaming && !queueForForegroundAct;
 				const queueForBusy = options?.queueIfBusy === true && this._isBusyForSessionInput("preflight");
-				const visibleQueued = queueForStreaming || queueForBusy;
-				if (visibleQueued && !options?.streamingBehavior) {
+				const visibleQueued = queueForForegroundAct || queueForStreaming || queueForBusy;
+				if (visibleQueued && !options?.streamingBehavior && !queueForForegroundAct) {
 					const stateDescription = queueForStreaming ? "Agent is already processing" : "Agent has queued work";
 					throw new Error(
 						`${stateDescription}. Specify streamingBehavior ('steer' or 'followUp') to queue the message.`,
@@ -4850,6 +4912,7 @@ export class AgentSession {
 					prefixMessages,
 					suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
 					resumeIfIdle:
+						queueForForegroundAct ||
 						!visibleQueued ||
 						options?.resumeIfIdle ||
 						(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
@@ -5430,7 +5493,7 @@ export class AgentSession {
 	}
 
 	private _assertSessionActionAdmissionAvailable(): void {
-		if (this._disposed || this._disposing) {
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 		if (this.unfinishedActionCount > 0 && this._sessionInputPumpSuspended) {
@@ -5451,7 +5514,7 @@ export class AgentSession {
 		disposition: "starts_when_admitted" | "queued";
 		ticket?: ActionTicket;
 	} {
-		if (this._disposed || this._disposing) {
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
@@ -5518,14 +5581,14 @@ export class AgentSession {
 
 	private _runtimeActivity(): RuntimeActivity {
 		return {
-			lowerAgentRun: this.isStreaming,
+			lowerAgentRun: this.isStreaming && !this._rootForeground.actActive,
 			compaction: this.isCompacting,
 			retry: this.isRetrying,
 			bash: this.isBashRunning,
 			refinementApply: this._refineInFlight !== undefined,
 			branchMutation: this._branchSummaryOperation !== undefined,
 			schedulerPauseCount: this._queuedWorkPauses.size + (this._sessionInputPumpSuspended ? 1 : 0),
-			disposing: this._disposed || this._disposing,
+			disposing: this._disposed || this._disposing || this._disposalAdmissionClosed,
 		};
 	}
 
@@ -5558,7 +5621,13 @@ export class AgentSession {
 
 	private _scheduleSessionInputPump(): void {
 		if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) return;
-		if (this._disposed || this._disposing || this._sessionInputPumpRequested || !this._hasSelectableSessionInput()) {
+		if (
+			this._disposed ||
+			this._disposing ||
+			this._disposalAdmissionClosed ||
+			this._sessionInputPumpRequested ||
+			!this._hasSelectableSessionInput()
+		) {
 			return;
 		}
 		this._sessionInputPumpRequested = true;
@@ -5574,8 +5643,13 @@ export class AgentSession {
 	private async _pumpSessionInputs(epoch: number): Promise<void> {
 		let blocked = false;
 		try {
-			while (!this._disposed && !this._disposing && this._hasSelectableSessionInput()) {
-				await this.agent.waitForIdle();
+			while (
+				!this._disposed &&
+				!this._disposing &&
+				!this._disposalAdmissionClosed &&
+				this._hasSelectableSessionInput()
+			) {
+				if (!this._rootForeground.actActive) await this.agent.waitForIdle();
 				const preselected = this._actionStore
 					.activeActions()
 					.find((action) => action.lifecycle.state === "selected");
@@ -5724,7 +5798,11 @@ export class AgentSession {
 		}
 	}
 
-	private async _executeSelectedSessionCommand(action: QueuedSessionAction, epoch: number): Promise<void> {
+	private _executeSelectedSessionCommand(action: QueuedSessionAction, epoch: number): Promise<void> {
+		return this._rootForeground.run("root-turn", () => this._executeSelectedSessionCommandWithLease(action, epoch));
+	}
+
+	private async _executeSelectedSessionCommandWithLease(action: QueuedSessionAction, epoch: number): Promise<void> {
 		if (action.payload.kind !== "session_command") throw new Error("Expected a selected session command");
 		const input = action.payload;
 		const commitFence = await this._acquireSessionActionCommitFence();
@@ -5787,7 +5865,9 @@ export class AgentSession {
 				this._branchSummaryOperation !== undefined
 			);
 		}
-		return externalBusy || this._actionStore.unfinishedActions().length > 0;
+		return (
+			this._rootForeground.blocksCurrentContext || externalBusy || this._actionStore.unfinishedActions().length > 0
+		);
 	}
 
 	private _isSessionInputHandoffDeferred(epoch: number): boolean {
@@ -5822,7 +5902,11 @@ export class AgentSession {
 		}
 	}
 
-	private async _startPreparedTurnActions(actions: QueuedSessionAction[], epoch: number): Promise<void> {
+	private _startPreparedTurnActions(actions: QueuedSessionAction[], epoch: number): Promise<void> {
+		return this._rootForeground.run("root-turn", () => this._startPreparedTurnActionsWithLease(actions, epoch));
+	}
+
+	private async _startPreparedTurnActionsWithLease(actions: QueuedSessionAction[], epoch: number): Promise<void> {
 		let nextTurnMessages: CustomMessage[] = [];
 		const activeTurns = () =>
 			actions.filter(
@@ -6655,7 +6739,46 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
+	private _beginActTeardown(): Promise<void> | undefined {
+		if (this._actTeardownPromise) return this._actTeardownPromise;
+		const lane = this._actLane;
+		const completion = this._activeActCompletion;
+		if (!lane?.running && !completion) return undefined;
+		const foregroundRelease =
+			lane?.running || completion ? this._rootForeground.waitForCurrentActorRelease() : undefined;
+		const laneIdle = lane?.running ? lane.waitForIdle() : undefined;
+		const cleanup = Promise.allSettled([
+			...(laneIdle ? [laneIdle] : []),
+			...(completion ? [completion] : []),
+			...(foregroundRelease ? [foregroundRelease] : []),
+		]).then(() => undefined);
+		this._actTeardownPromise = cleanup;
+		lane?.cancel();
+		void cleanup.finally(() => {
+			if (this._actTeardownPromise === cleanup) this._actTeardownPromise = undefined;
+		});
+		return cleanup;
+	}
+
+	private _closeDisposalAdmission(): void {
+		if (this._disposalAdmissionClosed) return;
+		this._disposalAdmissionClosed = true;
+		this._sessionInputPumpRequested = false;
+		this._sessionInputPumpEpoch++;
+		this._sessionInputPumpSuspended = true;
+		this._sessionActionCommitDisposeAbortController.abort();
+		this._rootForeground.dispose(new Error("Session disposed before foreground admission"));
+		this._notifySessionInputCheckpointChange();
+	}
+
+	private _disposeKernelOnce(): Promise<void> {
+		if (this._kernelDisposePromise) return this._kernelDisposePromise;
+		this._kernelDisposePromise = this._ipythonKernelProvisioner?.dispose() ?? Promise.resolve();
+		return this._kernelDisposePromise;
+	}
+
 	requestAbort(): void {
+		void this._beginActTeardown()?.catch(() => undefined);
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
@@ -6681,6 +6804,7 @@ export class AgentSession {
 	async abort(): Promise<void> {
 		const compactionOperation = this._compactionOperation;
 		const branchSummaryOperation = this._branchSummaryOperation;
+		const actTeardown = this._beginActTeardown();
 		this.requestAbort();
 		this._cancelActiveRlmChildRuns("Parent session aborted");
 		this._goalAbortInProgress = this._goalState.status === "active";
@@ -6690,6 +6814,7 @@ export class AgentSession {
 				this._agentEventQueue,
 				...(compactionOperation ? [compactionOperation] : []),
 				...(branchSummaryOperation ? [branchSummaryOperation] : []),
+				...(actTeardown ? [actTeardown] : []),
 			]);
 		} finally {
 			this._goalAbortInProgress = false;
@@ -6697,6 +6822,7 @@ export class AgentSession {
 	}
 
 	abortForUpdateRestart(): void {
+		void this._beginActTeardown()?.catch(() => undefined);
 		// Cancel scheduled pumps and suspend new ones: queued inputs must survive
 		// into the restart manifest instead of starting a turn during teardown.
 		this._sessionInputPumpRequested = false;
@@ -7175,12 +7301,25 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string, options: { skipAbort?: boolean } = {}): Promise<CompactionResult> {
-		if (options.skipAbort && this.isStreaming) {
+		const queuesBehindForegroundAct = this._rootForeground.blocksCurrentContext && this._rootForeground.actActive;
+		if (options.skipAbort && this.isStreaming && !queuesBehindForegroundAct) {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
+		if (!options.skipAbort && !queuesBehindForegroundAct) await this.abort();
+		return this._rootForeground.run("compaction", () =>
+			this._compactWithLease(customInstructions, hadPostCompactionContinue),
+		);
+	}
+
+	private async _compactWithLease(
+		customInstructions: string | undefined,
+		hadPostCompactionContinue: boolean,
+	): Promise<CompactionResult> {
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
+			throw new Error("Cannot compact a disposing or disposed session.");
+		}
 		this._disconnectFromAgent();
-		if (!options.skipAbort) await this.abort();
 		let didCompact = false;
 		this._compactionAbortController = new AbortController();
 		let resolveCompactionOperation: () => void = () => {};
@@ -7538,7 +7677,12 @@ export class AgentSession {
 		if (!this._postCompactionContinuationScheduled) {
 			return;
 		}
-		if (this.isStreaming || this.isCompacting || this.isRetrying || this._queuedWorkPauses.size > 0) {
+		if (
+			(this.isStreaming && !this._rootForeground.actActive) ||
+			this.isCompacting ||
+			this.isRetrying ||
+			this._queuedWorkPauses.size > 0
+		) {
 			this._postCompactionContinuationScheduled = false;
 			this._schedulePostCompactionContinue();
 			return;
@@ -7572,7 +7716,10 @@ export class AgentSession {
 
 		this._postCompactionContinuationScheduled = false;
 		try {
-			await this.agent.continue();
+			await this._rootForeground.run("root-turn", () => {
+				if (this._disposed || this._disposing) return Promise.resolve();
+				return this.agent.continue();
+			});
 			this._forgetConsumedPostCompactionContinuations(continuationMessages);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -8802,6 +8949,7 @@ export class AgentSession {
 				env: this._rlmKernelEnv(),
 				sessionId: this.sessionId,
 				hostHandlers: this._createKernelHostHandlers(),
+				foregroundLease: this._rootForeground,
 				pythonSkills,
 				snapshotDir: this._ipythonKernelSnapshotDir,
 				readyGate: previousDispose,
@@ -8900,6 +9048,364 @@ export class AgentSession {
 		return skills;
 	}
 
+	private _emitActProgress(actId: string, outerToolCallId: string, sequence: number, progress: ActLaneProgress): void {
+		if (progress.type === "assistant_delta") {
+			const text = truncateActEventText(progress.text, ACT_EVENT_CELL_TEXT_MAX_CHARS);
+			this._emit({
+				type: "act_event",
+				actId,
+				outerToolCallId,
+				sequence,
+				event: "assistant_delta",
+				stream: progress.stream,
+				text: text.text,
+				textTruncated: text.truncated,
+			});
+			return;
+		}
+		if (progress.type === "cell_start") {
+			const code = truncateActEventText(progress.code, ACT_EVENT_CELL_TEXT_MAX_CHARS);
+			this._emit({
+				type: "act_event",
+				actId,
+				outerToolCallId,
+				sequence,
+				event: "cell_start",
+				cellId: progress.cellId,
+				code: code.text,
+				codeTruncated: code.truncated,
+			});
+			return;
+		}
+		const stdout = truncateActEventText(progress.stdout, ACT_EVENT_CELL_TEXT_MAX_CHARS);
+		const stderr = truncateActEventText(progress.stderr, ACT_EVENT_CELL_TEXT_MAX_CHARS);
+		const result =
+			progress.result === undefined
+				? undefined
+				: truncateActEventText(progress.result, ACT_EVENT_CELL_TEXT_MAX_CHARS);
+		const error =
+			progress.error === undefined ? undefined : truncateActEventText(progress.error, ACT_EVENT_ERROR_MAX_CHARS);
+		this._emit({
+			type: "act_event",
+			actId,
+			outerToolCallId,
+			sequence,
+			event: "cell_terminal",
+			cellId: progress.cellId,
+			...(progress.durationMs !== undefined ? { durationMs: progress.durationMs } : {}),
+			status: progress.status,
+			stdout: stdout.text,
+			stdoutTruncated: stdout.truncated,
+			stderr: stderr.text,
+			stderrTruncated: stderr.truncated,
+			...(result ? { result: result.text } : {}),
+			resultTruncated: result?.truncated ?? false,
+			...(error ? { error: error.text } : {}),
+			errorTruncated: error?.truncated ?? false,
+		});
+	}
+
+	private async _runAct(
+		payload: Record<string, unknown>,
+		_signal: AbortSignal | undefined,
+		channel: HostRequestChannel | undefined,
+	): Promise<Record<string, unknown>> {
+		if (typeof payload.prompt !== "string" || payload.prompt.trim().length === 0) {
+			throw new Error("rlm.act requires a non-empty prompt");
+		}
+		if (!channel) throw new Error("rlm.act requires a duplex kernel channel");
+		if (!channel.outerToolCallId) throw new Error("rlm.act requires outer tool-call correlation");
+		const requestedModel = normalizeRequestedRlmSubagentModel(payload.model, "rlm.act");
+		const model = requestedModel ?? this.settingsManager.getRlmActDefaultModel();
+		if (!model) {
+			throw new Error("rlm.act requires an explicit model when rlmActDefaultModel is not configured");
+		}
+		this._actLane ??= new ActLane(
+			(tool, model) => this._createActLaneSession(tool, model),
+			(session, model) => this._selectActLaneModel(session, model),
+		);
+		const lane = this._actLane;
+		const actId = randomUUID();
+		const outerToolCallId = channel.outerToolCallId;
+		const prompt = truncateActEventText(payload.prompt, ACT_EVENT_PROMPT_MAX_CHARS);
+		const cancellationCapability = actCancellationCapability();
+		let sequence = 0;
+		const pendingProgress: ActLaneProgress[] = [];
+		let started:
+			| {
+					baseline: Usage;
+					model: { provider: string; id: string; name?: string };
+					thinkingLevel: string;
+					directingModel?: { provider: string; id: string; name?: string };
+					directingThinkingLevel: string;
+			  }
+			| undefined;
+		let status: Exclude<ActTerminalStatus, "interrupted"> = "error";
+		let terminalError: string | undefined;
+		let admitted = false;
+		let resolveTerminalCompletion: () => void = () => {};
+		const terminalCompletion = new Promise<void>((resolve) => {
+			resolveTerminalCompletion = resolve;
+		});
+		try {
+			const result = await lane.run(
+				payload.prompt,
+				channel,
+				model,
+				(state) => {
+					if (!state.model) throw new Error("Act model selection did not resolve a model");
+					this.sessionManager.appendActStart(actId, state.usage);
+					started = {
+						baseline: state.usage,
+						model: state.model,
+						thinkingLevel: state.thinkingLevel,
+						directingModel: this.model
+							? { provider: this.model.provider, id: this.model.id, name: this.model.name }
+							: undefined,
+						directingThinkingLevel: this.thinkingLevel,
+					};
+					this._emit({
+						type: "act_event",
+						actId,
+						outerToolCallId,
+						sequence: ++sequence,
+						event: "start",
+						prompt: prompt.text,
+						promptTruncated: prompt.truncated,
+						model: { ...state.model },
+						thinkingLevel: state.thinkingLevel,
+						...(started.directingModel ? { directingModel: { ...started.directingModel } } : {}),
+						directingThinkingLevel: started.directingThinkingLevel,
+						cancellationCapability,
+					});
+					for (const progress of pendingProgress.splice(0)) {
+						this._emitActProgress(actId, outerToolCallId, ++sequence, progress);
+					}
+				},
+				() => {
+					admitted = true;
+					const foregroundRelease = this._rootForeground.waitForCurrentActorRelease();
+					const completion = Promise.allSettled([terminalCompletion, foregroundRelease]).then(() => undefined);
+					this._activeActCompletion = completion;
+					void completion.finally(() => {
+						if (this._activeActCompletion === completion) this._activeActCompletion = undefined;
+					});
+				},
+				(progress) => {
+					if (!started) pendingProgress.push(progress);
+					else this._emitActProgress(actId, outerToolCallId, ++sequence, progress);
+				},
+			);
+			status = result.outcome === "done" ? "done" : result.outcome === "cancelled" ? "cancelled" : "error";
+			if (result.outcome === "text") terminalError = "Act ended without calling rlm.done()";
+			return { ...result };
+		} catch (error) {
+			status = channel.signal.aborted ? "cancelled" : "error";
+			terminalError = actErrorText(error);
+			throw error;
+		} finally {
+			try {
+				if (started) {
+					const terminalUsage = actUsageDelta(lane.usage, started.baseline);
+					const error = terminalError
+						? truncateActEventText(terminalError, ACT_EVENT_ERROR_MAX_CHARS)
+						: { text: "", truncated: false };
+					this.sessionManager.appendActTerminal(actId, status, terminalUsage, {
+						model: started.model,
+						...(terminalError ? { error: error.text } : {}),
+					});
+					this._emit({
+						type: "act_event",
+						actId,
+						outerToolCallId,
+						sequence: ++sequence,
+						event: "terminal",
+						status,
+						prompt: prompt.text,
+						promptTruncated: prompt.truncated,
+						model: { ...started.model },
+						thinkingLevel: started.thinkingLevel,
+						...(started.directingModel ? { directingModel: { ...started.directingModel } } : {}),
+						directingThinkingLevel: started.directingThinkingLevel,
+						cancellationCapability,
+						usage: cloneUsage(terminalUsage),
+						...(terminalError ? { error: error.text } : {}),
+						errorTruncated: error.truncated,
+					});
+				}
+			} finally {
+				if (admitted) resolveTerminalCompletion();
+			}
+		}
+	}
+
+	private _actSessionLocation(): { dir: string; file: string } | undefined {
+		const artifactDir = this.sessionManager.getSessionArtifactDir();
+		if (!artifactDir) return undefined;
+		const dir = join(artifactDir, ACT_SESSION_DIRNAME);
+		return { dir, file: join(dir, ACT_SESSION_FILENAME) };
+	}
+
+	private _openActSessionManager(): SessionManager {
+		const location = this._actSessionLocation();
+		if (!location) return SessionManager.inMemory(this._cwd);
+		return SessionManager.open(location.file, location.dir, this._cwd);
+	}
+
+	private _persistedActState(): {
+		usage: Usage;
+		model?: { provider: string; id: string };
+	} {
+		const location = this._actSessionLocation();
+		if (!location || !existsSync(location.file)) return { usage: emptyUsage() };
+		const manager = SessionManager.open(location.file, location.dir, this._cwd);
+		const branch = manager.getBranch();
+		const modelEntry = branch
+			.slice()
+			.reverse()
+			.find((entry) => entry.type === "model_change");
+		const { totalUsage } = computeOwnAndTotalUsage(branch, manager.getEntries());
+		return {
+			usage: totalUsage,
+			...(modelEntry?.type === "model_change"
+				? { model: { provider: modelEntry.provider, id: modelEntry.modelId } }
+				: {}),
+		};
+	}
+
+	private _recoverInterruptedActs(): void {
+		const branch = this.sessionManager.getBranch();
+		const terminalIds = new Set(branch.filter((entry) => entry.type === "act_terminal").map((entry) => entry.actId));
+		const interrupted = branch.filter(
+			(entry): entry is ActStartEntry => entry.type === "act_start" && !terminalIds.has(entry.actId),
+		);
+		if (interrupted.length === 0) return;
+		const persisted = this._persistedActState();
+		for (const start of interrupted) {
+			this.sessionManager.appendActTerminal(
+				start.actId,
+				"interrupted",
+				actUsageDelta(persisted.usage, start.usageBaseline),
+				{
+					...(persisted.model ? { model: persisted.model } : {}),
+					error: "Act was interrupted before the root session restarted",
+				},
+			);
+		}
+	}
+
+	private async _resolveActModel(model: string | undefined): Promise<NativeRlmSubagentModelSelection> {
+		if (!model) throw new Error("Act model selection requires a model");
+		const selection = await this._resolveRlmSubagentModel(model);
+		if (selection.runtime !== "native") {
+			throw new Error(`Act model selector "${model}" must resolve to a native model`);
+		}
+		return selection;
+	}
+
+	private async _selectActLaneModel(session: AgentSession, model: string | undefined): Promise<void> {
+		const selection = await this._resolveActModel(model);
+		await session._applyActModelSelection(selection);
+	}
+
+	private async _applyActModelSelection(
+		selection: NativeRlmSubagentModelSelection,
+		forceModelChange = false,
+	): Promise<void> {
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
+			throw new Error("Cannot select an Act model after lane disposal");
+		}
+		const previousModel = this.model;
+		const thinkingLevel = this._getThinkingLevelForModelSwitch(selection.thinkingLevel);
+		const serviceTier = this._getServiceTierForModelSwitch();
+		const modelChanged = !previousModel || !modelsAreEqual(previousModel, selection.model);
+		if (modelChanged || forceModelChange) this._applySessionModelChange(selection.model);
+		this._applyThinkingLevel(thinkingLevel, false);
+		this._clampServiceTierForModel(serviceTier);
+		this._rlmModelCandidates.splice(
+			0,
+			this._rlmModelCandidates.length,
+			...(selection.modelCandidates ?? [{ model: selection.model, thinkingLevel: selection.thinkingLevel }]),
+		);
+		this._rlmModelCandidateIndex = 0;
+		if (modelChanged) await this._queueModelSelectEmit(selection.model, previousModel, "set");
+	}
+
+	private async _createActLaneSession(tool: AgentTool, requestedModel: string | undefined): Promise<AgentSession> {
+		const selection = await this._resolveActModel(requestedModel);
+		const sessionManager = this._openActSessionManager();
+		const restored = sessionManager.buildSessionContext();
+		const persistedModel = sessionManager
+			.getBranch()
+			.slice()
+			.reverse()
+			.find((entry) => entry.type === "model_change");
+		const restoredModel =
+			persistedModel?.type === "model_change"
+				? this._modelRegistry.find(persistedModel.provider, persistedModel.modelId)
+				: undefined;
+		const hasPersistedModel = persistedModel?.type === "model_change";
+		const model = restoredModel ?? selection.model;
+		const thinkingLevel = clampThinkingLevel(
+			model,
+			hasPersistedModel && restoredModel
+				? (restored.thinkingLevel as ThinkingLevel)
+				: (selection.thinkingLevel ?? this.thinkingLevel),
+		) as ThinkingLevel;
+		const inheritedServiceTier = hasPersistedModel ? restored.serviceTier : this.serviceTier;
+		const serviceTier =
+			inheritedServiceTier === "priority" && !supportsFastMode(model) ? "default" : inheritedServiceTier;
+		if (!hasPersistedModel) {
+			sessionManager.appendModelChange(model.provider, model.id);
+			sessionManager.appendThinkingLevelChange(thinkingLevel);
+			sessionManager.appendServiceTierChange(serviceTier);
+		}
+		const agent = new Agent({
+			initialState: {
+				systemPrompt: "",
+				model,
+				thinkingLevel,
+				serviceTier,
+				tools: [],
+				messages: restored.messages,
+			},
+			convertToLlm: this.agent.convertToLlm,
+			transformContext: this.agent.transformContext,
+			streamFn: this.agent.streamFn,
+			getApiKey: this.agent.getApiKey,
+			onPayload: this.agent.onPayload,
+			onResponse: this.agent.onResponse,
+			steeringMode: this.settingsManager.getSteeringMode(),
+			followUpMode: this.settingsManager.getFollowUpMode(),
+			sessionId: sessionManager.getSessionId(),
+			thinkingBudgets: this.settingsManager.getThinkingBudgets(),
+			transport: this.settingsManager.getTransport(),
+			maxRetryDelayMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+			toolExecution: this.agent.toolExecution,
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager: this.settingsManager,
+			cwd: this._cwd,
+			agentDir: this._agentDir,
+			resourceLoader: createActResourceLoader(),
+			modelRegistry: this._modelRegistry,
+			baseToolsOverride: { [tool.name]: tool },
+			allowedToolNames: [tool.name],
+			includeGoals: false,
+			includeCompactSkill: false,
+			rlmDepth: this._rlmDepth,
+			rlmMaxDepth: this._rlmMaxDepth,
+			rlmModelCandidates: selection.modelCandidates,
+			autonomous: { enabled: false },
+		});
+		if (hasPersistedModel) {
+			await session._applyActModelSelection(selection, restoredModel === undefined);
+		}
+		return session;
+	}
+
 	/** Typed handlers for host requests arriving from the IPython kernel comm bridge. */
 	private _createKernelHostHandlers(): HostRequestHandlers {
 		const handlers: HostRequestHandlers = {
@@ -8915,6 +9421,9 @@ export class AgentSession {
 				input: this.model?.input ?? [],
 			}),
 		};
+		if (this._rlmDepth === 0) {
+			handlers["rlm.act"] = async (payload, signal, channel) => this._runAct(payload, signal, channel);
+		}
 		if (this._includeGoals) {
 			for (const type of ["goal.get", "goal.create", "goal.pause", "goal.resume", "goal.complete"]) {
 				handlers[type] = async (payload) => this.handleGoalHostRequest(type, payload);
@@ -10372,7 +10881,9 @@ export class AgentSession {
 		} finally {
 			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
 		}
-		if (this._disposed || this._disposing) throw new Error("Cannot spawn a subagent after its parent was disposed");
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
+			throw new Error("Cannot spawn a subagent after its parent was disposed");
+		}
 
 		const childSessionDir = this._createChildRlmSessionDir();
 		const childNodeId = basename(childSessionDir);
@@ -11026,9 +11537,14 @@ export class AgentSession {
 
 		// Retry via continue() - use setTimeout to break out of event handler chain
 		setTimeout(() => {
-			this.agent.continue().catch(() => {
-				// Retry failed - will be caught by next agent_end
-			});
+			this._rootForeground
+				.run("root-turn", () => {
+					if (this._disposed || this._disposing) return Promise.resolve();
+					return this.agent.continue();
+				})
+				.catch(() => {
+					// Retry failed - will be caught by next agent_end
+				});
 		}, 0);
 
 		return true;
@@ -11834,12 +12350,49 @@ export class AgentSession {
 	 */
 	getContextTree(): ContextTreeNode {
 		const resolveContextWindow = this._contextWindowResolver();
-		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(
-			this.sessionManager.getBranch(),
-			this.sessionManager.getEntries(),
-		);
+		const branch = this.sessionManager.getBranch();
+		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(branch, this.sessionManager.getEntries());
 
 		const children: ContextTreeNode[] = [];
+		const actLocation = this._actSessionLocation();
+		const liveActNode = this._actLane?.contextTree;
+		const diskActNode =
+			!liveActNode && actLocation && existsSync(actLocation.file)
+				? loadContextTreeChildFromDisk(actLocation.dir, resolveContextWindow)
+				: undefined;
+		const actNode = liveActNode ?? diskActNode;
+		if (actNode) {
+			const actUsage = emptyUsage();
+			for (const entry of branch) {
+				if (entry.type === "act_terminal") addAssistantUsage(actUsage, entry.usage);
+			}
+			const terminal = branch
+				.slice()
+				.reverse()
+				.find((entry) => entry.type === "act_terminal");
+			if (this._actLane?.running || terminal?.type === "act_terminal") {
+				const status = this._actLane?.running
+					? "running"
+					: terminal?.type === "act_terminal" && terminal.status === "error"
+						? "error"
+						: terminal?.type === "act_terminal" &&
+								(terminal.status === "cancelled" || terminal.status === "interrupted")
+							? "cancelled"
+							: "done";
+				const selectedModel = this._actLane?.running ? actNode.model : (terminal?.model ?? actNode.model);
+				children.push({
+					...actNode,
+					id: "act",
+					label: actContextLabel(),
+					status,
+					...(selectedModel ? { model: selectedModel } : {}),
+					cancellationCapability: actCancellationCapability(),
+					ownUsage: actUsage,
+					totalUsage: cloneUsage(actUsage),
+				});
+			}
+		}
+
 		const liveIds = new Set<string>();
 		for (const run of this._activeRlmChildRuns.values()) {
 			liveIds.add(run.id);

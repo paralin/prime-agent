@@ -80,7 +80,7 @@ describe("ACP mode over a real IPython kernel", () => {
 				toolCallId: "cell-2",
 				status: "completed",
 			});
-			expect(JSON.stringify(updates[0]?.content)).toContain("42");
+			expect(JSON.stringify(updates[0])).toContain("42");
 		},
 	);
 

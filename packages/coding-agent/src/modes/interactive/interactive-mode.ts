@@ -1300,10 +1300,12 @@ export class InteractiveMode {
 			takesArgument: command.takesArgument,
 		}));
 
-		const modelCommand = slashCommands.find((command) => command.name === "model");
-		if (modelCommand) {
-			modelCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
-				getModelArgumentCompletions(prefix, this.getCachedModelCandidates());
+		for (const commandName of ["model", "switch"]) {
+			const modelCommand = slashCommands.find((command) => command.name === commandName);
+			if (modelCommand) {
+				modelCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
+					getModelArgumentCompletions(prefix, this.getCachedModelCandidates());
+			}
 		}
 
 		const effortCommand = slashCommands.find((command) => command.name === "effort");
@@ -4725,10 +4727,10 @@ export class InteractiveMode {
 					await this.showModelsSelector();
 					return;
 				}
-				if (commandName === "model") {
+				if (commandName === "model" || commandName === "switch") {
 					const searchTerm = commandArgs || undefined;
 					this.editor.setText("");
-					await this.handleModelCommand(searchTerm);
+					await this.handleModelCommand(searchTerm, commandName === "model");
 					return;
 				}
 				if (commandName === "effort") {
@@ -7762,9 +7764,9 @@ export class InteractiveMode {
 		});
 	}
 
-	private async handleModelCommand(searchTerm?: string): Promise<void> {
+	private async handleModelCommand(searchTerm?: string, persistDefault = true): Promise<void> {
 		if (!searchTerm) {
-			this.showModelSelector();
+			this.showModelSelector(undefined, persistDefault);
 			return;
 		}
 
@@ -7774,14 +7776,14 @@ export class InteractiveMode {
 				const authFlows = this.createAuthFlows();
 				const providerOptions = authFlows.getLoginProviderOptions();
 				if (!(await this.ensureModelProviderConfigured(model, authFlows, providerOptions))) return;
-				await this.completeModelSelection(model);
+				await this.completeModelSelection(model, persistDefault);
 			} catch (error) {
 				this.showError(error instanceof Error ? error.message : String(error));
 			}
 			return;
 		}
 
-		this.showModelSelector(searchTerm);
+		this.showModelSelector(searchTerm, persistDefault);
 	}
 
 	private async findExactModelMatch(searchTerm: string): Promise<Model<Api> | undefined> {
@@ -7802,10 +7804,10 @@ export class InteractiveMode {
 		}
 	}
 
-	private async applySelectedModel(model: AgentConnectionModel): Promise<void> {
+	private async applySelectedModel(model: AgentConnectionModel, persistDefault = true): Promise<void> {
 		const connection = this.agentConnection;
 		const sessionId = this.connectionState?.sessionId;
-		await connection.setModel(model.provider, model.id);
+		await connection.setModel(model.provider, model.id, { persistDefault });
 		const state = await connection.getState();
 		if (
 			this.agentConnection !== connection ||
@@ -7814,7 +7816,7 @@ export class InteractiveMode {
 		) {
 			return;
 		}
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		if (persistDefault) this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 		this.patchConnectionState({
 			model: state.model ?? model,
 			serviceTier: state.serviceTier,
@@ -7827,9 +7829,9 @@ export class InteractiveMode {
 		this.setupAutocompleteProvider();
 	}
 
-	private async completeModelSelection(model: AgentConnectionModel): Promise<void> {
+	private async completeModelSelection(model: AgentConnectionModel, persistDefault = true): Promise<void> {
 		this.showStatus(`Switching model: ${model.id}`);
-		await this.applySelectedModel(model);
+		await this.applySelectedModel(model, persistDefault);
 		this.showStatus(`Model: ${model.id}`);
 		void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 		this.checkDaxnutsEasterEgg(model);
@@ -8142,11 +8144,15 @@ export class InteractiveMode {
 			});
 	}
 
-	private showModelSelector(initialSearchInput?: string): void {
-		void this.showConfigurationMenu("models", initialSearchInput);
+	private showModelSelector(initialSearchInput?: string, persistDefault = true): void {
+		void this.showConfigurationMenu("models", initialSearchInput, persistDefault);
 	}
 
-	private showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
+	private showConfigurationMenu(
+		initialTab: ConfigurationMenuTab,
+		initialModelSearch?: string,
+		persistDefault = true,
+	): Promise<void> {
 		const modelCatalog = this.getCachedModelCandidates();
 		const authFlows = this.createAuthFlows();
 		const providerOptions = authFlows.getLoginProviderOptions();
@@ -8260,7 +8266,7 @@ export class InteractiveMode {
 							);
 							if (!ready || settled) return;
 							conceal();
-							await this.completeModelSelection(model);
+							await this.completeModelSelection(model, persistDefault);
 							completed = true;
 						} catch (error) {
 							show();

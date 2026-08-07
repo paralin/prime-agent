@@ -58,8 +58,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 13 narrows agent-origin reach and roster wire shapes to the nuclear family.
 // Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
 // Revision 15 adds capability-gated durable family mailbox commands and receipt metadata.
-export const DAEMON_SCHEMA_REVISION = 15;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-15-09a6bc7091f1";
+// Revision 16 adds the capability-gated nested Act event stream.
+// Revision 17 adds Act model-handoff presentation metadata.
+export const DAEMON_SCHEMA_REVISION = 17;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-17-09a6bc7091f1";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -77,7 +79,8 @@ export type DaemonClientCapability =
 	| "extension_ui"
 	| "slim_attach"
 	| "chunked_snapshot"
-	| "client_owned_sessions";
+	| "client_owned_sessions"
+	| "rlm_act_stream";
 export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
 export interface DaemonPromptAdmissionCancellationResult {
 	status: DaemonPromptAdmissionCancellationStatus;
@@ -124,6 +127,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"slim_attach",
 	"chunked_snapshot",
 	"client_owned_sessions",
+	"rlm_act_stream",
 ];
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
@@ -986,6 +990,23 @@ export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	extension_ui_request: LEGACY_DAEMON_COMMAND,
 	extension_error: LEGACY_DAEMON_COMMAND,
 } as const satisfies Record<DaemonOutbound["type"], DaemonCommandCompatibility>;
+
+export const DAEMON_SESSION_EVENT_COMPATIBILITY = {
+	act_event: {
+		minProtocol: 7,
+		minSchemaRevision: 17,
+		capability: "rlm_act_stream",
+	},
+} as const satisfies Partial<Record<AgentConnectionSessionEvent["type"], DaemonCommandCompatibility>>;
+
+export function daemonClientSupportsSessionEvent(
+	capabilities: ReadonlySet<DaemonClientCapability>,
+	event: AgentConnectionSessionEvent,
+): boolean {
+	const compatibility =
+		DAEMON_SESSION_EVENT_COMPATIBILITY[event.type as keyof typeof DAEMON_SESSION_EVENT_COMPATIBILITY];
+	return compatibility?.capability === undefined || capabilities.has(compatibility.capability);
+}
 
 export function createDaemonCommandEnvelope<TCommand extends DaemonCommand>(
 	command: TCommand,

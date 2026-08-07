@@ -259,6 +259,12 @@ const image = new Image(
 );
 ```
 
+## Nested Act Execution
+
+Interactive mode renders a supported `act_event` stream as an `ActExecutionComponent` directly beneath the exactly correlated outer IPython component. The collapsed row retains reducer state and shows the selected model, terminal status, cell count, and usage. Expanded output adds the bounded prompt, thinking and text progress, scoped cells and results, exact cancellation capability, and terminal error. A self-contained late terminal can create the component after root-tool completion, and a later Act with another accepted model remains a separate nested component.
+
+The component is presentation-only. Editor submission continues through the session's ordinary steering path, and interrupt keys continue through the session's ordinary abort path. Older or unsupported connections emit no nested event and therefore render the ordinary IPython component unchanged. The reducer bounds prompts, aggregate progress, cells, Acts per root tool, and retained late terminals; truncation and omission are visible.
+
 ## Keyboard Input
 
 Use `matchesKey()` for key detection:

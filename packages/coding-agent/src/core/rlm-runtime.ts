@@ -94,16 +94,16 @@ export function normalizeRequestedRlmSubagentSessionName(value: unknown): string
 }
 
 /** Validate and normalize an orchestrator-supplied subagent model reference. */
-export function normalizeRequestedRlmSubagentModel(value: unknown): string | undefined {
+export function normalizeRequestedRlmSubagentModel(value: unknown, operation = "rlm.run"): string | undefined {
 	if (value === undefined) {
 		return undefined;
 	}
 	if (typeof value !== "string") {
-		throw new Error("rlm.run model must be a string");
+		throw new Error(`${operation} model must be a string`);
 	}
 	const model = value.trim();
 	if (!model) {
-		throw new Error("rlm.run model must not be empty");
+		throw new Error(`${operation} model must not be empty`);
 	}
 	return model;
 }

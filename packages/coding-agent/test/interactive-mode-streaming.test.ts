@@ -6,7 +6,7 @@ import type { AgentConnectionSessionEvent } from "../src/modes/agent-connection/
 import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import type { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import type { FileChangeSummary } from "../src/modes/interactive/components/edit-summary.js";
-import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -40,6 +40,9 @@ type HandleEventThis = {
 	streamingComponent: AssistantMessageComponent | undefined;
 	streamingMessage: AssistantMessage | undefined;
 	pendingTools: Map<string, ToolExecutionComponent>;
+	ipythonToolComponents: Map<string, ToolExecutionComponent>;
+	lateIpythonSentAgentMessages: Map<string, never[]>;
+	lateActTerminals: Map<string, Extract<AgentConnectionSessionEvent, { type: "act_event" }>>;
 	agentRunFileChanges: Map<string, FileChangeSummary>;
 	updateConnectionStateFromEvent(event: AgentConnectionSessionEvent): void;
 	getMarkdownThemeWithSettings(): MarkdownTheme;
@@ -91,6 +94,9 @@ function createFakeInteractiveModeThis(): HandleEventThis {
 		pendingMessagesContainer: new Container(),
 		pendingBashComponents: [],
 		pendingTools: new Map<string, ToolExecutionComponent>(),
+		ipythonToolComponents: new Map<string, ToolExecutionComponent>(),
+		lateIpythonSentAgentMessages: new Map<string, never[]>(),
+		lateActTerminals: new Map<string, Extract<AgentConnectionSessionEvent, { type: "act_event" }>>(),
 		agentRunFileChanges: new Map<string, FileChangeSummary>(),
 		updateConnectionStateFromEvent: vi.fn(),
 		getMarkdownThemeWithSettings: () => getMarkdownTheme(),
@@ -127,9 +133,109 @@ function renderChat(container: Container): string {
 	return stripAnsi(container.render(120).join("\n"));
 }
 
+function actTerminalEvent(outerToolCallId: string): Extract<AgentConnectionSessionEvent, { type: "act_event" }> {
+	return {
+		type: "act_event",
+		actId: "late-act",
+		outerToolCallId,
+		sequence: 4,
+		event: "terminal",
+		status: "done",
+		prompt: "late prompt",
+		promptTruncated: false,
+		model: { provider: "test", id: "late-model" },
+		cancellationCapability: "cooperative-only",
+		usage: EMPTY_USAGE,
+		errorTruncated: false,
+	};
+}
+
 describe("InteractiveMode streaming events", () => {
 	beforeAll(() => {
 		initTheme("dark");
+	});
+
+	test("routes Act events only beneath their exactly correlated root IPython tool", async () => {
+		const fakeThis = createFakeInteractiveModeThis();
+		const handleEvent = (InteractiveMode.prototype as unknown as { handleEvent: HandleEvent }).handleEvent;
+		const root = new ToolExecutionComponent(
+			"ipython",
+			"outer-act",
+			{ code: "await rlm.act('inspect')" },
+			{},
+			undefined,
+			fakeThis.ui,
+			"/tmp",
+		);
+		const other = new ToolExecutionComponent(
+			"ipython",
+			"outer-other",
+			{ code: "1 + 1" },
+			{},
+			undefined,
+			fakeThis.ui,
+			"/tmp",
+		);
+		fakeThis.ipythonToolComponents.set("outer-act", root);
+		fakeThis.ipythonToolComponents.set("outer-other", other);
+
+		await handleEvent.call(fakeThis, {
+			type: "act_event",
+			actId: "act-live",
+			outerToolCallId: "outer-act",
+			sequence: 1,
+			event: "start",
+			prompt: "inspect",
+			promptTruncated: false,
+			model: { provider: "test", id: "live-model" },
+			cancellationCapability: "posix-managed",
+		});
+		await handleEvent.call(fakeThis, {
+			type: "act_event",
+			actId: "act-live",
+			outerToolCallId: "outer-act",
+			sequence: 2,
+			event: "terminal",
+			status: "done",
+			prompt: "inspect",
+			promptTruncated: false,
+			model: { provider: "test", id: "live-model" },
+			cancellationCapability: "posix-managed",
+			usage: EMPTY_USAGE,
+			errorTruncated: false,
+		});
+
+		expect(renderChat(root)).toContain("test/live-model");
+		expect(renderChat(root)).toContain("· done ·");
+		expect(renderChat(other)).not.toContain("Act");
+		expect(fakeThis.ui.requestRender).toHaveBeenCalled();
+	});
+
+	test("retains one self-contained late terminal until its root IPython component appears", async () => {
+		const fakeThis = createFakeInteractiveModeThis();
+		const handleEvent = (InteractiveMode.prototype as unknown as { handleEvent: HandleEvent }).handleEvent;
+		await handleEvent.call(fakeThis, actTerminalEvent("outer-late"));
+		expect(fakeThis.lateActTerminals.size).toBe(1);
+
+		const root = new ToolExecutionComponent(
+			"ipython",
+			"outer-late",
+			{ code: "await act" },
+			{},
+			undefined,
+			fakeThis.ui,
+			"/tmp",
+		);
+		const register = (
+			InteractiveMode.prototype as unknown as {
+				registerIpythonToolComponent(name: string, id: string, component: ToolExecutionComponent): void;
+			}
+		).registerIpythonToolComponent;
+		register.call(fakeThis, "ipython", "outer-late", root);
+
+		expect(fakeThis.lateActTerminals.size).toBe(0);
+		expect(renderChat(root)).toContain("test/late-model");
+		expect(renderChat(root)).toContain("· done ·");
 	});
 
 	test("renders assistant updates when attaching after message_start", async () => {

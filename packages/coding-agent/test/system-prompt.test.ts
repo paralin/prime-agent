@@ -1,4 +1,5 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import { actCancellationPromptBoundary } from "../src/core/act-cancellation.js";
 import { DEFAULT_RLM_EXTRA_IMPORT_LABELS } from "../src/core/kernel/bootstrap.js";
 import { buildRlmPrompt } from "../src/core/prompts/index.js";
 import type { HarnessState } from "../src/core/refinement/index.js";
@@ -82,6 +83,9 @@ describe("buildRlmPrompt", () => {
 				"",
 				"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through an available messaging capability or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
 				"",
+				"For one bounded serial task that benefits from a retained low-level actor, assign `result = await rlm.act(prompt)`. Omit `model` for the configured `@luna` default, or pass an ordinary named-role or concrete native selector such as `result = await rlm.act(prompt, model='@deepseek')` when the task needs another model. One retained lane keeps its transcript across accepted model changes, runs serialized full cells in this live IPython namespace, and finishes with `rlm.done(value)`. The assigned result is the exact in-kernel object; assignment avoids displaying its representation. Act shares this root session's authority and is distinct from ordinary asynchronous, isolated `rlm(...)` children. Only one Act may run at a time.",
+				actCancellationPromptBoundary(),
+				"",
 				"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. It returns immediately and runs when the current turn ends, so continue working normally after calling it. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
 			].join("\n"),
 		);
@@ -98,6 +102,45 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain("A callable `rlm` is already in your global namespace");
 		expect(prompt).toContain("IPython is the agent's long-lived notebook");
 		expect(prompt).toContain("Each `%%bash` cell runs in a throw-away subshell");
+	});
+
+	test("offers Act only to the root IPython actor", () => {
+		const root = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/session.jsonl",
+			activeTools: ["ipython"],
+			depth: 0,
+		});
+		const child = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/child.jsonl",
+			activeTools: ["ipython"],
+			depth: 1,
+		});
+
+		expect(root).toContain("result = await rlm.act(prompt)");
+		expect(root).toContain("result = await rlm.act(prompt, model='@deepseek')");
+		expect(root).toContain("finishes with `rlm.done(value)`");
+		expect(root).toContain(actCancellationPromptBoundary());
+		expect(child).not.toContain("rlm.act(prompt)");
+	});
+
+	test("publishes the native Windows Act cancellation boundary", () => {
+		const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+		try {
+			const prompt = buildRlmPrompt({
+				cwd: "C:\\repo",
+				messagesPath: "C:\\repo\\session.jsonl",
+				activeTools: ["ipython"],
+				depth: 0,
+			});
+			expect(prompt).toContain(
+				"On native Windows, synchronous Python and blocking shell work have no prompt-stop guarantee",
+			);
+			expect(prompt).toContain("do not claim they stopped until they return");
+		} finally {
+			platform.mockRestore();
+		}
 	});
 
 	test("discovers requested models through a bounded authenticated host search", () => {

@@ -1,3 +1,4 @@
+import { actCancellationPromptBoundary } from "../act-cancellation.js";
 import { DEFAULT_RLM_EXTRA_IMPORT_LABELS } from "../kernel/bootstrap.js";
 
 export interface RlmPromptOptions {
@@ -153,6 +154,13 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 
 	if (hasIpython) {
 		parts.push("", IPYTHON_CONTROL_PROMPT);
+		if (depth === 0) {
+			parts.push(
+				"",
+				"For one bounded serial task that benefits from a retained low-level actor, assign `result = await rlm.act(prompt)`. Omit `model` for the configured `@luna` default, or pass an ordinary named-role or concrete native selector such as `result = await rlm.act(prompt, model='@deepseek')` when the task needs another model. One retained lane keeps its transcript across accepted model changes, runs serialized full cells in this live IPython namespace, and finishes with `rlm.done(value)`. The assigned result is the exact in-kernel object; assignment avoids displaying its representation. Act shares this root session's authority and is distinct from ordinary asynchronous, isolated `rlm(...)` children. Only one Act may run at a time.",
+				actCancellationPromptBoundary(),
+			);
+		}
 		if (installedSkills.includes("refine")) {
 			parts.push(
 				"",

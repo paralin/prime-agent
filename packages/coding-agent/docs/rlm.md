@@ -109,7 +109,36 @@ await rlm.delete_subagent(children[0])
 
 The default recursion depth allows a root agent to create children. Raising the configured depth allows descendants to recurse further.
 
-### 3. Skills add programmatic capability
+### 3. Act transfers one serial task into the root world
+
+A root agent can synchronously transfer one bounded task to the associated `@luna` default or select another ordinary native model route:
+
+```python
+result = await rlm.act("Inspect the current state, implement the focused change, and return the live result.")
+deep_result = await rlm.act("Solve the harder bounded task.", model="@deepseek")
+```
+
+`model` accepts the same named-role and concrete native selectors as ordinary RLM model selection. Use a `concrete_selector` returned by `await rlm.find_models(...)` when selecting a concrete model. Omission selects `@luna`. Invalid, unavailable, unauthenticated, and non-native selectors fail before provider or shared-cell work.
+
+Act retains one private model session and gives it a serialized `shared_ipython` tool. Accepted model changes append to that session's one transcript rather than creating another lane. The cells run in the root session's existing IPython shell and namespace, so the active model sees prior variables and mutations directly. The private session has no family identity, child registry entry, or separate kernel. A persisted root restores the private transcript and the root kernel's completed namespace snapshot, so a later Act continues both contexts after restart. An Act interrupted by restart is closed once as an `interrupted` journal fact without replaying its provider request or shared cell.
+
+The active model completes through a shared cell:
+
+```python
+rlm.done(value)
+```
+
+`done` stops that cell and returns the identical Python object to the suspended root call. The value is not serialized through the TypeScript host. Assign the result so IPython does not display an accidental representation. A normal text response without `done` is an `ActError`, and only one Act may be active in a root session.
+
+Cancelling Act aborts provider work and awaited Python first. `rlm.ACT_CANCELLATION_CAPABILITY` reports the current kernel contract. `"posix-managed"` means that, if the same correlated inner cell remains active after a short grace period, Prime Agent interrupts that cell and terminates the supervised process group used by managed `%%bash`. `"cooperative-only"` is the native Windows contract: synchronous Python and blocking shell work may remain active until they return. WSL is POSIX and reports `"posix-managed"`.
+
+The live namespace remains authoritative and later root cells reuse it. Native, detached, daemonized, remote, already-completed, and otherwise unmanaged work remains outside the prompt-stop guarantee on every platform. Cancellation does not roll back effects completed before the stop.
+
+Act is a foreground transfer, not parallel delegation. The directing turn and its nested root cells share one foreground lease. Concurrent root prompts, root cells, compaction, and continuations wait in admission order until that lease is released; ordinary RLM children remain independent. Steering accepted before the Act terminal goes directly to the retained model's ordered conversation without waking Sol. A terminal-race loss rejects that targeted steering request. Use ordinary `rlm(...)` children when work should proceed independently, needs a separate kernel or family identity, or must be messaged and observed as a child.
+
+Supported clients project Act beneath the correlated outer IPython cell. The live stream identifies the selected model, exact cancellation capability, bounded prompt and progress, shared cells, status, and usage. Interactive mode renders a nested collapsible component; JSON and RPC preserve the typed event; ACP maps one Act to one bounded synthetic tool call; and text print emits one terminal record on stderr. Older peers still receive the ordinary outer IPython event. No client projection receives the Python value passed to `rlm.done()`.
+
+### 4. Skills add programmatic capability
 
 Prime Agent supports the Agent Skills markdown format and extends it with Python-backed skills. Both use `SKILL.md` for discovery, routing, and instructions. A Python-backed skill also contains a Python package that Prime Agent installs into the kernel environment and exposes by import name.
 
@@ -123,7 +152,7 @@ This makes Python-backed skills a superset of instruction-only skills: they can 
 
 Only skill metadata is placed in the startup prompt. The agent loads the full `SKILL.md` when the task matches, then inspects and calls the documented Python API. See [Skills](skills.md) for discovery, packaging, and the built-in skill-creation workflow.
 
-### 4. State is designed to outlive one turn
+### 5. State is designed to outlive one turn
 
 The RLM programming model assumes useful work may take many turns or continue after the terminal UI closes:
 

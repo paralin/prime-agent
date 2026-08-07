@@ -1,3 +1,14 @@
+export {
+	ACT_COMPONENT_MAX_ACTS_PER_TOOL,
+	ACT_COMPONENT_MAX_CELLS,
+	ACT_COMPONENT_PROGRESS_MAX_CHARS,
+	ACT_COMPONENT_PROMPT_MAX_CHARS,
+	type ActExecutionCellState,
+	ActExecutionComponent,
+	type ActExecutionState,
+	createActExecutionState,
+	reduceActExecutionState,
+} from "./act-execution.js";
 // UI Components for extensions
 
 export { AgentMessageComponent } from "./agent-message.js";

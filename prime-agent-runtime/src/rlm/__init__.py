@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
-from .bash import BashHandle, BashResult, bash
+from ._act import _ActCellResult, _ActInterrupted, _run_cells, done
 from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
 
 try:
@@ -22,6 +24,7 @@ except Exception:  # pragma: no cover - only available in kernels
     get_ipython = None  # type: ignore[assignment]
 
 HOST_COMM_TARGET = "host.request"
+ACT_CANCELLATION_CAPABILITY = "posix-managed" if os.name == "posix" else "cooperative-only"
 RLM_SERVICE_TIERS = ("auto", "default", "flex", "scale", "priority")
 
 
@@ -29,6 +32,15 @@ def _validate_service_tier(value: Any) -> None:
     if value is None or value in RLM_SERVICE_TIERS:
         return
     raise ValueError(f"service_tier must be one of {', '.join(RLM_SERVICE_TIERS)} or None")
+
+
+class ActError(RuntimeError):
+    """An Act ended without an accepted terminal value."""
+
+
+class ActCancelledError(ActError):
+    """The host accepted Act cancellation under ACT_CANCELLATION_CAPABILITY."""
+
 
 
 @dataclass(frozen=True)
@@ -318,8 +330,13 @@ _harness_state = _HarnessProxy()
 
 
 class _RLMCallable:
+    ACT_CANCELLATION_CAPABILITY = ACT_CANCELLATION_CAPABILITY
     harness = _harness_state
     get_harness_state = staticmethod(get_harness_state)
+    done = staticmethod(done)
+
+    async def act(self, prompt: str, model: str | None = None) -> Any:
+        return await act(prompt, model)
 
     async def run(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
         return await run(prompt, **kwargs)
@@ -349,8 +366,9 @@ class _CallableModule(types.ModuleType):
 sys.modules[__name__].__class__ = _CallableModule
 
 __all__ = [
-    "BashHandle",
-    "BashResult",
+    "ACT_CANCELLATION_CAPABILITY",
+    "ActCancelledError",
+    "ActError",
     "HarnessEntry",
     "HarnessScope",
     "HarnessState",
@@ -361,9 +379,9 @@ __all__ = [
     "RLMSpawnHandle",
     "RLMSubagent",
     "RefinementEvent",
-    "bash",
+    "act",
     "delete_subagent",
-    "emit",
+    "done",
     "find_models",
     "get_harness_state",
     "harness",

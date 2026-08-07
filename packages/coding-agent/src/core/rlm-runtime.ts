@@ -3,7 +3,6 @@ import type { Api, Model, ServiceTier } from "@earendil-works/pi-ai";
 import type { AgentSession } from "./agent-session.js";
 import type { ToolDefinition } from "./extensions/index.js";
 import type { HostRequestHandler } from "./kernel/index.js";
-import { THINKING_LEVELS } from "./thinking-levels.js";
 
 /** Request emitted by `rlm.run`; cellSourceCode preserves the spawning cell for display. */
 export interface RlmRunRequest {
@@ -94,30 +93,17 @@ export function normalizeRequestedRlmSubagentSessionName(value: unknown): string
 	return name;
 }
 
-export function normalizeRequestedRlmSubagentThinkingLevel(value: unknown): ThinkingLevel | undefined {
+/** Validate and normalize an orchestrator-supplied subagent model reference. */
+export function normalizeRequestedRlmSubagentModel(value: unknown, operation = "rlm.run"): string | undefined {
 	if (value === undefined) {
 		return undefined;
 	}
 	if (typeof value !== "string") {
-		throw new Error("rlm.run thinking must be a string");
-	}
-	const level = value.trim().toLowerCase();
-	if (!THINKING_LEVELS.includes(level as ThinkingLevel)) {
-		throw new Error(`rlm.run thinking must be one of: ${THINKING_LEVELS.join(", ")}`);
-	}
-	return level as ThinkingLevel;
-}
-
-export function normalizeRequestedRlmSubagentModel(value: unknown): string | undefined {
-	if (value === undefined) {
-		return undefined;
-	}
-	if (typeof value !== "string") {
-		throw new Error("rlm.run model must be a string");
+		throw new Error(`${operation} model must be a string`);
 	}
 	const model = value.trim();
 	if (!model) {
-		throw new Error("rlm.run model must not be empty");
+		throw new Error(`${operation} model must not be empty`);
 	}
 	return model;
 }

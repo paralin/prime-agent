@@ -59,13 +59,50 @@ sequenceDiagram
     H->>H: update registry and attribute usage
 ```
 
+## Act Flow
+
+`await rlm.act(prompt, model=None)` keeps the root `execute_request` suspended while one private retained Act `AgentSession` runs. The request keeps one Jupyter comm open in both directions:
+
+```mermaid
+sequenceDiagram
+    participant S as Root Sol
+    participant K as Root IPython
+    participant H as Root AgentSession
+    participant L as Private Act AgentSession
+
+    S->>K: result = await rlm.act(prompt, model=None)
+    K->>H: host.request · rlm.act
+    H->>L: prompt retained session
+    loop Serialized shared cells
+        L->>H: shared_ipython(code)
+        H->>K: cell event
+        K->>K: run_cell_async in root shell
+        K->>H: cell result metadata
+        H->>L: tool result
+    end
+    L->>H: shared_ipython(rlm.done(value))
+    K->>K: retain exact value
+    K->>H: terminal metadata only
+    H-->>K: done acknowledgement
+    K-->>S: identical Python object
+```
+
+`KernelManager` preserves the existing one-request/one-reply behavior for ordinary host calls. The Act handler additionally uses the request's `HostRequestChannel` to send non-terminal cell events and receive their replies before the final status. Comm closure aborts the channel and the private model turn.
+
+Act depth starts at 0 for Sol. `rlmActMaxDepth` defaults to 1. A scalar default selector applies only at depth 1; an array supplies selectors by depth, and an explicit selector overrides that depth's entry. Missing, over-depth, invalid, unavailable, and non-native admissions fail before provider or cell work. Each admitted depth retains a separate private transcript per resolved model. Repeating a selector that resolves to the same model resumes that transcript; resolving another model opens another retained session instead of appending a model change to the previous actor's context. Every lane still uses only `shared_ipython` in the one root kernel. The private sessions receive no kernel provisioner, goals, heartbeat, autonomous continuation, family controllers, child registry entry, or daemon publication. The first model at depth 1 persists at `session-artifacts/<root-session-id>/act/session.jsonl`; the first model at depth N uses `act-depth-N/session.jsonl`. Additional resolved models use stable `-model-<hash>` sibling directories. A private `model-key` marker binds each directory without entering model context.
+
+The root journal appends an `act_start` entry with explicit `depth`, optional `parentActId`, and that depth lane's cumulative usage baseline before provider or cell work, then a correlated `act_terminal` for `done`, `cancelled`, or `error`. Terminal entries contain the selected model's usage delta, concrete model, and bounded error text; they never contain the returned Python value or executable task state. On reconstruction, each current-branch start without a terminal becomes one `interrupted` terminal from its own depth transcript. Historical entries without `depth` normalize to 1. Recovery never calls a provider, resumes a request, or replays a cell.
+
+Act usage is additive to the root total but is not folded into Sol's assistant message. `/context` therefore reports Sol own usage and context-window use unchanged, reports one nested `act` / `act-depth-N` node per retained depth, reconciles each node from that depth's terminals, and keeps the aggregate root total equal to Sol plus every Act depth plus ordinary attributed children.
+
 ## Component Ownership
 
 | Component | Responsibility |
 |---|---|
 | `src/core/kernel/repl-manager.ts` | Runtime process, stdio protocol, execution, host-request dispatch, interrupt, and shutdown. |
 | `src/core/tools/ipython.ts` | Agent tool wrapper, lazy kernel provisioning, namespace bootstrap, and output shaping. |
-| `src/core/agent-session.ts` | RLM policy, child creation, registry, usage attribution, cancellation, and goal handlers. |
+| `src/core/agent-session.ts` | RLM policy, child creation, private Act session creation, registry, usage attribution, cancellation, and goal handlers. |
+| `src/core/act-lane.ts` | One retained private model session at one Act depth, serialized shared-cell exchange, terminal completion, and one-active-per-depth enforcement. |
 | `src/core/rlm-runtime.ts` | Typed request/spawn-handle validation for `rlm.run`, model discovery, list, and delete. |
 | `prime-agent-runtime/src/rlm/` | Python shim, handle types, callable `rlm`, and session-backed harness state. |
 
@@ -114,6 +151,11 @@ The runtime ships the call to the host as a `host_request` event and keeps its e
 
 ```python
 rlm
+act(prompt: str, model: str | None = None)
+done(value)
+ActError
+ActCancelledError
+ActSteeredError
 run(prompt: str, **kwargs)
 find_models(query: str = "", limit: int = 8)
 list_subagents()
@@ -130,6 +172,23 @@ The kernel bootstrap places the callable `rlm` object in the user namespace, so 
 await rlm("subtask")
 await rlm.run("subtask")
 ```
+
+The root-only foreground API is:
+
+```python
+result = await rlm.act("bounded serial task", model=None)
+# The active model terminates from a shared cell with rlm.done(value).
+```
+
+One root foreground lease spans the directing model turn and its nested IPython executions. A correlated Act remains the active foreground actor until the outer kernel execution reports idle. Root prompts, root cells, compaction, and automatic or goal continuations enter one deterministic admission path and begin once after the prior actor releases it. The session scheduler retains its existing prompt priority, and the foreground lease admits ready mutations in FIFO order. Ordinary RLM children use their own sessions and do not enter this root lease.
+
+Ordinary text submitted while Act is active is admitted to the root's visible steering queue. It remains hidden from Act and cannot request a handoff, stop cell admission, or interrupt provider work. Act runs to its normal `rlm.done()`, failure, or cancellation boundary; then queued messages enter the ordinary parent steering lifecycle in submission order. Escape is the explicit interactive Act interruption. Ctrl-C remains hard cancellation under the published host capability.
+
+The returned value never crosses the host boundary. The Python API publishes `rlm.ACT_CANCELLATION_CAPABILITY`: `"posix-managed"` covers cooperative inner-task cancellation plus the correlated synchronous-cell interrupt and managed `%%bash` process groups, while native Windows reports `"cooperative-only"` and makes no prompt-stop claim for synchronous Python or blocking shell work. WSL uses the POSIX contract. `ActCancelledError` reports accepted cancellation under that capability. Root-session cancellation closes pending lane steering, aborts the retained provider, cancels cooperative work, and then uses the correlated grace interrupt when the same cell remains active. Replacement, update-restart, daemon or worker shutdown, and synchronous or asynchronous disposal enter the same idempotent cleanup. New admission closes immediately. Synchronous disposal initiates bounded cleanup without pretending to wait; asynchronous disposal waits for the provider, host exchange, inner task and process group, typed terminal, captured foreground actor, and final kernel snapshot before replacement state is usable. Kernel disposal waits for any claimed grace timer to finish, while request correlation prevents a delivered interrupt from reaching another cell. The Act runtime supervises the process group used by managed `%%bash`. Ordinary non-Act execution keeps immediate interrupt behavior. Windows and arbitrary native, detached, daemonized, or remote work remain outside the prompt-stop guarantee, and cancellation neither replays nor rolls back completed effects.
+
+After each journal start, the session emits one additive projection bounded by that Act's start and terminal. Every event carries `actId`, explicit `depth`, optional `parentActId`, the exact outer IPython `toolCallId`, and a monotonic Act-local `sequence`. Missing historical depth normalizes to 1. Start records the bounded prompt, resolved Act and immediate directing models, thinking levels, and cancellation capability. Assistant thinking/text deltas and `shared_ipython` cell facts follow. Terminal records status, bounded error text, and that depth's usage. It contains no Python value, queued user text, private transcript identity, or family identity. Live events are not replayed.
+
+The interactive transcript presents Act as a foreground model chain. Depth-labelled actor separators nest by `parentActId`, while assistant activity and shared-IPython cells use the parent `AssistantMessageComponent` and `IPythonCellComponent`. The tray keeps root RLM depth and Sol visible while naming the deepest active Act depth and model; an inner terminal restores its caller and only the depth-1 terminal restores Sol. ACP metadata, RPC, JSON, print, and supported daemon delivery carry the same depth facts; unsupported peers keep the outer-IPython fallback.
 
 `RLMSpawnHandle` contains `rlm_child_id`, `name`, `session_dir`, and `model`. It confirms admission only and never contains the child's answer.
 
@@ -225,6 +284,8 @@ For a persisted root session, the relevant layout is:
       scheduled-jobs.json
       harness/
         harness_state.json
+      act/
+        session.jsonl
       sub-xxxxxxxx/
         <child-session-id>.jsonl
         sub-yyyyyyyy/

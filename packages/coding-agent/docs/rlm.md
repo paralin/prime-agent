@@ -41,7 +41,9 @@ config_files = list(Path(".").rglob("*.toml"))
 large_files = [path for path in config_files if path.stat().st_size > 10_000]
 ```
 
-Run a project's normal commands through its own environment with `bash()`:
+Use provider turns for judgment rather than for each already-known operation. Once the source scope and sequence are known, combine adjacent deterministic reads, searches, transformations, and focused checks in one cell, retain complete results in named variables, and display compact evidence. When the location is unknown, run one bounded discovery step and inspect it before batching confirmed reads. Fewer turns never replace source verification.
+
+Run a project's normal commands through its own environment from an IPython cell:
 
 ```python
 result = await bash("npm run check")
@@ -73,7 +75,7 @@ test_review = await rlm("Review the test coverage", name="test-reviewer")
 integration_audit = await rlm("Run the slow integration audit", name="integration-audit")
 ```
 
-Results arrive only through explicit `agent_message` replies or files, never as an `rlm()` return value. Children reply when an answer is needed:
+Results arrive only through explicit `agent_message` replies or files, never as an `rlm()` return value. Children reply when an answer is needed by executing the call in IPython; writing the call as assistant text does not deliver it:
 
 ```python
 await agent_message.send(message, receiver_role="parent")
@@ -109,7 +111,59 @@ await rlm.delete_subagent(children[0])
 
 The default recursion depth allows a root agent to create children. Raising the configured depth allows descendants to recurse further.
 
-### 3. Skills add programmatic capability
+### 3. Act transfers one serial task into the root world
+
+Use Act for one inspectable action expected to take roughly 30 seconds to 5 minutes, with shorter actions preferred. The directing model keeps architecture, synthesis, decomposition, and acceptance. It inspects decisive source, diff, or test evidence after each result before choosing another action.
+
+Bad—this incorrectly hands Act an entire multi-phase plan:
+
+```python
+await rlm.act("Implement every phase of the migration, verify everything, and ship it")
+```
+
+Good—this assigns one inspectable step:
+
+```python
+result = await rlm.act("Inspect the parser owner, fix the delimiter advance, run parser.test.ts, and return the diff and raw test result")
+```
+
+Set up the retained lane once with its stable working directory, editing or verification authority, return contract, and expectation of a bounded sequence. Later prompts can be terse deltas because the lane keeps its transcript:
+
+```python
+await rlm.act("In /repo, you may edit parser files and run focused tests. Return the inspected diff and raw test result. First inspect the parser owner.")
+await rlm.act("Now run the StarPC baseline")
+await rlm.act("Now fix the failing delimiter case and rerun its focused test")
+await rlm.act("Now verify only; do not edit. Work from /repo/wt/review and return raw test output")
+```
+
+A delta restates any changed or ambiguous directory, authority, safety, or result-shape constraint. The directing model inspects every returned result.
+
+One bounded Act action may use several mechanical cells to answer one inspectable question. When a predictable inspection chain would otherwise require repeated directing-model turns, choose the cheapest suitable route from the live routing policy and give it a bounded source scope: named paths, symbols, live variables, or an explicit search root and exclusions. Exact-source routes receive exact inputs; broader discovery routes receive a bounded search area. Require compact source-backed evidence and retain every branching, design, and acceptance decision in the directing model.
+
+```python
+inspection_route = "<selector chosen from the live routing policy>"
+source_paths = ["src/parser.ts", "test/parser.test.ts"]
+caller_census = await rlm.act(
+    "Using source_paths, trace the parser definition and callers, leave the structured census in caller_census, and return compact source-backed evidence.",
+    model=inspection_route,
+)
+```
+
+The Act peer confirms that scope before inspection. It combines already-known operations, keeps complete intermediate objects in named variables, emits bounded counts or decisive excerpts, verifies every reported path and symbol, and returns uncertainty instead of inventing evidence.
+
+Use the live IPython namespace as the handoff between both models. The directing model can bind clients, datasets, parsed structures, helpers, and intermediate results to clear names before calling Act. Act reuses those objects and can leave useful state in named variables for the directing model to inspect or continue after return. This preserves exact Python identity and avoids describing or reconstructing live state in prompt text.
+
+`model` accepts the same named-role and concrete native selectors as ordinary RLM model selection. `rlmActMaxDepth` defaults to `1`, with Sol at depth 0. A scalar `rlmActDefaultModel` supplies only depth 1; an array supplies defaults in depth order. A missing entry requires an explicit selector, and an explicit selector overrides that depth's default. Invalid, unavailable, missing, and over-depth admissions fail before provider or shared-cell work.
+
+Act retains a private model session for each admitted depth and resolved model, and gives the active session a serialized `shared_ipython` tool. Repeating a selector that resolves to the same model reuses its transcript; changing to another resolved model selects a different retained transcript, so Luna never inherits DeepSeek's conversation or vice versa. Every cell still runs in the root IPython namespace. These private sessions have no family identity, registry entry, or separate kernel. Restart restores completed transcripts and namespace state but never replays interrupted work. The first retained model at depth 1 keeps the shipped `act/session.jsonl` path; other resolved models use stable model-qualified sibling paths, and deeper depths follow the same rule below `act-depth-N`.
+
+An actor finishes with `rlm.done(value)` in a shared cell. The identical Python object returns to its suspended caller without TypeScript serialization. When another configured depth remains, that caller may inspect the value and shared state, continue, and then return a separate exact object upward. Assign each result to avoid accidental display. A normal text response without `done` is an `ActError`; one synchronous nested chain may be active.
+
+Act is a foreground transfer. Root prompts, cells, compaction, and continuations wait until depth 1 ends; an inner return resumes its calling Act without releasing Sol. Ordinary RLM children remain independent. Text submitted during the chain appears immediately in the normal queued-steering section, remains hidden from every Act depth, and does not interrupt it. After the outermost natural completion or failure, queued messages enter the ordinary directing-model steering lifecycle in submission order. Escape and Ctrl-C cancel the active chain deepest-to-outer. Provider and cooperative awaited Python stop on every host, with correlated synchronous-cell and managed-process-group termination on POSIX. Completed effects are not rolled back.
+
+Supported interactive clients frame each Act depth with actor separators, render nested boundaries in chain order, and feed thinking, text, IPython, shell, and tool activity through the same parent transcript renderers. The footer names the deepest active actor. Events, JSON, RPC, ACP, and print carry `depth` plus optional `parentActId`; missing historical depth normalizes to 1. Unsupported peers retain the outer IPython fallback. No projection receives the value passed to `rlm.done()`.
+
+### 4. Skills add programmatic capability
 
 Prime Agent supports the Agent Skills markdown format and extends it with Python-backed skills. Both use `SKILL.md` for discovery, routing, and instructions. A Python-backed skill also contains a Python package that Prime Agent installs into the kernel environment and exposes by import name.
 
@@ -123,7 +177,7 @@ This makes Python-backed skills a superset of instruction-only skills: they can 
 
 Only skill metadata is placed in the startup prompt. The agent loads the full `SKILL.md` when the task matches, then inspects and calls the documented Python API. See [Skills](skills.md) for discovery, packaging, and the built-in skill-creation workflow.
 
-### 4. State is designed to outlive one turn
+### 5. State is designed to outlive one turn
 
 The RLM programming model assumes useful work may take many turns or continue after the terminal UI closes:
 

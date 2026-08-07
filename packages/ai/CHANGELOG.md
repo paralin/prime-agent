@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Added OpenRouter session grouping and sticky routing through each request's opaque Prime session identifier.
+- Added an optional stateless OpenRouter Responses transport with a pre-stream Chat Completions fallback.
 - Fixed Kimi K3 reasoning levels being restricted to max.
 
 ## [0.7.2] - 2026-08-11

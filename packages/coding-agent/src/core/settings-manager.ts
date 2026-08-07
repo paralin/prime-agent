@@ -150,6 +150,8 @@ export interface Settings {
 	defaultServiceTier?: ServiceTier;
 	/** Service tiers that rlm(...) may request explicitly; defaults to defaultServiceTier. */
 	rlmAllowedServiceTiers?: ServiceTier[];
+	/** Native model selector used when rlm.act(...) omits model. */
+	rlmActDefaultModel?: string;
 	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 1
 	modelRoles?: Record<string, ModelRoleSelector>;
 	claudeCode?: ClaudeCodeSettings;
@@ -869,6 +871,11 @@ export class SettingsManager {
 		return this.settings.rlmAllowedServiceTiers
 			? [...this.settings.rlmAllowedServiceTiers]
 			: [this.getDefaultServiceTier()];
+	}
+
+	getRlmActDefaultModel(): string | undefined {
+		const model = this.settings.rlmActDefaultModel?.trim();
+		return model || undefined;
 	}
 
 	getRlmMaxDepth(): number | undefined {

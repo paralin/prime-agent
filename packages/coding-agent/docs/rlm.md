@@ -41,6 +41,8 @@ config_files = list(Path(".").rglob("*.toml"))
 large_files = [path for path in config_files if path.stat().st_size > 10_000]
 ```
 
+Use provider turns for judgment rather than for each already-known operation. Once the source scope and sequence are known, combine adjacent deterministic reads, searches, transformations, and focused checks in one cell, retain complete results in named variables, and display compact evidence. When the location is unknown, run one bounded discovery step and inspect it before batching confirmed reads. Fewer turns never replace source verification.
+
 Run a project's normal commands through its own environment from an IPython cell:
 
 ```bash
@@ -73,7 +75,7 @@ test_review = await rlm("Review the test coverage", name="test-reviewer")
 integration_audit = await rlm("Run the slow integration audit", name="integration-audit")
 ```
 
-Results arrive only through explicit `agent_message` replies or files, never as an `rlm()` return value. Children reply when an answer is needed:
+Results arrive only through explicit `agent_message` replies or files, never as an `rlm()` return value. Children reply when an answer is needed by executing the call in IPython; writing the call as assistant text does not deliver it:
 
 ```python
 await agent_message.send(message, receiver_role="parent")
@@ -135,6 +137,19 @@ await rlm.act("Now verify only; do not edit. Work from /repo/wt/review and retur
 ```
 
 A delta restates any changed or ambiguous directory, authority, safety, or result-shape constraint. The directing model inspects every returned result.
+
+One bounded Act action may use several mechanical cells to answer one inspectable question. When a predictable inspection chain would otherwise require repeated directing-model turns, choose the cheapest suitable route from the live routing policy and give it a bounded source scope: named paths, symbols, live variables, or an explicit search root and exclusions. Exact-source routes receive exact inputs; broader discovery routes receive a bounded search area. Require compact source-backed evidence and retain every branching, design, and acceptance decision in the directing model.
+
+```python
+inspection_route = "<selector chosen from the live routing policy>"
+source_paths = ["src/parser.ts", "test/parser.test.ts"]
+caller_census = await rlm.act(
+    "Using source_paths, trace the parser definition and callers, leave the structured census in caller_census, and return compact source-backed evidence.",
+    model=inspection_route,
+)
+```
+
+The Act peer confirms that scope before inspection. It combines already-known operations, keeps complete intermediate objects in named variables, emits bounded counts or decisive excerpts, verifies every reported path and symbol, and returns uncertainty instead of inventing evidence.
 
 Use the live IPython namespace as the handoff between both models. The directing model can bind clients, datasets, parsed structures, helpers, and intermediate results to clear names before calling Act. Act reuses those objects and can leave useful state in named variables for the directing model to inspect or continue after return. This preserves exact Python identity and avoids describing or reconstructing live state in prompt text.
 

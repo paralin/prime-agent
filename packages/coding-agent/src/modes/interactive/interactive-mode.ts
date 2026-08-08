@@ -65,7 +65,7 @@ import {
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	VERSION,
 } from "../../config.js";
-import { actEventDepth } from "../../core/act-events.js";
+import { type ActProjectionEvent, actEventDepth } from "../../core/act-events.js";
 import { AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL, isAgentSessionMessage } from "../../core/agent-messages.js";
 import {
 	type AgentTracePreviewResult,
@@ -266,7 +266,7 @@ interface Expandable {
 	setExpanded(expanded: boolean): void;
 }
 
-const MAX_LATE_ACT_TERMINALS = 32;
+const MAX_LATE_ACT_EVENTS = 128;
 
 interface PendingToolCallRenderInput {
 	id: string;
@@ -935,10 +935,8 @@ export class InteractiveMode {
 	private ipythonToolComponents = new Map<string, ToolExecutionComponent>();
 	private lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	private activeActTrays = new Map<number, { actId: string; depth: number; model: string; thinkingLevel?: string }>();
-	private lateActTerminals = new Map<
-		string,
-		Extract<AgentConnectionSessionEvent, { type: "act_event" }> & { event: "terminal" }
-	>();
+	private lateActEvents = new Map<string, ActProjectionEvent[]>();
+	private lateActEventOrder: Array<{ outerToolCallId: string; event: ActProjectionEvent }> = [];
 	private pendingToolCreations = new Set<string>();
 	private startedToolCalls = new Set<string>();
 	private pendingToolGeneration = 0;
@@ -2834,7 +2832,8 @@ export class InteractiveMode {
 		this.renderRecap();
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
-		this.lateActTerminals?.clear();
+		this.lateActEvents?.clear();
+		this.lateActEventOrder?.splice(0);
 		this.activeActTrays?.clear();
 		this.resetSubagentSummary();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
@@ -2930,12 +2929,32 @@ export class InteractiveMode {
 		);
 	}
 
-	private getLateActTerminals(): Map<
-		string,
-		Extract<AgentConnectionSessionEvent, { type: "act_event" }> & { event: "terminal" }
-	> {
-		if (!this.lateActTerminals) this.lateActTerminals = new Map();
-		return this.lateActTerminals;
+	private getLateActEvents(): Map<string, ActProjectionEvent[]> {
+		if (!this.lateActEvents) this.lateActEvents = new Map();
+		return this.lateActEvents;
+	}
+
+	private getLateActEventOrder(): Array<{ outerToolCallId: string; event: ActProjectionEvent }> {
+		if (!this.lateActEventOrder) this.lateActEventOrder = [];
+		return this.lateActEventOrder;
+	}
+
+	private retainLateActEvent(event: ActProjectionEvent): void {
+		const events = this.getLateActEvents();
+		const retained = events.get(event.outerToolCallId) ?? [];
+		retained.push(event);
+		events.set(event.outerToolCallId, retained);
+		const order = this.getLateActEventOrder();
+		order.push({ outerToolCallId: event.outerToolCallId, event });
+		while (order.length > MAX_LATE_ACT_EVENTS) {
+			const oldest = order.shift();
+			if (!oldest) break;
+			const oldestEvents = events.get(oldest.outerToolCallId);
+			if (!oldestEvents) continue;
+			const index = oldestEvents.indexOf(oldest.event);
+			if (index !== -1) oldestEvents.splice(index, 1);
+			if (oldestEvents.length === 0) events.delete(oldest.outerToolCallId);
+		}
 	}
 
 	private registerIpythonToolComponent(toolName: string, toolCallId: string, component: ToolExecutionComponent): void {
@@ -2946,12 +2965,13 @@ export class InteractiveMode {
 		for (const lateMessage of this.lateIpythonSentAgentMessages.get(toolCallId) ?? []) {
 			component.appendSentAgentMessage(lateMessage);
 		}
-		const terminals = this.getLateActTerminals();
-		for (const [key, event] of terminals) {
-			if (event.outerToolCallId !== toolCallId) continue;
+		const events = this.getLateActEvents();
+		for (const event of events.get(toolCallId) ?? []) {
 			component.appendActEvent(event);
-			terminals.delete(key);
 		}
+		events.delete(toolCallId);
+		const order = this.getLateActEventOrder();
+		order.splice(0, order.length, ...order.filter((entry) => entry.outerToolCallId !== toolCallId));
 	}
 
 	private async getOrCreatePendingToolComponent(
@@ -5507,13 +5527,8 @@ export class InteractiveMode {
 				const component = this.ipythonToolComponents.get(event.outerToolCallId);
 				if (component) {
 					component.appendActEvent(event);
-				} else if (event.event === "terminal") {
-					const terminals = this.getLateActTerminals();
-					terminals.set(`${event.outerToolCallId}:${event.actId}`, event);
-					if (terminals.size > MAX_LATE_ACT_TERMINALS) {
-						const oldest = terminals.keys().next().value;
-						if (oldest !== undefined) terminals.delete(oldest);
-					}
+				} else {
+					this.retainLateActEvent(event);
 				}
 				this.ui.requestRender();
 				break;
@@ -6428,7 +6443,8 @@ export class InteractiveMode {
 		const messagesToRender = options.limitTranscript ? initialRenderMessages(transcriptMessages) : transcriptMessages;
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
-		this.lateActTerminals?.clear();
+		this.lateActEvents?.clear();
+		this.lateActEventOrder?.splice(0);
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 		const toolNames: string[] = [];
 		for (const message of messagesToRender) {

@@ -197,6 +197,7 @@ export interface ActStartEntry extends SessionEntryBase {
 	actId: string;
 	depth?: number;
 	parentActId?: string;
+	sessionKey?: string;
 	usageBaseline: Usage;
 }
 
@@ -208,6 +209,7 @@ export interface ActTerminalEntry extends SessionEntryBase {
 	actId: string;
 	depth?: number;
 	parentActId?: string;
+	sessionKey?: string;
 	status: ActTerminalStatus;
 	usage: Usage;
 	model?: { provider: string; id: string };
@@ -1676,7 +1678,11 @@ export class SessionManager {
 	}
 
 	/** Append a retained-lane Act start fact. Returns entry id. */
-	appendActStart(actId: string, usageBaseline: Usage, options?: { depth?: number; parentActId?: string }): string {
+	appendActStart(
+		actId: string,
+		usageBaseline: Usage,
+		options?: { depth?: number; parentActId?: string; sessionKey?: string },
+	): string {
 		const entry: ActStartEntry = {
 			type: "act_start",
 			id: generateId(this.byId),
@@ -1685,6 +1691,7 @@ export class SessionManager {
 			actId,
 			depth: options?.depth ?? 1,
 			...(options?.parentActId ? { parentActId: options.parentActId } : {}),
+			...(options?.sessionKey ? { sessionKey: options.sessionKey } : {}),
 			usageBaseline: cloneUsage(usageBaseline),
 		};
 		this._appendEntry(entry);
@@ -1701,6 +1708,7 @@ export class SessionManager {
 			error?: string;
 			depth?: number;
 			parentActId?: string;
+			sessionKey?: string;
 		},
 	): string {
 		const entry: ActTerminalEntry = {
@@ -1711,6 +1719,7 @@ export class SessionManager {
 			actId,
 			depth: options?.depth ?? 1,
 			...(options?.parentActId ? { parentActId: options.parentActId } : {}),
+			...(options?.sessionKey ? { sessionKey: options.sessionKey } : {}),
 			status,
 			usage: cloneUsage(usage),
 			...(options?.model ? { model: { ...options.model } } : {}),

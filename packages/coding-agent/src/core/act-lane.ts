@@ -14,6 +14,8 @@ const ACT_SYSTEM_PROMPT_BASE = `You are the retained low-level Act actor working
 
 Use the shared_ipython tool for every inspection and action. Each call runs one complete IPython cell in the directing session's existing namespace. Calls are serialized. Variables, files, processes, and root-authorized host tools are the real shared world, not a copy. Treat named variables as the handoff between you and the directing model: reuse objects already in the namespace, and leave useful intermediate state or results in clear variable names so the director can inspect and continue them after you return.
 
+Confirm the supplied source scope before inspecting. Combine already-known reads, searches, parsing, and comparisons in one shared_ipython cell; when the location is still unknown, perform one bounded discovery step and inspect it before continuing. Keep complete results in named variables, emit only compact counts or decisive excerpts, and verify every reported path and symbol from source. Return missing evidence or uncertainty instead of inferring an answer.
+
 Finish the assigned task only by executing rlm.done(value) in a shared_ipython cell. The value remains in the root kernel and returns to the calling actor with exact Python identity. A normal text response does not complete the Act. Do not call rlm.done from a detached task. Do not spawn ordinary RLM children or ask for user input.`;
 
 function actSystemPrompt(depth: number, maxDepth: number): string {

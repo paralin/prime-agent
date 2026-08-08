@@ -52,7 +52,8 @@ import {
 	createAgentSessionServices,
 } from "./core/agent-session-services.js";
 import { formatNoModelsAvailableMessage } from "./core/auth-guidance.js";
-import { AuthStorage } from "./core/auth-storage.js";
+import { AuthStorage, RuntimeApiKeyChainState } from "./core/auth-storage.js";
+import { applyCodexHomes } from "./core/codex-homes.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import type { ExtensionFactory } from "./core/extensions/types.js";
 import { KeybindingsManager } from "./core/keybindings.js";
@@ -728,11 +729,13 @@ async function prepareRuntimeServices(options: {
 	sessionManager: SessionManager;
 	extensionFactories?: ExtensionFactory[];
 	sessionOptionsOverride?: CreateAgentSessionOptions;
+	sharedRuntimeApiKeyChainState?: RuntimeApiKeyChainState;
 }): Promise<PreparedRuntimeServices> {
 	const { config, sessionManager } = options;
 	const effectiveAgentDir = config.agentDir ?? options.agentDir;
 	const authStorage = AuthStorage.create(join(effectiveAgentDir, "auth.json"), {
 		usePrimeCliConfig: effectiveAgentDir === options.agentDir,
+		runtimeApiKeyChainState: options.sharedRuntimeApiKeyChainState,
 	});
 	const services = await createAgentSessionServices({
 		cwd: options.cwd,
@@ -759,6 +762,9 @@ async function prepareRuntimeServices(options: {
 		},
 	});
 	const { settingsManager, modelRegistry, resourceLoader } = services;
+	if (!options.sharedRuntimeApiKeyChainState) {
+		applyCodexHomes(authStorage, settingsManager.getCodexHomes());
+	}
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [
 		...services.diagnostics,
 		...collectSettingsDiagnostics(settingsManager, "runtime creation"),
@@ -1266,6 +1272,11 @@ export async function main(args: string[], options?: MainOptions) {
 	// daemon fallback must not seed that goal into unrelated future sessions.
 	const daemonDefaultSessionConfig = daemonServerDefaultSessionConfig(defaultSessionConfig);
 	const runtimeDefaultSessionConfig = appMode === "daemon" ? daemonDefaultSessionConfig : defaultSessionConfig;
+	const daemonRuntimeApiKeyChainState =
+		appMode === "daemon" && isDaemonWorkerProcess() ? new RuntimeApiKeyChainState() : undefined;
+	if (daemonRuntimeApiKeyChainState) {
+		applyCodexHomes(daemonRuntimeApiKeyChainState, startupSettingsManager.getCodexHomes());
+	}
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -1282,6 +1293,7 @@ export async function main(args: string[], options?: MainOptions) {
 			sessionManager,
 			extensionFactories: options?.extensionFactories,
 			sessionOptionsOverride: runtimeSessionOptions,
+			sharedRuntimeApiKeyChainState: daemonRuntimeApiKeyChainState,
 		});
 		const { services, sessionOptions, diagnostics } = prepared;
 		const resolvedSessionOptions = resolveRuntimeSessionOptions(sessionOptions, runtimeSessionOptions);

@@ -891,6 +891,7 @@ export interface ModelCycleResult {
 
 interface ModelSelectOptions {
 	waitForExtensions?: boolean;
+	persistDefault?: boolean;
 }
 
 interface ToolDefinitionEntry {
@@ -6886,7 +6887,8 @@ export class AgentSession {
 
 	/**
 	 * Set model directly.
-	 * Validates that the model is available, saves to session and settings.
+	 * Validates that the model is available and saves it to the session. The
+	 * configured default is updated unless persistDefault is false.
 	 * @throws Error if the model is not available
 	 */
 	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
@@ -6901,7 +6903,9 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
 		this._applySessionModelChange(model);
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		if (options.persistDefault !== false) {
+			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		}
 
 		this.setThinkingLevel(thinkingLevel);
 		this._clampServiceTierForModel(serviceTier);

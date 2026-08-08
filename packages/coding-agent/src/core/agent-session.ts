@@ -287,6 +287,7 @@ import {
 } from "./session-action-store.js";
 import type {
 	ActStartEntry,
+	ActTerminalEntry,
 	ActTerminalStatus,
 	BranchSummaryEntry,
 	CompactionEntry,
@@ -1325,7 +1326,8 @@ export class AgentSession {
 		this._notifySessionInputCheckpointChange();
 		this._scheduleSessionInputPump();
 	});
-	private _actLane?: ActLane;
+	private readonly _actLanes = new Map<number, ActLane>();
+	private readonly _activeActStack: Array<{ actId: string; depth: number; lane: ActLane }> = [];
 	private _activeActCompletion?: Promise<void>;
 	private _actTeardownPromise?: Promise<void>;
 	private readonly _startClaudeCodeQuery?: StartClaudeCodeQuery;
@@ -4170,8 +4172,11 @@ export class AgentSession {
 			this._pendingRequestedRefine = undefined;
 			this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
 			this._autoRefineBranchVersion++;
-			this._actLane?.dispose();
-			this._actLane = undefined;
+			for (const [, lane] of [...this._actLanes.entries()].sort(([left], [right]) => right - left)) {
+				lane.dispose();
+			}
+			this._actLanes.clear();
+			this._activeActStack.length = 0;
 			this._rootForeground.dispose(new Error("Session disposed before foreground admission."));
 			this._cancelActiveRlmChildRuns("Parent session disposed");
 			this._disposeExternalRlmChildRuntimes();
@@ -6741,19 +6746,21 @@ export class AgentSession {
 
 	private _beginActTeardown(): Promise<void> | undefined {
 		if (this._actTeardownPromise) return this._actTeardownPromise;
-		const lane = this._actLane;
+		const runningLanes = [...this._actLanes.entries()]
+			.filter(([, lane]) => lane.running)
+			.sort(([left], [right]) => right - left);
 		const completion = this._activeActCompletion;
-		if (!lane?.running && !completion) return undefined;
-		const foregroundRelease =
-			lane?.running || completion ? this._rootForeground.waitForCurrentActorRelease() : undefined;
-		const laneIdle = lane?.running ? lane.waitForIdle() : undefined;
-		const cleanup = Promise.allSettled([
-			...(laneIdle ? [laneIdle] : []),
-			...(completion ? [completion] : []),
-			...(foregroundRelease ? [foregroundRelease] : []),
-		]).then(() => undefined);
+		if (runningLanes.length === 0 && !completion) return undefined;
+		const foregroundRelease = this._rootForeground.waitForCurrentActorRelease();
+		const cleanup = (async () => {
+			for (const [, lane] of runningLanes) {
+				if (!lane.running) continue;
+				lane.cancel();
+				await Promise.allSettled([lane.waitForIdle()]);
+			}
+			await Promise.allSettled([...(completion ? [completion] : []), foregroundRelease]);
+		})();
 		this._actTeardownPromise = cleanup;
-		lane?.cancel();
 		void cleanup.finally(() => {
 			if (this._actTeardownPromise === cleanup) this._actTeardownPromise = undefined;
 		});
@@ -9048,12 +9055,21 @@ export class AgentSession {
 		return skills;
 	}
 
-	private _emitActProgress(actId: string, outerToolCallId: string, sequence: number, progress: ActLaneProgress): void {
+	private _emitActProgress(
+		actId: string,
+		depth: number,
+		parentActId: string | undefined,
+		outerToolCallId: string,
+		sequence: number,
+		progress: ActLaneProgress,
+	): void {
 		if (progress.type === "assistant_delta") {
 			const text = truncateActEventText(progress.text, ACT_EVENT_CELL_TEXT_MAX_CHARS);
 			this._emit({
 				type: "act_event",
 				actId,
+				depth,
+				...(parentActId ? { parentActId } : {}),
 				outerToolCallId,
 				sequence,
 				event: "assistant_delta",
@@ -9068,6 +9084,8 @@ export class AgentSession {
 			this._emit({
 				type: "act_event",
 				actId,
+				depth,
+				...(parentActId ? { parentActId } : {}),
 				outerToolCallId,
 				sequence,
 				event: "cell_start",
@@ -9088,6 +9106,8 @@ export class AgentSession {
 		this._emit({
 			type: "act_event",
 			actId,
+			depth,
+			...(parentActId ? { parentActId } : {}),
 			outerToolCallId,
 			sequence,
 			event: "cell_terminal",
@@ -9116,16 +9136,36 @@ export class AgentSession {
 		if (!channel) throw new Error("rlm.act requires a duplex kernel channel");
 		if (!channel.outerToolCallId) throw new Error("rlm.act requires outer tool-call correlation");
 		const requestedModel = normalizeRequestedRlmSubagentModel(payload.model, "rlm.act");
-		const model = requestedModel ?? this.settingsManager.getRlmActDefaultModel();
-		if (!model) {
-			throw new Error("rlm.act requires an explicit model when rlmActDefaultModel is not configured");
+		const depth = this._activeActStack.length + 1;
+		const maxDepth = this.settingsManager.getRlmActMaxDepth();
+		if (depth > maxDepth) {
+			throw new Error(`rlm.act depth ${depth} exceeds rlmActMaxDepth ${maxDepth}`);
 		}
-		this._actLane ??= new ActLane(
-			(tool, model) => this._createActLaneSession(tool, model),
-			(session, model) => this._selectActLaneModel(session, model),
-		);
-		const lane = this._actLane;
+		const parent = this._activeActStack.at(-1);
+		const parentActId = parent?.actId;
+		if (parent && !parent.lane.cellRunning) {
+			throw new Error("Nested rlm.act requires the calling Act's active shared-IPython cell");
+		}
+		const model = requestedModel ?? this.settingsManager.getRlmActDefaultModel(depth);
+		if (!model) {
+			if (depth === 1) {
+				throw new Error("rlm.act requires an explicit model when rlmActDefaultModel is not configured");
+			}
+			throw new Error(
+				`rlm.act requires an explicit model at Act depth ${depth} because rlmActDefaultModel has no entry`,
+			);
+		}
+		let lane = this._actLanes.get(depth);
+		if (!lane) {
+			lane = new ActLane(
+				(tool, model) => this._createActLaneSession(tool, model, depth),
+				(session, model) => this._selectActLaneModel(session, model),
+			);
+			this._actLanes.set(depth, lane);
+		}
 		const actId = randomUUID();
+		const frame = { actId, depth, lane };
+		this._activeActStack.push(frame);
 		const outerToolCallId = channel.outerToolCallId;
 		const prompt = truncateActEventText(payload.prompt, ACT_EVENT_PROMPT_MAX_CHARS);
 		const cancellationCapability = actCancellationCapability();
@@ -9154,19 +9194,23 @@ export class AgentSession {
 				model,
 				(state) => {
 					if (!state.model) throw new Error("Act model selection did not resolve a model");
-					this.sessionManager.appendActStart(actId, state.usage);
+					this.sessionManager.appendActStart(actId, state.usage, { depth, parentActId });
 					started = {
 						baseline: state.usage,
 						model: state.model,
 						thinkingLevel: state.thinkingLevel,
-						directingModel: this.model
-							? { provider: this.model.provider, id: this.model.id, name: this.model.name }
-							: undefined,
-						directingThinkingLevel: this.thinkingLevel,
+						directingModel:
+							parent?.lane.model ??
+							(this.model
+								? { provider: this.model.provider, id: this.model.id, name: this.model.name }
+								: undefined),
+						directingThinkingLevel: parent?.lane.thinkingLevel ?? this.thinkingLevel,
 					};
 					this._emit({
 						type: "act_event",
 						actId,
+						depth,
+						...(parentActId ? { parentActId } : {}),
 						outerToolCallId,
 						sequence: ++sequence,
 						event: "start",
@@ -9179,21 +9223,23 @@ export class AgentSession {
 						cancellationCapability,
 					});
 					for (const progress of pendingProgress.splice(0)) {
-						this._emitActProgress(actId, outerToolCallId, ++sequence, progress);
+						this._emitActProgress(actId, depth, parentActId, outerToolCallId, ++sequence, progress);
 					}
 				},
 				() => {
 					admitted = true;
-					const foregroundRelease = this._rootForeground.waitForCurrentActorRelease();
-					const completion = Promise.allSettled([terminalCompletion, foregroundRelease]).then(() => undefined);
-					this._activeActCompletion = completion;
-					void completion.finally(() => {
-						if (this._activeActCompletion === completion) this._activeActCompletion = undefined;
-					});
+					if (depth === 1) {
+						const foregroundRelease = this._rootForeground.waitForCurrentActorRelease();
+						const completion = Promise.allSettled([terminalCompletion, foregroundRelease]).then(() => undefined);
+						this._activeActCompletion = completion;
+						void completion.finally(() => {
+							if (this._activeActCompletion === completion) this._activeActCompletion = undefined;
+						});
+					}
 				},
 				(progress) => {
 					if (!started) pendingProgress.push(progress);
-					else this._emitActProgress(actId, outerToolCallId, ++sequence, progress);
+					else this._emitActProgress(actId, depth, parentActId, outerToolCallId, ++sequence, progress);
 				},
 			);
 			status = result.outcome === "done" ? "done" : result.outcome === "cancelled" ? "cancelled" : "error";
@@ -9211,12 +9257,16 @@ export class AgentSession {
 						? truncateActEventText(terminalError, ACT_EVENT_ERROR_MAX_CHARS)
 						: { text: "", truncated: false };
 					this.sessionManager.appendActTerminal(actId, status, terminalUsage, {
+						depth,
+						parentActId,
 						model: started.model,
 						...(terminalError ? { error: error.text } : {}),
 					});
 					this._emit({
 						type: "act_event",
 						actId,
+						depth,
+						...(parentActId ? { parentActId } : {}),
 						outerToolCallId,
 						sequence: ++sequence,
 						event: "terminal",
@@ -9235,28 +9285,30 @@ export class AgentSession {
 				}
 			} finally {
 				if (admitted) resolveTerminalCompletion();
+				const frameIndex = this._activeActStack.lastIndexOf(frame);
+				if (frameIndex >= 0) this._activeActStack.splice(frameIndex, 1);
 			}
 		}
 	}
 
-	private _actSessionLocation(): { dir: string; file: string } | undefined {
+	private _actSessionLocation(depth = 1): { dir: string; file: string } | undefined {
 		const artifactDir = this.sessionManager.getSessionArtifactDir();
 		if (!artifactDir) return undefined;
-		const dir = join(artifactDir, ACT_SESSION_DIRNAME);
+		const dir = join(artifactDir, depth === 1 ? ACT_SESSION_DIRNAME : `${ACT_SESSION_DIRNAME}-depth-${depth}`);
 		return { dir, file: join(dir, ACT_SESSION_FILENAME) };
 	}
 
-	private _openActSessionManager(): SessionManager {
-		const location = this._actSessionLocation();
+	private _openActSessionManager(depth = 1): SessionManager {
+		const location = this._actSessionLocation(depth);
 		if (!location) return SessionManager.inMemory(this._cwd);
 		return SessionManager.open(location.file, location.dir, this._cwd);
 	}
 
-	private _persistedActState(): {
+	private _persistedActState(depth = 1): {
 		usage: Usage;
 		model?: { provider: string; id: string };
 	} {
-		const location = this._actSessionLocation();
+		const location = this._actSessionLocation(depth);
 		if (!location || !existsSync(location.file)) return { usage: emptyUsage() };
 		const manager = SessionManager.open(location.file, location.dir, this._cwd);
 		const branch = manager.getBranch();
@@ -9280,13 +9332,16 @@ export class AgentSession {
 			(entry): entry is ActStartEntry => entry.type === "act_start" && !terminalIds.has(entry.actId),
 		);
 		if (interrupted.length === 0) return;
-		const persisted = this._persistedActState();
 		for (const start of interrupted) {
+			const depth = start.depth ?? 1;
+			const persisted = this._persistedActState(depth);
 			this.sessionManager.appendActTerminal(
 				start.actId,
 				"interrupted",
 				actUsageDelta(persisted.usage, start.usageBaseline),
 				{
+					depth,
+					parentActId: start.parentActId,
 					...(persisted.model ? { model: persisted.model } : {}),
 					error: "Act was interrupted before the root session restarted",
 				},
@@ -9331,9 +9386,13 @@ export class AgentSession {
 		if (modelChanged) await this._queueModelSelectEmit(selection.model, previousModel, "set");
 	}
 
-	private async _createActLaneSession(tool: AgentTool, requestedModel: string | undefined): Promise<AgentSession> {
+	private async _createActLaneSession(
+		tool: AgentTool,
+		requestedModel: string | undefined,
+		depth = 1,
+	): Promise<AgentSession> {
 		const selection = await this._resolveActModel(requestedModel);
-		const sessionManager = this._openActSessionManager();
+		const sessionManager = this._openActSessionManager(depth);
 		const restored = sessionManager.buildSessionContext();
 		const persistedModel = sessionManager
 			.getBranch()
@@ -9389,7 +9448,7 @@ export class AgentSession {
 			settingsManager: this.settingsManager,
 			cwd: this._cwd,
 			agentDir: this._agentDir,
-			resourceLoader: createActResourceLoader(),
+			resourceLoader: createActResourceLoader({ depth, maxDepth: this.settingsManager.getRlmActMaxDepth() }),
 			modelRegistry: this._modelRegistry,
 			baseToolsOverride: { [tool.name]: tool },
 			allowedToolNames: [tool.name],
@@ -12354,43 +12413,56 @@ export class AgentSession {
 		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(branch, this.sessionManager.getEntries());
 
 		const children: ContextTreeNode[] = [];
-		const actLocation = this._actSessionLocation();
-		const liveActNode = this._actLane?.contextTree;
-		const diskActNode =
-			!liveActNode && actLocation && existsSync(actLocation.file)
-				? loadContextTreeChildFromDisk(actLocation.dir, resolveContextWindow)
-				: undefined;
-		const actNode = liveActNode ?? diskActNode;
-		if (actNode) {
-			const actUsage = emptyUsage();
-			for (const entry of branch) {
-				if (entry.type === "act_terminal") addAssistantUsage(actUsage, entry.usage);
-			}
+		const actDepths = new Set<number>(this._actLanes.keys());
+		for (const entry of branch) {
+			if (entry.type === "act_start" || entry.type === "act_terminal") actDepths.add(entry.depth ?? 1);
+		}
+		const actNodes = new Map<number, ContextTreeNode>();
+		for (const depth of [...actDepths].sort((left, right) => left - right)) {
+			const lane = this._actLanes.get(depth);
+			const location = this._actSessionLocation(depth);
+			const liveNode = lane?.contextTree;
+			const diskNode =
+				!liveNode && location && existsSync(location.file)
+					? loadContextTreeChildFromDisk(location.dir, resolveContextWindow)
+					: undefined;
+			const sourceNode = liveNode ?? diskNode;
+			if (!sourceNode) continue;
 			const terminal = branch
 				.slice()
 				.reverse()
-				.find((entry) => entry.type === "act_terminal");
-			if (this._actLane?.running || terminal?.type === "act_terminal") {
-				const status = this._actLane?.running
-					? "running"
-					: terminal?.type === "act_terminal" && terminal.status === "error"
-						? "error"
-						: terminal?.type === "act_terminal" &&
-								(terminal.status === "cancelled" || terminal.status === "interrupted")
-							? "cancelled"
-							: "done";
-				const selectedModel = this._actLane?.running ? actNode.model : (terminal?.model ?? actNode.model);
-				children.push({
-					...actNode,
-					id: "act",
-					label: actContextLabel(),
-					status,
-					...(selectedModel ? { model: selectedModel } : {}),
-					cancellationCapability: actCancellationCapability(),
-					ownUsage: actUsage,
-					totalUsage: cloneUsage(actUsage),
-				});
+				.find((entry): entry is ActTerminalEntry => entry.type === "act_terminal" && (entry.depth ?? 1) === depth);
+			if (!lane?.running && terminal?.type !== "act_terminal") continue;
+			const usage = emptyUsage();
+			for (const entry of branch) {
+				if (entry.type === "act_terminal" && (entry.depth ?? 1) === depth) addAssistantUsage(usage, entry.usage);
 			}
+			const status = lane?.running
+				? "running"
+				: terminal?.type === "act_terminal" && terminal.status === "error"
+					? "error"
+					: terminal?.type === "act_terminal" &&
+							(terminal.status === "cancelled" || terminal.status === "interrupted")
+						? "cancelled"
+						: "done";
+			const selectedModel = lane?.running ? sourceNode.model : (terminal?.model ?? sourceNode.model);
+			actNodes.set(depth, {
+				...sourceNode,
+				id: depth === 1 ? "act" : `act-depth-${depth}`,
+				label: depth === 1 ? actContextLabel() : `${actContextLabel()} depth ${depth}`,
+				depth,
+				status,
+				...(selectedModel ? { model: selectedModel } : {}),
+				cancellationCapability: actCancellationCapability(),
+				ownUsage: usage,
+				totalUsage: cloneUsage(usage),
+				children: [],
+			});
+		}
+		for (const [depth, node] of actNodes) {
+			const parent = actNodes.get(depth - 1);
+			if (parent) parent.children.push(node);
+			else children.push(node);
 		}
 
 		const liveIds = new Set<string>();

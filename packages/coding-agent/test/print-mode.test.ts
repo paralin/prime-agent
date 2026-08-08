@@ -63,13 +63,17 @@ const actUsage = {
 	cost: { input: 0.003, output: 0.005, cacheRead: 0, cacheWrite: 0, total: 0.008 },
 };
 
-function createActEvents(actId: string, status: "done" | "error" | "cancelled"): ActProjectionEvent[] {
+function createActEvents(
+	actId: string,
+	status: "done" | "error" | "cancelled",
+	options?: { depth?: number; parentActId?: string },
+): ActProjectionEvent[] {
 	const outerToolCallId = `outer-${actId}`;
+	const correlation = { actId, outerToolCallId, ...options };
 	return [
 		{
 			type: "act_event",
-			actId,
-			outerToolCallId,
+			...correlation,
 			sequence: 1,
 			event: "start",
 			prompt: `prompt ${actId}`,
@@ -79,8 +83,7 @@ function createActEvents(actId: string, status: "done" | "error" | "cancelled"):
 		},
 		{
 			type: "act_event",
-			actId,
-			outerToolCallId,
+			...correlation,
 			sequence: 2,
 			event: "assistant_delta",
 			stream: "text",
@@ -89,8 +92,7 @@ function createActEvents(actId: string, status: "done" | "error" | "cancelled"):
 		},
 		{
 			type: "act_event",
-			actId,
-			outerToolCallId,
+			...correlation,
 			sequence: 3,
 			event: "terminal",
 			status,
@@ -350,7 +352,7 @@ describe("runPrintMode", () => {
 	it("emits ordered Act envelopes unchanged in JSON mode", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "sol answer" }));
 		const events = [
-			...createActEvents("done-act", "done"),
+			...createActEvents("done-act", "done", { depth: 2, parentActId: "parent-act" }),
 			...createActEvents("error-act", "error"),
 			...createActEvents("cancel-act", "cancelled"),
 		];
@@ -365,6 +367,7 @@ describe("runPrintMode", () => {
 		expect(exitCode).toBe(0);
 		const records = output.write.mock.calls.map(([line]) => JSON.parse(String(line)) as ActProjectionEvent);
 		expect(records).toEqual(events);
+		expect(records.slice(0, 3).every((event) => event.depth === 2 && event.parentActId === "parent-act")).toBe(true);
 		expect(records.map((event) => event.sequence)).toEqual([1, 2, 3, 1, 2, 3, 1, 2, 3]);
 		expect(records.filter((event) => event.event === "terminal").map((event) => event.status)).toEqual([
 			"done",
@@ -397,6 +400,7 @@ describe("runPrintMode", () => {
 			expect(record).toMatchObject({
 				type: "act_terminal",
 				actId: `${status}-act`,
+				depth: 1,
 				outerToolCallId: `outer-${status}-act`,
 				sequence: 3,
 				status,
@@ -410,6 +414,24 @@ describe("runPrintMode", () => {
 			expect(record).not.toHaveProperty("value");
 		},
 	);
+
+	it("prints nested depth and parent correlation", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "sol answer" }));
+		emitDuringPrompt(runtimeHost, createActEvents("nested-act", "done", { depth: 2, parentActId: "outer-act" }));
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		output.write.mockClear();
+
+		await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+			initialMessage: "nested terminal",
+		});
+		const line = String(errorSpy.mock.calls[0]?.[0]);
+		expect(JSON.parse(line.slice(TEXT_PRINT_ACT_TERMINAL_PREFIX.length))).toMatchObject({
+			actId: "nested-act",
+			depth: 2,
+			parentActId: "outer-act",
+		});
+	});
 
 	it("prints a self-contained terminal when text mode attaches after the Act start", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "sol answer" }));

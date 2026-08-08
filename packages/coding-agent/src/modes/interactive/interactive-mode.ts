@@ -65,6 +65,7 @@ import {
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	VERSION,
 } from "../../config.js";
+import { actEventDepth } from "../../core/act-events.js";
 import { AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL, isAgentSessionMessage } from "../../core/agent-messages.js";
 import {
 	type AgentTracePreviewResult,
@@ -933,7 +934,7 @@ export class InteractiveMode {
 	private pendingTools = new Map<string, ToolExecutionComponent>();
 	private ipythonToolComponents = new Map<string, ToolExecutionComponent>();
 	private lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
-	private activeActTray: { actId: string; model: string; thinkingLevel?: string } | undefined;
+	private activeActTrays = new Map<number, { actId: string; depth: number; model: string; thinkingLevel?: string }>();
 	private lateActTerminals = new Map<
 		string,
 		Extract<AgentConnectionSessionEvent, { type: "act_event" }> & { event: "terminal" }
@@ -2834,7 +2835,7 @@ export class InteractiveMode {
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
 		this.lateActTerminals?.clear();
-		this.activeActTray = undefined;
+		this.activeActTrays?.clear();
 		this.resetSubagentSummary();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
@@ -5490,15 +5491,17 @@ export class InteractiveMode {
 				break;
 
 			case "act_event": {
+				const depth = actEventDepth(event);
 				if (event.event === "start") {
-					this.activeActTray = {
+					this.activeActTrays.set(depth, {
 						actId: event.actId,
+						depth,
 						model: event.model.name?.trim() || event.model.id,
 						thinkingLevel: event.thinkingLevel,
-					};
+					});
 					this.subagentSummaryLine.invalidate();
-				} else if (event.event === "terminal" && this.activeActTray?.actId === event.actId) {
-					this.activeActTray = undefined;
+				} else if (event.event === "terminal" && this.activeActTrays.get(depth)?.actId === event.actId) {
+					this.activeActTrays.delete(depth);
 					this.subagentSummaryLine.invalidate();
 				}
 				const component = this.ipythonToolComponents.get(event.outerToolCallId);
@@ -5997,12 +6000,13 @@ export class InteractiveMode {
 	}
 
 	private getActTrayLabel(): string | undefined {
-		const active = this.activeActTray;
+		const active = [...this.activeActTrays.values()].sort((left, right) => right.depth - left.depth)[0];
 		if (!active) return undefined;
 		const parts = [active.model];
 		if (active.thinkingLevel && active.thinkingLevel !== "off") parts.push(active.thinkingLevel);
 		const pulse = theme.fg("bashMode", workingIconFrame(getWorkingPulseFrame()));
-		return `${theme.fg("dim", "│")}  ${pulse} ${theme.fg("accent", `act: ${parts.join(" • ")}`)}`;
+		const label = active.depth > 1 ? `act ${active.depth}` : "act";
+		return `${theme.fg("dim", "│")}  ${pulse} ${theme.fg("accent", `${label}: ${parts.join(" • ")}`)}`;
 	}
 
 	private getShortcutsTrayHint(): string | undefined {

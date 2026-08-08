@@ -200,12 +200,16 @@ export interface AgentConnectionChildUsageAttributionEntry extends AgentConnecti
 export interface AgentConnectionActStartEntry extends AgentConnectionSessionEntryBase {
 	type: "act_start";
 	actId: string;
+	depth?: number;
+	parentActId?: string;
 	usageBaseline: Usage;
 }
 
 export interface AgentConnectionActTerminalEntry extends AgentConnectionSessionEntryBase {
 	type: "act_terminal";
 	actId: string;
+	depth?: number;
+	parentActId?: string;
 	status: "done" | "cancelled" | "error" | "interrupted";
 	usage: Usage;
 	model?: { provider: string; id: string };

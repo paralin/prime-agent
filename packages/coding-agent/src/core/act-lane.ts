@@ -10,11 +10,24 @@ import { addAssistantUsage, emptyUsage } from "./usage.js";
 
 const ACT_TOOL_NAME = "shared_ipython";
 
-export const ACT_SYSTEM_PROMPT = `You are the retained low-level Act actor working inside the directing model's live IPython world.
+const ACT_SYSTEM_PROMPT_BASE = `You are the retained low-level Act actor working inside the directing model's live IPython world.
 
 Use the shared_ipython tool for every inspection and action. Each call runs one complete IPython cell in the directing session's existing namespace. Calls are serialized. Variables, files, processes, and root-authorized host tools are the real shared world, not a copy. Treat named variables as the handoff between you and the directing model: reuse objects already in the namespace, and leave useful intermediate state or results in clear variable names so the director can inspect and continue them after you return.
 
-Finish the assigned task only by executing rlm.done(value) in a shared_ipython cell. The value remains in the root kernel and returns to Sol with exact Python identity. A normal text response does not complete the Act. Do not call rlm.done from a detached task. Do not spawn another actor or ask for user input.`;
+Finish the assigned task only by executing rlm.done(value) in a shared_ipython cell. The value remains in the root kernel and returns to the calling actor with exact Python identity. A normal text response does not complete the Act. Do not call rlm.done from a detached task. Do not spawn ordinary RLM children or ask for user input.`;
+
+function actSystemPrompt(depth: number, maxDepth: number): string {
+	if (depth < maxDepth) {
+		return `${ACT_SYSTEM_PROMPT_BASE}
+
+Another configured Act depth remains. You may delegate one bounded next-depth action with \`nested = await rlm.act(prompt, model=...)\` in a shared_ipython cell. Omit \`model\` only when that depth has a configured default. Before calling it, reuse named live objects already in the namespace, mention those bindings in the action, and ask the nested actor to leave useful state in named variables. After it returns, inspect the returned object and shared state before continuing or calling your own rlm.done(value).`;
+	}
+	return `${ACT_SYSTEM_PROMPT_BASE}
+
+You are at the maximum configured Act depth. Complete the action yourself through shared_ipython and rlm.done(value); another nested Act is unavailable.`;
+}
+
+export const ACT_SYSTEM_PROMPT = actSystemPrompt(1, 1);
 
 export interface ActLaneResult {
 	outcome: "done" | "text" | "cancelled";
@@ -298,9 +311,13 @@ export class ActLane {
 		return this.session ? usageFromSession(this.session) : this.disposedUsage;
 	}
 
-	get model(): { provider: string; id: string } | undefined {
+	get model(): { provider: string; id: string; name?: string } | undefined {
 		const model = this.session?.model;
-		return model ? { provider: model.provider, id: model.id } : this.disposedModel;
+		return model ? { provider: model.provider, id: model.id, name: model.name } : this.disposedModel;
+	}
+
+	get thinkingLevel(): string | undefined {
+		return this.session?.thinkingLevel;
 	}
 
 	get contextTree(): ContextTreeNode | undefined {
@@ -309,6 +326,10 @@ export class ActLane {
 
 	get running(): boolean {
 		return this.active !== undefined;
+	}
+
+	get cellRunning(): boolean {
+		return this.active?.cellActive ?? false;
 	}
 
 	dispose(): void {
@@ -386,15 +407,18 @@ export class ActLane {
 	}
 }
 
-export function createActResourceLoader(): ResourceLoader {
+export function createActResourceLoader(
+	options: { depth: number; maxDepth: number } = { depth: 1, maxDepth: 1 },
+): ResourceLoader {
 	const extensions = { extensions: [], errors: [], runtime: createExtensionRuntime() };
+	const systemPrompt = actSystemPrompt(options.depth, options.maxDepth);
 	return {
 		getExtensions: () => extensions,
 		getSkills: () => ({ skills: [], diagnostics: [] }),
 		getPrompts: () => ({ prompts: [], diagnostics: [] }),
 		getThemes: () => ({ themes: [], diagnostics: [] }),
 		getAgentsFiles: () => ({ agentsFiles: [] }),
-		getSystemPrompt: () => ACT_SYSTEM_PROMPT,
+		getSystemPrompt: () => systemPrompt,
 		getAppendSystemPrompt: () => [],
 		extendResources: () => {},
 		reload: async () => {},

@@ -50,6 +50,9 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain("leave useful state in named variables for your next inspection");
 		expect(ACT_SYSTEM_PROMPT).toContain("Treat named variables as the handoff between you and the directing model");
 		expect(ACT_SYSTEM_PROMPT).toContain("leave useful intermediate state or results in clear variable names");
+		expect(ACT_SYSTEM_PROMPT).toContain("perform one bounded discovery step");
+		expect(ACT_SYSTEM_PROMPT).toContain("verify every reported path and symbol from source");
+		expect(ACT_SYSTEM_PROMPT).toContain("Return missing evidence or uncertainty instead of inferring an answer");
 	});
 	test("exposes nested Act only while configured depth remains", () => {
 		const nested = createActResourceLoader({ depth: 1, maxDepth: 2 }).getSystemPrompt();
@@ -98,6 +101,8 @@ describe("buildRlmPrompt", () => {
 				"",
 				"Use Python for reading, searching, and editing files — it gives you reusable variables you can slice, filter, and act on without re-reading. Always assign read/search results to named variables so you can revisit them later.",
 				"",
+				"Use a model turn for judgment, not merely to issue the next already-known command. Once the next operations and source scope are known, combine adjacent deterministic reads, searches, parsing, transformations, and focused checks in one IPython cell. If the source location is unknown, do one bounded discovery step, inspect its result, and then batch reads only across the confirmed scope. Keep complete results in named variables, display compact evidence, and never trade source verification for fewer turns.",
+				"",
 				"Each `%%bash` cell runs in a throw-away subshell, so shell-level state (`cd`, `export`, `source`, shell variables) does NOT carry to later cells. Keep dependent shell steps inside one `%%bash` cell when they need shared shell state, or use kernel-level equivalents that survive across calls: `%cd <dir>` for the working directory and `os.environ['VAR'] = '...'` (or `%env VAR=...`) for environment variables — these apply to all subsequent `%%bash` calls.",
 				"",
 				"Python state in the kernel, by contrast, persists across cells: named variables, helper functions, classes, imports, notes, parsed outputs, and helper data structures all remain available in every later turn. Tool calls are themselves Python `await` expressions, so their return values can be bound to variables and composed into program logic just like any other call.",
@@ -109,6 +114,7 @@ describe("buildRlmPrompt", () => {
 				"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through an available messaging capability or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
 				"",
 				"Use `rlm.act()` for one inspectable action expected to take roughly 30 seconds to 5 minutes; prefer shorter actions. You remain responsible for architecture, synthesis, decomposition, and acceptance. After every Act result, regain control and inspect decisive source, diff, or test evidence before choosing the next bounded action. Bad: `await rlm.act('Implement every phase of the migration plan, verify everything, and ship it')`. Good: `result = await rlm.act('Inspect the parser owner, fix the delimiter advance, run parser.test.ts, and return the diff and test result')`.",
+				"One bounded Act action may contain several mechanical inspection cells when they answer one inspectable question. When a predictable inspection chain would otherwise require repeated turns here, delegate it to the cheapest suitable route under the live routing policy only after supplying a bounded source scope: named paths, symbols, live variables, or an explicit search root and exclusions. Give exact-source routes exact inputs; give broader discovery routes a bounded search area. Require compact source-backed evidence, then regain control to inspect it and make every branching, design, or acceptance decision.",
 				"Set up a retained Act lane once with stable context: working directory, editing or verification authority, return contract, and the expectation that later calls are a sequence of bounded actions. The lane keeps its transcript, so later calls should be terse deltas: first `await rlm.act('In /repo, you may edit parser files and run focused tests. Return the inspected diff and raw test result. First inspect the parser owner.')`; then `await rlm.act('Now run the StarPC baseline')`; then `await rlm.act('Now fix the failing delimiter case and rerun its focused test')`. Restate any changed or ambiguous constraint, for example `await rlm.act('Now verify only; do not edit. Work from /repo/wt/review and return raw test output')`. Inspect every returned result yourself.",
 				"Treat the live IPython namespace as the handoff between you and Act. Bind useful clients, datasets, parsed structures, helpers, and intermediate results to clear variable names before calling Act, and mention those variables in the action. Ask Act to reuse them and leave useful state in named variables for your next inspection instead of reconstructing it through prompt text.",
 				"Omit `model` only when `rlmActDefaultModel` configures a default for the next Act depth, or pass an ordinary named-role or concrete native selector. One retained lane per admitted depth keeps a separate private model session for each resolved model, runs serialized full cells in this live IPython namespace, and finishes with `rlm.done(value)`. Repeating a selector that resolves to the same model resumes its context; changing the resolved model does not share conversation history. An Act actor may call one deeper `rlm.act()` only while `rlmActMaxDepth` permits it; the nested value returns by exact identity so the caller can inspect it and continue before returning upward. Assign each result to preserve its exact in-kernel object without displaying its representation. Act shares this root session's authority, is distinct from asynchronous isolated `rlm(...)` children, and admits one nested chain at a time.",
@@ -246,7 +252,8 @@ describe("buildRlmPrompt", () => {
 			allowRecursion: true,
 			depth: 1,
 		});
-		expect(withCapabilities).toContain("agent_message.send");
+		expect(withCapabilities).toContain("execute `await agent_message.send");
+		expect(withCapabilities).toContain("text does not deliver the reply");
 		expect(withCapabilities).toContain("agent_message.list_agents");
 		expect(withCapabilities).toContain("agent_observe");
 		expect(withCapabilities).toContain("restricted to your parent, siblings, and direct children");
@@ -262,7 +269,7 @@ describe("buildRlmPrompt", () => {
 		});
 
 		expect(prompt).toContain("You are a child agent");
-		expect(prompt).not.toContain("When a task calls for an answer, reply explicitly with `await agent_message.send");
+		expect(prompt).not.toContain("When a task calls for an answer, execute `await agent_message.send");
 	});
 
 	test("exposes the automatic child registry independently of observation skills", () => {

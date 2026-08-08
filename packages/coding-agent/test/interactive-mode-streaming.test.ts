@@ -32,7 +32,7 @@ type HandleEventThis = {
 	toolOutputExpanded: boolean;
 	footer: { invalidate(): void };
 	subagentSummaryLine: { invalidate(): void };
-	activeActTray?: { actId: string; model: string; thinkingLevel?: string; returning: boolean };
+	activeActTrays: Map<number, { actId: string; depth: number; model: string; thinkingLevel?: string }>;
 	ui: TUI;
 	chatContainer: Container;
 	recapContainer: Container;
@@ -100,6 +100,7 @@ function createFakeInteractiveModeThis(): HandleEventThis {
 		ipythonToolComponents: new Map<string, ToolExecutionComponent>(),
 		lateIpythonSentAgentMessages: new Map<string, never[]>(),
 		lateActTerminals: new Map<string, Extract<AgentConnectionSessionEvent, { type: "act_event" }>>(),
+		activeActTrays: new Map(),
 		agentRunFileChanges: new Map<string, FileChangeSummary>(),
 		updateConnectionStateFromEvent: vi.fn(),
 		getMarkdownThemeWithSettings: () => getMarkdownTheme(),
@@ -199,14 +200,49 @@ describe("InteractiveMode streaming events", () => {
 			directingThinkingLevel: "low",
 			cancellationCapability: "posix-managed",
 		});
-		expect(fakeThis.activeActTray).toEqual({
-			actId: "act-live",
-			model: "Luna",
-			thinkingLevel: "medium",
-		});
+		expect([...fakeThis.activeActTrays.values()]).toEqual([
+			{ actId: "act-live", depth: 1, model: "Luna", thinkingLevel: "medium" },
+		]);
 		const getActTrayLabel = (
 			InteractiveMode.prototype as unknown as { getActTrayLabel(this: HandleEventThis): string | undefined }
 		).getActTrayLabel;
+		expect(stripAnsi(getActTrayLabel.call(fakeThis) ?? "")).toContain("act: Luna • medium");
+		await handleEvent.call(fakeThis, {
+			type: "act_event",
+			actId: "act-nested",
+			depth: 2,
+			parentActId: "act-live",
+			outerToolCallId: "outer-act",
+			sequence: 1,
+			event: "start",
+			prompt: "inspect nested",
+			promptTruncated: false,
+			model: { provider: "test", id: "nested-model", name: "DeepSeek" },
+			thinkingLevel: "high",
+			directingModel: { provider: "test", id: "live-model", name: "Luna" },
+			directingThinkingLevel: "medium",
+			cancellationCapability: "posix-managed",
+		});
+		expect(stripAnsi(getActTrayLabel.call(fakeThis) ?? "")).toContain("act 2: DeepSeek • high");
+		await handleEvent.call(fakeThis, {
+			type: "act_event",
+			actId: "act-nested",
+			depth: 2,
+			parentActId: "act-live",
+			outerToolCallId: "outer-act",
+			sequence: 2,
+			event: "terminal",
+			status: "done",
+			prompt: "inspect nested",
+			promptTruncated: false,
+			model: { provider: "test", id: "nested-model", name: "DeepSeek" },
+			thinkingLevel: "high",
+			directingModel: { provider: "test", id: "live-model", name: "Luna" },
+			directingThinkingLevel: "medium",
+			cancellationCapability: "posix-managed",
+			usage: EMPTY_USAGE,
+			errorTruncated: false,
+		});
 		expect(stripAnsi(getActTrayLabel.call(fakeThis) ?? "")).toContain("act: Luna • medium");
 		await handleEvent.call(fakeThis, {
 			type: "act_event",
@@ -226,9 +262,14 @@ describe("InteractiveMode streaming events", () => {
 			errorTruncated: false,
 		});
 
-		expect(fakeThis.activeActTray).toBeUndefined();
+		expect(fakeThis.activeActTrays.size).toBe(0);
 		expect(renderChat(root)).toContain("act  Luna • medium");
+		expect(renderChat(root)).toContain("act 2  DeepSeek • high");
+		expect(renderChat(root)).toContain("return 2  Luna • medium");
 		expect(renderChat(root)).toContain("return  Sol • low");
+		const rendered = renderChat(root);
+		expect(rendered.indexOf("act  Luna")).toBeLessThan(rendered.indexOf("act 2  DeepSeek"));
+		expect(rendered.indexOf("return 2  Luna")).toBeLessThan(rendered.indexOf("return  Sol"));
 		expect(renderChat(other)).not.toContain("Act");
 		expect(fakeThis.ui.requestRender).toHaveBeenCalled();
 	});

@@ -3569,12 +3569,16 @@ export class AgentSession {
 			return;
 		}
 
+		const lastAssistant = this._findLastAssistantInMessages(event.messages);
+		if (lastAssistant && this._isOpenAICodexUsageExhaustion(lastAssistant)) {
+			this._rotateExhaustedCodexHome(lastAssistant);
+		}
+
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled) {
 			return;
 		}
 
-		const lastAssistant = this._findLastAssistantInMessages(event.messages);
 		const concreteAuthFailure = lastAssistant ? this._isConcreteProviderAuthFailure(lastAssistant) : false;
 		if (!lastAssistant || (!this._isRetryableError(lastAssistant) && !concreteAuthFailure)) {
 			return;
@@ -11596,6 +11600,24 @@ export class AgentSession {
 			return Number.isInteger(parsed) ? parsed : undefined;
 		}
 		return undefined;
+	}
+
+	private _isOpenAICodexUsageExhaustion(message: AssistantMessage): boolean {
+		if (message.provider !== "openai-codex" || message.stopReason !== "error") return false;
+		const details = this._getProviderStreamFailureDetails(message);
+		const providerErrorType = details?.providerErrorType;
+		if (typeof providerErrorType === "string" && /usage_limit_reached|usage_not_included/i.test(providerErrorType)) {
+			return true;
+		}
+		return /(?:chatgpt\s+)?usage[ _-]?limit(?:[ _-]?reached)?|usage[ _-]?not[ _-]?included/i.test(
+			message.errorMessage ?? "",
+		);
+	}
+
+	private _rotateExhaustedCodexHome(message: AssistantMessage): boolean {
+		const token = this._modelRegistry.getCurrentProviderAuthSourceToken(message.provider);
+		if (token?.source !== "runtime_chain") return false;
+		return this._markProviderAuthStale(message, [token]);
 	}
 
 	private _isConcreteProviderAuthFailure(message: AssistantMessage): boolean {

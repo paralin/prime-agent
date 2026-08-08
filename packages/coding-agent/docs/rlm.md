@@ -136,6 +136,8 @@ await rlm.act("Now verify only; do not edit. Work from /repo/wt/review and retur
 
 A delta restates any changed or ambiguous directory, authority, safety, or result-shape constraint. The directing model inspects every returned result.
 
+Use the live IPython namespace as the handoff between both models. The directing model can bind clients, datasets, parsed structures, helpers, and intermediate results to clear names before calling Act. Act reuses those objects and can leave useful state in named variables for the directing model to inspect or continue after return. This preserves exact Python identity and avoids describing or reconstructing live state in prompt text.
+
 `model` accepts the same named-role and concrete native selectors as ordinary RLM model selection. Omission selects `rlmActDefaultModel`; without it callers pass `model` explicitly. Invalid or unavailable selectors fail before provider or shared-cell work.
 
 Act retains one private model session and gives it a serialized `shared_ipython` tool. Accepted model changes append to that session's transcript. Cells run in the root IPython namespace. The private session has no family identity, registry entry, or separate kernel. Restart restores completed transcript and namespace state but never replays interrupted work.

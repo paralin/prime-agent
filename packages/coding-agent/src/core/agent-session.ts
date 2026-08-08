@@ -14,7 +14,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -1051,6 +1051,7 @@ const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 const ACT_SESSION_DIRNAME = "act";
 const ACT_SESSION_FILENAME = "session.jsonl";
+const ACT_SESSION_MODEL_KEY_FILENAME = "model-key";
 
 function actUsageDelta(after: Usage, before: Usage): Usage {
 	const delta = cloneUsage(after);
@@ -9255,12 +9256,14 @@ export class AgentSession {
 				`rlm.act requires an explicit model at Act depth ${depth} because rlmActDefaultModel has no entry`,
 			);
 		}
+		const selection = await this._resolveActModel(model);
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed || channel.signal.aborted) {
+			return { outcome: "cancelled" };
+		}
+		const sessionKey = `${selection.model.provider}/${selection.model.id}`;
 		let lane = this._actLanes.get(depth);
 		if (!lane) {
-			lane = new ActLane(
-				(tool, model) => this._createActLaneSession(tool, model, depth),
-				(session, model) => this._selectActLaneModel(session, model),
-			);
+			lane = new ActLane();
 			this._actLanes.set(depth, lane);
 		}
 		const actId = randomUUID();
@@ -9273,6 +9276,7 @@ export class AgentSession {
 		const pendingProgress: ActLaneProgress[] = [];
 		let started:
 			| {
+					sessionKey: string;
 					baseline: Usage;
 					model: { provider: string; id: string; name?: string };
 					thinkingLevel: string;
@@ -9291,11 +9295,19 @@ export class AgentSession {
 			const result = await lane.run(
 				payload.prompt,
 				channel,
-				model,
+				{
+					sessionKey,
+					createSession: (tool) => this._createActLaneSession(tool, selection, depth, sessionKey),
+				},
 				(state) => {
 					if (!state.model) throw new Error("Act model selection did not resolve a model");
-					this.sessionManager.appendActStart(actId, state.usage, { depth, parentActId });
+					this.sessionManager.appendActStart(actId, state.usage, {
+						depth,
+						parentActId,
+						sessionKey: state.sessionKey,
+					});
 					started = {
+						sessionKey: state.sessionKey,
 						baseline: state.usage,
 						model: state.model,
 						thinkingLevel: state.thinkingLevel,
@@ -9359,6 +9371,7 @@ export class AgentSession {
 					this.sessionManager.appendActTerminal(actId, status, terminalUsage, {
 						depth,
 						parentActId,
+						sessionKey: started.sessionKey,
 						model: started.model,
 						...(terminalError ? { error: error.text } : {}),
 					});
@@ -9391,24 +9404,101 @@ export class AgentSession {
 		}
 	}
 
-	private _actSessionLocation(depth = 1): { dir: string; file: string } | undefined {
+	private _baseActSessionLocation(depth = 1): { dir: string; file: string } | undefined {
 		const artifactDir = this.sessionManager.getSessionArtifactDir();
 		if (!artifactDir) return undefined;
 		const dir = join(artifactDir, depth === 1 ? ACT_SESSION_DIRNAME : `${ACT_SESSION_DIRNAME}-depth-${depth}`);
 		return { dir, file: join(dir, ACT_SESSION_FILENAME) };
 	}
 
-	private _openActSessionManager(depth = 1): SessionManager {
-		const location = this._actSessionLocation(depth);
+	private _actSessionLocation(
+		depth = 1,
+		sessionKey?: string,
+		claimModel?: { provider: string; id: string },
+	): { dir: string; file: string } | undefined {
+		const base = this._baseActSessionLocation(depth);
+		if (!base || !sessionKey) return base;
+		const marker = join(base.dir, ACT_SESSION_MODEL_KEY_FILENAME);
+		if (existsSync(marker)) {
+			if (readFileSync(marker, "utf8").trim() === sessionKey) return base;
+			return this._qualifiedActSessionLocation(base, sessionKey, claimModel);
+		}
+		if (existsSync(base.file)) {
+			if (!claimModel) return this._qualifiedActSessionLocation(base, sessionKey);
+			const manager = SessionManager.open(base.file, base.dir, this._cwd);
+			const persistedModel = manager
+				.getBranch()
+				.slice()
+				.reverse()
+				.find((entry) => entry.type === "model_change");
+			if (
+				persistedModel?.type === "model_change" &&
+				persistedModel.provider === claimModel.provider &&
+				persistedModel.modelId === claimModel.id
+			) {
+				writeFileSync(marker, `${sessionKey}\n`, { encoding: "utf8", mode: 0o600 });
+				return base;
+			}
+			return this._qualifiedActSessionLocation(base, sessionKey, claimModel);
+		}
+		if (!claimModel) return this._qualifiedActSessionLocation(base, sessionKey);
+		mkdirSync(base.dir, { recursive: true });
+		writeFileSync(marker, `${sessionKey}\n`, { encoding: "utf8", mode: 0o600 });
+		return base;
+	}
+
+	private _qualifiedActSessionLocation(
+		base: { dir: string; file: string },
+		sessionKey: string,
+		claimModel?: { provider: string; id: string },
+	): { dir: string; file: string } {
+		const suffix = createHash("sha256").update(sessionKey).digest("hex").slice(0, 16);
+		const dir = `${base.dir}-model-${suffix}`;
+		const file = join(dir, ACT_SESSION_FILENAME);
+		const marker = join(dir, ACT_SESSION_MODEL_KEY_FILENAME);
+		if (existsSync(marker) && readFileSync(marker, "utf8").trim() !== sessionKey) {
+			throw new Error("Act model session key collision");
+		}
+		if (claimModel && !existsSync(marker)) {
+			if (existsSync(file)) {
+				const manager = SessionManager.open(file, dir, this._cwd);
+				const persistedModel = manager
+					.getBranch()
+					.slice()
+					.reverse()
+					.find((entry) => entry.type === "model_change");
+				if (
+					persistedModel?.type !== "model_change" ||
+					persistedModel.provider !== claimModel.provider ||
+					persistedModel.modelId !== claimModel.id
+				) {
+					throw new Error("Act model session key collision");
+				}
+			}
+			mkdirSync(dir, { recursive: true });
+			writeFileSync(marker, `${sessionKey}\n`, { encoding: "utf8", mode: 0o600 });
+		}
+		return { dir, file };
+	}
+
+	private _openActSessionManager(
+		depth: number,
+		sessionKey: string,
+		model: { provider: string; id: string },
+	): SessionManager {
+		const location = this._actSessionLocation(depth, sessionKey, model);
 		if (!location) return SessionManager.inMemory(this._cwd);
 		return SessionManager.open(location.file, location.dir, this._cwd);
 	}
 
-	private _persistedActState(depth = 1): {
+	private _persistedActState(
+		depth = 1,
+		sessionKey?: string,
+	): {
 		usage: Usage;
 		model?: { provider: string; id: string };
 	} {
-		const location = this._actSessionLocation(depth);
+		const location = this._actSessionLocation(depth, sessionKey);
 		if (!location || !existsSync(location.file)) return { usage: emptyUsage() };
 		const manager = SessionManager.open(location.file, location.dir, this._cwd);
 		const branch = manager.getBranch();
@@ -9434,7 +9524,7 @@ export class AgentSession {
 		if (interrupted.length === 0) return;
 		for (const start of interrupted) {
 			const depth = start.depth ?? 1;
-			const persisted = this._persistedActState(depth);
+			const persisted = this._persistedActState(depth, start.sessionKey);
 			this.sessionManager.appendActTerminal(
 				start.actId,
 				"interrupted",
@@ -9442,6 +9532,7 @@ export class AgentSession {
 				{
 					depth,
 					parentActId: start.parentActId,
+					sessionKey: start.sessionKey,
 					...(persisted.model ? { model: persisted.model } : {}),
 					error: "Act was interrupted before the root session restarted",
 				},
@@ -9456,11 +9547,6 @@ export class AgentSession {
 			throw new Error(`Act model selector "${model}" must resolve to a native model`);
 		}
 		return selection;
-	}
-
-	private async _selectActLaneModel(session: AgentSession, model: string | undefined): Promise<void> {
-		const selection = await this._resolveActModel(model);
-		await session._applyActModelSelection(selection);
 	}
 
 	private async _applyActModelSelection(
@@ -9488,11 +9574,11 @@ export class AgentSession {
 
 	private async _createActLaneSession(
 		tool: AgentTool,
-		requestedModel: string | undefined,
-		depth = 1,
+		selection: NativeRlmSubagentModelSelection,
+		depth: number,
+		sessionKey: string,
 	): Promise<AgentSession> {
-		const selection = await this._resolveActModel(requestedModel);
-		const sessionManager = this._openActSessionManager(depth);
+		const sessionManager = this._openActSessionManager(depth, sessionKey, selection.model);
 		const restored = sessionManager.buildSessionContext();
 		const persistedModel = sessionManager
 			.getBranch()
@@ -12520,7 +12606,11 @@ export class AgentSession {
 		const actNodes = new Map<number, ContextTreeNode>();
 		for (const depth of [...actDepths].sort((left, right) => left - right)) {
 			const lane = this._actLanes.get(depth);
-			const location = this._actSessionLocation(depth);
+			const terminal = branch
+				.slice()
+				.reverse()
+				.find((entry): entry is ActTerminalEntry => entry.type === "act_terminal" && (entry.depth ?? 1) === depth);
+			const location = this._actSessionLocation(depth, terminal?.sessionKey);
 			const liveNode = lane?.contextTree;
 			const diskNode =
 				!liveNode && location && existsSync(location.file)
@@ -12528,10 +12618,6 @@ export class AgentSession {
 					: undefined;
 			const sourceNode = liveNode ?? diskNode;
 			if (!sourceNode) continue;
-			const terminal = branch
-				.slice()
-				.reverse()
-				.find((entry): entry is ActTerminalEntry => entry.type === "act_terminal" && (entry.depth ?? 1) === depth);
 			if (!lane?.running && terminal?.type !== "act_terminal") continue;
 			const usage = emptyUsage();
 			for (const entry of branch) {

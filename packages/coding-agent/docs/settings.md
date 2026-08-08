@@ -86,7 +86,7 @@ modelRoles:
   deepseek: openrouter/deepseek/deepseek-v4-flash-0731:max
 ```
 
-Array index zero supplies depth 1, index one supplies depth 2, and so on. A missing entry requires an explicit `model=` at that depth. An explicit selector overrides the configured entry. Prime Agent rejects calls beyond `rlmActMaxDepth` and calls without a selector before provider or shared-cell work. Each admitted depth retains its own private transcript while every depth shares the root IPython namespace.
+Array index zero supplies depth 1, index one supplies depth 2, and so on. A missing entry requires an explicit `model=` at that depth. An explicit selector overrides the configured entry. Prime Agent rejects calls beyond `rlmActMaxDepth` and calls without a selector before provider or shared-cell work. Each admitted depth retains a private transcript per resolved model while every selector and depth shares the root IPython namespace. Reusing a selector that resolves to the same model resumes its transcript; changing the resolved model never carries one model's conversation into another model's session.
 
 A native child retains its admitted role order for its resident lifetime. A retryable provider failure that occurs before the response produces text, thinking, or tool calls advances immediately to the next available and authenticated candidate. The new candidate uses its configured effort and a fresh same-model retry budget without changing global model or thinking defaults. Prime Agent checks candidate availability and authentication again at the switch. Exact selectors and `claude-code/<model>` children do not use role fallback.
 

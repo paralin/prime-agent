@@ -60,8 +60,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 15 adds capability-gated durable family mailbox commands and receipt metadata.
 // Revision 16 adds the capability-gated nested Act event stream.
 // Revision 17 adds Act model-handoff presentation metadata.
-export const DAEMON_SCHEMA_REVISION = 17;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-17-09a6bc7091f1";
+// Revision 18 adds capability-gated session-only model selection.
+export const DAEMON_SCHEMA_REVISION = 18;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-18-f965887025ce";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -101,7 +102,8 @@ export type DaemonServerCapability =
 	| "transient_bash"
 	| "session_input_admission"
 	| "prompt_admission_cancellation"
-	| "family_mailbox";
+	| "family_mailbox"
+	| "session_model_selection";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -141,6 +143,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_admission",
 	"prompt_admission_cancellation",
 	"family_mailbox",
+	"session_model_selection",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -568,7 +571,14 @@ export type DaemonCommand =
 			promoteOwnedSession?: boolean;
 	  }
 	| { id?: string; type: "heartbeat_update"; activeSessionId: string; action: AgentHeartbeatUpdateAction }
-	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
+	| {
+			id?: string;
+			type: "set_model";
+			activeSessionId: string;
+			provider: string;
+			modelId: string;
+			persistDefault?: boolean;
+	  }
 	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }
 	| { id?: string; type: "set_scoped_models"; activeSessionId: string; scopedModels: AgentConnectionScopedModel[] }
 	| { id?: string; type: "set_thinking_level"; activeSessionId: string; level: ThinkingLevel }

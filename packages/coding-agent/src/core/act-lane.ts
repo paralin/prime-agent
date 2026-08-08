@@ -34,10 +34,13 @@ export interface ActLaneResult {
 	text?: string;
 }
 
-type CreateActSession = (tool: AgentTool, model: string | undefined) => Promise<AgentSession>;
-type SelectActSession = (session: AgentSession, model: string | undefined) => Promise<void>;
+export interface ActLaneTarget {
+	sessionKey: string;
+	createSession(tool: AgentTool): Promise<AgentSession>;
+}
 
 type BeforeActPrompt = (state: {
+	sessionKey: string;
 	usage: Usage;
 	model?: { provider: string; id: string; name?: string };
 	thinkingLevel: string;
@@ -184,9 +187,10 @@ function formatCellResult(result: ActCellResult): string {
 	return sections.join("\n").trim() || "Cell completed without output.";
 }
 
-/** ActLane retains one private model session and serializes its root-world tasks. */
+/** ActLane retains one private session per resolved model and serializes its root-world tasks. */
 export class ActLane {
 	private session: AgentSession | undefined;
+	private readonly sessions = new Map<string, AgentSession>();
 	private creating: Promise<AgentSession> | undefined;
 	private active: ActiveAct | undefined;
 	private readonly idleWaiters = new Set<() => void>();
@@ -194,15 +198,10 @@ export class ActLane {
 	private disposedModel: { provider: string; id: string } | undefined;
 	private disposed = false;
 
-	constructor(
-		private readonly createSession: CreateActSession,
-		private readonly selectSession: SelectActSession,
-	) {}
-
 	async run(
 		prompt: string,
 		channel: HostRequestChannel,
-		model: string | undefined,
+		target: ActLaneTarget,
 		beforePrompt?: BeforeActPrompt,
 		onAdmitted?: () => void,
 		onProgress?: ActProgressHandler,
@@ -241,9 +240,10 @@ export class ActLane {
 		if (channel.interruptSignal?.aborted) interruptFromExecution();
 		try {
 			if (controller.signal.aborted) return { outcome: "cancelled" };
-			const session = await this.getSession(model);
+			const session = await this.getSession(target);
 			if (controller.signal.aborted) return { outcome: "cancelled" };
 			beforePrompt?.({
+				sessionKey: target.sessionKey,
 				usage: usageFromSession(session),
 				model: session.model
 					? { provider: session.model.provider, id: session.model.id, name: session.model.name }
@@ -340,26 +340,30 @@ export class ActLane {
 			this.disposedUsage = usageFromSession(this.session);
 			const model = this.session.model;
 			this.disposedModel = model ? { provider: model.provider, id: model.id } : undefined;
-			if (!cancelledActive) this.session.requestAbort();
-			this.session.dispose();
 		}
+		for (const session of this.sessions.values()) {
+			if (!cancelledActive || session !== this.session) session.requestAbort();
+			session.dispose();
+		}
+		this.sessions.clear();
 		this.session = undefined;
 	}
 
-	private async getSession(model: string | undefined): Promise<AgentSession> {
-		if (this.session) {
-			const session = this.session;
-			await this.selectSession(session, model);
-			if (this.disposed || this.session !== session) throw new Error("Act lane has been disposed");
-			return session;
+	private async getSession(target: ActLaneTarget): Promise<AgentSession> {
+		const retained = this.sessions.get(target.sessionKey);
+		if (retained) {
+			this.session = retained;
+			return retained;
 		}
-		this.creating ??= this.createSession(this.createTool(), model);
+		this.session = undefined;
+		this.creating ??= target.createSession(this.createTool());
 		try {
 			const session = await this.creating;
 			if (this.disposed) {
 				session.dispose();
 				throw new Error("Act lane has been disposed");
 			}
+			this.sessions.set(target.sessionKey, session);
 			this.session = session;
 			return session;
 		} finally {

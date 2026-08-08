@@ -202,6 +202,7 @@ export interface AgentConnectionActStartEntry extends AgentConnectionSessionEntr
 	actId: string;
 	depth?: number;
 	parentActId?: string;
+	sessionKey?: string;
 	usageBaseline: Usage;
 }
 
@@ -210,6 +211,7 @@ export interface AgentConnectionActTerminalEntry extends AgentConnectionSessionE
 	actId: string;
 	depth?: number;
 	parentActId?: string;
+	sessionKey?: string;
 	status: "done" | "cancelled" | "error" | "interrupted";
 	usage: Usage;
 	model?: { provider: string; id: string };

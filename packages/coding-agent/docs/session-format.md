@@ -281,28 +281,32 @@ Reload applies `aggregateUsage` to the target assistant message. Context-tree ac
 
 ### ActStartEntry and ActTerminalEntry
 
-A persisted root records the retained Act lane without placing its messages in the root model context:
+A persisted root records each retained Act depth without placing private lane messages in the root model context:
 
 ```typescript
 interface ActStartEntry extends SessionEntryBase {
   type: "act_start";
   actId: string;
-  usageBaseline: Usage;  // Cumulative private-lane usage before this Act
+  depth?: number;         // Explicit on new entries; absent historical entries mean 1
+  parentActId?: string;   // Immediate calling Act, absent for depth 1
+  usageBaseline: Usage;   // Cumulative usage for this depth lane before this Act
 }
 
 interface ActTerminalEntry extends SessionEntryBase {
   type: "act_terminal";
   actId: string;
+  depth?: number;
+  parentActId?: string;
   status: "done" | "cancelled" | "error" | "interrupted";
-  usage: Usage;          // Selected low-level model delta for this Act
+  usage: Usage;           // Selected model delta for this Act depth
   model?: { provider: string; id: string };
-  error?: string;        // Bounded host/provider description
+  error?: string;         // Bounded host/provider description
 }
 ```
 
-The terminal never contains the returned Python object. On resume, a current-branch start without a terminal is closed once as `interrupted`; the recorded baseline recovers persisted private-lane usage without replaying work. These entries are additive v3 bookkeeping that older readers ignore while traversing the same entry chain, so the session version does not change.
+New writers always include positive `depth`; readers normalize an absent value to depth 1. A depth-N start and terminal repeat the same `parentActId`, while depth 1 omits it. The terminal never contains the returned Python object. On resume, every current-branch start without a terminal is closed once as `interrupted` from its own depth transcript; the baseline recovers persisted usage without provider, request, or cell replay. These fields remain additive v3 bookkeeping, so the session version does not change.
 
-The private lane messages use an ordinary session file at `session-artifacts/<root-session-id>/act/session.jsonl`. They are restored only into the private Act session, whose accepted model changes use ordinary `model_change` entries. Root totals add terminal Act usage separately, leaving Sol's assistant usage and context-window measurement unchanged.
+Depth 1 keeps the compatible private path `session-artifacts/<root-session-id>/act/session.jsonl`. Deeper lanes use `act-depth-N/session.jsonl`. Each file is an ordinary private session with its own accepted `model_change` entries. Root totals add every correlated terminal exactly once, leaving Sol's assistant usage and context-window measurement unchanged.
 
 ### CustomMessageEntry
 

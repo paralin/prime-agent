@@ -3982,7 +3982,6 @@ export class AgentSession {
 			} catch (error) {
 				drainError = error;
 			}
-			}
 			if (this._disposed) {
 				if (actTeardown) await actTeardown;
 				await this._disposeKernelOnce();

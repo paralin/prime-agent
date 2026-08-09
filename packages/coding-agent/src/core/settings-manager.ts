@@ -391,7 +391,7 @@ export class SettingsManager {
 	private globalSettings: Settings;
 	private projectSettings: Settings;
 	private settings: Settings = {};
-	private overrides: Settings = {};
+	private runtimeOverrides: Settings = {};
 	private stopWatching: (() => void) | undefined;
 	private reloadTimer: NodeJS.Timeout | undefined;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
@@ -446,7 +446,10 @@ export class SettingsManager {
 	}
 
 	private refreshMergedSettings(): void {
-		this.settings = deepMergeSettings(deepMergeSettings(this.globalSettings, this.projectSettings), this.overrides);
+		this.settings = deepMergeSettings(
+			deepMergeSettings(this.globalSettings, this.projectSettings),
+			this.runtimeOverrides,
+		);
 	}
 
 	dispose(): void {
@@ -628,7 +631,7 @@ export class SettingsManager {
 
 	/** Apply additional overrides on top of current settings */
 	applyOverrides(overrides: Partial<Settings>): void {
-		this.overrides = deepMergeSettings(this.overrides, overrides);
+		this.runtimeOverrides = deepMergeSettings(this.runtimeOverrides, overrides);
 		this.refreshMergedSettings();
 	}
 

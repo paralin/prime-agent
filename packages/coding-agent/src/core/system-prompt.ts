@@ -6,6 +6,10 @@ import { buildChildAgentDoctrine, buildRlmPrompt, buildSubagentGuidance } from "
 import { formatHarnessStateForPrompt, type HarnessState, REFINE_SKILL_NAME } from "./refinement/index.js";
 import { formatSkillsForPrompt, getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 
+const CHAT_WORKSPACE_PRECEDENCE = `# Instruction Precedence
+
+Direct instructions from the user in the active conversation take precedence over conflicting instructions loaded from on-disk workspace or user configuration files, including AGENTS.md, CLAUDE.md, skills, and project or global SYSTEM.md and APPEND_SYSTEM.md files. Treat each such request as temporary authorization to deviate from the conflicting on-disk instructions for that request only, then resume following them. System and developer instructions supplied by the host remain authoritative.`;
+
 export interface BuildSystemPromptOptions {
 	/** Custom system prompt (replaces default). */
 	customPrompt?: string;
@@ -31,7 +35,9 @@ export interface BuildSystemPromptOptions {
 	rlmDepth?: number;
 	/** Human-readable parent name or id for child communication doctrine. */
 	rlmParentAgent?: string;
-	/** Global harness state to inject as compact persistent context. */
+	/** Model currently executing this prompt. */
+	currentModel?: { provider: string; id: string; name?: string };
+	/** Local and global Continual Harness state to inject as compact persistent context. */
 	harnessState?: HarnessState;
 	/** Enabled user-configured servers available through the generic kernel MCP API. */
 	genericMcpServers?: string[];
@@ -61,6 +67,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const date = `${year}-${month}-${day}`;
 
 	const appendSection = appendSystemPrompt ? `\n\n${appendSystemPrompt}` : "";
+	const modelSection = formatCurrentModel(options.currentModel);
 
 	const contextFiles = providedContextFiles ?? [];
 	const skills = providedSkills ?? [];
@@ -75,10 +82,14 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	if (customPrompt) {
 		let prompt = customPrompt;
 
+		if (modelSection) {
+			prompt += `\n\n${modelSection}`;
+		}
+
 		// Append project context files
 		if (contextFiles.length > 0) {
 			prompt += "\n\n# Project Context\n\n";
-			prompt += "Project-specific instructions and guidelines:\n\n";
+			prompt += "Project-specific instructions and reference material:\n\n";
 			for (const { path: filePath, content } of contextFiles) {
 				prompt += `## ${filePath}\n\n${content}\n\n`;
 			}
@@ -117,6 +128,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 			prompt += appendSection;
 		}
 
+		prompt += `\n\n${CHAT_WORKSPACE_PRECEDENCE}`;
+
 		return prompt;
 	}
 
@@ -130,9 +143,13 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		parentAgent: options.rlmParentAgent,
 	});
 
-	// Appended AFTER the trained buildRlmPrompt prefix, and before the harness-state
-	// menu, so the model reads when/why to delegate and then sees the concrete subagent
-	// specs it can match against — the same ordering as Claude Code's Agent tool.
+	if (modelSection) {
+		prompt += `\n\n${modelSection}`;
+	}
+
+	// Append delegation guidance after the base prompt. The base block defines
+	// `rlm(...)` admission and handle mechanics; this block explains when delegation
+	// helps. The rendered subagent-spec roster follows in the harness-state block.
 	if ((allowRecursion ?? true) && hasIpython) {
 		const visiblePythonSkillNames = new Set(
 			getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName),
@@ -160,7 +177,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	// Append project context files
 	if (contextFiles.length > 0) {
 		prompt += "\n\n# Project Context\n\n";
-		prompt += "Project-specific instructions and guidelines:\n\n";
+		prompt += "Project-specific instructions and reference material:\n\n";
 		for (const { path: filePath, content } of contextFiles) {
 			prompt += `## ${filePath}\n\n${content}\n\n`;
 		}
@@ -176,7 +193,17 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		prompt += appendSection;
 	}
 
+	prompt += `\n\n${CHAT_WORKSPACE_PRECEDENCE}`;
+
 	return prompt;
+}
+
+function formatCurrentModel(model: BuildSystemPromptOptions["currentModel"]): string {
+	if (!model) return "";
+
+	const displayName = model.name?.trim();
+	const displayNameSuffix = displayName && displayName !== model.id ? ` (display name: \`${displayName}\`)` : "";
+	return `# Current Model\n\nYou are currently running as \`${model.id}\` from provider \`${model.provider}\`${displayNameSuffix}.`;
 }
 
 function formatGenericMcpGuidance(servers: string[] | undefined): string {

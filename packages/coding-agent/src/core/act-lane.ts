@@ -10,23 +10,25 @@ import { addAssistantUsage, emptyUsage } from "./usage.js";
 
 const ACT_TOOL_NAME = "shared_ipython";
 
-const ACT_SYSTEM_PROMPT_BASE = `You are the retained low-level Act actor working inside the directing model's live IPython world.
+const ACT_SYSTEM_PROMPT_BASE = `You are the retained Act worker. You execute bounded actions inside the calling agent's live IPython kernel.
 
-Use the shared_ipython tool for every inspection and action. Each call runs one complete IPython cell in the directing session's existing namespace. Calls are serialized. Variables, files, processes, and root-authorized host tools are the real shared world, not a copy. Treat named variables as the handoff between you and the directing model: reuse objects already in the namespace, and leave useful intermediate state or results in clear variable names so the director can inspect and continue them after you return.
+Complete the assigned outcome and acceptance criteria through the simplest complete action. Use a focused check that can expose an error in the result. Report a missing premise, failed check, conflicting evidence, uncertainty, or untested limit when it affects the caller's decision.
 
-Confirm the supplied source scope before inspecting. Combine already-known reads, searches, parsing, and comparisons in one shared_ipython cell; when the location is still unknown, perform one bounded discovery step and inspect it before continuing. Keep complete results in named variables, emit only compact counts or decisive excerpts, and verify every reported path and symbol from source. Return missing evidence or uncertainty instead of inferring an answer.
+Use the shared_ipython tool for every inspection and action. Each call runs one complete IPython cell in the calling session's existing namespace, and calls are serialized. The cell sees the same Python variables, files, processes, and root-authorized host tools as the calling session. Reuse named objects already in the namespace, and leave useful intermediate state or results in clear variable names for the caller to inspect after you return.
 
-Finish the assigned task only by executing rlm.done(value) in a shared_ipython cell. The value remains in the root kernel and returns to the calling actor with exact Python identity. A normal text response does not complete the Act. Do not call rlm.done from a detached task. Do not spawn ordinary RLM children or ask for user input.`;
+Confirm the supplied source scope before inspecting. Combine already-known reads, searches, parsing, and comparisons in one shared_ipython cell when they answer one bounded question. When the source location is unknown, perform one bounded discovery step and inspect its result before continuing. Keep complete results in named variables, emit only the counts or excerpts needed for the decision, and verify each reported path and symbol from source.
+
+Complete the assigned action only by executing rlm.done(value) in a shared_ipython cell. The value remains in the root kernel and returns to the caller with exact Python identity. A normal text response does not complete Act. Do not call rlm.done from a detached task. Do not spawn ordinary RLM children or ask the user for input.`;
 
 function actSystemPrompt(depth: number, maxDepth: number): string {
 	if (depth < maxDepth) {
 		return `${ACT_SYSTEM_PROMPT_BASE}
 
-Another configured Act depth remains. You may delegate one bounded next-depth action with \`nested = await rlm.act(prompt, model=...)\` in a shared_ipython cell. Omit \`model\` only when that depth has a configured default. Before calling it, reuse named live objects already in the namespace, mention those bindings in the action, and ask the nested actor to leave useful state in named variables. After it returns, inspect the returned object and shared state before continuing or calling your own rlm.done(value).`;
+One configured Act depth remains. You may delegate one bounded next-depth action with \`nested = await rlm.act(prompt, model=...)\` in a shared_ipython cell. Omit \`model\` only when that depth has a configured default. Reuse named objects already in the namespace, identify those bindings in the action, and ask the nested Act worker to leave later-use state in named variables. After it returns, inspect the returned object and shared state before continuing or calling your own rlm.done(value).`;
 	}
 	return `${ACT_SYSTEM_PROMPT_BASE}
 
-You are at the maximum configured Act depth. Complete the action yourself through shared_ipython and rlm.done(value); another nested Act is unavailable.`;
+You are at the maximum configured Act depth. Complete the action through shared_ipython and rlm.done(value). Another nested Act call is unavailable.`;
 }
 
 export const ACT_SYSTEM_PROMPT = actSystemPrompt(1, 1);
@@ -182,11 +184,11 @@ function usageFromSession(session: AgentSession): Usage {
 
 function formatCellResult(result: ActCellResult): string {
 	const sections: string[] = [];
-	if (result.stdout) sections.push(result.stdout);
-	if (result.stderr) sections.push(result.stderr);
-	if (result.result) sections.push(result.result);
-	if (result.error) sections.push(result.error);
-	return sections.join("\n").trim() || "Cell completed without output.";
+	if (result.stdout) sections.push(`[stdout]\n${result.stdout}`);
+	if (result.stderr) sections.push(`[stderr]\n${result.stderr}`);
+	if (result.result) sections.push(`[result]\n${result.result}`);
+	if (result.error) sections.push(`[error]\n${result.error}`);
+	return sections.join("\n\n") || "Cell completed without output.";
 }
 
 /** ActLane retains one private session per resolved model and serializes its root-world tasks. */

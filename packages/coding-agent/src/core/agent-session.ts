@@ -1083,7 +1083,7 @@ function autoRefineInstructions(reason: AutoRefineReason, review: AutoRefineRevi
 		? `
 Reviewer instructions: ${review.instructions}`
 		: "";
-	return `Automatic refine review triggered by ${reason}. Only create/update/delete local harness entries if there is clear evidence that should help this session continue. Prefer an empty edits array over speculative or one-off memories. Do not promote anything global unless explicitly requested. Reviewer rationale: ${review.rationale}${detail}`;
+	return `Automatic refinement review triggered by ${reason}. Create, update, or delete a local Continual Harness entry only when the trajectory contains concrete evidence that it should affect a later action in this session. Leave the edits array empty for speculative or one-off material. Global state requires an explicit request. Reviewer rationale: ${review.rationale}${detail}`;
 }
 
 function isNonNegativeInteger(value: unknown): value is number {
@@ -7530,9 +7530,10 @@ export class AgentSession {
 		const settings = this.settingsManager.getCompactionSettings();
 		const supportsNativeCompaction = settings.native && getApiProvider(model.api)?.compact !== undefined;
 		const portablePreparation = prepareCompaction(pathEntries, settings);
-		const nativePreparation = supportsNativeCompaction
-			? prepareCompaction(pathEntries, settings, model.provider)
-			: undefined;
+		const nativePreparation =
+			supportsNativeCompaction && !customInstructions
+				? prepareCompaction(pathEntries, settings, model.provider)
+				: undefined;
 		const hookPreparation = portablePreparation ?? nativePreparation;
 
 		if (!hookPreparation) {
@@ -7569,15 +7570,7 @@ export class AgentSession {
 		let nativeCompactionError: unknown;
 		if (!extensionCompaction && nativePreparation) {
 			try {
-				coreCompaction = await compactNative(
-					nativePreparation,
-					model,
-					apiKey,
-					headers,
-					customInstructions,
-					signal,
-					this.sessionId,
-				);
+				coreCompaction = await compactNative(nativePreparation, model, apiKey, headers, signal, this.sessionId);
 			} catch (error) {
 				if (signal.aborted) throw error;
 				nativeCompactionError = error;

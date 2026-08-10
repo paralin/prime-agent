@@ -75,6 +75,7 @@ import {
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
 	createAgentMessageHostHandlers,
+	DEFAULT_AGENT_MESSAGE_MAX_CHARS,
 	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 	normalizeAgentSessionMessage,
@@ -5510,17 +5511,21 @@ export class AgentSession {
 		};
 	}
 
-	private _coalescedFollowUpOwner(action: QueuedSessionAction): QueuedSessionAction | undefined {
-		if (action.delivery !== "when_run_idle" || action.payload.kind !== "turn" || !action.queueKey) return undefined;
-		return this._actionStore
-			.unfinishedActions()
-			.find(
-				(candidate) =>
-					candidate.queueKey === action.queueKey &&
-					(candidate.lifecycle.state === "queued" ||
-						candidate.lifecycle.state === "selected" ||
-						candidate.lifecycle.state === "preparing"),
+	private _coalescedActionOwner(
+		action: QueuedSessionAction,
+		coalesceByQueueKey: boolean,
+	): QueuedSessionAction | undefined {
+		if (action.payload.kind !== "turn" || !action.queueKey) return undefined;
+		if (!coalesceByQueueKey && action.delivery !== "when_run_idle") return undefined;
+		return this._actionStore.unfinishedActions().find((candidate) => {
+			if (candidate.queueKey !== action.queueKey) return false;
+			if (coalesceByQueueKey) return true;
+			return (
+				candidate.lifecycle.state === "queued" ||
+				candidate.lifecycle.state === "selected" ||
+				candidate.lifecycle.state === "preparing"
 			);
+		});
 	}
 
 	private _assertSessionActionAdmissionAvailable(): void {
@@ -5539,6 +5544,7 @@ export class AgentSession {
 			front?: boolean;
 			wake?: boolean;
 			immediatelyEligible?: boolean;
+			coalesceByQueueKey?: boolean;
 		} = {},
 	): {
 		accepted: boolean;
@@ -5548,7 +5554,9 @@ export class AgentSession {
 		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
-		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
+		const coalescedOwner = options.restore
+			? undefined
+			: this._coalescedActionOwner(action, options.coalesceByQueueKey === true);
 		if (coalescedOwner) {
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
 				this._rejectAgentMessage(
@@ -5601,13 +5609,16 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			coalesceByQueueKey?: boolean;
 		} = {},
 	): Promise<boolean> {
 		const action = this._createPreparedTurnAction(schedule, text, images, options);
 		if (action.suppressAutonomousContinuation) {
 			this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 		}
-		return this._admitSessionInput(action).accepted;
+		return this._admitSessionInput(action, {
+			coalesceByQueueKey: options.coalesceByQueueKey,
+		}).accepted;
 	}
 
 	private _runtimeActivity(): RuntimeActivity {
@@ -9572,6 +9583,54 @@ export class AgentSession {
 		return session;
 	}
 
+	/** Admit one kernel-originated external text event into this session. */
+	async handleSessionMessageHostRequest(
+		type: string,
+		payload: Record<string, unknown> = {},
+	): Promise<Record<string, unknown>> {
+		if (type !== "session_message.send") {
+			throw new Error(`unknown session message request type "${type}"`);
+		}
+		if (typeof payload.message !== "string") {
+			throw new Error("session_message.send message must be a string");
+		}
+		if (typeof payload.key !== "string") {
+			throw new Error("session_message.send key must be a string");
+		}
+		if (!payload.message.trim()) {
+			throw new Error("session_message.send message cannot be empty");
+		}
+		if (payload.message.length > DEFAULT_AGENT_MESSAGE_MAX_CHARS) {
+			throw new Error(
+				`session_message.send message is too long: ${payload.message.length} characters exceeds ${DEFAULT_AGENT_MESSAGE_MAX_CHARS}`,
+			);
+		}
+		const message = payload.message;
+		const key = payload.key.trim();
+		if (!key) {
+			throw new Error("session_message.send key cannot be empty");
+		}
+		if (key.length > 512) {
+			throw new Error("session_message.send key is too long: maximum is 512 characters");
+		}
+		const queued =
+			this.isStreaming ||
+			this._isBusyForSessionInput("preflight") ||
+			this._actionStore.unfinishedActions().length > 0;
+		const accepted = await this._queuePreparedPrompt("steer", message, undefined, {
+			queueKey: key,
+			resumeIfIdle: true,
+			suppressAutonomousContinuation: true,
+			source: "internal",
+			coalesceByQueueKey: true,
+		});
+		return {
+			accepted: true,
+			deliveryStatus: accepted ? (queued ? "queued" : "delivered") : "coalesced",
+			key,
+		};
+	}
+
 	/** Typed handlers for host requests arriving from the IPython kernel comm bridge. */
 	private _createKernelHostHandlers(): HostRequestHandlers {
 		const handlers: HostRequestHandlers = {
@@ -9586,6 +9645,8 @@ export class AgentSession {
 				provider: this.model?.provider ?? null,
 				input: this.model?.input ?? [],
 			}),
+			"session_message.send": async (payload) =>
+				this.handleSessionMessageHostRequest("session_message.send", payload),
 		};
 		if (this._rlmDepth === 0) {
 			handlers["rlm.act"] = async (payload, signal, channel) => this._runAct(payload, signal, channel);

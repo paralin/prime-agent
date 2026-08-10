@@ -17,6 +17,7 @@ import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ExtensionAPI } from "../src/index.js";
 import { createHarness } from "./suite/harness.js";
+import { withStreaming } from "./suite/scheduling.js";
 
 function resolveKernelPython(): string | null {
 	const candidates = [
@@ -71,6 +72,32 @@ describeIfKernel("AgentSession Act integration", { tags: ["kernel-heavy"] }, () 
 		if (priorForkserver === undefined) delete process.env.PRIME_AGENT_KERNEL_FORKSERVER;
 		else process.env.PRIME_AGENT_KERNEL_FORKSERVER = priorForkserver;
 	});
+
+	it("coalesces stable session event keys across a live kernel module reload", async () => {
+		const harness = await createHarness();
+		try {
+			withStreaming(harness, true);
+			const ipython = harness.session.agent.state.tools.find((tool) => tool.name === "ipython");
+			if (!ipython) throw new Error("root session has no IPython tool");
+			const result = await ipython.execute("session-message-host-request", {
+				code: `import importlib as _importlib
+import json as _json
+import rlm as _rlm
+_first = await _rlm.host_request("session_message.send", {"key": "matrix:$kernel", "message": "literal /compact first"})
+_rlm = _importlib.reload(_rlm)
+_second = await _rlm.host_request("session_message.send", {"key": "matrix:$kernel", "message": "duplicate after reload"})
+print(_json.dumps([_first, _second], sort_keys=True))`,
+			});
+			expect(result.content.find((content) => content.type === "text")?.text).toContain(
+				'"deliveryStatus": "coalesced"',
+			);
+			expect(harness.session.getSteeringMessages()).toEqual(["literal /compact first"]);
+			withStreaming(harness, false);
+			harness.session.clearQueue();
+		} finally {
+			harness.cleanup();
+		}
+	}, 60_000);
 
 	it("returns the exact shared object through an explicitly selected retained model", async () => {
 		const provider = "faux-act-kernel";

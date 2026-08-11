@@ -205,10 +205,15 @@ describe("Claude Code runtime", () => {
 			tools: ["Read", "Edit"],
 			disallowedTools: ["Agent", "Task", "SendMessage"],
 		});
-		expect(CLAUDE_CODE_COORDINATION_PROMPT).toContain("simplest complete approach");
+		expect(CLAUDE_CODE_COORDINATION_PROMPT).toContain("Deliver the assigned outcome");
+		expect(CLAUDE_CODE_COORDINATION_PROMPT).toContain("highest-leverage familiar approach");
+		expect(CLAUDE_CODE_COORDINATION_PROMPT).toContain("Decide reversible questions yourself");
+		expect(CLAUDE_CODE_COORDINATION_PROMPT).toContain("scale checking to the consequence and reversibility");
+		expect(CLAUDE_CODE_COORDINATION_PROMPT).toContain("Preserve the supplied authority and safety boundaries");
 		expect(CLAUDE_CODE_COORDINATION_PROMPT).toContain(
 			"Report material failed checks, conflicting evidence, uncertainty",
 		);
+		expect(CLAUDE_CODE_COORDINATION_PROMPT).toContain("only when it affects that decision");
 		await expect(harness.input().next()).resolves.toEqual({ done: false, value: "initial task" });
 		harness.events.push({
 			kind: "init",

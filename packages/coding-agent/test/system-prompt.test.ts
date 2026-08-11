@@ -51,14 +51,13 @@ describe("buildRlmPrompt", () => {
 		expect(ACT_SYSTEM_PROMPT).toContain("Reuse named objects already in the namespace");
 		expect(ACT_SYSTEM_PROMPT).toContain("leave useful intermediate state or results in clear variable names");
 		expect(ACT_SYSTEM_PROMPT).toContain("perform one bounded discovery step");
-		expect(ACT_SYSTEM_PROMPT).toContain("verify each reported path and symbol from source");
+		expect(ACT_SYSTEM_PROMPT).toContain("report only paths and symbols you read");
 		expect(ACT_SYSTEM_PROMPT).toContain(
 			"Report a missing premise, failed check, conflicting evidence, uncertainty, or untested limit",
 		);
-		expect(ACT_SYSTEM_PROMPT).toContain("Use a focused check that can expose an error");
-		expect(ACT_SYSTEM_PROMPT).toContain(
-			"Complete the assigned outcome and acceptance criteria through the simplest complete action",
-		);
+		expect(ACT_SYSTEM_PROMPT).toContain("scale checking to the consequence and reversibility");
+		expect(ACT_SYSTEM_PROMPT).toContain("Deliver the assigned outcome through the simplest complete action");
+		expect(ACT_SYSTEM_PROMPT).not.toContain("Confirm the supplied source scope before inspecting");
 	});
 	test("exposes nested Act only while configured depth remains", () => {
 		const nested = createActResourceLoader({ depth: 1, maxDepth: 2 }).getSystemPrompt();
@@ -81,14 +80,43 @@ describe("buildRlmPrompt", () => {
 			allowRecursion: false,
 		});
 
-		expect(prompt).toContain("You are a capable general-purpose agent.");
-		expect(prompt).toContain("Choose the simplest complete approach");
-		expect(prompt).toContain("Use the smallest safe check");
+		expect(prompt).toContain("You are a capable general-purpose agent with standing authority to decide and act.");
+		expect(prompt).toContain("take the highest-leverage path to it");
+		expect(prompt).toContain("Prefer a familiar, simple design");
+		expect(prompt).toContain("Decide a reversible question yourself and keep moving");
+		expect(prompt).toContain("Scale investigation and verification to the consequence and reversibility");
+		expect(prompt).toContain("Ground a consequential claim in something you checked");
+		expect(prompt).toContain("keep only the evidence that can change a decision");
 		expect(prompt).toContain(`Pre-installed Python packages: ${DEFAULT_RLM_EXTRA_IMPORT_LABELS.join(", ")}.`);
 		expect(prompt).toContain("Installed Python-backed skill modules (pre-imported): `websearch`, `refine`.");
 		expect(prompt).toContain("IPython is Prime Agent's persistent Python control environment");
 		expect(prompt).toContain("Continual Harness state is available through `rlm.harness`");
 		expect(prompt).not.toContain("A callable `rlm` is already in your global namespace");
+	});
+
+	test("keeps the approval boundaries and authority hierarchy in the base posture", () => {
+		const prompt = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/.pi/sessions/session.jsonl",
+			activeTools: ["ipython"],
+			allowRecursion: false,
+		});
+
+		expect(prompt).toContain(
+			"Get explicit approval before accessing secrets or credentials, destroying durable data, or publishing, releasing, or deploying.",
+		);
+		expect(prompt).toContain("Preserve security, authentication, authorization, and confidentiality boundaries");
+		expect(prompt).toContain("durable-data, security, and release work earns proportionate proof");
+		expect(prompt).toContain(
+			"Report material failed checks, conflicting evidence, uncertainty, and untested limits that affect what happens next.",
+		);
+		expect(prompt).toContain(
+			"Follow system and developer instructions, including applicable project and repository instructions they supply, before user requests.",
+		);
+		expect(prompt).toContain(
+			"Include a tradeoff, remaining risk, or next action only when it changes what the user should do.",
+		);
+		expect(prompt).not.toContain("user instructions, which outrank project and repository instructions");
 	});
 
 	test("defaults omitted activeTools to ipython guidance", () => {
@@ -491,7 +519,7 @@ describe("buildSystemPrompt", () => {
 			messagesPath: "/repo/.pi/sessions/session.jsonl",
 		});
 
-		expect(prompt).toContain("You are a capable general-purpose agent.");
+		expect(prompt).toContain("You are a capable general-purpose agent with standing authority to decide and act.");
 		expect(prompt).toContain("Working directory: /repo");
 		expect(prompt).toContain("Conversation log: /repo/.pi/sessions/session.jsonl");
 		expect(prompt).toContain("await rlm('sub-task')");
@@ -543,7 +571,7 @@ describe("buildSystemPrompt", () => {
 			harnessState,
 		});
 
-		expect(prompt).toContain("You are a capable general-purpose agent.");
+		expect(prompt).toContain("You are a capable general-purpose agent with standing authority to decide and act.");
 		expect(prompt).toContain("# Continual Harness State");
 		expect(prompt).toContain(
 			"Call contract: use an installed skill as a shell command only when its SKILL.md documents a CLI",

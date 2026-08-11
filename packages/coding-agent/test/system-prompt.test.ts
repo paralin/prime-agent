@@ -56,6 +56,7 @@ describe("buildRlmPrompt", () => {
 			"Report a missing premise, failed check, conflicting evidence, uncertainty, or untested limit",
 		);
 		expect(ACT_SYSTEM_PROMPT).toContain("Use a focused check that can expose an error");
+		expect(ACT_SYSTEM_PROMPT).toContain("The current run prompt is your sole active assignment");
 		expect(ACT_SYSTEM_PROMPT).toContain(
 			"Complete the assigned outcome and acceptance criteria through the simplest complete action",
 		);

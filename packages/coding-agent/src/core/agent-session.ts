@@ -60,6 +60,7 @@ import {
 	type ActProjectionEvent,
 	truncateActEventText,
 } from "./act-events.js";
+import { buildActCallerHistory } from "./act-history-snapshot.js";
 import { ActLane, type ActLaneProgress, createActResourceLoader } from "./act-lane.js";
 import {
 	AGENT_MESSAGE_CUSTOM_TYPE,
@@ -9261,6 +9262,23 @@ export class AgentSession {
 		if (this._disposed || this._disposing || this._disposalAdmissionClosed || channel.signal.aborted) {
 			return { outcome: "cancelled" };
 		}
+		const rootBranch = this.sessionManager.getBranch();
+		const previousAct = rootBranch
+			.slice()
+			.reverse()
+			.find((entry) => entry.type === "act_start" && (entry.depth ?? 1) === depth);
+		const callerEntries = parent?.lane.callerHistoryEntries ?? rootBranch;
+		const callerHistory = buildActCallerHistory(
+			callerEntries,
+			channel.outerToolCallId,
+			previousAct?.type === "act_start" ? previousAct.outerToolCallId : undefined,
+		);
+		if (callerHistory.images.length > 0 && !selection.model.input.includes("image")) {
+			throw new Error(
+				"rlm.act caller-history transfer requires an image-capable model after the first call at a depth",
+			);
+		}
+		const historyImages = callerHistory.images;
 		const sessionKey = `${selection.model.provider}/${selection.model.id}`;
 		let lane = this._actLanes.get(depth);
 		if (!lane) {
@@ -9306,6 +9324,7 @@ export class AgentSession {
 						depth,
 						parentActId,
 						sessionKey: state.sessionKey,
+						outerToolCallId,
 					});
 					started = {
 						sessionKey: state.sessionKey,
@@ -9354,6 +9373,7 @@ export class AgentSession {
 					if (!started) pendingProgress.push(progress);
 					else this._emitActProgress(actId, depth, parentActId, outerToolCallId, ++sequence, progress);
 				},
+				historyImages,
 			);
 			status = result.outcome === "done" ? "done" : result.outcome === "cancelled" ? "cancelled" : "error";
 			if (result.outcome === "text") terminalError = "Act ended without calling rlm.done()";

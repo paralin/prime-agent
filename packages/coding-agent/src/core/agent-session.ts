@@ -75,7 +75,6 @@ import {
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
 	createAgentMessageHostHandlers,
-	DEFAULT_AGENT_MESSAGE_MAX_CHARS,
 	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 	normalizeAgentSessionMessage,
@@ -179,6 +178,18 @@ import {
 } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
 import {
+	createExternalEventHostHandler,
+	EXTERNAL_EVENT_CUSTOM_TYPE,
+	EXTERNAL_EVENT_MAX_PENDING,
+	EXTERNAL_EVENT_PREVIEW_LABEL,
+	type ExternalEventDeliveryStatus,
+	type ExternalEventDetails,
+	type ExternalEventInput,
+	ExternalEventRegistry,
+	externalEventQueueKey,
+	isExternalEventQueueKey,
+} from "./external-events.js";
+import {
 	createGoalContextMessage,
 	emptyGoalState,
 	GOAL_CONTEXT_CUSTOM_TYPE,
@@ -275,6 +286,7 @@ import { RootForegroundLease } from "./root-foreground-lease.js";
 import {
 	ActionStore,
 	type ActionTicket,
+	type AdmissionDisposition,
 	canSelectSessionAction,
 	type DeliveryPolicy,
 	type DeliveryRecord,
@@ -923,6 +935,8 @@ function injectedMessagePreviewLabel(message: CustomMessage): string | undefined
 			return HEARTBEAT_PROMPT_PREVIEW_LABEL;
 		case GOAL_CONTEXT_CUSTOM_TYPE:
 			return GOAL_CONTEXT_PREVIEW_LABEL;
+		case EXTERNAL_EVENT_CUSTOM_TYPE:
+			return EXTERNAL_EVENT_PREVIEW_LABEL;
 		default:
 			return undefined;
 	}
@@ -1209,6 +1223,10 @@ export class AgentSession {
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
 	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
+	private readonly _externalEventRegistry = new ExternalEventRegistry();
+	private readonly _externalEventHostHandler = createExternalEventHostHandler(this._externalEventRegistry, (event) =>
+		this._admitExternalEvent(event),
+	);
 	private _sessionInputPump: Promise<void> = Promise.resolve();
 	// Coalesces wakes so overlapping submissions cannot start competing pumps.
 	private _sessionInputPumpRequested = false;
@@ -4767,7 +4785,7 @@ export class AgentSession {
 		text: string,
 		message: CustomMessage,
 		options?: InternalPromptOptions & { executionPolicy?: TurnExecutionPolicy },
-	): Promise<void> {
+	): Promise<AdmissionDisposition | undefined> {
 		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
 		const admissionFence = await this._acquireDirectTurnAdmissionFence(options?.signal).catch((error: unknown) => {
 			throwIfPromptAdmissionCancelled(options?.signal);
@@ -4811,7 +4829,7 @@ export class AgentSession {
 			if (!result.accepted || !result.ticket) {
 				if (prefixMessages) this._pendingNextTurnMessages.unshift(...prefixMessages);
 				reportPreflight(false, false);
-				return;
+				return undefined;
 			}
 			if (result.disposition === "queued") {
 				reportPreflight(true, true);
@@ -4823,10 +4841,11 @@ export class AgentSession {
 			}
 			if (options?.returnAfterAccepted) {
 				if (result.disposition === "starts_when_admitted") await result.ticket.delivered;
-				return;
+				return result.disposition;
 			}
-			if (visibleQueued) return;
+			if (visibleQueued) return result.disposition;
 			await result.ticket.completed;
+			return result.disposition;
 		} catch (error) {
 			reportPreflight(false);
 			throw error;
@@ -5511,21 +5530,17 @@ export class AgentSession {
 		};
 	}
 
-	private _coalescedActionOwner(
-		action: QueuedSessionAction,
-		coalesceByQueueKey: boolean,
-	): QueuedSessionAction | undefined {
-		if (action.payload.kind !== "turn" || !action.queueKey) return undefined;
-		if (!coalesceByQueueKey && action.delivery !== "when_run_idle") return undefined;
-		return this._actionStore.unfinishedActions().find((candidate) => {
-			if (candidate.queueKey !== action.queueKey) return false;
-			if (coalesceByQueueKey) return true;
-			return (
-				candidate.lifecycle.state === "queued" ||
-				candidate.lifecycle.state === "selected" ||
-				candidate.lifecycle.state === "preparing"
+	private _coalescedFollowUpOwner(action: QueuedSessionAction): QueuedSessionAction | undefined {
+		if (action.delivery !== "when_run_idle" || action.payload.kind !== "turn" || !action.queueKey) return undefined;
+		return this._actionStore
+			.unfinishedActions()
+			.find(
+				(candidate) =>
+					candidate.queueKey === action.queueKey &&
+					(candidate.lifecycle.state === "queued" ||
+						candidate.lifecycle.state === "selected" ||
+						candidate.lifecycle.state === "preparing"),
 			);
-		});
 	}
 
 	private _assertSessionActionAdmissionAvailable(): void {
@@ -5544,7 +5559,6 @@ export class AgentSession {
 			front?: boolean;
 			wake?: boolean;
 			immediatelyEligible?: boolean;
-			coalesceByQueueKey?: boolean;
 		} = {},
 	): {
 		accepted: boolean;
@@ -5554,9 +5568,7 @@ export class AgentSession {
 		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
-		const coalescedOwner = options.restore
-			? undefined
-			: this._coalescedActionOwner(action, options.coalesceByQueueKey === true);
+		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
 				this._rejectAgentMessage(
@@ -5565,6 +5577,13 @@ export class AgentSession {
 				);
 			}
 			return { accepted: false, disposition: "queued" };
+		}
+		if (
+			isExternalEventQueueKey(action.queueKey) &&
+			this._actionStore.unfinishedActions().filter((candidate) => isExternalEventQueueKey(candidate.queueKey))
+				.length >= EXTERNAL_EVENT_MAX_PENDING
+		) {
+			throw new Error(`session.external_event.emit queue is full: maximum is ${EXTERNAL_EVENT_MAX_PENDING} events`);
 		}
 		const canStartImmediately =
 			options.immediatelyEligible === true &&
@@ -5609,16 +5628,13 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
-			coalesceByQueueKey?: boolean;
 		} = {},
 	): Promise<boolean> {
 		const action = this._createPreparedTurnAction(schedule, text, images, options);
 		if (action.suppressAutonomousContinuation) {
 			this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 		}
-		return this._admitSessionInput(action, {
-			coalesceByQueueKey: options.coalesceByQueueKey,
-		}).accepted;
+		return this._admitSessionInput(action).accepted;
 	}
 
 	private _runtimeActivity(): RuntimeActivity {
@@ -6807,6 +6823,7 @@ export class AgentSession {
 	private _closeDisposalAdmission(): void {
 		if (this._disposalAdmissionClosed) return;
 		this._disposalAdmissionClosed = true;
+		this._externalEventRegistry.dispose();
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
@@ -9583,52 +9600,33 @@ export class AgentSession {
 		return session;
 	}
 
-	/** Admit one kernel-originated external text event into this session. */
-	async handleSessionMessageHostRequest(
-		type: string,
-		payload: Record<string, unknown> = {},
-	): Promise<Record<string, unknown>> {
-		if (type !== "session_message.send") {
-			throw new Error(`unknown session message request type "${type}"`);
-		}
-		if (typeof payload.message !== "string") {
-			throw new Error("session_message.send message must be a string");
-		}
-		if (typeof payload.key !== "string") {
-			throw new Error("session_message.send key must be a string");
-		}
-		if (!payload.message.trim()) {
-			throw new Error("session_message.send message cannot be empty");
-		}
-		if (payload.message.length > DEFAULT_AGENT_MESSAGE_MAX_CHARS) {
-			throw new Error(
-				`session_message.send message is too long: ${payload.message.length} characters exceeds ${DEFAULT_AGENT_MESSAGE_MAX_CHARS}`,
-			);
-		}
-		const message = payload.message;
-		const key = payload.key.trim();
-		if (!key) {
-			throw new Error("session_message.send key cannot be empty");
-		}
-		if (key.length > 512) {
-			throw new Error("session_message.send key is too long: maximum is 512 characters");
-		}
-		const queued =
-			this.isStreaming ||
-			this._isBusyForSessionInput("preflight") ||
-			this._actionStore.unfinishedActions().length > 0;
-		const accepted = await this._queuePreparedPrompt("steer", message, undefined, {
-			queueKey: key,
-			resumeIfIdle: true,
-			suppressAutonomousContinuation: true,
-			source: "internal",
-			coalesceByQueueKey: true,
-		});
-		return {
-			accepted: true,
-			deliveryStatus: accepted ? (queued ? "queued" : "delivered") : "coalesced",
-			key,
-		};
+	/** Admit one authenticated session-local external event through the session input owner. */
+	async handleExternalEventHostRequest(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+		return this._externalEventHostHandler(payload);
+	}
+
+	private async _admitExternalEvent(event: ExternalEventInput): Promise<ExternalEventDeliveryStatus> {
+		const disposition = await this._promptInjectedMessage(
+			event.text,
+			{
+				role: "custom",
+				customType: EXTERNAL_EVENT_CUSTOM_TYPE,
+				content: event.text,
+				display: true,
+				timestamp: Date.now(),
+				details: { name: event.name, eventId: event.eventId } satisfies ExternalEventDetails,
+			},
+			{
+				streamingBehavior: event.deliveryPolicy,
+				followUpQueueKey: externalEventQueueKey(event.name, event.eventId),
+				resumeIfIdle: true,
+				returnAfterAccepted: true,
+				queueIfBusy: true,
+				suppressAutonomousContinuation: true,
+			},
+		);
+		if (disposition === undefined) throw new Error("External event was not admitted into the session action store.");
+		return disposition === "starts_when_admitted" ? "delivered" : "queued";
 	}
 
 	/** Typed handlers for host requests arriving from the IPython kernel comm bridge. */
@@ -9645,8 +9643,7 @@ export class AgentSession {
 				provider: this.model?.provider ?? null,
 				input: this.model?.input ?? [],
 			}),
-			"session_message.send": async (payload) =>
-				this.handleSessionMessageHostRequest("session_message.send", payload),
+			"session.external_event.emit": async (payload) => this.handleExternalEventHostRequest(payload),
 		};
 		if (this._rlmDepth === 0) {
 			handlers["rlm.act"] = async (payload, signal, channel) => this._runAct(payload, signal, channel);

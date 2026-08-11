@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Added a kernel-local host callback for admitting keyed external text events directly into the current session.
+- Added bounded, session-local `session.external_event.emit` admission for event-driven kernel watches with stable event-ID coalescing and explicit busy-turn delivery.
 - Added privacy-safe pseudonymous product analytics for onboarding, command use, execution modes, run outcomes, TTFT, latency, usage, tools, retries, and compactions, with disclosure and opt-out controls ([ENG-4682](https://linear.app/primeintellect/issue/ENG-4682/add-privacy-safe-posthog-analytics-to-prime-agent)).
 - Removed the bundled `prime-intellect` skill and its product reference files.
 - Changed sent agent messages in the IPython cell UI to show only the message text with a `╰─` gutter when expanded, matching received messages, and hid the raw `agent_message.send` receipt dictionary.

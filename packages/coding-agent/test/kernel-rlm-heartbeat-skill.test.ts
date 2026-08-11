@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
+import { createExternalEventHostHandler, ExternalEventRegistry } from "../src/core/external-events.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
@@ -126,6 +127,35 @@ print(json.dumps({
 		expect(requests[1].payload).toMatchObject({ type: "rlm_heartbeat.list", include_inactive: true });
 		expect(requests[2].payload).toMatchObject({ type: "rlm_heartbeat.update", id: "job-1", status: "pause" });
 		expect(requests[3].payload).toMatchObject({ type: "rlm_heartbeat.delete", id: "job-1" });
+	});
+
+	it("admits and coalesces generic external events through a live kernel", async () => {
+		const emitted: string[] = [];
+		const registry = new ExternalEventRegistry();
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			hostHandlers: {
+				"session.external_event.emit": createExternalEventHostHandler(registry, async (event) => {
+					emitted.push(event.text);
+					return "queued";
+				}),
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+import json
+from rlm import host_request
+payload = {"name": "watch", "event_id": "stable", "text": "wake", "delivery_policy": "steer"}
+first = await host_request("session.external_event.emit", payload)
+second = await host_request("session.external_event.emit", payload)
+print(json.dumps([first, second], sort_keys=True))
+`);
+		expect(result.status).toBe("ok");
+		expect(JSON.parse(result.stdout.trim())).toMatchObject([
+			{ accepted: true, deliveryStatus: "queued", eventId: "stable" },
+			{ accepted: true, deliveryStatus: "coalesced", eventId: "stable" },
+		]);
+		expect(emitted).toEqual(["wake"]);
 	});
 
 	it("surfaces missing host handlers as Python exceptions", async () => {

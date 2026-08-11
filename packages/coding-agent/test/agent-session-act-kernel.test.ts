@@ -73,19 +73,71 @@ describeIfKernel("AgentSession Act integration", { tags: ["kernel-heavy"] }, () 
 		else process.env.PRIME_AGENT_KERNEL_FORKSERVER = priorForkserver;
 	});
 
-	it("coalesces stable session event keys across a live kernel module reload", async () => {
+	it("wakes an idle session from a background kernel external event", async () => {
+		const harness = await createHarness();
+		let unsubscribe = () => {};
+		try {
+			harness.setResponses([fauxAssistantMessage("done")]);
+			const delivered = new Promise<void>((resolve) => {
+				unsubscribe = harness.session.subscribe((event) => {
+					if (event.type !== "message_start" || event.message.role !== "custom") return;
+					if (event.message.customType !== "external_event") return;
+					unsubscribe();
+					resolve();
+				});
+			});
+			const ipython = harness.session.agent.state.tools.find((tool) => tool.name === "ipython");
+			if (!ipython) throw new Error("root session has no IPython tool");
+			const result = await ipython.execute("external-event-idle", {
+				code: `import asyncio
+from rlm import host_request
+async def _emit_external_event():
+    await asyncio.sleep(0)
+    await host_request("session.external_event.emit", {
+        "name": "matrix",
+        "event_id": "$idle",
+        "text": "wake from Matrix",
+        "delivery_policy": "followUp",
+    })
+asyncio.create_task(_emit_external_event())
+print("armed")`,
+			});
+			expect(result.content.find((content) => content.type === "text")?.text).toContain("armed");
+			await delivered;
+			await harness.session.waitForIdle();
+			expect(
+				harness.session.messages.find(
+					(message) => message.role === "custom" && message.customType === "external_event",
+				),
+			).toMatchObject({
+				content: "wake from Matrix",
+				details: { name: "matrix", eventId: "$idle" },
+			});
+		} finally {
+			unsubscribe();
+			harness.cleanup();
+		}
+	}, 60_000);
+
+	it("coalesces stable external event IDs across a live kernel module reload", async () => {
 		const harness = await createHarness();
 		try {
 			withStreaming(harness, true);
 			const ipython = harness.session.agent.state.tools.find((tool) => tool.name === "ipython");
 			if (!ipython) throw new Error("root session has no IPython tool");
-			const result = await ipython.execute("session-message-host-request", {
+			const result = await ipython.execute("external-event-coalesce", {
 				code: `import importlib as _importlib
 import json as _json
 import rlm as _rlm
-_first = await _rlm.host_request("session_message.send", {"key": "matrix:$kernel", "message": "literal /compact first"})
+_payload = {
+    "name": "matrix",
+    "event_id": "$kernel",
+    "text": "literal /compact first",
+    "delivery_policy": "steer",
+}
+_first = await _rlm.host_request("session.external_event.emit", _payload)
 _rlm = _importlib.reload(_rlm)
-_second = await _rlm.host_request("session_message.send", {"key": "matrix:$kernel", "message": "duplicate after reload"})
+_second = await _rlm.host_request("session.external_event.emit", {**_payload, "text": "duplicate after reload"})
 print(_json.dumps([_first, _second], sort_keys=True))`,
 			});
 			expect(result.content.find((content) => content.type === "text")?.text).toContain(

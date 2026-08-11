@@ -54,121 +54,135 @@ describe("AgentSession action contracts", () => {
 		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: ["transformed:queued"] });
 	});
 
-	it("admits external session messages as literal steering while busy", async () => {
-		let inputHandlerRuns = 0;
-		const harness = await createHarness({
-			extensionFactories: [
-				(pi) => {
-					pi.on("input", async () => {
-						inputHandlerRuns++;
-						return { action: "transform", text: "rewritten" };
-					});
-				},
-			],
-		});
-		harnesses.push(harness);
-		withStreaming(harness, true);
-
-		await expect(
-			harness.session.handleSessionMessageHostRequest("session_message.send", {
-				message: "/compact external text\n ",
-				key: "matrix:$busy",
-			}),
-		).resolves.toEqual({ accepted: true, deliveryStatus: "queued", key: "matrix:$busy" });
-		await expect(
-			harness.session.handleSessionMessageHostRequest("session_message.send", {
-				message: "duplicate body is ignored",
-				key: "matrix:$busy",
-			}),
-		).resolves.toEqual({ accepted: true, deliveryStatus: "coalesced", key: "matrix:$busy" });
-		await expect(
-			harness.session.handleSessionMessageHostRequest("session_message.send", {
-				message: "distinct event",
-				key: "matrix:$other",
-			}),
-		).resolves.toEqual({ accepted: true, deliveryStatus: "queued", key: "matrix:$other" });
-
-		expect(inputHandlerRuns).toBe(0);
-		expect(harness.session.getSteeringMessages()).toEqual(["/compact external text\n ", "distinct event"]);
-		withStreaming(harness, false);
-		harness.session.clearQueue();
-	});
-
-	it("wakes an idle session and returns after external message admission", async () => {
+	it("wakes idle sessions and coalesces stable external event IDs", async () => {
 		const gate = gatedHook({ prompt: "wake now" });
 		const harness = await createHarness({ extensionFactories: [gate.factory] });
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
 
-		await expect(
-			harness.session.handleSessionMessageHostRequest("session_message.send", {
-				message: "wake now",
-				key: "matrix:$idle",
-			}),
-		).resolves.toEqual({ accepted: true, deliveryStatus: "delivered", key: "matrix:$idle" });
+		const first = harness.session.handleExternalEventHostRequest({
+			name: "matrix",
+			event_id: "$idle",
+			text: "wake now",
+			delivery_policy: "followUp",
+		});
 		await gate.reached;
-		expect(harness.session.isStreaming).toBe(false);
-		expect(harness.session.queuedActionCount).toBe(0);
 		await expect(
-			harness.session.handleSessionMessageHostRequest("session_message.send", {
-				message: "duplicate while the admitted action is preparing",
-				key: "matrix:$idle",
+			harness.session.handleExternalEventHostRequest({
+				name: "matrix",
+				event_id: "$idle",
+				text: "duplicate body",
+				delivery_policy: "steer",
 			}),
 		).resolves.toMatchObject({ accepted: true, deliveryStatus: "coalesced" });
 
 		gate.release();
+		await expect(first).resolves.toMatchObject({
+			accepted: true,
+			deliveryStatus: "delivered",
+			eventId: "$idle",
+		});
 		await harness.session.waitForIdle();
-		expect(getUserTexts(harness)).toEqual(["wake now"]);
+		expect(getUserTexts(harness)).toEqual([]);
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === "external_event",
+			),
+		).toHaveLength(1);
 	});
 
-	it("releases external event keys after completion and cancellation", async () => {
+	it("reports delivered then queued for concurrent idle external follow-ups", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("first done"), fauxAssistantMessage("second done")]);
-
-		await harness.session.handleSessionMessageHostRequest("session_message.send", {
-			message: "first event",
-			key: "matrix:$reuse",
+		const pause = harness.session.acquireQueuedWorkPause();
+		const first = harness.session.handleExternalEventHostRequest({
+			name: "watch",
+			event_id: "first",
+			text: "first event",
+			delivery_policy: "followUp",
 		});
-		await harness.session.waitForIdle();
-		await expect(
-			harness.session.handleSessionMessageHostRequest("session_message.send", {
-				message: "same key after completion",
-				key: "matrix:$reuse",
-			}),
-		).resolves.toMatchObject({ accepted: true, deliveryStatus: "delivered" });
-		await harness.session.waitForIdle();
+		const second = harness.session.handleExternalEventHostRequest({
+			name: "watch",
+			event_id: "second",
+			text: "second event",
+			delivery_policy: "followUp",
+		});
 
+		pause.release();
+		await expect(first).resolves.toMatchObject({ deliveryStatus: "delivered" });
+		await expect(second).resolves.toMatchObject({ deliveryStatus: "queued" });
+		await harness.session.waitForIdle();
+	});
+
+	it("applies declared external event delivery while busy", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
 		withStreaming(harness, true);
-		await harness.session.handleSessionMessageHostRequest("session_message.send", {
-			message: "cancel this event",
-			key: "matrix:$cancelled",
-		});
-		expect(harness.session.clearQueue().steering).toEqual(["cancel this event"]);
+
 		await expect(
-			harness.session.handleSessionMessageHostRequest("session_message.send", {
-				message: "same key after cancellation",
-				key: "matrix:$cancelled",
+			harness.session.handleExternalEventHostRequest({
+				name: "watch",
+				event_id: "steer-1",
+				text: "steer event",
+				delivery_policy: "steer",
 			}),
-		).resolves.toMatchObject({ accepted: true, deliveryStatus: "queued" });
-		expect(harness.session.getSteeringMessages()).toEqual(["same key after cancellation"]);
+		).resolves.toMatchObject({ deliveryStatus: "queued" });
+		await expect(
+			harness.session.handleExternalEventHostRequest({
+				name: "watch",
+				event_id: "follow-1",
+				text: "follow event",
+				delivery_policy: "followUp",
+			}),
+		).resolves.toMatchObject({ deliveryStatus: "queued" });
+		expect(harness.session.getSteeringMessages()).toEqual(["steer event"]);
+		expect(harness.session.getFollowUpMessages()).toEqual(["follow event"]);
 		withStreaming(harness, false);
 		harness.session.clearQueue();
 	});
 
-	it("rejects malformed external session messages", async () => {
+	it("bounds pending external events and closes their handler on disposal", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
+		withStreaming(harness, true);
+		for (let index = 0; index < 128; index++) {
+			await harness.session.handleExternalEventHostRequest({
+				name: "bounded",
+				event_id: String(index),
+				text: `event ${index}`,
+				delivery_policy: "followUp",
+			});
+		}
+		await expect(
+			harness.session.handleExternalEventHostRequest({
+				name: "bounded",
+				event_id: "overflow",
+				text: "overflow",
+				delivery_policy: "followUp",
+			}),
+		).rejects.toThrow("queue is full");
+		withStreaming(harness, false);
+		harness.session.clearQueue();
+		const disposing = harness.session.disposeAsync();
+		await expect(
+			harness.session.handleExternalEventHostRequest({
+				name: "bounded",
+				event_id: "after-dispose",
+				text: "after disposal",
+				delivery_policy: "steer",
+			}),
+		).rejects.toThrow("session was disposed");
+		await disposing;
+	});
 
-		await expect(
-			harness.session.handleSessionMessageHostRequest("session_message.send", { message: "ok" }),
-		).rejects.toThrow("key must be a string");
-		await expect(
-			harness.session.handleSessionMessageHostRequest("session_message.send", { message: " ", key: "event" }),
-		).rejects.toThrow("cannot be empty");
-		await expect(
-			harness.session.handleSessionMessageHostRequest("session_message.send", { message: "ok", key: " " }),
-		).rejects.toThrow("key cannot be empty");
+	it("registers the generic external event host method", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const handlers = (
+			harness.session as unknown as { _createKernelHostHandlers(): Record<string, unknown> }
+		)._createKernelHostHandlers();
+		expect(handlers["session.external_event.emit"]).toBeTypeOf("function");
 	});
 
 	it("gives nextTurn delivery precedence over triggerTurn", async () => {

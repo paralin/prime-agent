@@ -1,18 +1,22 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { Usage } from "@earendil-works/pi-ai";
+import type { ImageContent, Usage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import type { AgentSession, AgentSessionEvent } from "./agent-session.js";
 import type { ContextTreeNode } from "./context-tree.js";
 import { createExtensionRuntime } from "./extensions/loader.js";
 import type { HostRequestChannel } from "./kernel/index.js";
 import type { ResourceLoader } from "./resource-loader.js";
+import type { SessionEntry } from "./session-manager.js";
 import { addAssistantUsage, emptyUsage } from "./usage.js";
 
 const ACT_TOOL_NAME = "shared_ipython";
+const ACT_BRANCH_RESET_ENTRY = "prime-agent.act-branch-reset";
 
 const ACT_SYSTEM_PROMPT_BASE = `You are the retained Act worker. You execute bounded actions inside the calling agent's live IPython kernel.
 
 Complete the assigned outcome and acceptance criteria through the simplest complete action. Use a focused check that can expose an error in the result. Report a missing premise, failed check, conflicting evidence, uncertainty, or untested limit when it affects the caller's decision.
+
+The current run prompt is your sole active assignment. Prior unfinished work and attached caller-history frames are context only: never resume an earlier assignment unless the current prompt asks for it.
 
 Use the shared_ipython tool for every inspection and action. Each call runs one complete IPython cell in the calling session's existing namespace, and calls are serialized. The cell sees the same Python variables, files, processes, and root-authorized host tools as the calling session. Reuse named objects already in the namespace, and leave useful intermediate state or results in clear variable names for the caller to inspect after you return.
 
@@ -209,6 +213,7 @@ export class ActLane {
 		beforePrompt?: BeforeActPrompt,
 		onAdmitted?: () => void,
 		onProgress?: ActProgressHandler,
+		historyImages: readonly ImageContent[] = [],
 	): Promise<ActLaneResult> {
 		if (this.disposed) throw new Error("Act lane has been disposed");
 		if (this.active) throw new Error("Another Act is already active in this session");
@@ -235,6 +240,8 @@ export class ActLane {
 			abort,
 		};
 		this.active = active;
+		let activeSession: AgentSession | undefined;
+		let previousLeafId: string | null | undefined;
 		onAdmitted?.();
 		const abortFromChannel = () => abort();
 		const interruptFromExecution = () => abort(true);
@@ -245,6 +252,8 @@ export class ActLane {
 		try {
 			if (controller.signal.aborted) return { outcome: "cancelled" };
 			const session = await this.getSession(target);
+			activeSession = session;
+			previousLeafId = session.sessionManager.getLeafId();
 			if (controller.signal.aborted) return { outcome: "cancelled" };
 			beforePrompt?.({
 				sessionKey: target.sessionKey,
@@ -264,7 +273,13 @@ export class ActLane {
 					)
 				: () => {};
 			try {
-				await session.prompt(prompt, {
+				const contextNote = historyImages.length
+					? `
+
+${historyImages.length} attached bitmap frame(s) contain the caller's message delta since the previous Act at this depth. Use them only as context for the current assignment.`
+					: "";
+				await session.prompt(`${prompt}${contextNote}`, {
+					images: historyImages.length > 0 ? [...historyImages] : undefined,
 					expandPromptTemplates: false,
 					internalPrompt: true,
 					suppressAutonomousContinuation: true,
@@ -290,6 +305,12 @@ export class ActLane {
 			if (controller.signal.aborted) return { outcome: "cancelled" };
 			throw error;
 		} finally {
+			if (!active.completed && activeSession && previousLeafId !== undefined) {
+				if (previousLeafId === null) activeSession.sessionManager.resetLeaf();
+				else activeSession.sessionManager.branch(previousLeafId);
+				activeSession.sessionManager.appendCustomEntry(ACT_BRANCH_RESET_ENTRY);
+				activeSession.agent.state.messages = activeSession.buildSessionContext().messages;
+			}
 			channel.signal.removeEventListener("abort", abortFromChannel);
 			channel.interruptSignal?.removeEventListener("abort", interruptFromExecution);
 			if (this.active === active) {
@@ -326,6 +347,11 @@ export class ActLane {
 
 	get contextTree(): ContextTreeNode | undefined {
 		return this.session?.getContextTree();
+	}
+
+	/** callerHistoryEntries returns the active branch that invoked a nested Act. */
+	get callerHistoryEntries(): SessionEntry[] {
+		return this.session?.sessionManager.getBranch() ?? [];
 	}
 
 	get running(): boolean {

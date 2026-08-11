@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
+- Fixed retained `rlm.act` sessions resuming abandoned work, and added bounded caller-history bitmap frames between Act calls.
 
 ## [0.7.2] - 2026-08-11
 

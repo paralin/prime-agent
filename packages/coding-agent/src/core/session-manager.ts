@@ -198,6 +198,7 @@ export interface ActStartEntry extends SessionEntryBase {
 	depth?: number;
 	parentActId?: string;
 	sessionKey?: string;
+	outerToolCallId?: string;
 	usageBaseline: Usage;
 }
 
@@ -1681,7 +1682,7 @@ export class SessionManager {
 	appendActStart(
 		actId: string,
 		usageBaseline: Usage,
-		options?: { depth?: number; parentActId?: string; sessionKey?: string },
+		options?: { depth?: number; parentActId?: string; sessionKey?: string; outerToolCallId?: string },
 	): string {
 		const entry: ActStartEntry = {
 			type: "act_start",
@@ -1692,6 +1693,7 @@ export class SessionManager {
 			depth: options?.depth ?? 1,
 			...(options?.parentActId ? { parentActId: options.parentActId } : {}),
 			...(options?.sessionKey ? { sessionKey: options.sessionKey } : {}),
+			...(options?.outerToolCallId ? { outerToolCallId: options.outerToolCallId } : {}),
 			usageBaseline: cloneUsage(usageBaseline),
 		};
 		this._appendEntry(entry);

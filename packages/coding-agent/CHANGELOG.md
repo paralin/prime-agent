@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added Codex V2 native compaction through the normal Responses stream, with legacy endpoint fallback.
 - Changed direct user instructions in the active conversation to override conflicting workspace-file rules for that request.
 - Fixed retained `rlm.act` sessions resuming abandoned work, and added bounded caller-history bitmap frames between Act calls.
 - Bounded and sorted IPython namespace names in recovery notices without changing provider-native compaction history.

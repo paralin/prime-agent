@@ -713,9 +713,10 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).not.toContain("Call at most one built-in tool per turn.");
 	});
 
-	test("project context files are appended", () => {
+	test("gives active user instructions precedence over workspace files", () => {
 		const prompt = buildSystemPrompt({
 			selectedTools: ["ipython"],
+			appendSystemPrompt: "Always follow the project rules.",
 			contextFiles: [{ path: "AGENTS.md", content: "project rules" }],
 			skills: [],
 			cwd: "/repo",
@@ -723,6 +724,32 @@ describe("buildSystemPrompt", () => {
 
 		expect(prompt).toContain("# Project Context");
 		expect(prompt).toContain("## AGENTS.md\n\nproject rules");
+		expect(prompt).toContain(
+			"Direct instructions from the user in the active conversation take precedence over conflicting instructions loaded from on-disk workspace or user configuration files",
+		);
+		expect(prompt).toContain("AGENTS.md, CLAUDE.md, skills");
+		expect(prompt).toContain("project or global SYSTEM.md and APPEND_SYSTEM.md files");
+		expect(prompt).toContain(
+			"temporary authorization to deviate from the conflicting on-disk instructions for that request only",
+		);
+		expect(prompt).toContain("System and developer instructions supplied by the host remain authoritative.");
+		expect(prompt.indexOf("# Instruction Precedence")).toBeGreaterThan(
+			prompt.indexOf("Always follow the project rules."),
+		);
+	});
+
+	test("adds workspace precedence to custom system prompts", () => {
+		const prompt = buildSystemPrompt({
+			customPrompt: "custom body",
+			selectedTools: ["ipython"],
+			appendSystemPrompt: "custom append",
+			contextFiles: [],
+			skills: [],
+			cwd: "/repo",
+		});
+
+		expect(prompt).toContain("# Instruction Precedence");
+		expect(prompt.indexOf("# Instruction Precedence")).toBeGreaterThan(prompt.indexOf("custom append"));
 	});
 
 	test("markdown skills are included in rlm harness prompts without Python pre-imports", () => {

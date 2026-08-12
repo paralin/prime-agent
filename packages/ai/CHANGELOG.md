@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added built-in xAI Grok OAuth with device authorization, rotating token refresh, and Responses API routing for SuperGrok and X Premium+ subscriptions.
 - Added OpenRouter session grouping and sticky routing through each request's opaque Prime session identifier.
 - Added an optional stateless OpenRouter Responses transport with a pre-stream Chat Completions fallback.
 - Fixed Kimi K3 reasoning levels being restricted to max.

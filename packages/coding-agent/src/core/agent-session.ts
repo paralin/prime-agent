@@ -1050,6 +1050,15 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 
 /** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+const KERNEL_STATE_NOTICE_NAME_LIMIT = 12;
+
+function formatKernelStateNames(names: readonly string[]): string {
+	const sorted = [...new Set(names)].sort();
+	const shown = sorted.slice(0, KERNEL_STATE_NOTICE_NAME_LIMIT);
+	const hiddenCount = sorted.length - shown.length;
+	return `${shown.join(", ")}${hiddenCount > 0 ? ` (+${hiddenCount} more)` : ""}`;
+}
+
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 const ACT_SESSION_DIRNAME = "act";
 const ACT_SESSION_FILENAME = "session.jsonl";
@@ -7325,7 +7334,7 @@ export class AgentSession {
 			names === null
 				? ""
 				: names.length > 0
-					? ` These names are still defined: ${names.join(", ")}.`
+					? ` These names are still defined: ${formatKernelStateNames(names)}.`
 					: " You have not defined any names yet.";
 		const content = [
 			"<ipython_state>",
@@ -7362,7 +7371,7 @@ export class AgentSession {
 		const lines = ["<ipython_state_restored>"];
 		if (result.restored.length > 0) {
 			lines.push(
-				`Your IPython kernel state was revived from your previous session. These names are available again: ${result.restored.join(", ")}.`,
+				`Your IPython kernel state was revived from your previous session. These names are available again: ${formatKernelStateNames(result.restored)}.`,
 			);
 		} else {
 			lines.push(
@@ -7371,7 +7380,7 @@ export class AgentSession {
 		}
 		if (result.failed.length > 0) {
 			lines.push(
-				`These could not be restored and must be recreated if needed: ${result.failed.map((f) => f.name).join(", ")}.`,
+				`These could not be restored and must be recreated if needed: ${formatKernelStateNames(result.failed.map((entry) => entry.name))}.`,
 			);
 		}
 		lines.push("</ipython_state_restored>");

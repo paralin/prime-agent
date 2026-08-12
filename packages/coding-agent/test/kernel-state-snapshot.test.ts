@@ -1,6 +1,17 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { manifestPathIn, snapshotPathIn } from "../src/core/kernel/state-snapshot.js";
+import {
+	buildRestoreCode,
+	buildSnapshotCode,
+	DEFAULT_SNAPSHOT_MAX_BYTES,
+	DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES,
+	manifestPathIn,
+	parseRestoreResult,
+	parseSnapshotResult,
+	snapshotPathIn,
+} from "../src/core/kernel/state-snapshot.js";
+
+const MARKER = "__PRIME_AGENT_KERNEL_STATE__";
 
 describe("kernel state snapshot paths", () => {
 	it("places snapshot + manifest inside the session artifact directory", () => {

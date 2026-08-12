@@ -105,12 +105,12 @@
 - Added a working hint that recommends sharing traces with Prime Intellect to help train open-source LLMs.
 - Restored bare `prime-agent --resume` opening the agents view and the `/resume [id|path]` slash command; bare commands open the agents view and an argument resumes that session in place.
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
-- Fixed ctrl+p ("Toggle agent message expansion") only toggling received agent messages; it now expands and collapses sent agent messages together with received ones.
 - Added xAI Grok subscription login alongside the existing xAI API-key option.
 - Added Codex V2 native compaction through the normal Responses stream, with legacy endpoint fallback.
-- Bounded and sorted IPython namespace names in recovery notices without changing provider-native compaction history.
 - Changed direct user instructions in the active conversation to override conflicting workspace-file rules for that request.
 - Fixed retained `rlm.act` sessions resuming abandoned work, and added bounded caller-history bitmap frames between Act calls.
+- Bounded and sorted IPython namespace names in recovery notices without changing provider-native compaction history.
+- Fixed short-lived version 2 IPython snapshots failing recovery after returning to the stable snapshot format.
 
 ## [0.7.2] - 2026-08-11
 
@@ -150,10 +150,10 @@
 - Changed explicit RLM model-role effort suffixes to pass their exact value to the provider even when model capability metadata marks that effort unsupported.
 - Changed file-backed settings to hot-reload global and project JSON or YAML edits, including `modelRoles`, while retaining runtime overrides.
 - Changed Ctrl+C to clear non-empty editor text before applying its existing interrupt and exit behavior to an empty editor.
-- Fixed an empty OpenAI Codex discovery catalog blocking configured RLM child models that remain usable through interactive selection. Nonempty catalogs still restrict child admission to the models they list.
-- Fixed Python `rlm.find_models` results discarding the availability state of configured model roles.
 - Fixed large fragmented session-worker frames repeatedly copying their accumulated bytes and starving daemon commands such as session-tree requests.
 - Fixed native compaction failures launching an oversized local fallback request; Prime now checks the rebuilt portable request against the model context window and reports both failure causes.
+- Fixed an empty OpenAI Codex discovery catalog blocking configured RLM child models that remain usable through interactive selection. Nonempty catalogs still restrict child admission to the models they list.
+- Fixed Python `rlm.find_models` results discarding the availability state of configured model roles.
 
 ## [0.7.0] - 2026-08-05
 

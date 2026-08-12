@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Changed direct user instructions in the active conversation to override conflicting workspace-file rules for that request.
 - Fixed retained `rlm.act` sessions resuming abandoned work, and added bounded caller-history bitmap frames between Act calls.
 
 ## [0.7.2] - 2026-08-11

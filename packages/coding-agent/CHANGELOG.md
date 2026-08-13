@@ -2,34 +2,7 @@
 
 ## [Unreleased]
 
-- Fixed large IPython variables repeatedly slowing later turns by excluding them from persistent snapshots and removing them when context is compacted.
-- Fixed daemon socket paths being used verbatim in identity derivations: on supported platforms, `--daemon-socket` spellings differing only by duplicate or trailing slashes now normalize to one canonical path, so worker-descriptor namespaces, daemon log files, and persisted descriptors agree.
-- Added a `thinking` option to `rlm.run` for spawning subagents with an explicit reasoning level; invalid levels for the resolved child model fail spawn.
-- Changed opening the agents view (full or scoped) with a draft prompt to auto-stash the draft instead of refusing; the draft is restored into the editor when the session is reopened.
-- Fixed Shift+Enter no longer inserting a newline in terminals that send a literal `\n` (for example a Ghostty `shift+enter=text:\n` mapping): the byte decoded as `ctrl+j` and triggered the new edit-diff toggle instead of the editor newline.
-- Removed a system prompt paragraph referring to an async `bash()` kernel helper and managed jobs that do not exist in the runtime.
-- Changed RLM guidance to orchestrate independent workers in parallel, use available async shell helpers safely, end the turn instead of sleeping, polling, or blocking on long awaits, provide proactive outcome-focused progress updates from root agents, and use simplified technical English for user-facing prose.
-- Fixed new top-level daemon sessions inheriting an RLM child depth from the supervisor process.
-
-## [0.7.3] - 2026-08-17
-
-- Fixed assistant rendering when provider payloads contain null or sparse content blocks.
-- Added authenticated host-request contracts with per-call request IDs, generation fencing, cancellation signals, and currentness checks.
-- Fixed root daemon shutdown retaining cleanup ownership while kill events are in flight.
-- Changed RLM family discovery to use a daemon-owned append-only spawn ledger with per-child display metadata instead of reconstructing topology from session files.
-- Fixed long-running macOS supervisors losing ownership when system cleanup removed authority records from `$TMPDIR`.
-- Fixed deleted RLM children leaking kernel snapshots while retaining their readable transcript tombstones.
-- Changed Agents View subagent rows to show stable `name · model/effort · summary` metadata.
-- Changed the default Cerebras model to the available `gpt-oss-120b` route and aligned cross-provider handoff fixtures with the generated catalog.
-- Fixed the agent going silent after an automatic context compaction interrupted unfinished work: the tool loop now resumes when a threshold compaction fails or is skipped, and active goals keep continuing after a successful mid-goal threshold compaction.
-- Changed the agents view splash hint from "type to start" to "type to search sessions".
-- Added `app.edits.expand` (`ctrl+j`) to toggle edit diffs; diffs are now shown only by this toggle, and `ctrl+o` no longer affects them.
-- Changed edit rendering so the `╰─ <path> +N -M` summary line is always visible and `ctrl+j` toggles the diff inline beneath it, indented to the summary text.
-- Fixed fullscreen wheel scrolling in Ghostty while retaining application link clicks; set `terminal.fullscreenMouse` to `false` to use native Cmd-click instead.
-- Changed the agents view to sort idle and inactive sessions by last message time, newest first, while keeping running agents in stable creation order.
-- Fixed `openai-codex` models being invisible to `rlm` subagents and `find_models` because model discovery reported Prime Agent's own version as the Codex client version ([#1375](https://github.com/PrimeIntellect-ai/prime-agent/pull/1375) by [@bilelrais](https://github.com/bilelrais)).
-- Added a working hint that recommends sharing traces with Prime Intellect to help train open-source LLMs.
-- Restored bare `prime-agent --resume` opening the agents view and the `/resume [id|path]` slash command; bare commands open the agents view and an argument resumes that session in place.
+- Added bounded, event-driven kernel host admission for external session messages, including stable event-ID coalescing and existing steer/follow-up delivery.
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
 - Added xAI Grok subscription login alongside the existing xAI API-key option.
 - Added Codex V2 native compaction through the normal Responses stream, with legacy endpoint fallback.

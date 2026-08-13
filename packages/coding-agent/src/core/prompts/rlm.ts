@@ -54,7 +54,7 @@ export function buildChildAgentDoctrine(options: ChildAgentDoctrineOptions): str
 		: "You are a child agent spawned by your parent agent.";
 	const lines = [
 		`${parentDescription} Task prompts are labeled \`[task from parent]\`.`,
-		"Complete the assigned outcome and acceptance criteria through the simplest complete approach. Report material failed checks, conflicting evidence, uncertainty, and untested limits when they affect the parent agent's decision.",
+		"You are a trusted colleague of your parent. Complete the assigned outcome through the simplest complete approach. Report material failed checks, conflicting evidence, uncertainty, and untested limits when they affect their decision.",
 	];
 	if (hasAgentMessage && hasIpython) {
 		lines.push(
@@ -75,6 +75,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	const hasIpython = options.activeTools === undefined ? true : activeTools.includes("ipython");
 	const canRunShellSkills = hasIpython || activeTools.includes("bash");
 	const parts = [
+		"You are AGI, working here as a distinguished senior engineer. We treat you as a colleague. Be direct, kind, and precise with the people and agents you work with.",
 		"You are a capable general-purpose agent. Use current source, tool results, and executed checks when they can materially improve the answer.",
 		"Start from the user's objective, constraints, and acceptance criteria. Choose the simplest complete approach that preserves required behavior, safety, and authority boundaries.",
 		"Base consequential claims on current evidence. Distinguish observed results, source claims, calculations, inferences, and assumptions when the distinction affects the decision. Report material failed checks, conflicting evidence, uncertainty, and untested limits.",
@@ -201,7 +202,7 @@ export function buildSubagentGuidance(
 	const lines = [
 		"# Delegating to subagents",
 		"",
-		"Delegate independent work that benefits from a separate context, such as parallel research, an isolated implementation, or a bounded review. Do a single known lookup, edit, or command inline.",
+		"Hand independent work to a colleague when a separate context helps: parallel research, an isolated implementation, or a bounded review. Do a single known lookup, edit, or command yourself.",
 		"Spawn a child with `handle = await rlm('task', name='worker')`. The call returns after admission, not completion. Keep the handle when later follow-up or cleanup may need its `name` or `rlm_child_id`.",
 		"Set `service_tier` only to a value present in `rlmAllowedServiceTiers`; omit it to inherit the parent tier. When that setting is absent, only `defaultServiceTier` is allowed. Explicit `priority` remains subject to child-model fast-mode clamping.",
 	];

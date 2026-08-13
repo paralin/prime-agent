@@ -50,24 +50,24 @@ Prime Agent combines a persistent Python control environment with durable harnes
 
 ## Getting Started
 
-This repository is [our fork](https://github.com/paralin/prime-agent) of [Prime Intellect's Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent). Clone the fork, install its dependencies, and build it from source:
+This repository is [our fork](https://github.com/paralin/prime-agent) of [Prime Intellect's Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent). Clone the fork and set it up:
 
 ```bash
-git clone https://github.com/paralin/prime-agent.git ~/company/repos/prime-agent
-cd ~/company/repos/prime-agent
+git clone https://github.com/paralin/prime-agent.git
+cd prime-agent
 npm i
 npm run build
 ```
 
-Add `~/.local/bin` to `PATH`, then create the local launcher used for this checkout:
+Add `~/.local/bin` to `PATH`, then create a local launcher that points to this checkout:
 
 ```bash
 mkdir -p ~/.local/bin
-cat > ~/.local/bin/prime-agent <<'EOF'
+cat > ~/.local/bin/prime-agent <<EOF
 #!/bin/bash
 set -eo pipefail
 
-exec ~/company/repos/prime-agent/prime-agent.sh "$@"
+exec "$PWD/prime-agent.sh" "\$@"
 EOF
 chmod +x ~/.local/bin/prime-agent
 ```

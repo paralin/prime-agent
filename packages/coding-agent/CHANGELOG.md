@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added bounded, event-driven kernel host admission for external session messages, including stable event-ID coalescing and existing steer/follow-up delivery.
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
 - Added xAI Grok subscription login alongside the existing xAI API-key option.
 - Added Codex V2 native compaction through the normal Responses stream, with legacy endpoint fallback.

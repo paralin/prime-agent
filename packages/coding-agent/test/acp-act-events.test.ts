@@ -73,6 +73,10 @@ class EventOnlyConnection {
 		return { cwd: process.cwd() };
 	}
 
+	async getInitialSnapshot() {
+		return { children: [] };
+	}
+
 	async emit(event: AgentConnectionEvent): Promise<void> {
 		for (const listener of this.listeners) await listener(event);
 	}

@@ -791,10 +791,9 @@ describe("buildSystemPrompt", () => {
 		});
 
 		expect(prompt).not.toContain("Installed Python-backed skill modules (pre-imported)");
-		expect(prompt).toContain("<available_skills>");
-		expect(prompt).toContain("<name>websearch</name>");
-		expect(prompt).toContain("<type>markdown</type>");
-		expect(prompt).toContain("<location>/skills/websearch/SKILL.md</location>");
+		expect(prompt).toContain("Skills live on disk");
+		expect(prompt).not.toContain("<available_skills>");
+		expect(prompt).not.toContain("<name>websearch</name>");
 	});
 
 	test("Python skills are configured for IPython and included in skill metadata", () => {
@@ -806,9 +805,21 @@ describe("buildSystemPrompt", () => {
 		});
 
 		expect(prompt).toContain("Installed Python-backed skill modules (pre-imported): `web_search`.");
-		expect(prompt).toContain("<name>web-search</name>");
-		expect(prompt).toContain("<type>python</type>");
-		expect(prompt).toContain("<python_import>web_search</python_import>");
+		expect(prompt).toContain("Skills live on disk");
+		expect(prompt).not.toContain("<name>web-search</name>");
+		expect(prompt).not.toContain("<python_import>web_search</python_import>");
+	});
+
+	test("does not inject a multi-skill description roster", () => {
+		const prompt = buildSystemPrompt({
+			selectedTools: ["ipython"],
+			contextFiles: [],
+			skills: [skill("alpha-skill"), skill("beta-skill")],
+			cwd: "/repo",
+		});
+
+		expect(prompt).not.toContain("<available_skills>");
+		expect((prompt.match(/<description>/g) || []).length).toBe(0);
 	});
 
 	test("prompt guidelines are appended and deduplicated", () => {

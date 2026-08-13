@@ -4537,6 +4537,9 @@ export class AgentSession {
 			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
+			currentModel: this.model
+				? { provider: this.model.provider, id: this.model.id, name: this.model.name }
+				: undefined,
 			harnessState: this._loadMergedHarnessState(),
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
@@ -7006,8 +7009,14 @@ export class AgentSession {
 	}
 
 	private _applySessionModelChange(model: Model<any>): void {
+		const oldBaseSystemPrompt = this._baseSystemPrompt;
 		this.agent.state.model = model;
 		this.sessionManager.appendModelChange(model.provider, model.id);
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._refreshExtensionSystemPrompt(
+			this.agent.state.systemPrompt,
+			oldBaseSystemPrompt,
+		);
 		if ((this.agent.state.isStreaming || this._pendingAgentEventCount > 0) && !this._processingAgentEnd) {
 			this._pendingModelContextRebuild = true;
 			return;
@@ -8828,7 +8837,13 @@ export class AgentSession {
 			return;
 		}
 
+		const oldBaseSystemPrompt = this._baseSystemPrompt;
 		this.agent.state.model = refreshedModel;
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._refreshExtensionSystemPrompt(
+			this.agent.state.systemPrompt,
+			oldBaseSystemPrompt,
+		);
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {

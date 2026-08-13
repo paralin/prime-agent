@@ -310,6 +310,36 @@ describe("buildRlmPrompt", () => {
 });
 
 describe("buildSystemPrompt", () => {
+	test("identifies the model currently executing the prompt", () => {
+		const currentModel = {
+			provider: "prime-inference",
+			id: "internal/gpt-5.6-sol",
+			name: "GPT 5.6 Sol",
+		};
+		const defaultPrompt = buildSystemPrompt({
+			selectedTools: [],
+			contextFiles: [],
+			skills: [],
+			cwd: "/repo",
+			currentModel,
+		});
+		const customPrompt = buildSystemPrompt({
+			customPrompt: "Custom instructions",
+			selectedTools: [],
+			contextFiles: [],
+			skills: [],
+			cwd: "/repo",
+			currentModel,
+		});
+
+		for (const prompt of [defaultPrompt, customPrompt]) {
+			expect(prompt).toContain("# Current Model");
+			expect(prompt).toContain(
+				"You are currently running as `internal/gpt-5.6-sol` from provider `prime-inference` (display name: `GPT 5.6 Sol`).",
+			);
+		}
+	});
+
 	test("injects compact global harness context and refine guidance by default", () => {
 		const harnessState: HarnessState = {
 			schema: 1,

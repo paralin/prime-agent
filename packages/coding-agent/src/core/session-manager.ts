@@ -1911,6 +1911,23 @@ export class SessionManager {
 		return h ? (h as SessionHeader) : null;
 	}
 
+	/**
+	 * Get the earliest finite message timestamp on the current conversation branch.
+	 */
+	getConversationStartedAt(): number | undefined {
+		let earliest: number | undefined;
+		for (const entry of this.getBranch()) {
+			if (entry.type !== "message" || !Number.isFinite(entry.message.timestamp)) continue;
+			earliest = earliest === undefined ? entry.message.timestamp : Math.min(earliest, entry.message.timestamp);
+		}
+		return earliest;
+	}
+
+	/**
+	 * Get all session entries (excludes header). Returns a shallow copy.
+	 * The session is append-only: use appendXXX() to add entries, branch() to
+	 * change the leaf pointer. Entries cannot be modified or deleted.
+	 */
 	getEntries(): SessionEntry[] {
 		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
 	}

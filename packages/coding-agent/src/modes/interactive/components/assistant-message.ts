@@ -17,6 +17,7 @@ import {
 	shouldCollapseErrorDetails,
 	summarizeErrorDetails,
 } from "./collapsible-error.js";
+import { isElapsedToolMarkerBlock, parseElapsedToolMarker } from "./elapsed-tool-marker.js";
 import { expandCollapseHint } from "./keybinding-hints.js";
 import type { MermaidMarkdownTransform } from "./mermaid.js";
 
@@ -30,6 +31,8 @@ export interface AssistantMessageComponentOptions {
 	precededByToolActivity?: boolean;
 	/** Replaces Mermaid code blocks in assistant text (never thinking) with Unicode diagrams. */
 	mermaidTransform?: MermaidMarkdownTransform;
+	/** Hide exact elapsed markers until the assistant message ends. */
+	streaming?: boolean;
 }
 
 function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
@@ -128,6 +131,7 @@ export class AssistantMessageComponent extends Container {
 	private precededByToolActivity: boolean;
 	private mermaidTransform?: MermaidMarkdownTransform;
 	private isStreaming = false;
+	private streaming: boolean;
 
 	constructor(
 		message?: AssistantMessage,
@@ -144,6 +148,7 @@ export class AssistantMessageComponent extends Container {
 		this.expanded = options.expanded ?? false;
 		this.precededByToolActivity = options.precededByToolActivity ?? false;
 		this.mermaidTransform = options.mermaidTransform;
+		this.streaming = options.streaming ?? false;
 
 		// Container for text/thinking content
 		this.contentContainer = new Container();
@@ -169,6 +174,13 @@ export class AssistantMessageComponent extends Container {
 	setHiddenThinkingLabel(label: string): void {
 		this.hiddenThinkingLabel = label;
 		this.dirty = true;
+	}
+
+	setStreaming(streaming: boolean): void {
+		if (this.streaming !== streaming) {
+			this.streaming = streaming;
+			this.dirty = true;
+		}
 	}
 
 	setExpanded(expanded: boolean): void {
@@ -228,8 +240,9 @@ export class AssistantMessageComponent extends Container {
 			`hide:${this.hideThinkingBlock}`,
 			`label:${this.hiddenThinkingLabel}`,
 			`expanded:${this.expanded}`,
-			// In the signature so the streaming->final transition rebuilds (mermaid renders differently).
+		// In the signature so the streaming->final transition rebuilds (mermaid renders differently).
 			`streaming:${this.isStreaming}`,
+			`elapsed-streaming:${this.streaming}`,
 			`stop:${message.stopReason ?? ""}`,
 			`error:${message.errorMessage ?? ""}`,
 		);
@@ -272,7 +285,11 @@ export class AssistantMessageComponent extends Container {
 		this.lastBlockTexts.clear();
 
 		const hasVisibleContent = message.content.some(
-			(c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && c.thinking.trim()),
+			(content, index) =>
+				(content?.type === "text" &&
+					content.text.trim() &&
+					!this.shouldHideElapsedToolMarker(message.content, index)) ||
+				(content?.type === "thinking" && content.thinking.trim()),
 		);
 
 		if (hasVisibleContent) {
@@ -283,6 +300,9 @@ export class AssistantMessageComponent extends Container {
 		for (let i = 0; i < message.content.length; i++) {
 			const content = message.content[i];
 			if (content?.type === "text" && content.text.trim()) {
+				if (this.shouldHideElapsedToolMarker(message.content, i)) {
+					continue;
+				}
 				// Assistant text messages with no background - trim the text
 				// Set paddingY=0 to avoid extra spacing before tool executions
 				const mermaidTransform = this.mermaidTransform;
@@ -356,6 +376,15 @@ export class AssistantMessageComponent extends Container {
 		if (hasToolCalls && (hasVisibleContent || message.stopReason === "aborted" || !this.precededByToolActivity)) {
 			this.contentContainer.addChild(new Spacer(1));
 		}
+	}
+
+	private shouldHideElapsedToolMarker(content: AssistantMessage["content"], index: number): boolean {
+		return (
+			isElapsedToolMarkerBlock(content, index) ||
+			(this.streaming &&
+				content[index]?.type === "text" &&
+				parseElapsedToolMarker(content[index].text) !== undefined)
+		);
 	}
 
 	private createErrorComponent(message: string, prefix?: string): Component {

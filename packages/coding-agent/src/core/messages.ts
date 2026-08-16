@@ -36,6 +36,8 @@ export const REFINEMENT_OUTCOME_CUSTOM_TYPE = "refinement_outcome";
 export const RLM_CHILD_FAILURE_CUSTOM_TYPE = "rlm_child_failure";
 export const RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE = "rlm_child_terminal_notice";
 export const MANUAL_CONTINUE_CUSTOM_TYPE = "manual_continue";
+/** Hidden extension context that is intended for the model, not the transcript UI. */
+export const MODEL_CONTEXT_CUSTOM_TYPE = "model-context";
 export const MANUAL_CONTINUE_PROMPT = `<system-notice>
 Continue.
 
@@ -498,6 +500,34 @@ export function createHeartbeatPromptMessage(
 	};
 }
 
+const ELAPSED_TIME_INTERVAL_SECONDS = 30;
+
+/**
+ * addElapsedSystemPrompt exposes quantized session time only to the provider.
+ *
+ * Keeping the hint in the transient system prompt avoids transcript and TUI
+ * messages. Quantization also keeps the prompt stable between 30-second
+ * boundaries.
+ */
+export function addElapsedSystemPrompt(
+	systemPrompt: string | undefined,
+	conversationStartedAt: number,
+	now = Date.now(),
+): string | undefined {
+	if (!Number.isFinite(conversationStartedAt) || !Number.isFinite(now)) return systemPrompt;
+	const elapsedSeconds = Math.max(0, Math.floor((now - conversationStartedAt) / 1000));
+	const elapsedBucket = Math.floor(elapsedSeconds / ELAPSED_TIME_INTERVAL_SECONDS) * ELAPSED_TIME_INTERVAL_SECONDS;
+	if (elapsedBucket < ELAPSED_TIME_INTERVAL_SECONDS) return systemPrompt;
+	const hint = `<session-elapsed-time>
+T+${elapsedBucket}s since the first persisted session message.
+</session-elapsed-time>`;
+	return systemPrompt && systemPrompt.length > 0
+		? `${systemPrompt}
+
+${hint}`
+		: hint;
+}
+
 /**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
@@ -528,7 +558,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						};
 					}
 					if (
-						!m.display ||
+						(!m.display && m.customType !== MODEL_CONTEXT_CUSTOM_TYPE) ||
 						m.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
 						m.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE ||
 						m.customType === COMPACTION_OUTCOME_CUSTOM_TYPE ||

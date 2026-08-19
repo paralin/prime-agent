@@ -928,7 +928,10 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async abort(): Promise<void> {
-		await this.requestOk({ type: "abort", activeSessionId: this.activeSessionId });
+		await this.requestOk(
+			{ type: "abort", activeSessionId: this.activeSessionId },
+			DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
+		);
 	}
 
 	async cancelRlmChild(childId: string): Promise<boolean> {
@@ -1440,8 +1443,8 @@ export class DaemonAgentConnection implements AgentConnection {
 		return this.reconnectPromise;
 	}
 
-	private async requestOk(command: DaemonCommandBody): Promise<void> {
-		await this.requestData<unknown>(command);
+	private async requestOk(command: DaemonCommandBody, timeoutMs?: number): Promise<void> {
+		await this.requestData<unknown>(command, timeoutMs);
 	}
 
 	private async requestData<T>(

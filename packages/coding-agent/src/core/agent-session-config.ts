@@ -45,6 +45,9 @@ export interface AgentSessionRuntimeConfig {
 	 * thread_goal_state entry (idempotent restart/rehydration).
 	 */
 	initialGoal?: { objective: string; tokenBudget?: number };
+	rlmMaxDepthCeiling?: number;
+	disableRlmAct?: boolean;
+	harnessMode?: "rpc-only";
 }
 
 export function mergeAgentSessionRuntimeConfig(
@@ -54,6 +57,7 @@ export function mergeAgentSessionRuntimeConfig(
 	if (!override) {
 		return cloneAgentSessionRuntimeConfig(base);
 	}
+	const harnessMode = override.harnessMode ?? base.harnessMode;
 	return {
 		cwd: override.cwd ?? base.cwd,
 		agentDir: override.agentDir ?? base.agentDir,
@@ -82,11 +86,20 @@ export function mergeAgentSessionRuntimeConfig(
 			base.extensionFlagValues || override.extensionFlagValues
 				? { ...(base.extensionFlagValues ?? {}), ...(override.extensionFlagValues ?? {}) }
 				: undefined,
-		serializedRefine: override.serializedRefine ?? base.serializedRefine,
+		serializedRefine: harnessMode === "rpc-only" ? false : (override.serializedRefine ?? base.serializedRefine),
 		executionMode: override.executionMode ?? base.executionMode,
 		telemetryDisabled: base.telemetryDisabled || override.telemetryDisabled ? true : undefined,
 		initialGoal: override.initialGoal ?? base.initialGoal,
+		rlmMaxDepthCeiling: mergeCeiling(base.rlmMaxDepthCeiling, override.rlmMaxDepthCeiling),
+		disableRlmAct: base.disableRlmAct || override.disableRlmAct ? true : undefined,
+		harnessMode,
 	};
+}
+
+function mergeCeiling(base: number | undefined, override: number | undefined): number | undefined {
+	if (base === undefined) return override;
+	if (override === undefined) return base;
+	return Math.min(base, override);
 }
 
 function cloneAgentSessionRuntimeConfig(config: AgentSessionRuntimeConfig): AgentSessionRuntimeConfig {
@@ -101,7 +114,7 @@ function cloneAgentSessionRuntimeConfig(config: AgentSessionRuntimeConfig): Agen
 		themes: cloneArray(config.themes),
 		autonomous: mergeAutonomousConfig(undefined, config.autonomous),
 		extensionFlagValues: config.extensionFlagValues ? { ...config.extensionFlagValues } : undefined,
-		serializedRefine: config.serializedRefine,
+		serializedRefine: config.harnessMode === "rpc-only" ? false : config.serializedRefine,
 		executionMode: config.executionMode,
 		telemetryDisabled: config.telemetryDisabled,
 		initialGoal: config.initialGoal ? { ...config.initialGoal } : undefined,

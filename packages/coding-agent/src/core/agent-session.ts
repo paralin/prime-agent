@@ -541,6 +541,9 @@ export interface AgentSessionConfig {
 	rlmDepth?: number;
 	/** Maximum RLM recursion depth. Defaults to RLM_MAX_DEPTH or 1. */
 	rlmMaxDepth?: number;
+	rlmMaxDepthCeiling?: number;
+	actEnabled?: boolean;
+	harnessMode?: "rpc-only";
 	/** Directory exposed to the kernel as RLM_SESSION_DIR. */
 	rlmSessionDir?: string;
 	/** Node id for this session when it is itself an RLM child. */
@@ -1350,6 +1353,9 @@ export class AgentSession {
 	private _rlmDepth: number;
 	private readonly _configuredRlmMaxDepth: number | undefined;
 	private _rlmMaxDepth: number;
+	private readonly _rlmMaxDepthCeiling?: number;
+	private readonly _actEnabled: boolean;
+	private readonly _harnessMode?: "rpc-only";
 	private _rlmMaxDepthSource: RlmMaxDepthSource;
 	private _rlmSessionDir?: string;
 	private _rlmParentNodeId?: string;
@@ -1455,8 +1461,8 @@ export class AgentSession {
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
 		this._includeGoals = config.includeGoals ?? true;
 		this._includeCompactSkill = config.includeCompactSkill ?? this.settingsManager.getCompactionAgentCallable();
-		this._rlmHeartbeatController = config.rlmHeartbeatController;
-		this._agentMessageController = config.agentMessageController;
+		this._rlmHeartbeatController = config.harnessMode === "rpc-only" ? undefined : config.rlmHeartbeatController;
+		this._agentMessageController = config.harnessMode === "rpc-only" ? undefined : config.agentMessageController;
 		this._agentObserveController = config.agentObserveController;
 		this._mcpManager = config.mcpManager;
 		this._baseToolsOverride = config.baseToolsOverride;
@@ -1466,6 +1472,9 @@ export class AgentSession {
 			config.rlmDepth ??
 			(isNonNegativeInteger(headerRlmDepth) ? headerRlmDepth : parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH"));
 		this._configuredRlmMaxDepth = config.rlmMaxDepth;
+		this._rlmMaxDepthCeiling = config.rlmMaxDepthCeiling;
+		this._actEnabled = config.actEnabled ?? true;
+		this._harnessMode = config.harnessMode;
 		if (this._configuredRlmMaxDepth !== undefined && !isNonNegativeInteger(this._configuredRlmMaxDepth)) {
 			throw new Error("rlmMaxDepth must be a non-negative integer");
 		}
@@ -1474,12 +1483,12 @@ export class AgentSession {
 		this._rlmMaxDepthSource = resolvedRlmMaxDepth.source;
 		this._prewarmIpythonKernel = (config.prewarmIpythonKernel ?? false) && this._rlmDepth === 0;
 		this._autoRefineReviewer = config.autoRefineReviewer;
-		this._serializedRefine = config.serializedRefine ?? false;
+		this._serializedRefine = this._harnessMode === "rpc-only" ? false : (config.serializedRefine ?? false);
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
 		this._rlmModelCandidates = [...(config.rlmModelCandidates ?? [])];
-		if (this._rlmDepth === 0) this._recoverInterruptedActs();
+		if (this._rlmDepth === 0 && this._actEnabled) this._recoverInterruptedActs();
 		this._startClaudeCodeQuery = config.startClaudeCodeQuery;
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
@@ -1491,7 +1500,7 @@ export class AgentSession {
 		this._autonomousState = createAutonomousRuntimeState(config.autonomous, {
 			cwd: this._cwd,
 		});
-		this._goalState = this._loadPersistedGoalState();
+		this._goalState = this._harnessMode === "rpc-only" ? emptyGoalState() : this._loadPersistedGoalState();
 		// Seed initial goal from CLI --goal flag, but only for top-level sessions
 		// and only when the branch contains only bootstrap entry types (model_change,
 		// thinking_level_change, service_tier_change) and no persisted
@@ -1503,7 +1512,7 @@ export class AgentSession {
 			// admission is unavailable mid-construction, so ride the next turn.
 			this._pendingNextTurnMessages.push(createGoalContextMessage(this._goalState, "continuation"));
 		}
-		this._restoreLateIpythonSentAgentMessages();
+		if (this._harnessMode !== "rpc-only") this._restoreLateIpythonSentAgentMessages();
 		if (this._goalState.status === "active") {
 			this._goalAccountingStartedAt = Date.now();
 		}
@@ -1527,6 +1536,7 @@ export class AgentSession {
 	 * when the session is created outside the daemon.
 	 */
 	setRlmHeartbeatController(controller: AgentRlmHeartbeatController): void {
+		if (this._harnessMode === "rpc-only") return;
 		if (this._rlmHeartbeatController === controller) {
 			return;
 		}
@@ -1734,22 +1744,23 @@ export class AgentSession {
 		maxDepth: number;
 		source: RlmMaxDepthSource;
 	} {
+		const cap = (value: number) => Math.min(value, this._rlmMaxDepthCeiling ?? value);
 		const persisted = this._loadPersistedRlmMaxDepthState();
 		if (persisted) {
-			return { maxDepth: persisted.maxDepth, source: "chat" };
+			return { maxDepth: cap(persisted.maxDepth), source: "chat" };
 		}
 		if (this._configuredRlmMaxDepth !== undefined) {
-			return { maxDepth: this._configuredRlmMaxDepth, source: "inherited" };
+			return { maxDepth: cap(this._configuredRlmMaxDepth), source: "inherited" };
 		}
 		const global = this.settingsManager.getRlmMaxDepth();
 		if (global !== undefined && isNonNegativeInteger(global)) {
-			return { maxDepth: global, source: "global" };
+			return { maxDepth: cap(global), source: "global" };
 		}
 		const env = process.env.RLM_MAX_DEPTH;
 		if (env !== undefined && env !== "") {
-			return { maxDepth: parseDepth(env, 1, "RLM_MAX_DEPTH"), source: "env" };
+			return { maxDepth: cap(parseDepth(env, 1, "RLM_MAX_DEPTH")), source: "env" };
 		}
-		return { maxDepth: 1, source: "default" };
+		return { maxDepth: cap(1), source: "default" };
 	}
 
 	private _loadPersistedGoalState(): GoalState {
@@ -4438,7 +4449,17 @@ export class AgentSession {
 		return this._rlmDepth;
 	}
 
-	/** Current absolute RLM spawn-depth cap. */
+	/** actEnabled reports whether this session exposes rlm.act. */
+	get actEnabled(): boolean {
+		return this._actEnabled;
+	}
+
+	/** foregroundMode identifies whether this session is the rpc-only harness. */
+	get foregroundMode(): "rpc_only" | "ordinary" {
+		return this._harnessMode === "rpc-only" ? "rpc_only" : "ordinary";
+	}
+
+	/** rlmMaxDepth is the current absolute RLM spawn-depth cap. */
 	get rlmMaxDepth(): number {
 		return this._rlmMaxDepth;
 	}
@@ -4754,6 +4775,7 @@ export class AgentSession {
 	}
 
 	async acceptAgentMessagePrompt(text: string, options?: PromptOptions): Promise<void> {
+		if (this._harnessMode === "rpc-only") throw new Error("Agent messages are disabled in rpc-only harness mode");
 		const customMessage =
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
 		await this._prompt(text, {
@@ -4773,6 +4795,7 @@ export class AgentSession {
 		streamingBehavior: "steer" | "followUp",
 		customMessage?: AgentSessionMessage,
 	): Promise<boolean> {
+		if (this._harnessMode === "rpc-only") throw new Error("Agent messages are disabled in rpc-only harness mode");
 		const agentMessageId = customMessage?.details.id ?? parseAgentSessionMessagePromptId(text);
 		if (streamingBehavior === "steer") {
 			await this._queuePreparedPrompt("steer", text, undefined, {
@@ -4791,6 +4814,7 @@ export class AgentSession {
 	}
 
 	async promptHeartbeat(job: AgentCronJob, options?: PromptOptions): Promise<void> {
+		if (this._harnessMode === "rpc-only") throw new Error("Scheduled prompts are disabled in rpc-only harness mode");
 		const message = createHeartbeatPromptMessage(job);
 		await this._promptInjectedMessage(job.prompt, message, {
 			...options,
@@ -7709,7 +7733,7 @@ export class AgentSession {
 	}
 
 	private _autoRefineAllowedForSession(): boolean {
-		return this._rlmDepth === 0 && this._localHarnessStateDir() !== undefined;
+		return this._harnessMode !== "rpc-only" && this._rlmDepth === 0 && this._localHarnessStateDir() !== undefined;
 	}
 
 	private _cancelPostCompactionContinue(): void {
@@ -9769,9 +9793,14 @@ export class AgentSession {
 				provider: this.model?.provider ?? null,
 				input: this.model?.input ?? [],
 			}),
-			"session.external_event.emit": async (payload) => this.handleExternalEventHostRequest(payload),
+			...(this._harnessMode === "rpc-only"
+				? {}
+				: {
+						"session.external_event.emit": async (payload: Record<string, unknown>) =>
+							this.handleExternalEventHostRequest(payload),
+					}),
 		};
-		if (this._rlmDepth === 0) {
+		if (this._rlmDepth === 0 && this._actEnabled) {
 			handlers["rlm.act"] = async (payload, signal, channel) => this._runAct(payload, signal, channel);
 		}
 		if (this._includeGoals) {
@@ -9784,7 +9813,7 @@ export class AgentSession {
 				handlers[type] = async (payload) => this.handleCompactHostRequest(type, payload);
 			}
 		}
-		if (this._autoRefineAllowedForSession()) {
+		if (this._harnessMode !== "rpc-only" && this._autoRefineAllowedForSession()) {
 			for (const type of ["refine.run", "refine.status"]) {
 				handlers[type] = async (payload) => this.handleRefineHostRequest(type, payload);
 			}

@@ -684,7 +684,7 @@ const CLIENT_OWNED_DAEMON_COMMAND = {
 } as const;
 const FAMILY_MAILBOX_COMMAND = {
 	minProtocol: 7,
-	minSchemaRevision: 16,
+	minSchemaRevision: 17,
 	capability: "family_mailbox",
 } as const;
 const DELETE_RLM_SUBAGENT_COMMAND = {

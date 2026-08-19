@@ -6034,7 +6034,7 @@ export class InteractiveMode {
 	}
 
 	private getActTrayLabel(): string | undefined {
-		const active = [...this.activeActTrays.values()].sort((left, right) => right.depth - left.depth)[0];
+		const active = [...(this.activeActTrays?.values() ?? [])].sort((left, right) => right.depth - left.depth)[0];
 		if (!active) return undefined;
 		const parts = [active.model];
 		if (active.thinkingLevel && active.thinkingLevel !== "off") parts.push(active.thinkingLevel);
@@ -6688,7 +6688,8 @@ export class InteractiveMode {
 	}
 
 	private handleCtrlC(): void {
-		if (this.editor.getText().length > 0) {
+		const hasQueuedMessages = this.connectionQueue.steering.length + this.connectionQueue.followUp.length > 0;
+		if (this.editor.getText().length > 0 && (!this.hasInterruptibleWork() || !hasQueuedMessages)) {
 			this.clearInputBar();
 			return;
 		}

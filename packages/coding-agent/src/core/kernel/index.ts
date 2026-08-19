@@ -1510,7 +1510,7 @@ export class KernelManager {
 			try {
 				const result = await this.handleHostRequest(data, controller.signal, channel);
 				try {
-					await this.sendCommMessage(commId, { ...result, status: "ok" });
+					await this.sendCommMessage(commId, { status: "ok", ...result });
 				} catch (replyError) {
 					this.appendKernelDiagnostic(
 						`failed to send host request ok reply for comm ${commId}: ${errorMessage(replyError)}`,

@@ -931,7 +931,11 @@ type AutonomousSlashCommand = { kind: "status" } | { kind: "on" } | { kind: "off
 
 import type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
 
-export type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
+export type {
+	RlmMaxDepthSource,
+	RlmMaxDepthStatus,
+	SetRlmMaxDepthResult,
+} from "./rlm-max-depth.js";
 
 interface PersistedRlmMaxDepthState {
 	maxDepth: number;
@@ -1031,7 +1035,7 @@ function autoRefineInstructions(reason: AutoRefineReason, review: AutoRefineRevi
 		? `
 Reviewer instructions: ${review.instructions}`
 		: "";
-	return `Automatic refinement review triggered by ${reason}. Create, update, or delete a local Continual Harness entry only when the trajectory contains concrete evidence that it should affect a later action in this session. Leave the edits array empty for speculative or one-off material. Global state requires an explicit request. Reviewer rationale: ${review.rationale}${detail}`;
+	return `Automatic refinement review triggered by ${reason}. Review local harness entries and create, update, or delete one only when the trajectory contains concrete evidence that it should affect a later action in this session. Leave the edits array empty for speculative or one-off material. Do not promote anything global without an explicit request. Reviewer rationale: ${review.rationale}${detail}`;
 }
 
 function isNonNegativeInteger(value: unknown): value is number {
@@ -1277,7 +1281,11 @@ export class AgentSession {
 		this._scheduleSessionInputPump();
 	});
 	private readonly _actLanes = new Map<number, ActLane>();
-	private readonly _activeActStack: Array<{ actId: string; depth: number; lane: ActLane }> = [];
+	private readonly _activeActStack: Array<{
+		actId: string;
+		depth: number;
+		lane: ActLane;
+	}> = [];
 	private _activeActCompletion?: Promise<void>;
 	private _actTeardownPromise?: Promise<void>;
 	private readonly _startClaudeCodeQuery?: StartClaudeCodeQuery;
@@ -1363,7 +1371,10 @@ export class AgentSession {
 		this._agentObserveController = config.agentObserveController;
 		this._mcpManager = config.mcpManager;
 		this._baseToolsOverride = config.baseToolsOverride;
-		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._sessionStartEvent = config.sessionStartEvent ?? {
+			type: "session_start",
+			reason: "startup",
+		};
 		const headerRlmDepth = this.sessionManager.getHeader()?.rlmDepth;
 		this._rlmDepth =
 			config.rlmDepth ??
@@ -1639,7 +1650,10 @@ export class AgentSession {
 			return { maxDepth: cap(persisted.maxDepth), source: "chat" };
 		}
 		if (this._configuredRlmMaxDepth !== undefined) {
-			return { maxDepth: cap(this._configuredRlmMaxDepth), source: "inherited" };
+			return {
+				maxDepth: cap(this._configuredRlmMaxDepth),
+				source: "inherited",
+			};
 		}
 		const global = this.settingsManager.getRlmMaxDepth();
 		if (global !== undefined && isNonNegativeInteger(global)) {
@@ -1647,7 +1661,10 @@ export class AgentSession {
 		}
 		const env = process.env.RLM_MAX_DEPTH;
 		if (env !== undefined && env !== "") {
-			return { maxDepth: cap(parseDepth(env, 1, "RLM_MAX_DEPTH")), source: "env" };
+			return {
+				maxDepth: cap(parseDepth(env, 1, "RLM_MAX_DEPTH")),
+				source: "env",
+			};
 		}
 		return { maxDepth: cap(1), source: "default" };
 	}
@@ -2880,7 +2897,10 @@ export class AgentSession {
 		// A stale marker (continuation already consumed) matches no action; only an
 		// actual cancellation may roll back its queue-time continuationsUsed increment.
 		if (cancelled.length === 0) return;
-		this._setGoalState({ ...this._goalState, continuationsUsed: this._goalState.continuationsUsed - 1 });
+		this._setGoalState({
+			...this._goalState,
+			continuationsUsed: this._goalState.continuationsUsed - 1,
+		});
 		this._emitQueueUpdate();
 	}
 
@@ -3962,6 +3982,7 @@ export class AgentSession {
 			if (this._disposed) {
 				if (actTeardown) await actTeardown;
 				await this._disposeKernelOnce();
+				await this._startDisposeCallbacks();
 			} else {
 				this._disposing = true;
 				await this._disposeAsyncOnce(actTeardown);
@@ -4474,7 +4495,11 @@ export class AgentSession {
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
 			currentModel: this.model
-				? { provider: this.model.provider, id: this.model.id, name: this.model.name }
+				? {
+						provider: this.model.provider,
+						id: this.model.id,
+						name: this.model.name,
+					}
 				: undefined,
 			harnessState: this._loadMergedHarnessState(),
 		};
@@ -4621,7 +4646,10 @@ export class AgentSession {
 
 	async promptUntilAccepted(text: string, options?: PromptOptions): Promise<void> {
 		const normalized = this._normalizeManualContinuation(text, options);
-		return this._prompt(normalized.text, { ...normalized.options, returnAfterAccepted: true });
+		return this._prompt(normalized.text, {
+			...normalized.options,
+			returnAfterAccepted: true,
+		});
 	}
 
 	private _normalizeManualContinuation(
@@ -5977,20 +6005,21 @@ export class AgentSession {
 					);
 					const firstPrimaryIndex = turns[0].payload.records.indexOf(primaryDeliveryRecord(turns[0]));
 					turns[0].payload.records.splice(firstPrimaryIndex, 0, ...contextRecords);
-					const preparedMessages: AgentMessage[] = turns.flatMap((action) =>
-						action.payload.records.map((record) => record.message),
-					);
 					for (const action of turns) {
 						if (action.suppressAutonomousContinuation) {
 							this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 						}
 					}
 					if (executionPolicy.runBeforeAgentStart) {
-						this._appendBeforeAgentStartMessages(preparedMessages, prepared?.result);
 						this._applyPreparedSystemPrompt(prepared, executionPolicy.preserveEmptyExtensionPrompt);
 					} else if (executionPolicy.nextTurnContextTiming !== "skip") {
 						this.agent.state.systemPrompt = this._baseSystemPrompt;
 					}
+					const preparedMessages: AgentMessage[] = turns.flatMap((action) =>
+						action.payload.records.map((record) => record.message),
+					);
+					if (executionPolicy.runBeforeAgentStart)
+						this._appendBeforeAgentStartMessages(preparedMessages, prepared?.result);
 					for (const action of turns) transitionSessionAction(action, { state: "committing" });
 					this._notifySessionInputCheckpointChange();
 					this._emitQueueUpdate();
@@ -6259,7 +6288,10 @@ export class AgentSession {
 		}
 	}
 
-	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): { steering: string[]; followUp: string[] } {
+	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): {
+		steering: string[];
+		followUp: string[];
+	} {
 		const ownedActions = this._actionStore.ownedActions();
 		const dispatchedTurnCount = ownedActions.filter(
 			(action) =>
@@ -7212,10 +7244,13 @@ export class AgentSession {
 		return this.model ? (clampThinkingLevel(this.model, level) as ThinkingLevel) : "off";
 	}
 
-	private async _syncKernelStateAfterCompaction(): Promise<void> {
+	private async _notifyKernelStateAfterCompaction(): Promise<void> {
 		const provisioner = this._ipythonKernelProvisioner;
 		if (!provisioner?.hasRunningKernel) return;
-		const pruned = await provisioner.pruneOversizedVariables().catch(() => null);
+		const pruned =
+			typeof provisioner.pruneOversizedVariables === "function"
+				? await provisioner.pruneOversizedVariables().catch(() => null)
+				: null;
 		const abort = new AbortController();
 		const timer = setTimeout(() => abort.abort(), KERNEL_STATE_LISTING_TIMEOUT_MS);
 		if (typeof timer === "object" && "unref" in timer) timer.unref();
@@ -7515,10 +7550,16 @@ export class AgentSession {
 				fromExtension,
 			});
 		}
-		await this._syncKernelStateAfterCompaction();
+		await this._notifyKernelStateAfterCompaction();
 		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
 
-		return { summary, firstKeptEntryId, tokensBefore, details, providerNativeCompaction };
+		return {
+			summary,
+			firstKeptEntryId,
+			tokensBefore,
+			details,
+			providerNativeCompaction,
+		};
 	}
 
 	private async _reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void> {
@@ -9213,7 +9254,11 @@ export class AgentSession {
 						directingModel:
 							parent?.lane.model ??
 							(this.model
-								? { provider: this.model.provider, id: this.model.id, name: this.model.name }
+								? {
+										provider: this.model.provider,
+										id: this.model.id,
+										name: this.model.name,
+									}
 								: undefined),
 						directingThinkingLevel: parent?.lane.thinkingLevel ?? this.thinkingLevel,
 					};
@@ -9336,7 +9381,10 @@ export class AgentSession {
 				persistedModel.provider === claimModel.provider &&
 				persistedModel.modelId === claimModel.id
 			) {
-				writeFileSync(marker, `${sessionKey}\n`, { encoding: "utf8", mode: 0o600 });
+				writeFileSync(marker, `${sessionKey}\n`, {
+					encoding: "utf8",
+					mode: 0o600,
+				});
 				return base;
 			}
 			return this._qualifiedActSessionLocation(base, sessionKey, claimModel);
@@ -9376,7 +9424,10 @@ export class AgentSession {
 				}
 			}
 			mkdirSync(dir, { recursive: true });
-			writeFileSync(marker, `${sessionKey}\n`, { encoding: "utf8", mode: 0o600 });
+			writeFileSync(marker, `${sessionKey}\n`, {
+				encoding: "utf8",
+				mode: 0o600,
+			});
 		}
 		return { dir, file };
 	}
@@ -9534,7 +9585,10 @@ export class AgentSession {
 			settingsManager: this.settingsManager,
 			cwd: this._cwd,
 			agentDir: this._agentDir,
-			resourceLoader: createActResourceLoader({ depth, maxDepth: this.settingsManager.getRlmActMaxDepth() }),
+			resourceLoader: createActResourceLoader({
+				depth,
+				maxDepth: this.settingsManager.getRlmActMaxDepth(),
+			}),
 			modelRegistry: this._modelRegistry,
 			baseToolsOverride: { [tool.name]: tool },
 			allowedToolNames: [tool.name],
@@ -9566,7 +9620,10 @@ export class AgentSession {
 				content: event.text,
 				display: true,
 				timestamp: Date.now(),
-				details: { name: event.name, eventId: event.eventId } satisfies ExternalEventDetails,
+				details: {
+					name: event.name,
+					eventId: event.eventId,
+				} satisfies ExternalEventDetails,
 			},
 			{
 				streamingBehavior: event.deliveryPolicy,
@@ -10029,7 +10086,9 @@ export class AgentSession {
 
 	/** Deliver and durably retain ordered follow-up input for an external direct child. */
 	async deliverRlmChildInput(target: string, message: string): Promise<"queued" | "woken"> {
-		const receipt = await this._receiveExternalRlmChildMessage(target, { message });
+		const receipt = await this._receiveExternalRlmChildMessage(target, {
+			message,
+		});
 		return receipt.deliveryStatus === "delivered" ? "woken" : "queued";
 	}
 
@@ -10652,7 +10711,12 @@ export class AgentSession {
 							: [];
 					}),
 				];
-				return { runtime: "native", model, thinkingLevel: candidate.thinkingLevel, modelCandidates };
+				return {
+					runtime: "native",
+					model,
+					thinkingLevel: candidate.thinkingLevel,
+					modelCandidates,
+				};
 			}
 			throw new Error(`RLM model role "@${role}" has no executable candidates`);
 		}
@@ -11011,13 +11075,26 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
-		const { name: rawName, model: rawModel, service_tier: rawServiceTier, ...unsupported } = kwargs;
+		const {
+			name: rawName,
+			model: rawModel,
+			service_tier: rawServiceTier,
+			thinking: rawThinking,
+			...unsupported
+		} = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
 			throw new Error(`Unsupported rlm.run kwargs: ${unsupportedKwargs.sort().join(", ")}`);
 		}
 		const requestedSessionName = normalizeRequestedRlmSubagentSessionName(rawName);
 		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
+		if (rawThinking !== undefined && typeof rawThinking !== "string") {
+			throw new Error("rlm.run thinking must be a string");
+		}
+		if (rawThinking !== undefined && !THINKING_LEVELS.includes(rawThinking as ThinkingLevel)) {
+			throw new Error(`rlm.run thinking must be one of: ${THINKING_LEVELS.join(", ")}`);
+		}
+		const requestedThinking = rawThinking as ThinkingLevel | undefined;
 		const requestedServiceTier = normalizeRequestedRlmSubagentServiceTier(rawServiceTier);
 		if (requestedServiceTier !== undefined) {
 			const allowedServiceTiers = this.settingsManager.getRlmAllowedServiceTiers();
@@ -11050,6 +11127,24 @@ export class AgentSession {
 		}
 		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
 			throw new Error("Cannot spawn a subagent after its parent was disposed");
+		}
+		if (requestedThinking && modelSelection.runtime === "native") {
+			const supportedLevels = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
+			if (!supportedLevels.includes(requestedThinking)) {
+				throw new Error(
+					`Requested thinking level "${requestedThinking}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supportedLevels.join(", ")}`,
+				);
+			}
+		}
+		if (requestedThinking) {
+			modelSelection =
+				modelSelection.runtime === "native"
+					? {
+							...modelSelection,
+							model: withExplicitRlmThinkingLevel(modelSelection.model, requestedThinking),
+							thinkingLevel: requestedThinking,
+						}
+					: { ...modelSelection, thinkingLevel: requestedThinking };
 		}
 
 		const childSessionDir = this._createChildRlmSessionDir();
@@ -11131,7 +11226,7 @@ export class AgentSession {
 				spawnCode,
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
-				thinkingLevel: modelSelection.thinkingLevel,
+				thinkingLevel: requestedThinking ?? modelSelection.thinkingLevel,
 				modelCandidates: modelSelection.modelCandidates,
 				serviceTier: requestedServiceTier,
 			}),

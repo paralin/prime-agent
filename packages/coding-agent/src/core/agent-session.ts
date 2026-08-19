@@ -3586,7 +3586,7 @@ export class AgentSession {
 			this._rotateExhaustedCodexHome(lastAssistant);
 		}
 
-		const settings = this.settingsManager.getRetrySettings();
+		const settings = this.retrySettings;
 		if (!settings.enabled) {
 			return;
 		}
@@ -11724,7 +11724,7 @@ export class AgentSession {
 			authSourceTokens?: readonly AuthSourceToken[];
 		},
 	): Promise<boolean> {
-		const settings = this.settingsManager.getRetrySettings();
+		const settings = this.retrySettings;
 		if (!settings.enabled) {
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			this._retryAuthFailureSources = [];
@@ -11855,8 +11855,13 @@ export class AgentSession {
 			);
 	}
 
+	/** autoRetryEnabled reports whether this session can retry model failures automatically. */
 	get autoRetryEnabled(): boolean {
-		return this.settingsManager.getRetryEnabled();
+		return this._harnessMode !== "rpc-only" && this.settingsManager.getRetryEnabled();
+	}
+
+	private get retrySettings(): { enabled: boolean; maxRetries: number; baseDelayMs: number } {
+		return { ...this.settingsManager.getRetrySettings(), enabled: this.autoRetryEnabled };
 	}
 
 	setAutoRetryEnabled(enabled: boolean): void {

@@ -163,7 +163,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			"",
 			"A callable `rlm` is already in your global namespace. `handle = await rlm('sub-task')` spawns a child agent and returns an `RLMSpawnHandle` immediately after admission. The handle has `rlm_child_id`, `name`, `session_dir`, and `model`; it never contains the child's answer.",
 			"Choose a stable child name with `handle = await rlm('sub-task', name='api-reviewer')`. Names must be unique among siblings. If omitted, the host generates a readable unique name.",
-			"A child inherits your model and service tier when those options are omitted. If a different model is explicitly requested, use `await rlm.find_models(...)` and an exact returned selector. An unavailable requested model fails spawn; decide whether to retry or omit `model`.",
+			"A child inherits your model, thinking level, and service tier when those options are omitted. Set `thinking` to a supported level to override the selected child runtime. If a different model is explicitly requested, use `await rlm.find_models(...)` and an exact returned selector. An unavailable requested model fails spawn; decide whether to retry or omit `model`.",
 			"`service_tier` may be `auto`, `default`, `flex`, `scale`, `priority`, or `None`, but only values in the `rlmAllowedServiceTiers` settings array are accepted. When that setting is absent, only `defaultServiceTier` is allowed. `priority` is clamped to `default` when the selected child model does not support fast mode.",
 		);
 		if (hasAgentMessage) {

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added an RPC-only foreground harness mode with literal prompts, bounded RLM and Act policy, service-tier state, and autonomous-entry isolation.
+
 - Added elapsed-time prefixes to LLM-visible conversation messages without changing persisted or UI content.
 - Added bounded, event-driven kernel host admission for external session messages, including stable event-ID coalescing and existing steer/follow-up delivery.
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.

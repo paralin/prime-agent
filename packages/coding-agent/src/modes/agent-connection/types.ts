@@ -353,6 +353,9 @@ export interface AgentConnectionState {
 	model?: AgentConnectionModel;
 	thinkingLevel: ThinkingLevel;
 	serviceTier: ServiceTier;
+	rlmMaxDepth?: number;
+	actEnabled?: boolean;
+	retryEnabled?: boolean;
 	availableThinkingLevels: ThinkingLevel[];
 	isStreaming: boolean;
 	isCompacting: boolean;
@@ -732,6 +735,7 @@ export interface AgentConnection {
 	abortSideQuestion(id: string): Promise<boolean>;
 	steer(message: string, images?: ImageContent[]): Promise<void>;
 	followUp(message: string, images?: ImageContent[]): Promise<void>;
+	/** Abort the active operation and drain its events without consuming queued work. */
 	abort(): Promise<void>;
 	cancelRlmChild(childId: string): Promise<boolean>;
 	waitForIdle(): Promise<void>;

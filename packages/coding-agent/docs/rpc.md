@@ -4,6 +4,24 @@ RPC mode enables headless operation of the coding agent via a JSON protocol over
 
 **Note for Node.js/TypeScript users**: If you're building a Node.js application, consider using `AgentSession` directly from `@earendil-works/pi-coding-agent` instead of spawning a subprocess. See [`src/core/agent-session.ts`](../src/core/agent-session.ts) for the API. For a subprocess-based TypeScript client, see [`src/modes/rpc/rpc-client.ts`](../src/modes/rpc/rpc-client.ts).
 
+
+## Supported harness boundary
+
+Prime Agent exposes protocol version `1` and schema revision `3`. Every
+`get_state` response includes these versions together with `cwd`, `serviceTier`,
+effective `rlmMaxDepth`, `actEnabled`, `retryEnabled`, and `foregroundMode`.
+In `rpc-only` harness mode, `retryEnabled` is always `false`, regardless of
+persisted retry settings. Schema revision 3 makes `abort` an
+active-operation/event fence: its response follows the aborted operation's
+terminal events and drained event queue while preserving queued work.
+
+Launch `--mode rpc --harness-mode rpc-only` for an externally supervised
+foreground session. This mode accepts model work only from literal `prompt`
+frames. It permits `get_state`, `set_service_tier`, `prompt`, `abort`, and
+`compact`; other RPC commands are rejected. Launch ceilings
+`--rlm-max-depth-ceiling <n>` and `--disable-rlm-act` override persisted and
+configured session behavior, including resumed sessions.
+
 ## Starting RPC Mode
 
 ```bash
@@ -122,7 +140,10 @@ See [set_follow_up_mode](#set_follow_up_mode) for controlling how follow-up mess
 
 #### abort
 
-Abort the current agent operation.
+Abort the current agent operation. In schema revision 3, the success response
+is emitted only after that operation is idle and its pending events are
+emitted. Queued work remains suspended; `abort` does not wait for the whole
+queue to become idle.
 
 ```json
 {"type": "abort"}
@@ -177,6 +198,7 @@ Response:
     "thinkingLevel": "medium",
     "isStreaming": false,
     "isCompacting": false,
+    "retryEnabled": true,
     "steeringMode": "all",
     "followUpMode": "one-at-a-time",
     "sessionFile": "/path/to/session.jsonl",

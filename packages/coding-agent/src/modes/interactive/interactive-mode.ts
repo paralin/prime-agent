@@ -193,6 +193,7 @@ import { DaxnutsComponent } from "./components/daxnuts.js";
 import { DynamicBorder } from "./components/dynamic-border.js";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.js";
 import { type FileChangeSummary, formatTotalChangeSummary, mergeTurnFileChanges } from "./components/edit-summary.js";
+import { collectElapsedToolMarkers, ElapsedToolLabelGate } from "./components/elapsed-tool-marker.js";
 import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
@@ -931,6 +932,9 @@ export class InteractiveMode {
 
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
+	// Spaces displayed elapsed tool labels; reset whenever the transcript is
+	// rebuilt from the session messages so replay stays deterministic.
+	private readonly elapsedToolLabelGate = new ElapsedToolLabelGate();
 	private sideQuestionComponent: SideQuestionComponent | undefined;
 	private sideQuestionEvent: AgentConnectionSideQuestionEvent | undefined;
 	private sideQuestionTurns: AgentConnectionSideQuestionEvent[] = [];
@@ -3058,10 +3062,25 @@ export class InteractiveMode {
 			this.chatContainer.addChild(component);
 			this.pendingTools.set(latestToolCall.id, component);
 			this.registerIpythonToolComponent(latestToolCall.name, latestToolCall.id, component);
+			this.applyElapsedToolLabel(component, latestToolCall.id);
 			return component;
 		} finally {
 			this.pendingToolCreations.delete(toolCall.id);
 		}
+	}
+
+	/**
+	 * applyElapsedToolLabel moves an exact `[T+<seconds>s]` marker that precedes
+	 * this tool call onto its status line, gated by the label interval.
+	 */
+	private applyElapsedToolLabel(component: ToolExecutionComponent, toolCallId: string): void {
+		const marker = this.streamingMessage
+			? collectElapsedToolMarkers(this.streamingMessage.content).get(toolCallId)
+			: undefined;
+		if (!marker) {
+			return;
+		}
+		component.setElapsedLabel(this.elapsedToolLabelGate.admit(marker.seconds, marker.label));
 	}
 
 	private createToolExecutionDefinition(
@@ -5501,7 +5520,9 @@ export class InteractiveMode {
 								: `Operation aborted${elapsedSuffix}`;
 						this.streamingMessage.errorMessage = errorMessage;
 					}
-					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage);
+					const component = this.ensureAssistantStreamingComponent(event.message);
+					component.setStreaming(false);
+					component.updateContent(this.streamingMessage);
 
 					if (this.streamingMessage.stopReason === "aborted" || this.streamingMessage.stopReason === "error") {
 						if (!errorMessage) {
@@ -5745,6 +5766,7 @@ export class InteractiveMode {
 			this.hiddenThinkingLabel,
 			{
 				expanded: this.toolOutputExpanded,
+				streaming: true,
 				precededByToolActivity:
 					this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 					this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
@@ -6454,6 +6476,9 @@ export class InteractiveMode {
 		} = {},
 	): Promise<void> {
 		this.resetPendingToolState();
+		// The rebuild recomputes every elapsed label from the transcript, so the
+		// interval gate starts clean for deterministic replay.
+		this.elapsedToolLabelGate.reset();
 		const transcriptMessages = this.orderMessagesForTranscript(sessionContext.messages);
 		const messagesToRender = options.limitTranscript ? initialRenderMessages(transcriptMessages) : transcriptMessages;
 		this.ipythonToolComponents.clear();
@@ -6510,8 +6535,10 @@ export class InteractiveMode {
 			if (message.role === "assistant") {
 				this.addMessageToChat(message);
 				// Render tool call components
+				const elapsedMarkers = collectElapsedToolMarkers(message.content);
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
+						const marker = elapsedMarkers.get(content.id);
 						const component = new ToolExecutionComponent(
 							content.name,
 							content.id,
@@ -6519,6 +6546,9 @@ export class InteractiveMode {
 							{
 								showImages: this.settingsManager.getShowImages(),
 								includeImageDimensions: false,
+								elapsedLabel: marker
+									? this.elapsedToolLabelGate.admit(marker.seconds, marker.label)
+									: undefined,
 							},
 							this.getCachedToolDefinition(content.name),
 							this.ui,

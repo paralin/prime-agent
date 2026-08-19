@@ -982,9 +982,6 @@ type NativeRlmSubagentModelSelection = Extract<RlmSubagentModelSelection, { runt
 // Constants
 // ============================================================================
 
-/** Standard thinking levels */
-const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
 /** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 const KERNEL_STATE_NOTICE_NAME_LIMIT = 12;

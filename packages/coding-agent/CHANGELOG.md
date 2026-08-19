@@ -5,6 +5,7 @@
 - Added an RPC-only foreground harness mode with literal prompts, bounded RLM and Act policy, service-tier state, and autonomous-entry isolation.
 
 - Added 30-second elapsed-time hints to provider system context without adding transcript or UI messages.
+- Changed exact `[T+<seconds>s]` assistant markers to render as a muted elapsed suffix on the following tool status line instead of a standalone paragraph, spaced at least 30 seconds apart.
 - Added bounded, event-driven kernel host admission for external session messages, including stable event-ID coalescing and existing steer/follow-up delivery.
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
 - Added xAI Grok subscription login alongside the existing xAI API-key option.

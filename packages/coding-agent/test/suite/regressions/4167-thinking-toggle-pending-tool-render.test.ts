@@ -8,6 +8,7 @@ import type {
 	AgentConnectionSessionEvent,
 } from "../../../src/modes/agent-connection/index.js";
 import { AgentActivityTracker } from "../../../src/modes/interactive/agent-activity.js";
+import { ElapsedToolLabelGate } from "../../../src/modes/interactive/components/elapsed-tool-marker.js";
 import type { ToolExecutionComponent } from "../../../src/modes/interactive/components/tool-execution.js";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
@@ -46,6 +47,7 @@ type RenderSessionContextThis = {
 	toolOutputExpanded: boolean;
 	isInitialized: boolean;
 	activityTracker: AgentActivityTracker;
+	elapsedToolLabelGate: ElapsedToolLabelGate;
 	updateWorkingLoaderMessage(): void;
 	updateEditorBorderColor(): void;
 	updateConnectionStateFromEvent(event: AgentConnectionSessionEvent): void;
@@ -89,6 +91,7 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		toolOutputExpanded: false,
 		isInitialized: true,
 		activityTracker: new AgentActivityTracker(),
+		elapsedToolLabelGate: new ElapsedToolLabelGate(),
 		updateWorkingLoaderMessage: vi.fn(),
 		updateEditorBorderColor: vi.fn(),
 		updateConnectionStateFromEvent: vi.fn(),

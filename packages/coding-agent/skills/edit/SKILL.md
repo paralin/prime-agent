@@ -14,6 +14,13 @@ Call the prepared async function from the IPython kernel:
 await edit(path="pkg/file.py", old_str=old, new_str=new)
 ```
 
+In an ordinary Python process, the package exports the same callable name:
+
+```python
+from edit import edit
+await edit(path="pkg/file.py", old_str=old, new_str=new)
+```
+
 Use exact old and new strings. When the text contains triple double quotes, use
 triple single-quoted variables such as `old = '''...'''`, or construct `old`
 and `new` from file slices already inspected. The call returns a short

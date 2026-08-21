@@ -152,22 +152,3 @@ export async function getLatestPiRelease(
 	}
 	return release;
 }
-
-export async function getLatestPiVersion(
-	currentVersion: string,
-	options: { timeoutMs?: number } = {},
-): Promise<string | undefined> {
-	return (await getLatestPiRelease(currentVersion, options))?.version;
-}
-
-export async function checkForNewPiVersion(currentVersion: string): Promise<string | undefined> {
-	try {
-		const latestVersion = await getLatestPiVersion(currentVersion);
-		if (latestVersion && isNewerPackageVersion(latestVersion, currentVersion)) {
-			return latestVersion;
-		}
-		return undefined;
-	} catch {
-		return undefined;
-	}
-}

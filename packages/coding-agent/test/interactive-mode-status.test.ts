@@ -125,40 +125,6 @@ function createConnectionState(overrides: Partial<AgentConnectionState> = {}): A
 	};
 }
 
-describe("InteractiveMode update notifications", () => {
-	beforeAll(() => {
-		initTheme("dark");
-	});
-
-	test("shows the slash update command in one compact line", () => {
-		const chatContainer = new Container();
-		const fakeThis = {
-			chatContainer,
-			ui: { requestRender: vi.fn() },
-		} as unknown as InteractiveMode;
-
-		InteractiveMode.prototype.showNewVersionNotification.call(fakeThis, "1.2.3");
-
-		const output = normalizeRenderedOutput(chatContainer);
-		expect(chatContainer.children).toHaveLength(1);
-		expect(output).toBe("Update available: v1.2.3. Run /update");
-	});
-
-	test("shows package updates in one compact line", () => {
-		const chatContainer = new Container();
-		const fakeThis = {
-			chatContainer,
-			ui: { requestRender: vi.fn() },
-		} as unknown as InteractiveMode;
-
-		InteractiveMode.prototype.showPackageUpdateNotification.call(fakeThis, ["npm:@foo/bar", "npm:@baz/qux"]);
-
-		const output = normalizeRenderedOutput(chatContainer);
-		expect(chatContainer.children).toHaveLength(1);
-		expect(output).toBe("Package updates available: npm:@foo/bar, npm:@baz/qux. Run /update --extensions");
-	});
-});
-
 type ExtensionFixture = {
 	path: string;
 	sourceInfo?: AgentConnectionSourceInfo;

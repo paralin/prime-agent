@@ -7,7 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
-import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
+import { ORPHAN_PROCESS_JOURNAL_ENV, readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
 import {
 	acquireSessionLease,
 	SESSION_LEASE_OWNER_ID_ENV,
@@ -18,6 +18,11 @@ import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agen
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import {
+	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
+	DAEMON_WORKER_ROLE_ENV,
+	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
+	DAEMON_WORKER_TOKEN_ENV,
 	type DaemonWorkerDescriptor,
 	type DaemonWorkerFrameHeader,
 	isDaemonWorkerFrameHeader,
@@ -103,6 +108,14 @@ function spawnSupervisor(
 				[ENV_AGENT_DIR]: agentDir,
 				PI_OFFLINE: "1",
 				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+				[DAEMON_WORKER_ROLE_ENV]: undefined,
+				[DAEMON_WORKER_TOKEN_ENV]: undefined,
+				[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: undefined,
+				[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: undefined,
+				[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]: undefined,
+				[ORPHAN_PROCESS_JOURNAL_ENV]: undefined,
+				[SESSION_LEASES_ENABLED_ENV]: undefined,
+				[SESSION_LEASE_OWNER_ID_ENV]: undefined,
 			},
 			stdio: ["ignore", "pipe", "pipe"],
 		},
@@ -207,7 +220,11 @@ async function connectEventually(socketPath: string, child?: ChildProcess): Prom
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 		}
 	}
-	throw new Error(`Timed out waiting for supervisor: ${String(lastError)}`);
+	const diagnostics = child ? childDiagnostics.get(child) : undefined;
+	throw new Error(
+		`Timed out waiting for supervisor: ${String(lastError)}\n` +
+			`stdout:\n${diagnostics?.stdout ?? ""}\nstderr:\n${diagnostics?.stderr ?? ""}`,
+	);
 }
 
 async function waitForSocketGone(socketPath: string): Promise<void> {

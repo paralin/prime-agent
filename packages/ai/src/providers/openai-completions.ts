@@ -162,7 +162,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				totalTokens: 0,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
-			stopReason: "stop",
+			// A stream that ends without any truthy finish_reason (provider closed
+			// early or sent [DONE] with no terminal chunk) must surface "unknown",
+			// never "stop"; real finish_reason values overwrite this below.
+			stopReason: "unknown",
 			timestamp: Date.now(),
 		};
 
@@ -1276,7 +1279,8 @@ function mapStopReason(reason: ChatCompletionChunk.Choice["finish_reason"] | str
 	stopReason: StopReason;
 	errorMessage?: string;
 } {
-	if (reason === null) return { stopReason: "stop" };
+	// No terminal finish_reason: the stream ended without a real completion.
+	if (reason === null) return { stopReason: "unknown" };
 	switch (reason) {
 		case "stop":
 		case "end":

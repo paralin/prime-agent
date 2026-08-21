@@ -201,6 +201,13 @@ Create provider file exporting:
 
 The script handles: version bump, folding `.changes/` fragments into the release section, commit, tag, and publish.
 
+## Repository Target and Publication
+
+- The writable repository for this checkout is `paralin/prime-agent`.
+- Prefer a normal branch or a direct commit on `main`, then push to the matching branch or `main` in `paralin/prime-agent`.
+- Open a pull request only when review, branch protection, or the user requires one.
+- Never open or update a pull request against `PrimeIntellect-ai/prime-agent`. That upstream automatically closes these pull requests. Treat it as read-only unless the user explicitly changes this policy.
+
 ## **CRITICAL** Git Rules for Parallel Agents **CRITICAL**
 
 Multiple agents may work on different files in the same worktree simultaneously. You MUST follow these rules:

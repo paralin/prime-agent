@@ -21,6 +21,12 @@ for arg in "$@"; do
   fi
 done
 
+# A bare source launcher reopens the most recent session instead of creating a
+# sibling session beside work that may already be active.
+if [[ "${#ARGS[@]}" -eq 0 ]]; then
+  ARGS=(--continue)
+fi
+
 if [[ "$NO_ENV" == "true" ]]; then
   # Unset API keys (see packages/ai/src/env-api-keys.ts)
   unset ANTHROPIC_API_KEY
@@ -69,7 +75,7 @@ if [[ "$USE_DIST" == "true" ]]; then
     echo "Bundle not found at $BUNDLE. Run npm run build first." >&2
     exit 1
   fi
-  exec node "$BUNDLE" ${ARGS[@]+"${ARGS[@]}"}
+  exec node "$BUNDLE" "${ARGS[@]}"
 fi
 
 TSX_BIN="$SCRIPT_DIR/node_modules/.bin/tsx"
@@ -78,4 +84,4 @@ if [[ ! -x "$TSX_BIN" ]]; then
   exit 1
 fi
 
-"$TSX_BIN" "$SCRIPT_DIR/packages/coding-agent/src/cli.ts" ${ARGS[@]+"${ARGS[@]}"}
+exec "$TSX_BIN" "$SCRIPT_DIR/packages/coding-agent/src/cli.ts" "${ARGS[@]}"

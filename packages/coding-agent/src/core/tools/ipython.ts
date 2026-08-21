@@ -428,6 +428,19 @@ export class IpythonKernelProvisioner {
 		if (signal?.aborted) {
 			return Promise.reject(createAbortError());
 		}
+		// A kernel that died unexpectedly is replaced by the next call: drop the
+		// dead cache entry so the memoized startup below launches exactly one
+		// fresh kernel (concurrent callers join it), which restores the last
+		// persisted snapshot. dispose()/kill() cleared the flag on the manager,
+		// so an explicitly torn-down kernel is never resurrected here.
+		const dead = this.startedManager;
+		if (dead && !dead.isRunning && dead.exitedUnexpectedly) {
+			this.managerPromise = undefined;
+			this.startedManager = undefined;
+			if (this.options?.kernelManagerRef?.current === dead) {
+				this.options.kernelManagerRef.current = undefined;
+			}
+		}
 		let cleanupProgressListener: (() => void) | undefined;
 		if (onProgress && !this.startedManager) {
 			this.startupListeners.add(onProgress);
@@ -542,9 +555,7 @@ export class IpythonKernelProvisioner {
 					const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
 					this.emitStartupProgress("Restoring IPython state...");
 					const restore = await raceWithAbort(m.restoreState(), startupSignal);
-					if (snapshotExisted) {
-						pendingRestore = restore ?? { restored: [], failed: [], path: snapshotPathIn(snapshotDir) };
-					}
+					pendingRestore = resolveRestoreReport(snapshotDir, snapshotExisted, restore);
 				}
 				this.emitStartupProgress("Preparing Python runtime...");
 				const bootstrap = await m.execute(bootstrapCode, {

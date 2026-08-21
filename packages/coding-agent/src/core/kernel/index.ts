@@ -49,6 +49,8 @@ const ACT_CELL_INTERRUPT_GRACE_MS = 100;
 const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
 const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
+// Diagnostics only; the full stream already reached the caller via onStream.
+const KERNEL_STDERR_TAIL_BYTES = 64 * 1024;
 const KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE =
 	"IPython kernel is still running the previously interrupted cell. Wait and try again, or kill the IPython kernel to start fresh.";
 
@@ -56,6 +58,18 @@ export class KernelBusyAfterInterruptError extends Error {
 	constructor() {
 		super(KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE);
 		this.name = "KernelBusyAfterInterruptError";
+	}
+}
+
+const KERNEL_EXITED_MESSAGE =
+	"IPython kernel exited unexpectedly; the running cell did not complete and is not replayed automatically. " +
+	"The next call starts one fresh kernel and restores the last persisted snapshot.";
+
+/** A cell failed because the kernel process died mid-execution. Never auto-replays the cell. */
+export class KernelExitedError extends Error {
+	constructor() {
+		super(KERNEL_EXITED_MESSAGE);
+		this.name = "KernelExitedError";
 	}
 }
 
@@ -718,6 +732,8 @@ export class KernelManager {
 	private readonly inFlightHostRequests = new Set<Promise<void>>();
 	private readonly pendingGraceInterrupts = new Set<Promise<void>>();
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
+	/** Set only by observed process death, never by an explicit teardown; cleared by a successful start. */
+	private exitedUnexpectedlyState = false;
 	/** Bumped by every teardown so a stale in-flight doStart can never touch a newer kernel. */
 	private startGeneration = 0;
 	/** Memoized so concurrent callers all await the same in-flight startup. */
@@ -743,8 +759,27 @@ export class KernelManager {
 		return this.options.sessionId;
 	}
 
+	/** True when the kernel process died without a local teardown request. */
+	get exitedUnexpectedly(): boolean {
+		return this.exitedUnexpectedlyState;
+	}
+
+	/** Keeps only the trailing KERNEL_STDERR_TAIL_BYTES so a chatty kernel cannot grow the host. */
+	private pushStderr(chunk: string): void {
+		this.kernelStderr = (this.kernelStderr + chunk).slice(-KERNEL_STDERR_TAIL_BYTES);
+	}
+
+	/**
+	 * Failure for any call that reaches a torn-down kernel: the typed exit error
+	 * when the kernel died on its own, the plain shutdown error after an explicit
+	 * teardown request.
+	 */
+	private shutdownError(): Error {
+		return this.exitedUnexpectedlyState ? new KernelExitedError() : new Error("Kernel has been shut down");
+	}
+
 	private appendKernelDiagnostic(message: string): void {
-		this.kernelStderr += `[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`;
+		this.pushStderr(`[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`);
 	}
 
 	async start(options: KernelStartOptions = {}): Promise<void> {
@@ -847,8 +882,7 @@ export class KernelManager {
 			if (kernel.pid !== undefined) recordOrphanProcessState(kernel.pid, true);
 
 			kernel.stderr?.on("data", (buf: Buffer) => {
-				const s = buf.toString();
-				this.kernelStderr += s;
+				this.pushStderr(buf.toString());
 			});
 
 			kernel.on("error", (err) => {
@@ -860,13 +894,7 @@ export class KernelManager {
 			});
 
 			kernel.on("exit", (code, signal) => {
-				if (this.kernel !== kernel) return;
-				if (this.state !== "shutdown") {
-					this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
-				}
-				this.state = "shutdown";
-				liveKernels.delete(this);
-				this.cleanupResources();
+				this.handleKernelProcessExit(kernel, code, signal);
 			});
 		}
 
@@ -912,7 +940,25 @@ export class KernelManager {
 		}
 
 		this.state = "running";
+		this.exitedUnexpectedlyState = false;
 		this.startForkedExitWatch();
+	}
+
+	/**
+	 * Single exit path for the spawned kernel process: an exit while the manager
+	 * is not already torn down is an unexpected death (recorded so the next call
+	 * can replace the kernel), while an exit after an explicit teardown stays
+	 * terminal and never marks the kernel as unexpectedly dead.
+	 */
+	private handleKernelProcessExit(kernel: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
+		if (this.kernel !== kernel) return;
+		if (this.state !== "shutdown") {
+			this.exitedUnexpectedlyState = true;
+			this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
+		}
+		this.state = "shutdown";
+		liveKernels.delete(this);
+		this.cleanupResources();
 	}
 
 	/** True when a teardown (or newer start) superseded the start that captured `generation`. */
@@ -929,6 +975,7 @@ export class KernelManager {
 
 	private handleForkedKernelExit(watched: ForkedKernelHandle): void {
 		if (this.state !== "running" || this.forkedKernel !== watched || this.forkedExitWatch !== watched) return;
+		this.exitedUnexpectedlyState = true;
 		this.appendKernelDiagnostic("forked kernel exited unexpectedly");
 		this.state = "shutdown";
 		liveKernels.delete(this);
@@ -1086,7 +1133,7 @@ export class KernelManager {
 		}
 		await this.start({ signal: opts.signal });
 		if ((this.state as string) === "shutdown") {
-			throw new Error("Kernel has been shut down");
+			throw this.shutdownError();
 		}
 
 		const prev = this.executionQueue;
@@ -1104,7 +1151,7 @@ export class KernelManager {
 				return { stdout: "", stderr: "", status: "aborted", durationMs: Date.now() - started };
 			}
 			if ((this.state as string) === "shutdown") {
-				throw new Error("Kernel has been shut down");
+				throw this.shutdownError();
 			}
 			if (executionTimeoutMs === undefined) {
 				return await this.executeInner(code, opts, started);
@@ -1527,7 +1574,7 @@ export class KernelManager {
 		const started = Date.now();
 		while (this.activeExecution && Date.now() - started < KERNEL_BUSY_REUSE_WAIT_MS) {
 			if ((this.state as string) === "shutdown") {
-				throw new Error("Kernel has been shut down");
+				throw this.shutdownError();
 			}
 			void this.interrupt().catch(() => undefined);
 			const remaining = KERNEL_BUSY_REUSE_WAIT_MS - (Date.now() - started);
@@ -1714,7 +1761,7 @@ export class KernelManager {
 		this.clearSnapshotTimer();
 		this.lateSentAgentMessageHandlers.clear();
 		this.forkedExitWatch = undefined;
-		this.rejectActiveExecution(new Error("Kernel has been shut down"));
+		this.rejectActiveExecution(this.shutdownError());
 		this.shell?.close();
 		this.iopub?.close();
 		this.control?.close();
@@ -1805,6 +1852,7 @@ export class KernelManager {
 
 	/** Resolves true when this call performed the cleanup (false: a concurrent teardown won). */
 	async shutdown(opts: { snapshot?: boolean } = {}): Promise<boolean> {
+		this.exitedUnexpectedlyState = false;
 		if (this.state === "shutdown") {
 			liveKernels.delete(this);
 			this.cleanupResources();
@@ -1883,6 +1931,7 @@ export class KernelManager {
 	}
 
 	async kill(): Promise<void> {
+		this.exitedUnexpectedlyState = false;
 		this.state = "shutdown";
 		this.abortHostRequests();
 		liveKernels.delete(this);
@@ -2012,6 +2061,7 @@ export class KernelManager {
 
 	/** Graceful cleanup. Waits briefly for in-flight host request handlers before closing sockets. */
 	dispose(): Promise<void> {
+		this.exitedUnexpectedlyState = false;
 		return (async () => {
 			// Let any claimed grace interrupt either stop its correlated cell or observe
 			// that the execution is already idle before taking the final snapshot.
@@ -2038,6 +2088,7 @@ export class KernelManager {
 
 	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */
 	disposeSync(): void {
+		this.exitedUnexpectedlyState = false;
 		this.state = "shutdown";
 		this.abortHostRequests();
 		liveKernels.delete(this);

@@ -1,0 +1,1 @@
+- Fixed IPython tool calls failing permanently after the kernel process died unexpectedly: the next call starts a fresh kernel, restores the last persisted snapshot, and reports the interrupted cell as failed instead of replaying it.

@@ -159,6 +159,34 @@ describe("IpythonKernelProvisioner", () => {
 		expect(countRuns()).toBe(2);
 	});
 
+	it("single-flights replacement after the running kernel exits unexpectedly", async () => {
+		const kernelManagerRef: { current?: KernelManager } = {};
+		const provisioner = new IpythonKernelProvisioner(tempDir, { kernelManagerRef });
+		const dead = { isRunning: false, exitedUnexpectedly: true } as KernelManager;
+		const fresh = { isRunning: true, exitedUnexpectedly: false } as KernelManager;
+		const startKernel = vi.fn(async () => fresh);
+		kernelManagerRef.current = dead;
+		Object.assign(
+			provisioner as unknown as {
+				managerPromise: Promise<KernelManager>;
+				startedManager: KernelManager;
+				startKernel: () => Promise<KernelManager>;
+			},
+			{
+				managerPromise: Promise.resolve(dead),
+				startedManager: dead,
+				startKernel,
+			},
+		);
+
+		const [first, second] = await Promise.all([provisioner.ensure(), provisioner.ensure()]);
+
+		expect(first).toBe(fresh);
+		expect(second).toBe(fresh);
+		expect(startKernel).toHaveBeenCalledTimes(1);
+		expect(kernelManagerRef.current).toBeUndefined();
+	});
+
 	it("prewarm() swallows the failure and the next ensure() starts fresh", async () => {
 		const { python, countRuns } = writeFakePython();
 		const provisioner = new IpythonKernelProvisioner(tempDir, { python });

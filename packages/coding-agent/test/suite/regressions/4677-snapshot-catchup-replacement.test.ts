@@ -148,7 +148,60 @@ function workerHarness(result: DaemonAttachResult, transcript: SnapshotTranscrip
 	};
 }
 
+function materializedResult(content: string): DaemonAttachResult {
+	const messages: AgentMessage[] = [{ role: "user", content: [{ type: "text", text: content }], timestamp: 1 }];
+	return {
+		protocol: DAEMON_PROTOCOL_INFO,
+		activeSessionId,
+		snapshot: {
+			activeSessionId,
+			summary: summary(messages.length),
+			state: { activeSessionId, sessionId: "session-4677" } as DaemonAttachResult["snapshot"]["state"],
+			messages,
+			lastEventSequence: 42,
+		},
+		replay: { status: "complete", toSequence: 42 },
+		lastEventSequence: 42,
+		client: { id: "supervisor", capabilities: ["chunked_snapshot"] },
+	};
+}
+
+function uncachedWorkerHarness(): WorkerHarness {
+	return {
+		descriptor: {
+			workerId: "worker-4677",
+			rootActiveSessionId: activeSessionId,
+			lifecycle: "ready",
+			pid: 4677,
+		},
+		summaries: new Map(),
+		snapshotCache: new Map(),
+		transcriptCaches: new Map(),
+		snapshotGenerations: new Map(),
+		snapshotLoads: new Map(),
+		intentionalStop: false,
+		stopRevision: 0,
+	};
+}
+
 describe("ENG-4677 snapshot catch-up replacement", () => {
+	it("keys supervisor materialized transcript caches by exact message bytes", () => {
+		const root = tempDirectory();
+		const supervisor = new DaemonSupervisor(join(root, "supervisor.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			descriptorDir: join(root, "state"),
+		});
+		const internals = supervisor as unknown as {
+			getOrCreateTranscriptCache(worker: WorkerHarness, result: DaemonAttachResult): SnapshotTranscriptCache;
+		};
+
+		const first = internals.getOrCreateTranscriptCache(uncachedWorkerHarness(), materializedResult("first"));
+		const retransmission = internals.getOrCreateTranscriptCache(uncachedWorkerHarness(), materializedResult("first"));
+		const changed = internals.getOrCreateTranscriptCache(uncachedWorkerHarness(), materializedResult("changed"));
+
+		expect(retransmission.snapshotId).toBe(first.snapshotId);
+		expect(changed.snapshotId).not.toBe(first.snapshotId);
+	});
 	it("lets an incomplete retained snapshot finish after a newer generation begins", async () => {
 		const root = tempDirectory();
 		const supervisor = new DaemonSupervisor(join(root, "supervisor.sock"), {

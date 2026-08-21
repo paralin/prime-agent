@@ -1,9 +1,10 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { KernelManager } from "../src/core/kernel/index.js";
+import { KernelExitedError, KernelManager } from "../src/core/kernel/index.js";
+import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
 function resolveKernelPython(): string | null {
 	const candidates = [
@@ -72,6 +73,31 @@ describeIfKernel("kernel state snapshot round-trip (real kernel)", { tags: ["ker
 			expect(echo.stdout.trim()).toBe("42 84 6");
 		} finally {
 			await reader.dispose();
+		}
+	}, 60_000);
+
+	it("fails the uncertain cell and single-flights replacement after an unexpected exit", async () => {
+		const recoveryDir = join(dir, "provisioner-recovery");
+		mkdirSync(recoveryDir, { recursive: true });
+		const provisioner = new IpythonKernelProvisioner(dir, {
+			python: python as string,
+			snapshotDir: recoveryDir,
+		});
+
+		try {
+			const first = await provisioner.ensure();
+			await first.execute("recovered_value = 42");
+			expect(await first.snapshotState()).not.toBeNull();
+
+			await expect(first.execute("import os; os._exit(17)")).rejects.toBeInstanceOf(KernelExitedError);
+
+			const [replacement, joined] = await Promise.all([provisioner.ensure(), provisioner.ensure()]);
+			expect(replacement).toBe(joined);
+			expect(replacement).not.toBe(first);
+			const restored = await replacement.execute("print(recovered_value)");
+			expect(restored.stdout.trim()).toBe("42");
+		} finally {
+			await provisioner.dispose();
 		}
 	}, 60_000);
 

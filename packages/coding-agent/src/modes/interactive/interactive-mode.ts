@@ -44,20 +44,12 @@ import {
 } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
 import {
-	buildDaemonUpdateRestartReport,
-	launchDaemonUpdateRestartCoordinator,
-	resolveDaemonUpdateRestartSocketPath,
-} from "../../cli/daemon-update-restart.js";
-import {
-	APP_NAME,
 	APP_TITLE,
 	getAgentDir,
 	getAgentTracesLogPath,
 	getDebugLogPath,
 	getLogsDir,
 	getShareViewerUrl,
-	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
-	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	VERSION,
 } from "../../config.js";
 import { type ActProjectionEvent, actEventDepth } from "../../core/act-events.js";
@@ -146,7 +138,6 @@ import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { ensureTool, ensureToolWithStatus, formatMissingRipgrepMessage } from "../../utils/tools-manager.js";
-import { checkForNewPiVersion } from "../../utils/version-check.js";
 import type {
 	AgentConnection,
 	AgentConnectionExtensionUiRequest,
@@ -171,12 +162,7 @@ import type {
 } from "../agent-connection/index.js";
 import { AgentConnectionPromptAdmissionError } from "../agent-connection/index.js";
 import { getModelArgumentCompletions } from "../model-autocomplete.js";
-import {
-	checkForPackageUpdates,
-	checkTmuxKeyboardSetup,
-	formatPackageUpdateNotice,
-	formatUpdateAvailableNotice,
-} from "../shared/startup-notices.js";
+import { checkTmuxKeyboardSetup } from "../shared/startup-notices.js";
 import { AGENT_ACTIVITY_LABELS, AgentActivityTracker, formatTokenCount } from "./agent-activity.js";
 import { type AuthenticationResult, getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "./auth-flows.js";
 import { AgentMessageComponent } from "./components/agent-message.js";
@@ -725,67 +711,6 @@ function getPayloadWorkingIndicatorOptions(
 		...(frames === undefined ? {} : { frames }),
 		...(intervalMs === undefined ? {} : { intervalMs }),
 	};
-}
-
-export function updateArgsIncludeSelf(args: readonly string[]): boolean {
-	let selfFlag = false;
-	let extensionsOnlyFlag = false;
-	let positional: string | undefined;
-	for (let index = 0; index < args.length; index++) {
-		const arg = args[index];
-		if (arg === "--self") {
-			selfFlag = true;
-		} else if (arg === "--extensions") {
-			extensionsOnlyFlag = true;
-		} else if (arg === "--extension") {
-			extensionsOnlyFlag = true;
-			index++;
-		} else if (arg === "--daemon-socket") {
-			index++;
-		} else if (arg && !arg.startsWith("-") && positional === undefined) {
-			positional = arg;
-		}
-	}
-	if (selfFlag) {
-		return true;
-	}
-	if (extensionsOnlyFlag) {
-		return false;
-	}
-	if (!positional) {
-		return true;
-	}
-	const normalized = positional.toLowerCase();
-	return normalized === "self" || normalized === "pi" || normalized === APP_NAME.toLowerCase();
-}
-
-function argsIncludeSessionSelection(args: readonly string[]): boolean {
-	for (const arg of args) {
-		if (arg === "--resume" || arg === "-r" || arg === "--continue" || arg === "-c" || arg === "--fork") {
-			return true;
-		}
-	}
-	return false;
-}
-
-export function buildUpdateRelaunchArgs(args: readonly string[], sessionFile: string | undefined): string[] {
-	const relaunchArgs = [...args];
-	if (sessionFile && !argsIncludeSessionSelection(relaunchArgs)) {
-		relaunchArgs.push("--resume", sessionFile);
-	}
-	return relaunchArgs;
-}
-
-export function buildUpdateChildArgs(args: readonly string[], daemonSocketPath: string): string[] {
-	return args.includes("--daemon-socket") ? [...args] : [...args, "--daemon-socket", daemonSocketPath];
-}
-
-export function resolveInteractiveUpdateDaemonSocketPath(
-	args: readonly string[],
-	activeDaemonSocketPath: string,
-): string {
-	const socketFlagIndex = args.indexOf("--daemon-socket");
-	return socketFlagIndex === -1 ? activeDaemonSocketPath : (args[socketFlagIndex + 1] ?? activeDaemonSocketPath);
 }
 
 export interface InteractiveInitialPrompt {
@@ -1506,14 +1431,6 @@ export class InteractiveMode {
 		// `returnToAgentsView`, which is also set for direct daemon attaches that never
 		// rendered the agents view and still want the in-session fallback.)
 		const ownsGlobalStartupNotices = !this.options.agentsViewOwnsStartupNotices;
-		const newVersionPromise = ownsGlobalStartupNotices ? checkForNewPiVersion(this.version) : undefined;
-		const packageUpdatesPromise = ownsGlobalStartupNotices
-			? checkForPackageUpdates({
-					cwd: this.getCurrentCwd(),
-					agentDir: getAgentDir(),
-					settingsManager: this.settingsManager,
-				})
-			: undefined;
 		const tmuxKeyboardWarningPromise = ownsGlobalStartupNotices ? checkTmuxKeyboardSetup() : undefined;
 
 		const {
@@ -1633,22 +1550,6 @@ export class InteractiveMode {
 			if (!ownsGlobalStartupNotices || this.sessionHasMessages) {
 				return;
 			}
-
-			void newVersionPromise
-				?.then((newVersion) => {
-					if (newVersion) {
-						this.showNewVersionNotification(newVersion);
-					}
-				})
-				.catch(() => {});
-
-			void packageUpdatesPromise
-				?.then((updates) => {
-					if (updates.length > 0) {
-						this.showPackageUpdateNotification(updates);
-					}
-				})
-				.catch(() => {});
 
 			void tmuxKeyboardWarningPromise
 				?.then((warning) => {
@@ -4921,19 +4822,6 @@ export class InteractiveMode {
 					await this.handleReloadCommand();
 					return;
 				}
-				if (commandName === "update") {
-					this.editor.setText("");
-					const updateArgs = parseCommandArgs(commandArgs);
-					if (
-						!updateArgsIncludeSelf(updateArgs) &&
-						(this.isAgentCompacting() || this.isAgentStreaming() || this.isBashRunning())
-					) {
-						this.showWarning("Wait for the current work to finish before updating.");
-						return;
-					}
-					await this.handleUpdateCommand(commandArgs);
-					return;
-				}
 				if (commandName === "fullscreen") {
 					this.editor.setText("");
 					const arg = commandArgs?.trim().toLowerCase();
@@ -7539,16 +7427,6 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	showNewVersionNotification(newVersion: string): void {
-		this.chatContainer.addChild(new Text(formatUpdateAvailableNotice(newVersion), 1, 0));
-		this.ui.requestRender();
-	}
-
-	showPackageUpdateNotification(packages: string[]): void {
-		this.chatContainer.addChild(new Text(formatPackageUpdateNotice(packages), 1, 0));
-		this.ui.requestRender();
-	}
-
 	private getAllQueuedMessages(): { steering: string[]; followUp: string[] } {
 		return {
 			steering: [...this.connectionQueue.steering],
@@ -8842,119 +8720,6 @@ export class InteractiveMode {
 		if (loggedOut?.startsWith("mcp:")) {
 			await this.handleReloadCommand();
 		}
-	}
-
-	private async handleUpdateCommand(args: string): Promise<void> {
-		const entrypoint = process.argv[1];
-		if (!entrypoint) {
-			this.showError("Cannot determine current CLI entrypoint for update");
-			return;
-		}
-
-		const updateArgs = parseCommandArgs(args);
-		const includesSelf = updateArgsIncludeSelf(updateArgs);
-		const updateCwd = this.getCurrentCwd();
-		const daemonSocketPath = resolveInteractiveUpdateDaemonSocketPath(
-			updateArgs,
-			resolveDaemonUpdateRestartSocketPath(this.options.daemonSocketPath),
-		);
-		const updateChildArgs = includesSelf ? buildUpdateChildArgs(updateArgs, daemonSocketPath) : updateArgs;
-		this.stopWorkingLoader();
-		await this.ui.terminal.drainInput(1000).catch(() => undefined);
-		this.ui.stop();
-
-		const updateEnv = includesSelf ? { ...process.env, [SELF_UPDATE_INTERACTIVE_CHILD_ENV]: "1" } : process.env;
-		const updateResult = spawnSync(
-			process.execPath,
-			[...process.execArgv, entrypoint, "update", ...updateChildArgs],
-			{
-				stdio: "inherit",
-				cwd: updateCwd,
-				env: updateEnv,
-			},
-		);
-		const updateExitCode = updateResult.status ?? (updateResult.signal ? 1 : 0);
-		const selfUpdateNotAttempted =
-			includesSelf && !updateResult.error && updateExitCode === SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE;
-
-		if (includesSelf && !selfUpdateNotAttempted) {
-			const relaunchArgs = buildUpdateRelaunchArgs(process.argv.slice(2), this.connectionState?.sessionFile);
-			if (updateResult.error) {
-				console.error(`Update failed: ${updateResult.error.message}`);
-				console.error(`Relaunching ${APP_NAME}...`);
-			} else if (updateExitCode !== 0) {
-				console.error(
-					updateResult.signal
-						? `Update terminated by signal ${updateResult.signal}`
-						: `Update exited with code ${updateExitCode}`,
-				);
-				console.error(`Relaunching ${APP_NAME}...`);
-			}
-			this.stop();
-			await this.agentConnection.dispose().catch(() => undefined);
-			try {
-				await this.options.onShutdown?.();
-			} catch {
-				// The update already completed; do not block relaunch on local teardown.
-			}
-			if (!updateResult.error && updateExitCode === 0) {
-				try {
-					const status = await launchDaemonUpdateRestartCoordinator({
-						socketPath: daemonSocketPath,
-						agentDir: getAgentDir(),
-						cwd: updateCwd,
-						originActiveSessionId: this.connectionState?.activeSessionId,
-					});
-					const report = buildDaemonUpdateRestartReport(status);
-					for (const message of report.info) {
-						console.log(message);
-					}
-					for (const warning of report.warnings) {
-						console.error(`Warning: ${warning}`);
-					}
-				} catch (error: unknown) {
-					console.error(
-						`Warning: updated, but could not coordinate the daemon restart (${error instanceof Error ? error.message : String(error)}).`,
-					);
-				}
-			}
-			const relaunchResult = spawnSync(process.execPath, [...process.execArgv, entrypoint, ...relaunchArgs], {
-				stdio: "inherit",
-				cwd: updateCwd,
-				env: process.env,
-			});
-			if (relaunchResult.error) {
-				console.error(`Failed to relaunch ${APP_NAME}: ${relaunchResult.error.message}`);
-				process.exit(1);
-			}
-			process.exit(relaunchResult.status ?? (relaunchResult.signal ? 1 : 0));
-		}
-
-		this.ui.start();
-		if (this.fullscreenEnabled) {
-			this.applyFullscreen(true);
-		}
-		this.ui.requestRender(true);
-
-		if (selfUpdateNotAttempted) {
-			this.showStatus(`Update did not change ${APP_NAME}. Reloading resources...`);
-			await this.handleReloadCommand();
-			return;
-		}
-		if (updateResult.error) {
-			this.showError(`Update failed: ${updateResult.error.message}`);
-			return;
-		}
-		if (updateExitCode !== 0) {
-			this.showError(
-				updateResult.signal
-					? `Update terminated by signal ${updateResult.signal}`
-					: `Update exited with code ${updateExitCode}`,
-			);
-			return;
-		}
-		this.showStatus("Packages updated. Reloading resources...");
-		await this.handleReloadCommand();
 	}
 
 	private async handleReloadCommand(): Promise<boolean> {

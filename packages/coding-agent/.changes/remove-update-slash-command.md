@@ -1,0 +1,1 @@
+- Removed the `/update` slash command and its startup update-available notices; updates now run through the top-level `prime-agent update` CLI command.

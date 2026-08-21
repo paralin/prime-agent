@@ -305,6 +305,20 @@ export interface IpythonToolOptions {
 	provisioner?: IpythonKernelProvisioner;
 }
 
+/**
+ * Restore reporting is honest: only a start that found an on-disk snapshot
+ * reports one, and a missing restore result over an existing snapshot reports
+ * an explicitly empty revival at that snapshot's path.
+ */
+function resolveRestoreReport(
+	snapshotDir: string,
+	snapshotExisted: boolean,
+	restore: RestoreResult | null,
+): RestoreResult | undefined {
+	if (!snapshotExisted) return undefined;
+	return restore ?? { restored: [], failed: [], path: snapshotPathIn(snapshotDir) };
+}
+
 function quoteScriptMagicArgument(value: string): string {
 	return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\"'\"'")}'`;
 }
@@ -436,6 +450,19 @@ export class IpythonKernelProvisioner {
 		if (signal?.aborted) {
 			return Promise.reject(createAbortError());
 		}
+		// A kernel that died unexpectedly is replaced by the next call: drop the
+		// dead cache entry so the memoized startup below launches exactly one
+		// fresh kernel (concurrent callers join it), which restores the last
+		// persisted snapshot. dispose()/kill() cleared the flag on the manager,
+		// so an explicitly torn-down kernel is never resurrected here.
+		const dead = this.startedManager;
+		if (dead && !dead.isRunning && dead.exitedUnexpectedly) {
+			this.managerPromise = undefined;
+			this.startedManager = undefined;
+			if (this.options?.kernelManagerRef?.current === dead) {
+				this.options.kernelManagerRef.current = undefined;
+			}
+		}
 		let cleanupProgressListener: (() => void) | undefined;
 		if (onProgress && !this.startedManager) {
 			this.startupListeners.add(onProgress);
@@ -538,9 +565,7 @@ export class IpythonKernelProvisioner {
 					const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
 					this.emitStartupProgress("Restoring IPython state...");
 					const restore = await raceWithAbort(m.restoreState(), startupSignal);
-					if (snapshotExisted) {
-						pendingRestore = restore ?? { restored: [], failed: [], path: snapshotPathIn(snapshotDir) };
-					}
+					pendingRestore = resolveRestoreReport(snapshotDir, snapshotExisted, restore);
 				}
 				this.emitStartupProgress("Preparing IPython runtime...");
 				const bootstrap = await m.execute(buildRlmBootstrapCode(this.options?.pythonSkills), {

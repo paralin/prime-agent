@@ -286,6 +286,7 @@ interface ResidentWorker {
 	launchEnv?: Record<string, string>;
 	transientCreateCommand?: DaemonCreateCommand;
 	stopFinalization?: Promise<void>;
+	staleReclaimAdmitted?: boolean;
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
 	updateRestartPrepareClient?: DaemonWorkerClient;
@@ -639,6 +640,7 @@ export class DaemonSupervisor {
 	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
 	private readonly sessionInputPauses = new Map<string, SupervisorSessionInputPause>();
 	private readonly signalCleanupHandlers: Array<() => void> = [];
+	private signalHandlersRegistered = false;
 	private readonly descriptorDir: string;
 	private readonly generation = randomUUID();
 	private readonly supervisorConfigPath: string;
@@ -1074,29 +1076,29 @@ export class DaemonSupervisor {
 		this.sessionInputPauseEpochs.set(client, 0);
 		this.detachingInputPauseSessions.set(client, new Set());
 		this.clients.add(client);
-		void this.ready.then(
-			() => {
-				if (!client.socket.destroyed && this.clients.has(client)) {
-					this.write(client, {
-						type: "daemon_hello",
-						socketPath: this.socketPath,
-						protocol: DAEMON_PROTOCOL_INFO,
-						schemaId: DAEMON_SCHEMA_ID,
-						schemaRevision: DAEMON_SCHEMA_REVISION,
-						appVersion: VERSION,
-						runtime: getDaemonRuntimeIdentity(),
-						supervisorGeneration: this.generation,
-						supervisorOwnerToken: this.ownership?.record.token,
-						supervisorPid: process.pid,
-						supervisorProcessStartId: this.ownership?.record.processStartId,
-						supervisorSocketPath: this.ownership?.record.socketPath,
-						clientId: client.id,
-						serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
-					});
-				}
-			},
-			() => client.socket.destroy(),
-		);
+		// Greet immediately: clients classify a connected daemon as stale when
+		// the hello misses their short deadline, and startup work (worker
+		// adoption, peer sync) can hold `ready` far past it. Commands still
+		// await `ready`; only the greeting is early.
+		this.write(client, {
+			type: "daemon_hello",
+			socketPath: this.socketPath,
+			protocol: DAEMON_PROTOCOL_INFO,
+			schemaId: DAEMON_SCHEMA_ID,
+			schemaRevision: DAEMON_SCHEMA_REVISION,
+			appVersion: VERSION,
+			runtime: getDaemonRuntimeIdentity(),
+			supervisorGeneration: this.generation,
+			supervisorOwnerToken: this.ownership?.record.token,
+			supervisorPid: process.pid,
+			supervisorProcessStartId: this.ownership?.record.processStartId,
+			supervisorSocketPath: this.ownership?.record.socketPath,
+			clientId: client.id,
+			serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+		});
+		// Admitted connections have nothing to talk to once a failed startup
+		// releases the socket lease, so destroy them with it.
+		void this.ready.catch(() => client.socket.destroy());
 
 		client.detachInput = attachJsonlLineReader(socket, (line) => void this.handleLine(client, line));
 		let cleaned = false;
@@ -2324,34 +2326,35 @@ export class DaemonSupervisor {
 	/**
 	 * A stopping worker whose process already died can strand its registration
 	 * (for example when the stop timed out and its finalization was interrupted
-	 * by a supervisor restart). Such a registration would block reopening the
-	 * saved transcript forever, so complete the interrupted stop and let the
-	 * caller launch a fresh worker for the saved session.
+	 * by a supervisor restart), and so can a client-owned worker marked failed
+	 * after its owner vanished without cleaning up. Such registrations block
+	 * reopening the saved transcript forever, so complete the interrupted stop
+	 * or deregister the dead failed worker and let the caller launch a fresh
+	 * worker for the saved session. A dead failed worker admits exactly one
+	 * reclaim at a time so concurrent creates never recover it twice.
 	 */
 	private async reclaimStaleWorkerRegistration(worker: ResidentWorker, freshCreate = false): Promise<boolean> {
 		if (worker.client !== undefined || worker.recovery !== undefined) {
 			return false;
 		}
 		if (worker.descriptor.stopRequestedAt === undefined) {
-			if (worker.descriptor.lifecycle !== "failed" || worker.descriptor.ownerClientId) {
+			// Concurrent fresh creates can both observe one dead failed worker.
+			// Admit exactly one reclaim synchronously; a concurrent caller
+			// returns false without recovering, so uncertain worker operations
+			// never run twice.
+			if (worker.staleReclaimAdmitted) {
 				return false;
 			}
-			const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
-			if (identity === "current") {
-				if (!freshCreate || !worker.descriptor.processStartId) return false;
-				await this.stopWorker(worker, true, true);
-				return true;
+			worker.staleReclaimAdmitted = true;
+			try {
+				return await this.reclaimDeadFailedWorkerRegistration(worker, freshCreate);
+			} finally {
+				if (this.workers.get(worker.descriptor.workerId) === worker) {
+					// The registration survived, so clear the marker and let a
+					// later caller retry the reclaim.
+					worker.staleReclaimAdmitted = false;
+				}
 			}
-			if (identity !== "gone" && identity !== "replaced") {
-				return false;
-			}
-			worker.intentionalStop = true;
-			await this.recoverUncertainWorkerOperations(worker, false);
-			this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
-			this.workers.delete(worker.descriptor.workerId);
-			this.deleteWorkerDescriptor(worker);
-			await this.syncAgentPeers().catch(() => undefined);
-			return true;
 		}
 		// Fail fast before waiting on anything: only a confirmed-dead process is
 		// reclaimable. A live, unknown, or still-stopping worker is left alone
@@ -2376,6 +2379,74 @@ export class DaemonSupervisor {
 			);
 		}
 		this.log(`Reclaimed stale registration for stopped worker ${worker.descriptor.workerId}`);
+		return true;
+	}
+
+	/**
+	 * Reclaim one failed worker's registration. An owner that is still
+	 * connected keeps authority over its failed worker, and only a fresh create
+	 * may reclaim a client-owned registration after its owner is gone; an
+	 * arbitrary attach must not deregister or seize it. A client-owned worker's
+	 * live process is never signalled here because its runtime context belongs
+	 * to the owner's own recovery path. An unowned live process has no such
+	 * authority: its supervisor connection is already lost and no client is
+	 * attached through the supervisor, so any reopen of the saved session may
+	 * stop it and launch a fresh worker from the transcript.
+	 */
+	private async reclaimDeadFailedWorkerRegistration(
+		worker: ResidentWorker,
+		freshCreate: boolean,
+	): Promise<boolean> {
+		if (worker.descriptor.lifecycle !== "failed") {
+			return false;
+		}
+		const ownerConnected =
+			worker.descriptor.ownerClientId !== undefined &&
+			[...this.clients].some((client) => this.protocolClientId(client) === worker.descriptor.ownerClientId);
+		if (ownerConnected) {
+			return false;
+		}
+		// Only a fresh create may reclaim a client-owned registration whose
+		// owner is gone; an arbitrary attach must not deregister or seize it.
+		if (worker.descriptor.ownerClientId !== undefined && !freshCreate) {
+			return false;
+		}
+		const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
+		if (identity === "current") {
+			if (!worker.descriptor.processStartId) {
+				return false;
+			}
+			// Confirm the stuck process dead while keeping its recovery journal,
+			// then fence uncertain operations from that journal before
+			// deregistering. Deleting the descriptor first would destroy the
+			// only record of what the worker left unresolved.
+			try {
+				await this.stopWorker(worker, false, true);
+			} catch (error) {
+				// The stop timed out or failed, so the process may still write.
+				// Keep the registration failed and reclaimable; fencing now could
+				// drop operations the live worker is still committing.
+				const message = error instanceof Error ? error.message : String(error);
+				worker.descriptor.lifecycle = "failed";
+				worker.descriptor.lastError = `Reclaim stop failed; registration stays failed and reclaimable: ${message}`;
+				this.persistWorker(worker);
+				return false;
+			}
+			worker.intentionalStop = true;
+			await this.recoverUncertainWorkerOperations(worker, false);
+			this.workers.delete(worker.descriptor.workerId);
+			this.deleteWorkerDescriptor(worker);
+			return true;
+		}
+		if (identity !== "gone" && identity !== "replaced") {
+			return false;
+		}
+		worker.intentionalStop = true;
+		await this.recoverUncertainWorkerOperations(worker, false);
+		this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
+		this.workers.delete(worker.descriptor.workerId);
+		this.deleteWorkerDescriptor(worker);
+		await this.syncAgentPeers().catch(() => undefined);
 		return true;
 	}
 
@@ -5373,18 +5444,44 @@ export class DaemonSupervisor {
 	}
 
 	private registerSignalHandlers(): void {
+		if (this.signalHandlersRegistered) {
+			return;
+		}
+		this.signalHandlersRegistered = true;
 		const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
 		if (process.platform !== "win32") {
 			signals.push("SIGHUP");
 		}
 		for (const signal of signals) {
-			const handler = () => void this.shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143, false);
+			const handler = () => {
+				this.log(`supervisor received ${signal}; shutting down`);
+				void this.shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143, false);
+			};
 			process.on(signal, handler);
 			this.signalCleanupHandlers.push(() => process.off(signal, handler));
 		}
+		// A crash thrown outside a command handler would otherwise vanish with
+		// the detached stdio; capture the stack in the rotating log before the
+		// process goes down.
+		const uncaughtExceptionHandler = (error: Error): never => {
+			this.log(`uncaught exception: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+			process.exit(1);
+		};
+		const unhandledRejectionHandler = (reason: unknown): never => {
+			this.log(
+				`unhandled rejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`,
+			);
+			process.exit(1);
+		};
+		process.on("uncaughtException", uncaughtExceptionHandler);
+		process.on("unhandledRejection", unhandledRejectionHandler);
 		const exitHandler = () => this.cleanupSocket();
 		process.on("exit", exitHandler);
-		this.signalCleanupHandlers.push(() => process.off("exit", exitHandler));
+		this.signalCleanupHandlers.push(() => {
+			process.off("uncaughtException", uncaughtExceptionHandler);
+			process.off("unhandledRejection", unhandledRejectionHandler);
+			process.off("exit", exitHandler);
+		});
 	}
 
 	private cleanupSocket(): void {

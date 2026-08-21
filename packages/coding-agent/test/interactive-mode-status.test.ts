@@ -47,6 +47,7 @@ import type { AuthenticationResult } from "../src/modes/interactive/auth-flows.j
 import { AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
 import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.js";
 import type { ConfigurationMenuComponent } from "../src/modes/interactive/components/configuration-menu.js";
+import { ElapsedToolLabelGate } from "../src/modes/interactive/components/elapsed-tool-marker.js";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
@@ -210,6 +211,7 @@ type RenderSessionContextHarness = {
 	ipythonToolComponents: Map<string, unknown>;
 	lateIpythonSentAgentMessages: Map<string, unknown[]>;
 	toolOutputExpanded: boolean;
+	elapsedToolLabelGate: ElapsedToolLabelGate;
 	chatContainer: Container;
 	editor: { addToHistory?: (text: string) => void };
 	footer: { invalidate: () => void };
@@ -258,6 +260,7 @@ function createRenderSessionContextHarness(overrides: Partial<RenderSessionConte
 		ipythonToolComponents: new Map<string, unknown>(),
 		lateIpythonSentAgentMessages: new Map<string, unknown[]>(),
 		toolOutputExpanded: false,
+		elapsedToolLabelGate: new ElapsedToolLabelGate(),
 		chatContainer,
 		editor: { addToHistory },
 		footer: { invalidate: vi.fn() },
@@ -329,6 +332,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 				ipythonToolComponents,
 				lateIpythonSentAgentMessages,
 				toolOutputExpanded: false,
+				elapsedToolLabelGate: new ElapsedToolLabelGate(),
 				chatContainer,
 				footer: { invalidate: vi.fn() },
 				updateEditorBorderColor: vi.fn(),
@@ -383,6 +387,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 				ipythonToolComponents: new Map(),
 				lateIpythonSentAgentMessages: new Map(),
 				toolOutputExpanded: false,
+				elapsedToolLabelGate: new ElapsedToolLabelGate(),
 				chatContainer,
 				footer: { invalidate: vi.fn() },
 				updateEditorBorderColor: vi.fn(),

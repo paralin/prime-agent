@@ -8,6 +8,7 @@ import type {
 	AgentConnectionSessionEvent,
 } from "../../../src/modes/agent-connection/index.js";
 import { AgentActivityTracker } from "../../../src/modes/interactive/agent-activity.js";
+import { ElapsedToolLabelGate } from "../../../src/modes/interactive/components/elapsed-tool-marker.js";
 import type { ToolExecutionComponent } from "../../../src/modes/interactive/components/tool-execution.js";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
@@ -34,6 +35,7 @@ type RenderSessionContextThis = {
 	pendingTools: Map<string, ToolExecutionComponent>;
 	ipythonToolComponents: Map<string, ToolExecutionComponent>;
 	lateIpythonSentAgentMessages: Map<string, unknown[]>;
+	elapsedToolLabelGate: ElapsedToolLabelGate;
 	pendingToolCreations: Set<string>;
 	startedToolCalls: Set<string>;
 	resetPendingToolState(): void;
@@ -73,6 +75,7 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		pendingTools,
 		ipythonToolComponents: new Map(),
 		lateIpythonSentAgentMessages: new Map(),
+		elapsedToolLabelGate: new ElapsedToolLabelGate(),
 		pendingToolCreations,
 		startedToolCalls,
 		resetPendingToolState() {

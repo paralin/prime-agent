@@ -1,0 +1,1 @@
+- Fixed the interactive session-context test harnesses missing the elapsed tool label gate after it became a required `InteractiveMode` dependency.

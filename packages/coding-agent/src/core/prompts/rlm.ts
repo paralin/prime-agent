@@ -149,7 +149,8 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	}
 	if (hasAgentMessage) {
 		parts.push(
-			"Agent messaging reaches only your parent, siblings, and direct children. Root agents are siblings. Communication with a deeper descendant relays through its parent.",
+			"`rlm(...)` spawns a new child agent; it does not deliver messages. To message an existing reachable agent, call `await agent_message.send(message, receiver_role=...)` in IPython.",
+			"Agent messaging reaches only your parent, siblings, and direct children. Root agents are siblings. Communication with a deeper descendant relays through its parent. Discover the full documented API with `help(agent_message)` or its SKILL.md; do not substitute an `rlm(...)` spawn for a direct message to an existing agent.",
 		);
 	}
 	if (hasAgentObserve) {
@@ -243,6 +244,11 @@ export function buildSubagentGuidance(
 		"Use direct messages for compact results. Use files when the result is a durable artifact or several children must contribute to one result.",
 		"A saved Continual Harness subagent specification supplies guidance for composing the task prompt. Call `rlm(...)` to create the child agent.",
 	);
+	if (options.hasAgentMessage) {
+		lines.push(
+			"`rlm(...)` only spawns new children. To contact an existing reachable agent, message it with `await agent_message.send(message, receiver_role=...)`; see `help(agent_message)` for the documented API.",
+		);
+	}
 	if (options.includeRefineExamples ?? true) {
 		lines.push("Persist a repeated, genuinely reusable delegation role with `await refine.run()`.");
 	}

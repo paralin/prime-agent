@@ -6,7 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getProcessStartId } from "../src/core/session-lease.js";
+import { ORPHAN_PROCESS_JOURNAL_ENV } from "../src/core/orphan-process-journal.js";
+import {
+	getProcessStartId,
+	SESSION_LEASE_OWNER_ID_ENV,
+	SESSION_LEASES_ENABLED_ENV,
+} from "../src/core/session-lease.js";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { CommandRecoveryJournal } from "../src/modes/daemon/command-recovery-journal.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
@@ -21,8 +26,13 @@ import {
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
+	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
+	DAEMON_WORKER_ROLE_ENV,
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
+	DAEMON_WORKER_STARTUP_GATE_FD_ENV,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
+	DAEMON_WORKER_TOKEN_ENV,
 	type DaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
@@ -38,7 +48,7 @@ const workerLaunchTestState = vi.hoisted(() => ({
 	gateMarkerPath: "",
 	tsxCliPath: "",
 	cliEntrypoint: "",
-	spawned: [] as Array<{ child: ChildProcess; args: readonly string[] }>,
+	spawned: [] as Array<{ child: ChildProcess; args: readonly string[]; env?: NodeJS.ProcessEnv }>,
 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -50,7 +60,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 		spawn(command: string, args: readonly string[], options: SpawnOptions): ChildProcess {
 			const child = actual.spawn(command, args, options);
 			if (workerLaunchTestState.capture) {
-				workerLaunchTestState.spawned.push({ child, args });
+				workerLaunchTestState.spawned.push({ child, args, env: options.env });
 			}
 			return child;
 		},
@@ -635,6 +645,57 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toEqual([]);
 		const child = workerLaunchTestState.spawned.at(-1)?.child;
 		expect(child?.exitCode !== null || child?.signalCode !== null).toBe(true);
+	});
+
+	it("spawns session workers with the required worker marker environment", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-worker-markers-test-"));
+		const descriptorDir = join(root, "descriptors");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		process.env[supervisorRegistryDirEnv] = join(root, "registry");
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.forceMissingProcessStartId = true;
+		workerLaunchTestState.fixtureMode = "close-gate";
+		let assertionCount = 0;
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers: new Map(),
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => {
+				assertionCount++;
+				if (assertionCount === 3) {
+					const child = workerLaunchTestState.spawned.at(-1)?.child;
+					if (!child) {
+						throw new Error("Worker child was not captured");
+					}
+					await waitForCapturedChildClose(child);
+				}
+			}),
+			connectWorker: vi.fn(),
+			syncAgentPeers: vi.fn(async () => undefined),
+			log: vi.fn(),
+		}) as {
+			launchWorker(command: { type: "create"; config: { cwd: string; agentDir: string } }): Promise<unknown>;
+		};
+
+		await expect(
+			supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } }),
+		).rejects.toBeInstanceOf(Error);
+
+		expect(workerLaunchTestState.spawned).toHaveLength(1);
+		const { env } = workerLaunchTestState.spawned[0]!;
+		expect(env?.[DAEMON_WORKER_ROLE_ENV]).toBe("1");
+		expect(env?.[DAEMON_WORKER_TOKEN_ENV]).toEqual(expect.any(String));
+		expect(env?.[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]).toEqual(expect.any(String));
+		expect(env?.[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]).toBe(join(root, "supervisor.sock"));
+		expect(env?.[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]).toMatch(/\.recovery\.jsonl$/);
+		expect(env?.[DAEMON_WORKER_STARTUP_GATE_FD_ENV]).toEqual(expect.any(String));
+		expect(env?.[ORPHAN_PROCESS_JOURNAL_ENV]).toMatch(/\.orphans\.jsonl$/);
+		expect(env?.[SESSION_LEASES_ENABLED_ENV]).toBe("1");
+		expect(env?.[SESSION_LEASE_OWNER_ID_ENV]).toBe(env?.[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]);
 	});
 
 	it("commits the startup marker after durable worker publication", async () => {

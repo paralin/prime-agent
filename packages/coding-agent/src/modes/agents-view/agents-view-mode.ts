@@ -13,7 +13,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSION } from "../../config.js";
+import { APP_TITLE, appendRotatingLog, getClientErrorLogPath, VERSION } from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
 import { SessionManager } from "../../core/session-manager.js";
@@ -58,13 +58,7 @@ import {
 	theme,
 } from "../interactive/theme/theme.js";
 import { WORKING_ICON_INTERVAL_MS, workingIconFrame } from "../interactive/theme/working-icon.js";
-import {
-	formatPackageUpdateNotice,
-	formatTmuxWarningNotice,
-	formatUpdateAvailableNotice,
-	gatherStartupNotices,
-	type StartupNotices,
-} from "../shared/startup-notices.js";
+import { formatTmuxWarningNotice, gatherStartupNotices, type StartupNotices } from "../shared/startup-notices.js";
 import {
 	type AgentsViewRow,
 	type AgentsViewScopeFrame,
@@ -995,14 +989,7 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		// Reuse an in-flight gather from an earlier agents-view instance so re-entry does
 		// not re-run the checks or lose a result that resolved meanwhile.
-		const promise =
-			this.persistentState.startupNoticesPromise ??
-			gatherStartupNotices({
-				version: VERSION,
-				cwd: this.options.uiServices.getInitialCwd(),
-				agentDir: getAgentDir(),
-				settingsManager: this.options.uiServices.settingsManager,
-			});
+		const promise = this.persistentState.startupNoticesPromise ?? gatherStartupNotices();
 		this.persistentState.startupNoticesPromise = promise;
 		void promise
 			.then((notices) => {
@@ -1020,12 +1007,6 @@ export class AgentsViewMode implements Component, Focusable {
 			return [];
 		}
 		const formatted: string[] = [];
-		if (notices.newVersion) {
-			formatted.push(formatUpdateAvailableNotice(notices.newVersion));
-		}
-		if (notices.packageUpdates.length > 0) {
-			formatted.push(formatPackageUpdateNotice(notices.packageUpdates));
-		}
 		if (notices.tmuxWarning) {
 			formatted.push(formatTmuxWarningNotice(notices.tmuxWarning));
 		}

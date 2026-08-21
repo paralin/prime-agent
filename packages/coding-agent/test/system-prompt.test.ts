@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import { actCancellationPromptBoundary } from "../src/core/act-cancellation.js";
 import { ACT_SYSTEM_PROMPT, createActResourceLoader } from "../src/core/act-lane.js";
 import { DEFAULT_RLM_EXTRA_IMPORT_LABELS } from "../src/core/kernel/bootstrap.js";
-import { buildRlmPrompt } from "../src/core/prompts/index.js";
+import { buildRlmPrompt, buildSubagentGuidance } from "../src/core/prompts/index.js";
 import type { HarnessState } from "../src/core/refinement/index.js";
 import type { Skill } from "../src/core/skills.js";
 import { buildSystemPrompt } from "../src/core/system-prompt.js";
@@ -227,6 +227,29 @@ describe("buildRlmPrompt", () => {
 		expect(withCapabilities).toContain("agent_message.list_agents");
 		expect(withCapabilities).toContain("agent_observe");
 		expect(withCapabilities).toContain("reaches only you, your parent, siblings, and direct children");
+	});
+
+	test("distinguishes rlm child spawning from agent_message delivery to existing agents", () => {
+		const prompt = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/session.jsonl",
+			installedSkills: ["agent_message"],
+			activeTools: ["ipython"],
+			allowRecursion: true,
+			depth: 0,
+		});
+
+		expect(prompt).toContain("`rlm(...)` spawns a new child agent; it does not deliver messages");
+		expect(prompt).toContain(
+			"To message an existing reachable agent, call `await agent_message.send(message, receiver_role=...)` in IPython",
+		);
+		expect(prompt).toContain("Agent messaging reaches only your parent, siblings, and direct children");
+		expect(prompt).toContain("help(agent_message)");
+
+		const guidance = buildSubagentGuidance({ hasAgentMessage: true });
+		expect(guidance).toContain("`rlm(...)` only spawns new children");
+		expect(guidance).toContain("await agent_message.send(message, receiver_role=...)");
+		expect(guidance).toContain("help(agent_message)");
 	});
 
 	test("does not prescribe kernel-only child replies without ipython", () => {

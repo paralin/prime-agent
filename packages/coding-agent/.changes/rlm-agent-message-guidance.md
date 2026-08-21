@@ -1,0 +1,1 @@
+- Fixed RLM agents attempting to spawn a child with `rlm(...)` when asked to message an existing agent: the system prompt now states that `rlm(...)` only spawns children, direct delivery to a reachable parent, sibling, or child uses `await agent_message.send(...)`, and `help(agent_message)` documents the messaging API.

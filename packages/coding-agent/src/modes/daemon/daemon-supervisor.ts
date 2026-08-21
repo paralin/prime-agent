@@ -956,7 +956,13 @@ export class DaemonSupervisor {
 		);
 		if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
 
-		await this.withEvictionFence("Timed out draining daemon mutations for idle eviction", async () => {
+		const releaseFence = await this.acquireIdleEvictionFence();
+		try {
+			// Mutations admitted before the fence are still finishing; skip this
+			// sweep and let the scheduler retry once they end instead of blocking,
+			// timing out, or logging here. Mutations admitted after the fence wait
+			// on it before begin(), so this check cannot race admission.
+			if (!this.mutationDrain.isDrained()) return;
 			if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
 			await Promise.all(
 				candidates.map((worker) => this.refreshWorkerSummaries(worker).catch(() => refreshed.delete(worker))),
@@ -985,7 +991,9 @@ export class DaemonSupervisor {
 					);
 				}),
 			);
-		});
+		} finally {
+			releaseFence();
+		}
 	}
 
 	/** Waits for any held eviction fence, then takes the slot; release clears it only if still ours. */
@@ -2747,10 +2755,7 @@ export class DaemonSupervisor {
 	 * attached through the supervisor, so any reopen of the saved session may
 	 * stop it and launch a fresh worker from the transcript.
 	 */
-	private async reclaimDeadFailedWorkerRegistration(
-		worker: ResidentWorker,
-		freshCreate: boolean,
-	): Promise<boolean> {
+	private async reclaimDeadFailedWorkerRegistration(worker: ResidentWorker, freshCreate: boolean): Promise<boolean> {
 		if (worker.descriptor.lifecycle !== "failed") {
 			return false;
 		}

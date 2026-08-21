@@ -129,7 +129,11 @@ import {
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import { createRlmLedgerRegistrySeedSource, RlmSpawnLedger } from "./rlm-ledger.js";
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
-import { SNAPSHOT_TARGET_CHUNK_BYTES, SnapshotTranscriptCache } from "./snapshot-transcript-cache.js";
+import {
+	SNAPSHOT_TARGET_CHUNK_BYTES,
+	SnapshotTranscriptCache,
+	snapshotTranscriptId,
+} from "./snapshot-transcript-cache.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
@@ -2387,10 +2391,7 @@ export class DaemonSupervisor {
 	 * live process is never signalled here because its runtime context belongs
 	 * to the owner's own recovery path.
 	 */
-	private async reclaimDeadFailedWorkerRegistration(
-		worker: ResidentWorker,
-		freshCreate: boolean,
-	): Promise<boolean> {
+	private async reclaimDeadFailedWorkerRegistration(worker: ResidentWorker, freshCreate: boolean): Promise<boolean> {
 		if (worker.descriptor.lifecycle !== "failed") {
 			return false;
 		}
@@ -4028,15 +4029,13 @@ export class DaemonSupervisor {
 		if (existing) {
 			this.retireWorkerSnapshotCache(worker, activeSessionId, existing);
 		}
-		const revision = createHash("sha256")
-			.update(
-				`${activeSessionId}:${result.snapshot.summary.sessionId}:${result.lastEventSequence}:${result.snapshot.messages.length}`,
-			)
-			.digest("hex")
-			.slice(0, 16);
+		const snapshotId = snapshotTranscriptId(
+			`${activeSessionId}-${result.snapshot.summary.sessionId}-${result.lastEventSequence}`,
+			result.snapshot.messages,
+		);
 		const transcript = new SnapshotTranscriptCache({
 			activeSessionId,
-			snapshotId: `${activeSessionId}-${revision}`,
+			snapshotId,
 			messages: result.snapshot.messages,
 			cacheRoot: this.snapshotCacheRoot,
 			targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,

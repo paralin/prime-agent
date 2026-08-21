@@ -1,0 +1,1 @@
+- Fixed daemon supervisor snapshot materialization serving stale transcript bytes when a replacement worker reused the previous snapshot's event sequence numbers; supervisor snapshot ids now derive from the serialized message content.

@@ -2387,10 +2387,7 @@ export class DaemonSupervisor {
 	 * live process is never signalled here because its runtime context belongs
 	 * to the owner's own recovery path.
 	 */
-	private async reclaimDeadFailedWorkerRegistration(
-		worker: ResidentWorker,
-		freshCreate: boolean,
-	): Promise<boolean> {
+	private async reclaimDeadFailedWorkerRegistration(worker: ResidentWorker, freshCreate: boolean): Promise<boolean> {
 		if (worker.descriptor.lifecycle !== "failed") {
 			return false;
 		}

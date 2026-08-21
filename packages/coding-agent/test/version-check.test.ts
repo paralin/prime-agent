@@ -1,11 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-	checkForNewPiVersion,
-	comparePackageVersions,
-	getLatestPiRelease,
-	getLatestPiVersion,
-	isNewerPackageVersion,
-} from "../src/utils/version-check.js";
+import { comparePackageVersions, getLatestPiRelease, isNewerPackageVersion } from "../src/utils/version-check.js";
 
 const defaultPrimeAgentDownloadBaseUrl = "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev";
 const originalSkipVersionCheck = process.env.PI_SKIP_VERSION_CHECK;
@@ -37,19 +31,11 @@ describe("version checks", () => {
 		expect(isNewerPackageVersion("0.70.6", "0.70.5")).toBe(true);
 	});
 
-	it("returns only newer versions", async () => {
-		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.3" }));
-		vi.stubGlobal("fetch", fetchMock);
-
-		await expect(checkForNewPiVersion("1.2.3")).resolves.toBeUndefined();
-		await expect(checkForNewPiVersion("1.2.2")).resolves.toBe("1.2.3");
-	});
-
 	it("uses the Prime Agent release manifest with a Prime Agent user agent", async () => {
 		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.4" }));
 		vi.stubGlobal("fetch", fetchMock);
 
-		await expect(getLatestPiVersion("1.2.3")).resolves.toBe("1.2.4");
+		await expect(getLatestPiRelease("1.2.3")).resolves.toMatchObject({ version: "1.2.4" });
 		expect(fetchMock).toHaveBeenCalledWith(
 			`${defaultPrimeAgentDownloadBaseUrl}/latest.json`,
 			expect.objectContaining({
@@ -65,7 +51,9 @@ describe("version checks", () => {
 		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.4-beta.124.1.abcdef0" }));
 		vi.stubGlobal("fetch", fetchMock);
 
-		await expect(getLatestPiVersion("1.2.4-beta.123.1.1234567")).resolves.toBe("1.2.4-beta.124.1.abcdef0");
+		await expect(getLatestPiRelease("1.2.4-beta.123.1.1234567")).resolves.toMatchObject({
+			version: "1.2.4-beta.124.1.abcdef0",
+		});
 		expect(fetchMock).toHaveBeenCalledWith(`${defaultPrimeAgentDownloadBaseUrl}/beta.json`, expect.any(Object));
 	});
 
@@ -91,7 +79,7 @@ describe("version checks", () => {
 		const fetchMock = vi.fn();
 		vi.stubGlobal("fetch", fetchMock);
 
-		await expect(getLatestPiVersion("1.2.3")).resolves.toBeUndefined();
+		await expect(getLatestPiRelease("1.2.3")).resolves.toBeUndefined();
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });

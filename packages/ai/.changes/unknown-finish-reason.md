@@ -1,0 +1,2 @@
+- Changed a missing OpenAI Responses terminal status to map to the `unknown` stop reason instead of `stop`, so consumers can distinguish incomplete turns from completed ones.
+- Changed a stream that ends without any truthy OpenAI Chat Completions finish reason (provider closed early or sent `[DONE]` with no terminal chunk) to map to the `unknown` stop reason instead of `stop`.

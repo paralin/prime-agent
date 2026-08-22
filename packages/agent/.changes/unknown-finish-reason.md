@@ -1,1 +1,2 @@
 - Fixed the agent loop ending mid-response when a provider reports an incomplete reasoning turn: a missing terminal finish reason now maps to the public `unknown` stop reason and continues the turn like tool use.
+- Changed consecutive `unknown` responses to be capped: after three in a row the loop stops without another provider call and surfaces an error stop reason instead of looping forever.

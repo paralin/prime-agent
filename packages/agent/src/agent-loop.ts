@@ -26,11 +26,11 @@ import type {
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 const ABORT_ERROR_MESSAGE = "Request was aborted";
-// Providers occasionally close a stream with partial content and no finish
-// reason ("unknown"). Continuing the same turn usually lets the model finish,
-// but a provider that never finishes would loop forever, so consecutive
-// unknown responses are capped.
-const MAX_CONSECUTIVE_UNKNOWN_RESPONSES = 3;
+// Providers occasionally close a stream before producing final content, either
+// without a finish reason or with an empty "stop" response. Continuing the same
+// turn usually lets the model finish, but a provider that never finishes would
+// loop forever, so consecutive incomplete responses are capped.
+const MAX_CONSECUTIVE_INCOMPLETE_RESPONSES = 3;
 const EMPTY_USAGE: AssistantMessage["usage"] = {
 	input: 0,
 	output: 0,
@@ -315,7 +315,7 @@ async function runLoop(
 	streamFn?: StreamFn,
 ): Promise<void> {
 	let firstTurn = true;
-	let consecutiveUnknownResponses = 0;
+	let consecutiveIncompleteResponses = 0;
 	let lastTurn: Parameters<NonNullable<AgentLoopConfig["getContinuationMessages"]>>[0] | undefined;
 	let pendingMessages: AgentMessage[] = await pollMessagesUnlessAborted(config.getSteeringMessages, signal);
 
@@ -352,26 +352,28 @@ async function runLoop(
 				return;
 			}
 
-			if (message.stopReason === "unknown") {
-				// Some providers report an incomplete reasoning turn as "unknown".
+			const toolCalls = message.content.filter((c) => c.type === "toolCall");
+			const hasFinalText = message.content.some((c) => c.type === "text" && c.text.trim().length > 0);
+			const incompleteResponse =
+				message.stopReason === "unknown" ||
+				(message.stopReason === "stop" && !hasFinalText && toolCalls.length === 0);
+			if (incompleteResponse) {
 				// Continue the same turn so the model can finish, just as it does
 				// after tool use. Past the cap, stop without another provider call
 				// and surface the failure as an error on the final response.
-				consecutiveUnknownResponses += 1;
-				if (consecutiveUnknownResponses >= MAX_CONSECUTIVE_UNKNOWN_RESPONSES) {
+				consecutiveIncompleteResponses += 1;
+				if (consecutiveIncompleteResponses >= MAX_CONSECUTIVE_INCOMPLETE_RESPONSES) {
 					message.stopReason = "error";
-					message.errorMessage = `Provider closed ${MAX_CONSECUTIVE_UNKNOWN_RESPONSES} consecutive streams without a finish reason`;
+					message.errorMessage = `Provider closed ${MAX_CONSECUTIVE_INCOMPLETE_RESPONSES} consecutive streams without final content`;
 					await emit({ type: "turn_end", message, toolResults: [] });
 					await emit({ type: "agent_end", messages: newMessages });
 					return;
 				}
 				hasMoreToolCalls = true;
 			} else {
-				consecutiveUnknownResponses = 0;
+				consecutiveIncompleteResponses = 0;
 				hasMoreToolCalls = false;
 			}
-
-			const toolCalls = message.content.filter((c) => c.type === "toolCall");
 
 			const toolResults: ToolResultMessage[] = [];
 			if (toolCalls.length > 0) {

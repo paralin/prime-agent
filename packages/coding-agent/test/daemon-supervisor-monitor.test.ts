@@ -1758,7 +1758,7 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(workers.has(worker.descriptor.workerId)).toBe(false);
 	});
 
-	it("stops only an identity-verified failed resident when a fresh create arrives", async () => {
+	it("stops an identity-verified unowned failed resident on attach or fresh create", async () => {
 		const worker = {
 			descriptor: {
 				workerId: "failed-live-resident",
@@ -1777,10 +1777,34 @@ describe("daemon worker supervisor monitoring", () => {
 			reclaimStaleWorkerRegistration(target: typeof worker, freshCreate?: boolean): Promise<boolean>;
 		};
 
-		await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(false);
-		expect(stopWorker).not.toHaveBeenCalled();
+		await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(true);
 		await expect(supervisor.reclaimStaleWorkerRegistration(worker, true)).resolves.toBe(true);
-		expect(stopWorker).toHaveBeenCalledWith(worker, true, true);
+		expect(stopWorker).toHaveBeenCalledTimes(2);
+		expect(stopWorker).toHaveBeenNthCalledWith(1, worker, true, true);
+		expect(stopWorker).toHaveBeenNthCalledWith(2, worker, true, true);
+	});
+
+	it("does not signal an unowned live failed worker without a verified process start id", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "failed-live-resident-unverified",
+				pid: 42,
+				lifecycle: "failed" as const,
+			},
+			intentionalStop: false,
+		};
+		const stopWorker = vi.fn(async () => {});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			processIdentity: vi.fn(() => "current"),
+			stopWorker,
+		}) as {
+			reclaimStaleWorkerRegistration(target: typeof worker, freshCreate?: boolean): Promise<boolean>;
+		};
+
+		await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(false);
+		await expect(supervisor.reclaimStaleWorkerRegistration(worker, true)).resolves.toBe(false);
+		expect(stopWorker).not.toHaveBeenCalled();
 	});
 
 	it("reclaims one dead stale client-owned failed worker on fresh create", async () => {

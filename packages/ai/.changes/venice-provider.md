@@ -1,0 +1,1 @@
+- Added a first-class `venice` provider: `venice` is now a known provider, `VENICE_API_KEY` is detected from the environment, and the generated catalog includes the Venice model list served through the OpenAI-compatible chat completions API at `https://api.venice.ai/api/v1`.

@@ -51,6 +51,10 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"xiaomi-token-plan-cn": "mimo-v2.5-pro",
 	"xiaomi-token-plan-ams": "mimo-v2.5-pro",
 	"xiaomi-token-plan-sgp": "mimo-v2.5-pro",
+	// Venice must stay last: findPreferredDefaultModel picks the first
+	// provider with a matching default, and Venice should never outrank a
+	// provider that was already selected just because both keys exist.
+	venice: "stealth-ox-alpha",
 };
 
 export interface ScopedModel {

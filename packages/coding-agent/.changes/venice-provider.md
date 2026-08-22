@@ -1,0 +1,1 @@
+- Added Venice AI as a built-in provider with display name "Venice AI" and default model `stealth-ox-alpha`; Venice stays last in default-provider precedence so it never outranks an already-selected provider when both credentials exist.

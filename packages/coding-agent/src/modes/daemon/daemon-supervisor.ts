@@ -643,6 +643,7 @@ export class DaemonSupervisor {
 	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
 	private readonly sessionInputPauses = new Map<string, SupervisorSessionInputPause>();
 	private readonly signalCleanupHandlers: Array<() => void> = [];
+	private signalHandlersRegistered = false;
 	private readonly descriptorDir: string;
 	private readonly generation = randomUUID();
 	private readonly supervisorConfigPath: string;
@@ -1078,29 +1079,29 @@ export class DaemonSupervisor {
 		this.sessionInputPauseEpochs.set(client, 0);
 		this.detachingInputPauseSessions.set(client, new Set());
 		this.clients.add(client);
-		void this.ready.then(
-			() => {
-				if (!client.socket.destroyed && this.clients.has(client)) {
-					this.write(client, {
-						type: "daemon_hello",
-						socketPath: this.socketPath,
-						protocol: DAEMON_PROTOCOL_INFO,
-						schemaId: DAEMON_SCHEMA_ID,
-						schemaRevision: DAEMON_SCHEMA_REVISION,
-						appVersion: VERSION,
-						runtime: getDaemonRuntimeIdentity(),
-						supervisorGeneration: this.generation,
-						supervisorOwnerToken: this.ownership?.record.token,
-						supervisorPid: process.pid,
-						supervisorProcessStartId: this.ownership?.record.processStartId,
-						supervisorSocketPath: this.ownership?.record.socketPath,
-						clientId: client.id,
-						serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
-					});
-				}
-			},
-			() => client.socket.destroy(),
-		);
+		// Greet immediately: clients classify a connected daemon as stale when
+		// the hello misses their short deadline, and startup work (worker
+		// adoption, peer sync) can hold `ready` far past it. Commands still
+		// await `ready`; only the greeting is early.
+		this.write(client, {
+			type: "daemon_hello",
+			socketPath: this.socketPath,
+			protocol: DAEMON_PROTOCOL_INFO,
+			schemaId: DAEMON_SCHEMA_ID,
+			schemaRevision: DAEMON_SCHEMA_REVISION,
+			appVersion: VERSION,
+			runtime: getDaemonRuntimeIdentity(),
+			supervisorGeneration: this.generation,
+			supervisorOwnerToken: this.ownership?.record.token,
+			supervisorPid: process.pid,
+			supervisorProcessStartId: this.ownership?.record.processStartId,
+			supervisorSocketPath: this.ownership?.record.socketPath,
+			clientId: client.id,
+			serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+		});
+		// Admitted connections have nothing to talk to once a failed startup
+		// releases the socket lease, so destroy them with it.
+		void this.ready.catch(() => client.socket.destroy());
 
 		client.detachInput = attachJsonlLineReader(socket, (line) => void this.handleLine(client, line));
 		let cleaned = false;
@@ -2412,10 +2413,29 @@ export class DaemonSupervisor {
 		}
 		const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
 		if (identity === "current") {
-			if (!worker.descriptor.processStartId || worker.descriptor.ownerClientId) {
+			if (!worker.descriptor.processStartId) {
 				return false;
 			}
-			await this.stopWorker(worker, true, true);
+			// Confirm the stuck process dead while keeping its recovery journal,
+			// then fence uncertain operations from that journal before
+			// deregistering. Deleting the descriptor first would destroy the
+			// only record of what the worker left unresolved.
+			try {
+				await this.stopWorker(worker, false, true);
+			} catch (error) {
+				// The stop timed out or failed, so the process may still write.
+				// Keep the registration failed and reclaimable; fencing now could
+				// drop operations the live worker is still committing.
+				const message = error instanceof Error ? error.message : String(error);
+				worker.descriptor.lifecycle = "failed";
+				worker.descriptor.lastError = `Reclaim stop failed; registration stays failed and reclaimable: ${message}`;
+				this.persistWorker(worker);
+				return false;
+			}
+			worker.intentionalStop = true;
+			await this.recoverUncertainWorkerOperations(worker, false);
+			this.workers.delete(worker.descriptor.workerId);
+			this.deleteWorkerDescriptor(worker);
 			return true;
 		}
 		if (identity !== "gone" && identity !== "replaced") {
@@ -5422,18 +5442,44 @@ export class DaemonSupervisor {
 	}
 
 	private registerSignalHandlers(): void {
+		if (this.signalHandlersRegistered) {
+			return;
+		}
+		this.signalHandlersRegistered = true;
 		const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
 		if (process.platform !== "win32") {
 			signals.push("SIGHUP");
 		}
 		for (const signal of signals) {
-			const handler = () => void this.shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143, false);
+			const handler = () => {
+				this.log(`supervisor received ${signal}; shutting down`);
+				void this.shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143, false);
+			};
 			process.on(signal, handler);
 			this.signalCleanupHandlers.push(() => process.off(signal, handler));
 		}
+		// A crash thrown outside a command handler would otherwise vanish with
+		// the detached stdio; capture the stack in the rotating log before the
+		// process goes down.
+		const uncaughtExceptionHandler = (error: Error): never => {
+			this.log(`uncaught exception: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+			process.exit(1);
+		};
+		const unhandledRejectionHandler = (reason: unknown): never => {
+			this.log(
+				`unhandled rejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`,
+			);
+			process.exit(1);
+		};
+		process.on("uncaughtException", uncaughtExceptionHandler);
+		process.on("unhandledRejection", unhandledRejectionHandler);
 		const exitHandler = () => this.cleanupSocket();
 		process.on("exit", exitHandler);
-		this.signalCleanupHandlers.push(() => process.off("exit", exitHandler));
+		this.signalCleanupHandlers.push(() => {
+			process.off("uncaughtException", uncaughtExceptionHandler);
+			process.off("unhandledRejection", unhandledRejectionHandler);
+			process.off("exit", exitHandler);
+		});
 	}
 
 	private cleanupSocket(): void {

@@ -2385,12 +2385,15 @@ export class DaemonSupervisor {
 	}
 
 	/**
-	 * Reclaim one dead failed worker's registration. An owner that is still
+	 * Reclaim one failed worker's registration. An owner that is still
 	 * connected keeps authority over its failed worker, and only a fresh create
 	 * may reclaim a client-owned registration after its owner is gone; an
 	 * arbitrary attach must not deregister or seize it. A client-owned worker's
 	 * live process is never signalled here because its runtime context belongs
-	 * to the owner's own recovery path.
+	 * to the owner's own recovery path. An unowned live process has no such
+	 * authority: its supervisor connection is already lost and no client is
+	 * attached through the supervisor, so any reopen of the saved session may
+	 * stop it and launch a fresh worker from the transcript.
 	 */
 	private async reclaimDeadFailedWorkerRegistration(worker: ResidentWorker, freshCreate: boolean): Promise<boolean> {
 		if (worker.descriptor.lifecycle !== "failed") {
@@ -2409,9 +2412,7 @@ export class DaemonSupervisor {
 		}
 		const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
 		if (identity === "current") {
-			// A client-owned live process is never signalled here because its
-			// runtime context belongs to the owner's own recovery path.
-			if (!freshCreate || !worker.descriptor.processStartId || worker.descriptor.ownerClientId) {
+			if (!worker.descriptor.processStartId || worker.descriptor.ownerClientId) {
 				return false;
 			}
 			await this.stopWorker(worker, true, true);

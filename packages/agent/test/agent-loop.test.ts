@@ -2004,7 +2004,7 @@ describe("agentLoopContinue with AgentMessage", () => {
 	});
 });
 
-describe("agent loop unknown finish-reason continuation", () => {
+describe("agent loop incomplete-response continuation", () => {
 	const emptyContext = (): AgentContext => ({
 		systemPrompt: "You are helpful.",
 		messages: [],
@@ -2065,7 +2065,31 @@ describe("agent loop unknown finish-reason continuation", () => {
 		expect(turnStarts).toBe(2);
 	});
 
-	it("stops with an observable error after too many consecutive unknown responses", async () => {
+	it.each([
+		["empty", []],
+		["thinking-only", [{ type: "thinking" as const, thinking: "partial" }]],
+	])("continues after an explicit stop with %s content", async (_name, content) => {
+		const context = emptyContext();
+		const partial = createAssistantMessage(content, "stop");
+		const complete = createAssistantMessage([{ type: "text", text: "complete" }], "stop");
+		const callCount = { value: 0 };
+		const seenContexts: Message[][] = [];
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Finish the answer")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter },
+			vi.fn(),
+			undefined,
+			recordedStreamFn([partial, complete], callCount, seenContexts),
+		);
+
+		expect(callCount.value).toBe(2);
+		expect(messages.filter((message) => message.role === "assistant")).toEqual([partial, complete]);
+		expect(seenContexts[1]?.filter((message) => message.role === "assistant")).toEqual([partial]);
+	});
+
+	it("stops with an observable error after too many consecutive incomplete responses", async () => {
 		const context = emptyContext();
 		const responses = [
 			createAssistantMessage([{ type: "thinking", thinking: "one" }], "unknown"),

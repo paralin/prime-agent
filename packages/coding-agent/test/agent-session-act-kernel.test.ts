@@ -638,6 +638,7 @@ print(replacement_marker is replacement_marker, "replacement-reused")`,
 			cwd: directory,
 			agentDir: directory,
 			sessionManager,
+			sessionOptions: { rlmDepth: 0 },
 		});
 		await runtime.session.bindExtensions({});
 		try {

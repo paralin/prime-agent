@@ -1,0 +1,1 @@
+- Fixed malformed Responses streams crashing the session with a raw error when null or non-string payloads arrive at eight Responses stream event boundaries.

@@ -31,7 +31,7 @@ import type { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { classifyStreamFailure, StreamFailureError } from "../utils/stream-failure.js";
+import { classifyStreamFailure, StreamFailureError, streamFailureMessage } from "../utils/stream-failure.js";
 import { transformMessages } from "./transform-messages.js";
 
 function encodeTextSignatureV1(id: string, phase?: TextSignatureV1["phase"]): string {
@@ -289,6 +289,10 @@ export async function processResponsesStream<TApi extends Api>(
 			output.responseId = event.response.id;
 		} else if (event.type === "response.output_item.added") {
 			const item = event.item;
+			if (!item || typeof item !== "object") {
+				const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+				throw new StreamFailureError(streamFailureMessage(info, "output_item.added carried no output item"), info);
+			}
 			if (item.type === "reasoning") {
 				currentItem = item;
 				currentBlock = { type: "thinking", thinking: "" };
@@ -359,6 +363,13 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.content_part.added") {
 			if (currentItem?.type === "message") {
 				currentItem.content = currentItem.content || [];
+				if (!event.part || typeof event.part !== "object") {
+					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+					throw new StreamFailureError(
+						streamFailureMessage(info, "content_part.added carried no content part"),
+						info,
+					);
+				}
 				if (event.part.type === "output_text" || event.part.type === "refusal") {
 					currentItem.content.push(event.part);
 				}
@@ -428,6 +439,10 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.output_item.done") {
 			const item = event.item;
+			if (!item || typeof item !== "object") {
+				const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+				throw new StreamFailureError(streamFailureMessage(info, "output_item.done carried no output item"), info);
+			}
 
 			if (item.type === "reasoning" && currentBlock?.type === "thinking") {
 				const summaryText = item.summary?.map((s) => s.text).join("\n\n") || "";

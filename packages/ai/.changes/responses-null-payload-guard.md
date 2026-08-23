@@ -1,0 +1,1 @@
+- Fixed a raw TypeError crash when a Responses-API provider stream carried null output items or content parts: malformed payloads now fail with a classified malformed-response stream failure naming the event boundary instead of an unhandled null read.

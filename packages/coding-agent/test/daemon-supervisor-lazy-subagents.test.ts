@@ -33,6 +33,7 @@ interface SupervisorInternals {
 }
 
 interface WorkerFixture {
+	schemaRevision?: number;
 	descriptor: {
 		workerId: string;
 		lifecycle: "ready";
@@ -645,7 +646,7 @@ describe("daemon supervisor passive subagent topology", () => {
 		await expect(first).resolves.toBe(launched);
 	});
 
-	it("retains passive worker summaries but syncs only roots to cross-worker peer maps", async () => {
+	it("falls back to full worker lists for pre-revision-23 workers", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-passive-peers-"));
 		tempDirs.push(directory);
 		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
@@ -698,5 +699,59 @@ describe("daemon supervisor passive subagent topology", () => {
 				runtimeKind: "top-level",
 			}),
 		]);
+	});
+
+	it("uses active-only worker summaries at schema revision 23", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-active-summaries-"));
+		tempDirs.push(directory);
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+		const root = summary({
+			id: "root-active",
+			activeSessionId: "root-active",
+			sessionId: "root-session",
+			runtimeKind: "top-level",
+		});
+		const resident = worker("active-only");
+		resident.schemaRevision = 23;
+		resident.client.requestWorker.mockResolvedValue(success(undefined, "list", { sessions: [root] }));
+
+		await supervisor.refreshWorkerSummaries(resident);
+
+		expect(resident.client.request).not.toHaveBeenCalled();
+		expect(resident.client.requestWorker).toHaveBeenCalledWith({ type: "worker_list_active_sessions" }, 5000);
+		expect(resident.summaries.get("root-active")).toEqual(root);
+	});
+
+	it("coalesces concurrent active-summary refreshes into one request plus one trailing refresh", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-coalesced-summaries-"));
+		tempDirs.push(directory);
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+		const resident = worker("coalesced");
+		resident.schemaRevision = 23;
+		let resolveFirst!: (response: ReturnType<typeof success>) => void;
+		resident.client.requestWorker
+			.mockImplementationOnce(
+				() =>
+					new Promise((resolve) => {
+						resolveFirst = resolve;
+					}),
+			)
+			.mockResolvedValue(success(undefined, "list", { sessions: [] }));
+
+		const first = supervisor.refreshWorkerSummaries(resident);
+		const second = supervisor.refreshWorkerSummaries(resident);
+		const third = supervisor.refreshWorkerSummaries(resident);
+		expect(resident.client.requestWorker).toHaveBeenCalledTimes(1);
+
+		resolveFirst(success(undefined, "list", { sessions: [] }));
+		await Promise.all([first, second, third]);
+
+		expect(resident.client.requestWorker).toHaveBeenCalledTimes(2);
 	});
 });

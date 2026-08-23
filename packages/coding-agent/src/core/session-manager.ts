@@ -1000,8 +1000,19 @@ interface SessionInfoCacheEntry {
 // Session files are append-only, so an unchanged (size, mtimeMs) means identical
 // content: cache list metadata and rescan only files that changed.
 const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
+const sessionInfoLoads = new Map<string, Promise<SessionInfo | null>>();
 
-export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
+export function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
+	const pending = sessionInfoLoads.get(filePath);
+	if (pending) return pending;
+	const load = readSessionInfoOnce(filePath).finally(() => {
+		if (sessionInfoLoads.get(filePath) === load) sessionInfoLoads.delete(filePath);
+	});
+	sessionInfoLoads.set(filePath, load);
+	return load;
+}
+
+async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null> {
 	let stats: Awaited<ReturnType<typeof stat>>;
 	try {
 		stats = await stat(filePath);

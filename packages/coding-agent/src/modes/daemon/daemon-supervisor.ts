@@ -111,6 +111,7 @@ import {
 import { DaemonWorkerClient } from "./daemon-worker-client.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_COMMAND_COMPATIBILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
@@ -275,6 +276,11 @@ interface ResidentWorker {
 	descriptor: DaemonWorkerDescriptor;
 	descriptorPath: string;
 	client?: DaemonWorkerClient;
+	schemaRevision?: number;
+	summaryRefresh?: Promise<void>;
+	summaryRefreshPending?: boolean;
+	summaryRefreshRecovery?: boolean;
+	fullSummaryRefresh?: Promise<void>;
 	heartbeatSnapshot?: AgentConnectionHeartbeat[];
 	heartbeatSnapshotStale?: boolean;
 	summaries: Map<string, SessionSummary>;
@@ -2176,7 +2182,7 @@ export class DaemonSupervisor {
 		await Promise.all(
 			[...this.workers.values()]
 				.filter((worker) => !this.isWorkerStopping(worker))
-				.map((worker) => this.refreshWorkerSummaries(worker).catch(() => undefined)),
+				.map((worker) => this.refreshWorkerSummaries(worker, false, true).catch(() => undefined)),
 		);
 		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 		const clientOwnedWorkers = [...this.workers.values()].filter((worker) => !this.isVisibleWorker(worker));
@@ -2728,7 +2734,7 @@ export class DaemonSupervisor {
 			const client = new DaemonWorkerClient(worker.descriptor.socketPath);
 			try {
 				await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
-				await client.waitForHello(1000);
+				const hello = await client.waitForHello(1000);
 				await client.authenticateWorker(
 					worker.descriptor.authenticationToken,
 					this.supervisorAuthenticationClaim(),
@@ -2739,6 +2745,7 @@ export class DaemonSupervisor {
 				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
 				worker.client?.close();
 				worker.client = client;
+				worker.schemaRevision = hello.schemaRevision;
 				return client;
 			} catch (error) {
 				lastError = error;
@@ -3349,14 +3356,66 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private async refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {
+	private async refreshWorkerSummaries(
+		worker: ResidentWorker,
+		recovery = false,
+		includePassive = false,
+	): Promise<void> {
+		if (includePassive) {
+			if (worker.fullSummaryRefresh) return worker.fullSummaryRefresh;
+			const refresh = (async () => {
+				if (worker.summaryRefresh) await worker.summaryRefresh;
+				await this.refreshWorkerSummariesOnce(worker, recovery, true);
+			})();
+			worker.fullSummaryRefresh = refresh;
+			try {
+				await refresh;
+			} finally {
+				if (worker.fullSummaryRefresh === refresh) worker.fullSummaryRefresh = undefined;
+			}
+			return;
+		}
+		if (worker.fullSummaryRefresh) return worker.fullSummaryRefresh;
+		if (worker.summaryRefresh) {
+			worker.summaryRefreshPending = true;
+			worker.summaryRefreshRecovery ||= recovery;
+			return worker.summaryRefresh;
+		}
+		const refresh = (async () => {
+			let requireRecovery = recovery;
+			do {
+				worker.summaryRefreshPending = false;
+				requireRecovery ||= worker.summaryRefreshRecovery === true;
+				worker.summaryRefreshRecovery = false;
+				await this.refreshWorkerSummariesOnce(worker, requireRecovery, false);
+				requireRecovery = false;
+			} while (worker.summaryRefreshPending);
+		})();
+		worker.summaryRefresh = refresh;
+		try {
+			await refresh;
+		} finally {
+			if (worker.summaryRefresh === refresh) worker.summaryRefresh = undefined;
+		}
+	}
+
+	private async refreshWorkerSummariesOnce(
+		worker: ResidentWorker,
+		recovery: boolean,
+		includePassive: boolean,
+	): Promise<void> {
 		if (this.isWorkerStopping(worker)) {
 			throw new Error("Session worker is stopping");
 		}
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
-		const response = await worker.client.request({ type: "list" }, 5000);
+		const response =
+			!includePassive &&
+			(worker.schemaRevision ?? 0) >=
+				DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_list_active_sessions.minSchemaRevision
+				? await worker.client.requestWorker({ type: "worker_list_active_sessions" }, 5000)
+				: await worker.client.request({ type: "list" }, 5000);
 		const summaries = sessionSummariesFromResponse(response);
 		worker.summaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
 		for (const summary of summaries) {

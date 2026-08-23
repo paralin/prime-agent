@@ -957,11 +957,12 @@ describe("daemon mode helpers", () => {
 					getCurrentState: () => ActiveSessionState | undefined,
 				): AgentSessionMessageController;
 			};
+			expect(await internals.listPassiveRlmSubagents()).toEqual([]);
 			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
 
-			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry.childId)).toContain(
-				fixture.childId,
-			);
+			const firstPassiveList = await internals.listPassiveRlmSubagents();
+			expect(firstPassiveList.map(({ entry }) => entry.childId)).toContain(fixture.childId);
+			expect(await internals.listPassiveRlmSubagents()).toBe(firstPassiveList);
 			await expect(internals.createAgentMessageController(() => parentState).roster?.()).resolves.toMatchObject({
 				entries: [expect.objectContaining({ relationship: "child", name: "renamed-worker" })],
 			});

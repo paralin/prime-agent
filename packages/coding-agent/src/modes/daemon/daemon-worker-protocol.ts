@@ -19,6 +19,10 @@ export const DAEMON_WORKER_STARTUP_GATE_FD_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WO
 export const DAEMON_WORKER_STARTUP_GATE_COMMIT = "start\n";
 export type DaemonWorkerLifecycle = "starting" | "ready" | "recovering" | "stopping" | "failed";
 
+export const DAEMON_WORKER_COMMAND_COMPATIBILITY = {
+	worker_list_active_sessions: { minSchemaRevision: 23 },
+} as const;
+
 export type DaemonWorkerFrameHeader =
 	| {
 			kind: "command";
@@ -70,6 +74,7 @@ export type DaemonWorkerCommand =
 			supportsExtensionUi?: boolean;
 	  }
 	| { id?: string; type: "worker_unsubscribe"; activeSessionId: string }
+	| { id?: string; type: "worker_list_active_sessions" }
 	| { id?: string; type: "worker_sync_agent_peers"; peers: AgentSessionMessageAgentSummary[] }
 	| { id?: string; type: "worker_archive_and_shutdown" }
 	| {

@@ -96,10 +96,32 @@ function daemonFixture(targetManager = mailboxManager()) {
 		};
 		agentMessageWaiters: Map<string, unknown[]>;
 		cancelAgentMessageWaiters(activeSessionId: string, reason: string): void;
+		handleWorkerCommand(
+			client: unknown,
+			command: {
+				id?: string;
+				type: string;
+				targetActiveSessionId: string;
+				message: string;
+				sender?: Record<string, unknown>;
+				messageId?: string;
+				replyTo?: string;
+			},
+		): Promise<void>;
 	};
 	internals.sessions.set(source.activeSessionId, source);
 	internals.sessions.set(target.activeSessionId, target);
 	return { internals, source, target, targetPrompt, targetManager };
+}
+
+function acceptedEntry(envelope: Record<string, unknown>): MailboxEntry {
+	return {
+		type: "custom_message",
+		customType: "agent_message.accepted",
+		content: "",
+		display: false,
+		details: { envelope },
+	};
 }
 
 describe("durable family mailbox", () => {
@@ -272,5 +294,83 @@ describe("durable family mailbox", () => {
 		);
 		fixture.internals.cancelAgentMessageWaiters(fixture.target.activeSessionId, "daemon shutdown");
 		await expect(tornDown).rejects.toThrow("daemon shutdown");
+	});
+	it("preserves stable message id and replyTo through supervisor-forwarded delivery", async () => {
+		const fixture = daemonFixture();
+		const writes: string[] = [];
+		const client = {
+			id: "supervisor",
+			socket: {
+				destroyed: false,
+				write: (chunk: string) => {
+					writes.push(chunk);
+					return true;
+				},
+			},
+		};
+		await fixture.internals.handleWorkerCommand(client, {
+			id: "deliver-1",
+			type: "worker_deliver_message",
+			targetActiveSessionId: fixture.target.activeSessionId,
+			message: "hello across workers",
+			sender: { activeSessionId: "source", sessionId: "session-source", sessionName: "Source" },
+			messageId: "agentmsg-cross-1",
+			replyTo: "agentmsg-question-1",
+		});
+		expect(fixture.targetPrompt).toHaveBeenCalledOnce();
+		const accepted = fixture.targetManager.entries.find((entry) => entry.customType === "agent_message.accepted");
+		expect(accepted).toMatchObject({
+			details: { envelope: { id: "agentmsg-cross-1", replyTo: "agentmsg-question-1" } },
+		});
+		const response = JSON.parse(writes.join("")) as { data?: Record<string, unknown> };
+		expect(response.data).toMatchObject({
+			id: "agentmsg-cross-1",
+			replyTo: "agentmsg-question-1",
+			deliveryStatus: "delivered",
+		});
+	});
+
+	it("resumes delivery after a crash between acceptance append and handoff append", async () => {
+		const manager = mailboxManager();
+		const crashedEnvelope = {
+			id: "agentmsg-crash-1",
+			source: "agent_message",
+			message: "original",
+			replyTo: "question-9",
+			from: { sessionId: "session-source", sessionName: "Source" },
+			target: { activeSessionId: "target", sessionId: "session-target" },
+			acceptedAt: "2026-08-23T00:00:00.000Z",
+			sequence: 4,
+		};
+		manager.entries.push(acceptedEntry(crashedEnvelope));
+		const fixture = daemonFixture(manager);
+		const deliver = {
+			id: "deliver-crash",
+			type: "worker_deliver_message",
+			targetActiveSessionId: fixture.target.activeSessionId,
+			message: "conflicting redelivery",
+			sender: { activeSessionId: "source", sessionId: "session-source", sessionName: "Source" },
+			messageId: "agentmsg-crash-1",
+			replyTo: "question-9",
+		};
+		await fixture.internals.handleWorkerCommand(
+			{ id: "supervisor", socket: { destroyed: false, write: () => true } },
+			deliver,
+		);
+		expect(fixture.targetPrompt).toHaveBeenCalledOnce();
+		expect(
+			fixture.targetManager.entries.filter((entry) => entry.customType === "agent_message.accepted"),
+		).toHaveLength(1);
+		const handoffs = fixture.targetManager.entries.filter((entry) => entry.customType === "agent_message.handoff");
+		expect(handoffs).toHaveLength(1);
+		await expect(
+			fixture.internals.sendAgentSessionMessage({
+				targetSelector: fixture.target.activeSessionId,
+				message: "third copy",
+				id: "agentmsg-crash-1",
+				origin: "cli",
+			}),
+		).resolves.toMatchObject({ message: "original", targetSequence: 4, handoff: "retry" });
+		expect(fixture.targetPrompt).toHaveBeenCalledOnce();
 	});
 });

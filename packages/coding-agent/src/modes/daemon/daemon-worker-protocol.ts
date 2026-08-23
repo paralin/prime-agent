@@ -21,6 +21,9 @@ export type DaemonWorkerLifecycle = "starting" | "ready" | "recovering" | "stopp
 
 export const DAEMON_WORKER_COMMAND_COMPATIBILITY = {
 	worker_list_active_sessions: { minSchemaRevision: 23 },
+	// Schema revision at which worker_deliver_message carries stable mailbox identity
+	// fields; older workers drop unknown fields, so senders must gate on this revision.
+	worker_deliver_message: { minSchemaRevision: 24 },
 } as const;
 
 export type DaemonWorkerFrameHeader =
@@ -91,6 +94,9 @@ export type DaemonWorkerCommand =
 			message: string;
 			sender: AgentSessionMessageSender;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
+			/** Stable mailbox identity carried across cross-worker forwarding. */
+			messageId?: string;
+			replyTo?: string;
 	  }
 	| { id?: string; type: "worker_prepare_update" }
 	| { id?: string; type: "worker_commit_update" }

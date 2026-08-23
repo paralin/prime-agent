@@ -1,0 +1,2 @@
+- Fixed cross-worker agent messages losing their stable message id and replyTo at the supervisor forwarding hop: workers now forward mailbox identity so retries stay idempotent, and delivery to a pre-update worker fails safely instead of silently dropping the identity.
+- Fixed a replaced supervisor being handed worker agent-message sends: sends now fail closed unless the answering supervisor generation still matches the authenticated claim bound to the worker's supervisor socket.

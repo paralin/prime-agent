@@ -126,7 +126,9 @@ import {
 	generateBranchSummary,
 	latestPersistedScratchHandoffPath,
 	prepareCompaction,
+	readScratchHandoffText,
 	resolveScratchHandoffPath,
+	SCRATCH_HANDOFF_PATH_CUSTOM_TYPE,
 	SCRATCH_HANDOFF_READ_CUSTOM_TYPE,
 	SCRATCH_HANDOFF_WRITE_CUSTOM_TYPE,
 	scratchHandoffRecentContextBudget,
@@ -7987,18 +7989,30 @@ export class AgentSession {
 		if (!this._scratchHandoffRoute()) return false;
 		const displayPath = this._scratchHandoffDisplayPath();
 		if (!displayPath) return false;
-		if (this._scratchCloseout?.displayPath === displayPath) return false;
+		if (this._scratchCloseout?.displayPath === displayPath) {
+			// Staged but the queued closeout turn has not drained yet. Compacting
+			// now would drop its write and leave a stale turn behind the boundary,
+			// so hold until the steering queue empties.
+			return this.agent.hasQueuedMessages();
+		}
 		let baselineText: string | undefined;
 		try {
-			baselineText = readFileSync(resolveToCwd(displayPath, this._cwd), "utf8").trim();
+			baselineText = await readScratchHandoffText(resolveToCwd(displayPath, this._cwd));
 		} catch {
-			// No checkpoint yet; the closeout turn creates it.
+			// Unreadable checkpoint (permissions, I/O): fall back to ordinary
+			// compaction instead of asking the model to overwrite unreadable state.
+			return false;
 		}
 		this._scratchCloseout = {
 			displayPath,
 			baselineWriteCount: this._scratchWriteCount(displayPath),
 			baselineText,
 		};
+		// Pin the path before the turn runs so a crash still resumes onto the
+		// same checkpoint file after a date rollover.
+		if (latestPersistedScratchHandoffPath(this.sessionManager.getBranch()) !== displayPath) {
+			this.sessionManager.appendCustomEntry(SCRATCH_HANDOFF_PATH_CUSTOM_TYPE, { path: displayPath });
+		}
 		await this.steer(renderScratchHandoffCloseoutMessage(displayPath, baselineText === undefined), undefined, {
 			queueKey: "scratch-handoff-closeout",
 			resumeIfIdle: true,
@@ -8014,12 +8028,9 @@ export class AgentSession {
 	private async _performScratchHandoffCompaction(): Promise<CompactionResult> {
 		const displayPath = this._scratchHandoffDisplayPath();
 		if (!displayPath) throw new Error("Scratch handoff is not active");
-		let scratchText: string | undefined;
-		try {
-			scratchText = readFileSync(resolveToCwd(displayPath, this._cwd), "utf8").trim();
-		} catch {
-			// ENOENT: no checkpoint yet.
-		}
+		// ENOENT means no checkpoint yet; other read failures fail the compaction
+		// visibly instead of rebuilding without existing state.
+		const scratchText = await readScratchHandoffText(resolveToCwd(displayPath, this._cwd));
 
 		const closeout = this._scratchCloseout?.displayPath === displayPath ? this._scratchCloseout : undefined;
 		if (closeout) {
@@ -8036,7 +8047,12 @@ export class AgentSession {
 			maxTokens: scratchHandoffRecentContextBudget(this.model?.contextWindow ?? 0),
 		});
 		const tokensBefore = estimateContextTokens(this.agent.state.messages).tokens;
-		const resumeMessage = buildScratchHandoffResumeMessage({ displayPath, scratchText, recentContext: delta });
+		const resumeMessage = buildScratchHandoffResumeMessage({
+			displayPath,
+			scratchText,
+			recentContext: delta,
+			contextWindow: this.model?.contextWindow,
+		});
 		const scratchEntryId = this.sessionManager.appendCustomMessageEntry(
 			SCRATCH_HANDOFF_READ_CUSTOM_TYPE,
 			resumeMessage,

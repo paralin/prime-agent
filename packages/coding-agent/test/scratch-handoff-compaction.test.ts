@@ -114,6 +114,12 @@ describe("scratch handoff compaction", () => {
 			await expect(internals._maybeStageScratchHandoffCloseout()).resolves.toBe(true);
 			const stagedPath = internals._scratchCloseout!.displayPath;
 
+			// The path pin persists before the closeout turn runs.
+			const pinEntry = session.sessionManager
+				.getBranch()
+				.find((e) => e.type === "custom" && (e as { customType?: string }).customType === "scratch-handoff-path");
+			expect((pinEntry as { data?: { path?: string } } | undefined)?.data?.path).toBe(stagedPath);
+
 			// Simulate the closeout turn writing the checkpoint.
 			const fs = await import("node:fs");
 			fs.mkdirSync(dirname(stagedPath), { recursive: true });
@@ -134,9 +140,11 @@ describe("scratch handoff compaction", () => {
 			const resumedText = JSON.stringify(session.agent.state.messages);
 			expect(resumedText).toContain("- Next action: Verify");
 
-			// A second staging attempt after consumption starts fresh.
+			// While the staged turn is still queued, staging holds compaction.
 			internals._scratchCloseout = undefined;
 			await expect(internals._maybeStageScratchHandoffCloseout()).resolves.toBe(true);
+			await session.waitForIdle();
+			await expect(internals._maybeStageScratchHandoffCloseout()).resolves.toBe(false);
 
 			await session.disposeAsync();
 		} finally {

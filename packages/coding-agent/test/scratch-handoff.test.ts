@@ -6,6 +6,7 @@ import {
 	latestPersistedScratchHandoffPath,
 	resolveScratchContinuityState,
 	resolveScratchHandoffPath,
+	SCRATCH_HANDOFF_PATH_CUSTOM_TYPE,
 	SCRATCH_HANDOFF_READ_CUSTOM_TYPE,
 	SCRATCH_HANDOFF_WRITE_CUSTOM_TYPE,
 	type ScratchHandoffDelta,
@@ -147,7 +148,16 @@ describe("scratchHandoffRecentContextBudget", () => {
 		expect(scratchHandoffRecentContextBudget(Number.NaN)).toBe(2048);
 		expect(scratchHandoffRecentContextBudget(100_000)).toBe(10_000);
 	});
+	it("small windows scale down instead of taking the full minimum", () => {
+		expect(scratchHandoffRecentContextBudget(20_480)).toBe(2_048);
+		expect(scratchHandoffRecentContextBudget(4_096)).toBe(409);
+		expect(scratchHandoffRecentContextBudget(1_024)).toBe(256);
+	});
 });
+
+function pathPin(path: string): SessionEntry {
+	return entry({ type: "custom", customType: SCRATCH_HANDOFF_PATH_CUSTOM_TYPE, data: { path } });
+}
 
 function readMarker(path: string): SessionEntry {
 	return entry({
@@ -169,6 +179,10 @@ describe("latestPersistedScratchHandoffPath", () => {
 	});
 	it("is undefined without markers", () => {
 		expect(latestPersistedScratchHandoffPath([messageEntry("user", "hi")])).toBeUndefined();
+	});
+	it("picks up path pins recorded before the first closeout", () => {
+		const entries = [pathPin("old.org"), pathPin("new.org")];
+		expect(latestPersistedScratchHandoffPath(entries)).toBe("new.org");
 	});
 });
 
@@ -233,6 +247,18 @@ describe("resume and closeout prompts", () => {
 		});
 		expect(message).toContain("No scratch checkpoint exists yet");
 		expect(message).toContain("bounded delta");
+	});
+
+	it("a small context window bounds the checkpoint preview", () => {
+		const longBody = Array.from({ length: 200 }, (_, i) => `- Detail line ${i} with padding text for length`).join(
+			"\n",
+		);
+		const message = buildScratchHandoffResumeMessage({
+			displayPath: "agent/x.org",
+			scratchText: `* TODO Work\n${longBody}`,
+			contextWindow: 4_096,
+		});
+		expect(message).toContain("Only checkpoint beginning is injected");
 	});
 
 	it("present checkpoint embeds the body and instructs against rereading", () => {

@@ -1,0 +1,1 @@
+- Fixed the daemon supervisor exiting on an unhandled rejection when a worker request timed out during send backpressure: the timeout now reaches the caller while the process stays alive and the same client remains usable.

@@ -924,6 +924,15 @@ function looksLikeMessageEntry(line: string): boolean {
 	return line.includes('"type":"message"') || line.includes('"type": "message"');
 }
 
+function isCatalogIrrelevantBookkeepingEntry(line: string): boolean {
+	return (
+		line.startsWith('{"type":"child_usage_attributed"') ||
+		line.startsWith('{"type":"git_state"') ||
+		line.startsWith('{"type":"act_start"') ||
+		line.startsWith('{"type":"act_terminal"')
+	);
+}
+
 function extractJsonStringPropertyPrefix(
 	text: string,
 	propertyName: string,
@@ -1078,6 +1087,7 @@ async function scanSessionInfoRange(
 		for await (const lineBuffer of readLinesAsBuffers(filePath, { start, end: stats.size - 1 })) {
 			const line = lineBuffer.toString("utf8");
 			if (!line.trim()) continue;
+			if (isCatalogIrrelevantBookkeepingEntry(line)) continue;
 
 			// Large tool-result entries can be many MB. They do not carry the
 			// session-list metadata we need, and parsing them during every refresh
@@ -1782,6 +1792,20 @@ export class SessionManager {
 	}
 
 	appendAgentStatus(status: AgentStatus): string {
+		let current = this.leafId ? this.byId.get(this.leafId) : undefined;
+		while (current) {
+			if (current.type === "agent_status") {
+				if (
+					current.status.summary === status.summary &&
+					current.status.taskState === status.taskState &&
+					current.status.basedOnMessageCount === status.basedOnMessageCount
+				) {
+					return current.id;
+				}
+				break;
+			}
+			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+		}
 		const entry: AgentStatusEntry = {
 			type: "agent_status",
 			id: generateId(this.byId),

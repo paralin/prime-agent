@@ -72,6 +72,16 @@ describe("captureGitContext", () => {
 		expect(captureGitContext(dir)?.repoUrl).toBe("git@github.com:acme/widgets.git");
 	});
 
+	it("invalidates cached context when the origin changes", () => {
+		initRepo(dir);
+		git(dir, "remote", "add", "origin", "https://github.com/acme/old.git");
+		commit(dir, "init");
+		expect(captureGitContext(dir)?.repoUrl).toBe("https://github.com/acme/old.git");
+
+		git(dir, "remote", "set-url", "origin", "https://github.com/acme/new.git");
+		expect(captureGitContext(dir)?.repoUrl).toBe("https://github.com/acme/new.git");
+	});
+
 	it("returns null outside a git repo", () => {
 		expect(captureGitContext(dir)).toBeNull();
 	});

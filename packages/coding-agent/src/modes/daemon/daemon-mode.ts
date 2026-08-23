@@ -104,6 +104,7 @@ import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../cor
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import {
 	canPassivateSession,
+	canPassivateSessionUnderPressure,
 	type IdleEvictionMinutes,
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
@@ -269,6 +270,7 @@ const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
+const MAX_RESIDENT_CHILDREN = 12;
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
@@ -2377,10 +2379,13 @@ export class AgentDaemon {
 						candidate.runtime.session === session,
 				);
 				if (!state?.runtime.session.sessionFile) return false;
-				if (state.runtime.metadata.rehydratedCompleted) return true;
+				if (state.runtime.metadata.rehydratedCompleted) {
+					void session.hibernateIpythonKernel().catch(() => undefined);
+					return true;
+				}
 				const metadata = state.runtime.metadata;
 				const model = session.model;
-				return this.recordRlmSubagentState(parentState, {
+				const recorded = this.recordRlmSubagentState(parentState, {
 					childId,
 					sessionName: session.sessionName ?? childId,
 					sessionDir: metadata.sessionDir ?? dirname(state.runtime.session.sessionFile),
@@ -2394,6 +2399,8 @@ export class AgentDaemon {
 					status: "completed",
 					createdAt: metadata.createdAt,
 				});
+				if (recorded) void session.hibernateIpythonKernel().catch(() => undefined);
+				return recorded;
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
 				// Persist the deletion boundary first, but never let a registry failure
@@ -2696,6 +2703,7 @@ export class AgentDaemon {
 		idleEvictionMinutes: IdleEvictionMinutes,
 		now: number,
 		selectedSnapshot?: SessionPassivationSnapshot,
+		underPressure = false,
 	): Promise<boolean> {
 		const sessionFile = state.runtime.session.sessionFile;
 		const metadata = state.runtime.metadata;
@@ -2711,7 +2719,11 @@ export class AgentDaemon {
 			return false;
 		}
 		const snapshot = selectedSnapshot ?? (await this.sessionPassivationSnapshot(state));
-		if (!canPassivateSession(snapshot, idleEvictionMinutes, now)) return false;
+		const canPassivate = (candidate: SessionPassivationSnapshot) =>
+			underPressure
+				? canPassivateSessionUnderPressure(candidate)
+				: canPassivateSession(candidate, idleEvictionMinutes, now);
+		if (!canPassivate(snapshot)) return false;
 
 		// Publish the durable identity before running the close so opens and lazy
 		// hydration can join throughout closeSessionOnce, including after sessions.delete.
@@ -2722,7 +2734,7 @@ export class AgentDaemon {
 				this.shuttingDown ||
 				this.updateRestart !== undefined ||
 				this.sessions.get(state.activeSessionId) !== state ||
-				!canPassivateSession(await this.sessionPassivationSnapshot(state), idleEvictionMinutes, now)
+				!canPassivate(await this.sessionPassivationSnapshot(state))
 			) {
 				return;
 			}
@@ -2767,6 +2779,7 @@ export class AgentDaemon {
 		idleEvictionMinutes: IdleEvictionMinutes,
 		now: number,
 		limit: number,
+		maxResidentChildren = Number.POSITIVE_INFINITY,
 	): Promise<number> {
 		if (this.shuttingDown || this.updateRestart !== undefined || limit <= 0) return 0;
 		const states = [...this.sessions.values()];
@@ -2777,12 +2790,24 @@ export class AgentDaemon {
 				snapshot: await this.sessionPassivationSnapshot(state, passiveRlmSubagents),
 			})),
 		);
-		const candidates = snapshots
+		const idleCandidates = snapshots
 			.filter(({ snapshot }) => canPassivateSession(snapshot, idleEvictionMinutes, now))
+			.map((candidate) => ({ ...candidate, underPressure: false }));
+		const residentChildren = snapshots.filter(({ snapshot }) => snapshot.hasParent).length;
+		const pressureBudget = Math.max(0, residentChildren - maxResidentChildren);
+		const idleStates = new Set(idleCandidates.map(({ state }) => state));
+		const pressureCandidates = snapshots
+			.filter(({ state, snapshot }) => !idleStates.has(state) && canPassivateSessionUnderPressure(snapshot))
+			.sort((left, right) => left.snapshot.lastActivityAt - right.snapshot.lastActivityAt)
+			.slice(0, pressureBudget)
+			.map((candidate) => ({ ...candidate, underPressure: true }));
+		const candidates = [...idleCandidates, ...pressureCandidates]
 			.sort((left, right) => left.snapshot.lastActivityAt - right.snapshot.lastActivityAt)
 			.slice(0, limit);
 		const results = await Promise.all(
-			candidates.map(({ state, snapshot }) => this.passivateSession(state, idleEvictionMinutes, now, snapshot)),
+			candidates.map(({ state, snapshot, underPressure }) =>
+				this.passivateSession(state, idleEvictionMinutes, now, snapshot, underPressure),
+			),
 		);
 		return results.filter(Boolean).length;
 	}
@@ -3777,7 +3802,12 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_passivate_idle_children": {
-					const count = await this.passivateIdleChildren(command.idleEvictionMinutes, command.now, command.limit);
+					const count = await this.passivateIdleChildren(
+						command.idleEvictionMinutes,
+						command.now,
+						command.limit,
+						MAX_RESIDENT_CHILDREN,
+					);
 					this.writeWorkerSuccess(client, command, { count });
 					return;
 				}
@@ -5606,7 +5636,9 @@ export class AgentDaemon {
 		const activePaths = new Set(
 			localAgents.flatMap((agent) => (agent.sessionPath ? [canonicalSessionPath(agent.sessionPath)] : [])),
 		);
-		const savedRoots = (await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir))
+		const savedRoots = (
+			await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir, activePaths)
+		)
 			.filter(
 				(info) =>
 					(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 &&

@@ -540,7 +540,6 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.latestSnapshot = {
 			state,
 			messages: messagesData.messages,
-			sessionContext: sessionContextData.context,
 			...(children ? { children } : {}),
 			...(streamingMessage ? { streamingMessage } : {}),
 		};

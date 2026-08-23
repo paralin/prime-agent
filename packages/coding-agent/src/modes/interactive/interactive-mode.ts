@@ -567,25 +567,15 @@ const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 // evicted past the cap to keep a long session bounded.
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
 const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT = 400;
+const EDITOR_HISTORY_LIMIT = 100;
 
 function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
 	if (messages.length <= INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT) {
 		return messages;
 	}
-	const toolCallMessages = new Map<string, { index: number; message: Extract<AgentMessage, { role: "assistant" }> }>();
-	for (const [index, message] of messages.entries()) {
-		if (message.role !== "assistant") {
-			continue;
-		}
-		for (const content of message.content) {
-			if (content.type === "toolCall") {
-				toolCallMessages.set(content.id, { index, message });
-			}
-		}
-	}
 
-	const initialStartIndex = messages.length - INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT;
-	for (let startIndex = initialStartIndex; startIndex < messages.length; startIndex++) {
+	let startIndex = messages.length - INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT;
+	while (startIndex < messages.length) {
 		const visibleMessages = messages.slice(startIndex);
 		const visibleToolCallIds = new Set<string>();
 		for (const message of visibleMessages) {
@@ -599,27 +589,42 @@ function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
 			}
 		}
 
+		const unresolvedToolCallIds = new Set<string>();
+		for (const message of visibleMessages) {
+			if (message.role === "toolResult" && !visibleToolCallIds.has(message.toolCallId)) {
+				unresolvedToolCallIds.add(message.toolCallId);
+			}
+		}
+
 		const requiredToolCallIdsByMessage = new Map<
 			number,
 			{ message: Extract<AgentMessage, { role: "assistant" }>; toolCallIds: Set<string> }
 		>();
-		for (const message of visibleMessages) {
-			if (message.role !== "toolResult" || visibleToolCallIds.has(message.toolCallId)) {
+		for (let index = startIndex - 1; index >= 0 && unresolvedToolCallIds.size > 0; index--) {
+			const message = messages[index];
+			if (message?.role !== "assistant") {
 				continue;
 			}
-			const toolCallMessage = toolCallMessages.get(message.toolCallId);
-			if (!toolCallMessage || toolCallMessage.index >= startIndex) {
+			const matchingToolCallIds = message.content.flatMap((content) =>
+				content.type === "toolCall" && unresolvedToolCallIds.has(content.id) ? [content.id] : [],
+			);
+			if (matchingToolCallIds.length === 0) {
 				continue;
 			}
-			const requiredMessage = requiredToolCallIdsByMessage.get(toolCallMessage.index) ?? {
-				message: toolCallMessage.message,
-				toolCallIds: new Set<string>(),
+			const requiredMessage = {
+				message,
+				toolCallIds: new Set(matchingToolCallIds),
 			};
-			requiredMessage.toolCallIds.add(message.toolCallId);
-			requiredToolCallIdsByMessage.set(toolCallMessage.index, requiredMessage);
+			requiredToolCallIdsByMessage.set(index, requiredMessage);
+			for (const toolCallId of matchingToolCallIds) {
+				unresolvedToolCallIds.delete(toolCallId);
+			}
 		}
 
-		if (visibleMessages.length + requiredToolCallIdsByMessage.size > INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT) {
+		const overflow =
+			visibleMessages.length + requiredToolCallIdsByMessage.size - INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT;
+		if (overflow > 0) {
+			startIndex += overflow;
 			continue;
 		}
 
@@ -6521,7 +6526,16 @@ export class InteractiveMode {
 		}
 
 		if (options.populateHistory) {
-			for (const message of sessionContext.messages) {
+			const recentUserMessages: AgentMessage[] = [];
+			for (
+				let index = sessionContext.messages.length - 1;
+				index >= 0 && recentUserMessages.length < EDITOR_HISTORY_LIMIT;
+				index--
+			) {
+				const message = sessionContext.messages[index];
+				if (message?.role === "user") recentUserMessages.push(message);
+			}
+			for (const message of recentUserMessages.reverse()) {
 				this.addMessageToEditorHistory(message);
 			}
 		}

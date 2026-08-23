@@ -354,6 +354,7 @@ export class IpythonKernelProvisioner {
 	private lastStartupMessage?: string;
 	private _lastRestore?: RestoreResult;
 	private readonly disposeController = new AbortController();
+	private restartGate?: Promise<void>;
 
 	constructor(
 		private readonly cwd: string,
@@ -402,12 +403,35 @@ export class IpythonKernelProvisioner {
 		const pending = this.managerPromise;
 		this.managerPromise = undefined;
 		this.startedManager = undefined;
+		await this.restartGate?.catch(() => undefined);
 		if (!pending) return;
 		try {
 			const m = await pending;
 			await m.shutdown({ snapshot: true, drainHostRequests: true });
 		} catch {
 			// a failed startup already cleaned up after itself
+		}
+	}
+
+	/** Persist and stop an idle kernel while keeping the provisioner reusable. */
+	async hibernate(): Promise<void> {
+		if (this.restartGate) return this.restartGate;
+		const pending = this.managerPromise;
+		this.managerPromise = undefined;
+		this.startedManager = undefined;
+		if (this.options?.kernelManagerRef) {
+			this.options.kernelManagerRef.current = undefined;
+		}
+		if (!pending) return;
+		const gate = pending.then(
+			(manager) => manager.dispose(),
+			() => undefined,
+		);
+		this.restartGate = gate;
+		try {
+			await gate;
+		} finally {
+			if (this.restartGate === gate) this.restartGate = undefined;
 		}
 	}
 
@@ -505,6 +529,9 @@ export class IpythonKernelProvisioner {
 		// kernels can't race over the same on-disk file. Guarded so the common
 		// no-gate path stays synchronous (callers rely on prompt startup progress).
 		try {
+			if (this.restartGate) {
+				await raceWithAbort(this.restartGate, startupSignal);
+			}
 			if (this.options?.readyGate) {
 				await raceWithAbort(
 					this.options.readyGate.catch(() => {}),

@@ -962,8 +962,11 @@ describe("daemon mode helpers", () => {
 				(state) => state.runtime.session === childRuntime.session,
 			);
 			if (!childState?.runtime.session.sessionFile) throw new Error("Missing child state");
+			const hibernateIpythonKernel = vi.fn(async () => {});
+			Object.assign(childRuntime.session, { hibernateIpythonKernel });
 			const host = internals.createSubagentRuntimeHost(parentState);
 			expect(host.completeRlmSubagentRuntime?.("child-1", childRuntime.session)).toBe(true);
+			expect(hibernateIpythonKernel).toHaveBeenCalledOnce();
 			await (
 				daemon as unknown as { closeSession(state: ActiveSessionState, reason: "shutdown"): Promise<void> }
 			).closeSession(childState, "shutdown");
@@ -6097,6 +6100,52 @@ describe("daemon mode helpers", () => {
 		expect(internals.passivateSession.mock.calls.map((call) => call[0])).toEqual([oldestLeaf, nextLeaf]);
 		expect(internals.passivateSession).not.toHaveBeenCalledWith(nonLeaf, expect.anything(), expect.anything());
 		expect(internals.passivateSession).not.toHaveBeenCalledWith(queuedLeaf, expect.anything(), expect.anything());
+	});
+
+	it("passivates the oldest safe child when resident count exceeds the pressure cap", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-passivation-pressure.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const root = makeState("root");
+		const oldestLeaf = makeState("oldest-leaf", "root");
+		const newerLeaf = makeState("newer-leaf", "root");
+		const newestLeaf = makeState("newest-leaf", "root");
+		const states = [root, oldestLeaf, newerLeaf, newestLeaf];
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			listPassiveRlmSubagents: ReturnType<typeof vi.fn>;
+			sessionPassivationSnapshot: ReturnType<typeof vi.fn>;
+			passivateSession: ReturnType<typeof vi.fn>;
+			passivateIdleChildren(
+				threshold: number,
+				now: number,
+				limit: number,
+				maxResidentChildren: number,
+			): Promise<number>;
+		};
+		for (const state of states) internals.sessions.set(state.activeSessionId, state);
+		const order = new Map([
+			[oldestLeaf, 197 * 60_000],
+			[newerLeaf, 198 * 60_000],
+			[newestLeaf, 199 * 60_000],
+			[root, 200 * 60_000],
+		]);
+		internals.listPassiveRlmSubagents = vi.fn(async () => []);
+		internals.sessionPassivationSnapshot = vi.fn(async (state: ActiveSessionState) => ({
+			isSessionActive: false,
+			attachedClients: 0,
+			hasRegisteredHeartbeat: false,
+			hasRegisteredCronJob: false,
+			lastActivityAt: order.get(state) ?? 0,
+			hasParent: state !== root,
+			hasNonPassiveDescendants: false,
+			isHydrating: false,
+		}));
+		internals.passivateSession = vi.fn(async () => true);
+
+		await expect(internals.passivateIdleChildren(90, 200 * 60_000, 8, 2)).resolves.toBe(1);
+		expect(internals.passivateSession).toHaveBeenCalledWith(oldestLeaf, 90, 200 * 60_000, expect.anything(), true);
 	});
 
 	it("passivates an idle leaf and makes list, attach, and message use the normal passive wake path", async () => {

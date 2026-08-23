@@ -458,15 +458,15 @@ describe("InteractiveMode.renderSessionContext", () => {
 		expect(renderAll(chatContainer)).not.toContain("for faster open");
 	});
 
-	test("populates editor history from the full transcript when initial rendering is capped", async () => {
+	test("populates editor history from only the editor's retained tail", async () => {
 		const { harness, addMessageToChat, addToHistory } = createRenderSessionContextHarness();
 		const messages = Array.from({ length: 405 }, (_, index) => userMessage(`message ${index}`, index));
 
 		await renderMessages(harness, messages, { populateHistory: true, limitTranscript: true });
 
 		expect(addMessageToChat).toHaveBeenCalledTimes(400);
-		expect(addToHistory).toHaveBeenCalledTimes(405);
-		expect(addToHistory.mock.calls[0]?.[0]).toBe("message 0");
+		expect(addToHistory).toHaveBeenCalledTimes(100);
+		expect(addToHistory.mock.calls[0]?.[0]).toBe("message 305");
 		expect(addToHistory.mock.calls.at(-1)?.[0]).toBe("message 404");
 	});
 

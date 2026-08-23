@@ -2435,7 +2435,6 @@ describe("DaemonAgentConnection", () => {
 			"attach",
 			"get_connection_state",
 			"get_messages",
-			"get_session_context",
 		]);
 	});
 
@@ -2751,11 +2750,7 @@ describe("DaemonAgentConnection", () => {
 					},
 				});
 			}
-			expect(fakeClient.requests.map((request) => request.type)).toEqual([
-				"get_connection_state",
-				"get_messages",
-				"get_session_context",
-			]);
+			expect(fakeClient.requests.map((request) => request.type)).toEqual(["get_connection_state", "get_messages"]);
 			emitSequencedQueueUpdate(fakeClient, "active-2", 13);
 			await vi.waitFor(() => expect(siblingEvents).toHaveLength(1));
 			expect(siblingEvents[0]).toMatchObject({ type: "session_event", event: { type: "session_action_update" } });
@@ -3044,10 +3039,8 @@ describe("DaemonAgentConnection", () => {
 				sessionId: "session-current",
 			},
 			messages: [{ role: "user", content: "current prompt", timestamp: 4 }],
-			sessionContext: {
-				messages: [{ role: "user", content: "context prompt", timestamp: 3 }],
-			},
 		});
+		expect(snapshot.sessionContext).toBeUndefined();
 		// The session tree is fetched lazily (only when the tree/branch selector is
 		// opened), so refreshing the initial snapshot must not request it.
 		expect(snapshot.sessionTree).toBeUndefined();
@@ -3055,7 +3048,6 @@ describe("DaemonAgentConnection", () => {
 			"attach",
 			"get_connection_state",
 			"get_messages",
-			"get_session_context",
 		]);
 	});
 

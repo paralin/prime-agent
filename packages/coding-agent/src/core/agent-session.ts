@@ -4188,6 +4188,11 @@ export class AgentSession {
 		return this._disposeAsyncPromise;
 	}
 
+	/** Persist and release an idle IPython process; the next tool call restores it lazily. */
+	hibernateIpythonKernel(): Promise<void> {
+		return this._ipythonKernelProvisioner?.hibernate() ?? Promise.resolve();
+	}
+
 	/**
 	 * Await any in-flight refinement (planning or application) and run a
 	 * pending auto-refine that was scheduled but not yet started. Called

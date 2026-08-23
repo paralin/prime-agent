@@ -110,6 +110,7 @@ describe("buildRestoreCode", () => {
 	it("embeds the input path and no-ops when the file is missing", () => {
 		expect(code).toContain('"/state/sess.dill"');
 		expect(code).toContain("os.path.exists");
-		expect(code).toContain("dill.loads");
+		expect(code).toContain("payload = SafeSnapshotUnpickler(fh).load()");
+		expect(code).toContain("ns[name] = SafeSnapshotUnpickler(io.BytesIO(blob)).load()");
 	});
 });

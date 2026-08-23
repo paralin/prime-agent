@@ -281,6 +281,85 @@ late_small = "d" * 1_000`);
 		}
 	}, 60_000);
 
+	it("rejects file handles on save and before restore can reopen them", async () => {
+		const unsafeDir = mkdtempSync(join(tmpdir(), "prime-agent-state-file-handle-"));
+		const targetPath = join(unsafeDir, "target.txt");
+		const unsafePath = join(unsafeDir, "unsafe.dill");
+		const manager = new KernelManager({
+			python: python as string,
+			cwd: unsafeDir,
+			snapshot: { path: unsafePath, manifestPath: join(unsafeDir, "unsafe.json"), debounceMs: 60_000 },
+		});
+		try {
+			await manager.execute(`handle = open(${JSON.stringify(targetPath)}, "a")
+nested_handle = [handle]
+safe_text = "_create_filehandle"
+safe_bytes = b"_create_filehandle"`);
+			const snapshot = await manager.snapshotState();
+			expect(snapshot?.skipped.map(({ name }) => name)).toEqual(expect.arrayContaining(["handle", "nested_handle"]));
+			expect(snapshot?.saved).toEqual(expect.arrayContaining(["safe_text", "safe_bytes"]));
+			await manager.execute(`handle.close()
+del handle, nested_handle`);
+
+			await manager.execute(`import dill
+closed_handle = open(${JSON.stringify(targetPath)}, "w")
+closed_handle.close()
+open(${JSON.stringify(targetPath)}, "w").write("keep")
+unsafe_blob = dill.dumps([closed_handle])
+open(${JSON.stringify(unsafePath)}, "wb").write(dill.dumps({"nested": unsafe_blob}))
+del closed_handle, unsafe_blob`);
+			const nestedRestore = await manager.restoreState();
+			expect(nestedRestore).toMatchObject({
+				restored: [],
+				failed: [{ name: "nested", reason: expect.stringContaining("unsafe file-handle reducer") }],
+			});
+			const nestedTarget = await manager.execute(`print(open(${JSON.stringify(targetPath)}).read())`);
+			expect(nestedTarget.stdout.trim()).toBe("keep");
+
+			await manager.execute(`legacy_handle = open(${JSON.stringify(targetPath)}, "w")
+legacy_handle.close()
+open(${JSON.stringify(targetPath)}, "w").write("keep")
+open(${JSON.stringify(unsafePath)}, "wb").write(dill.dumps(legacy_handle))
+del legacy_handle`);
+			expect(await manager.restoreState()).toBeNull();
+			const legacyTarget = await manager.execute(`print(open(${JSON.stringify(targetPath)}).read())`);
+			expect(legacyTarget.stdout.trim()).toBe("keep");
+
+			await manager.execute(`legacy_alias_handle = open(${JSON.stringify(targetPath)}, "w")
+legacy_alias_handle.close()
+open(${JSON.stringify(targetPath)}, "w").write("keep")
+legacy_alias_blob = dill.dumps(legacy_alias_handle, protocol=0).replace(
+    b"cdill._dill\\n_create_filehandle\\n",
+    b"cdill.dill\\n_create_filehandle\\n",
+)
+open(${JSON.stringify(unsafePath)}, "wb").write(dill.dumps({"nested_legacy_alias": legacy_alias_blob}))
+del legacy_alias_handle, legacy_alias_blob`);
+			const nestedLegacyAliasRestore = await manager.restoreState();
+			expect(nestedLegacyAliasRestore).toMatchObject({
+				restored: [],
+				failed: [{ name: "nested_legacy_alias", reason: expect.stringContaining("unsafe file-handle reducer") }],
+			});
+			const nestedLegacyAliasTarget = await manager.execute(`print(open(${JSON.stringify(targetPath)}).read())`);
+			expect(nestedLegacyAliasTarget.stdout.trim()).toBe("keep");
+
+			await manager.execute(`legacy_alias_handle = open(${JSON.stringify(targetPath)}, "w")
+legacy_alias_handle.close()
+open(${JSON.stringify(targetPath)}, "w").write("keep")
+legacy_alias_blob = dill.dumps(legacy_alias_handle, protocol=0).replace(
+    b"cdill._dill\\n_create_filehandle\\n",
+    b"cdill.dill\\n_create_filehandle\\n",
+)
+open(${JSON.stringify(unsafePath)}, "wb").write(legacy_alias_blob)
+del legacy_alias_handle, legacy_alias_blob`);
+			expect(await manager.restoreState()).toBeNull();
+			const legacyAliasTarget = await manager.execute(`print(open(${JSON.stringify(targetPath)}).read())`);
+			expect(legacyAliasTarget.stdout.trim()).toBe("keep");
+		} finally {
+			await manager.dispose();
+			rmSync(unsafeDir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
 	it("auto-snapshots after a successful execution (debounced)", async () => {
 		const autoDir = mkdtempSync(join(tmpdir(), "prime-agent-state-auto-"));
 		const autoPath = join(autoDir, "auto.dill");

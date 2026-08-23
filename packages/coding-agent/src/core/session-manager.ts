@@ -1204,7 +1204,9 @@ export interface SessionListCallbacks {
 // conversationMessageCount is undefined in fixtures that predate the scan;
 // only an exact zero hides a session.
 function isVisibleInCatalog(session: SessionInfo): boolean {
-	return session.conversationMessageCount !== 0;
+	if (session.conversationMessageCount !== 0) return true;
+	const status = session.state?.status;
+	return session.agentStatus !== undefined && status !== "archived" && status !== "crash";
 }
 
 async function listSessionsFromDir(
@@ -1573,6 +1575,7 @@ export class SessionManager {
 		const shouldPersistWithoutAssistant =
 			entry.type === "session_state" ||
 			entry.type === "session_info" ||
+			entry.type === "agent_status" ||
 			entry.type === "act_start" ||
 			entry.type === "act_terminal";
 		if (!hasAssistant && !shouldPersistWithoutAssistant) {

@@ -14,7 +14,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	AGENT_FAMILY_REACH_ERROR,
 	type AgentSessionMessageController,
@@ -57,6 +57,19 @@ import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
 
 describe("daemon mode helpers", () => {
+	// Fixture sessions must get their depth from the persisted data under
+	// test, not from the host shell: an ambient RLM_DEPTH (for example when
+	// the suite runs inside a nested agent session) seeds every new root
+	// session at that depth and shifts each derived child depth with it.
+	const ambientRlmDepth = { value: undefined as string | undefined };
+	beforeAll(() => {
+		ambientRlmDepth.value = process.env.RLM_DEPTH;
+		delete process.env.RLM_DEPTH;
+	});
+	afterAll(() => {
+		if (ambientRlmDepth.value !== undefined) process.env.RLM_DEPTH = ambientRlmDepth.value;
+	});
+
 	it("preserves envelope client identity while registering prompt admission", () => {
 		const daemon = new AgentDaemon("/tmp/unused-daemon.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },

@@ -1,0 +1,1 @@
+- Fixed dropped live events when a legacy sequenced frame followed a generation cursor.

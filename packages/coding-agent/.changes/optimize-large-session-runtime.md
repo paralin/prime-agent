@@ -1,0 +1,1 @@
+- Improved large-session responsiveness by incrementally indexing transcripts, skipping resident and bookkeeping scans, avoiding duplicate snapshot context, bounding initial UI work, passivating inactive children under resident pressure, and caching unchanged Git context.

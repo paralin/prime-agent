@@ -3410,14 +3410,15 @@ export class DaemonSupervisor {
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
-		const response =
+		const useActiveOnly =
 			!includePassive &&
 			(worker.schemaRevision ?? 0) >=
-				DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_list_active_sessions.minSchemaRevision
-				? await worker.client.requestWorker({ type: "worker_list_active_sessions" }, 5000)
-				: await worker.client.request({ type: "list" }, 5000);
+				DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_list_active_sessions.minSchemaRevision;
+		const response = useActiveOnly
+			? await worker.client.requestWorker({ type: "worker_list_active_sessions" }, 5000)
+			: await worker.client.request({ type: "list" }, 5000);
 		const summaries = sessionSummariesFromResponse(response);
-		worker.summaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
+		worker.summaries = this.mergeWorkerSummaries(worker.summaries, summaries, useActiveOnly);
 		for (const summary of summaries) {
 			const activeSessionId = summary.activeSessionId ?? summary.id;
 			if (summary.streamingMessage?.role === "assistant") {
@@ -3440,6 +3441,40 @@ export class DaemonSupervisor {
 			});
 			this.persistWorker(worker);
 		}
+	}
+
+	/**
+	 * Merge a summary listing into a worker's summary catalog.
+	 *
+	 * A full listing replaces the catalog. An active-only listing reports just
+	 * the worker's live sessions, so it must preserve passive catalog entries:
+	 * refresh active entries, drop active entries the worker stopped reporting,
+	 * and retire the passive twin of a session that became active.
+	 */
+	private mergeWorkerSummaries(
+		previous: ReadonlyMap<string, SessionSummary>,
+		summaries: SessionSummary[],
+		activeOnly: boolean,
+	): Map<string, SessionSummary> {
+		const next = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
+		if (!activeOnly) return next;
+		const passiveKeysBySessionId = new Map<string, string>();
+		for (const [key, summary] of previous) {
+			if (summary.activeSessionId === undefined && summary.sessionId !== undefined) {
+				passiveKeysBySessionId.set(summary.sessionId, key);
+			}
+		}
+		const merged = new Map(previous);
+		for (const [key, existing] of previous) {
+			if (existing.activeSessionId !== undefined && !next.has(key)) merged.delete(key);
+		}
+		for (const [key, summary] of next) {
+			merged.set(key, summary);
+			if (summary.sessionId === undefined) continue;
+			const passiveKey = passiveKeysBySessionId.get(summary.sessionId);
+			if (passiveKey !== undefined && passiveKey !== key) merged.delete(passiveKey);
+		}
+		return merged;
 	}
 
 	private async familyCatalogEntries(): Promise<AgentFamilyCatalogEntry[]> {

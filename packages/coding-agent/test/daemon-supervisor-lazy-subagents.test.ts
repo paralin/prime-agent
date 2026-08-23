@@ -725,6 +725,59 @@ describe("daemon supervisor passive subagent topology", () => {
 		expect(resident.summaries.get("root-active")).toEqual(root);
 	});
 
+	it("keeps passive catalog entries across active-only summary refreshes", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-passive-catalog-"));
+		tempDirs.push(directory);
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+		const root = summary({
+			id: "root-active",
+			activeSessionId: "root-active",
+			sessionId: "root-session",
+			runtimeKind: "top-level",
+		});
+		const passiveChild = summary({
+			id: "passive-child-session",
+			sessionId: "passive-child-session",
+			runtimeKind: "subagent",
+		});
+		const resident = worker("catalog", [root, passiveChild]);
+		resident.schemaRevision = 23;
+		resident.client.requestWorker.mockResolvedValue(success(undefined, "list", { sessions: [root] }));
+
+		await supervisor.refreshWorkerSummaries(resident);
+
+		expect(resident.summaries.get("root-active")).toEqual(root);
+		expect(resident.summaries.get("passive-child-session")).toBe(passiveChild);
+
+		// The passive child becomes active; the refresh retires its passive
+		// entry instead of keeping both.
+		const attachedChild = summary({
+			id: "child-active",
+			activeSessionId: "child-active",
+			sessionId: "passive-child-session",
+			runtimeKind: "subagent",
+		});
+		resident.client.requestWorker.mockResolvedValue(
+			success(undefined, "list", { sessions: [root, attachedChild] }),
+		);
+
+		await supervisor.refreshWorkerSummaries(resident);
+
+		expect(resident.summaries.get("root-active")).toEqual(root);
+		expect(resident.summaries.get("child-active")).toEqual(attachedChild);
+		expect(resident.summaries.has("passive-child-session")).toBe(false);
+
+		// A session that stopped being reported no longer lingers as active.
+		resident.client.requestWorker.mockResolvedValue(success(undefined, "list", { sessions: [attachedChild] }));
+
+		await supervisor.refreshWorkerSummaries(resident);
+
+		expect([...resident.summaries.keys()].sort()).toEqual(["child-active"]);
+	});
+
 	it("coalesces concurrent active-summary refreshes into one request plus one trailing refresh", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-coalesced-summaries-"));
 		tempDirs.push(directory);

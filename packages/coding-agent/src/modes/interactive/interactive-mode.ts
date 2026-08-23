@@ -96,7 +96,6 @@ import {
 	type CustomMessage,
 	createHeartbeatPromptMessage,
 	createManualContinueMessage,
-	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	isCompactionOutcomeMessage,
 	isRefinementOutcomeMessage,

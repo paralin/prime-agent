@@ -209,20 +209,30 @@ export class DaemonWorkerClient {
 			}, timeoutMs);
 			this.pending.set(id, { resolve, reject, timeout });
 		});
-		try {
-			await this.channel.send(
+		// The send can backpressure past the response timeout. Both promises get
+		// handlers immediately so a send-blocked timeout reaches the caller
+		// instead of surfacing as an unhandledRejection. A successful send still
+		// waits on the worker response; only a send failure resolves the race early.
+		response.catch(() => undefined);
+		const sent = this.channel
+			.send(
 				{ kind: "command", requestId: id, commandType: command.type },
 				Buffer.from(serializeJsonLine(fullCommand)),
+			)
+			.then(
+				(): Promise<DaemonResponse> => response,
+				(error: unknown) => {
+					const normalized = error instanceof Error ? error : new Error(String(error));
+					const pending = this.pending.get(id);
+					if (pending) {
+						clearTimeout(pending.timeout);
+						this.pending.delete(id);
+						pending.reject(normalized);
+					}
+					throw normalized;
+				},
 			);
-		} catch (error) {
-			const pending = this.pending.get(id);
-			if (pending) {
-				clearTimeout(pending.timeout);
-				this.pending.delete(id);
-				pending.reject(error instanceof Error ? error : new Error(String(error)));
-			}
-		}
-		return response;
+		return await Promise.race([response, sent]);
 	}
 
 	private handleFrame(frame: PrivateFrame<DaemonWorkerFrameHeader>): void {

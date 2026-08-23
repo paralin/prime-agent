@@ -1,0 +1,1 @@
+- Fixed passive RLM subagent sessions disappearing from the daemon session catalog after an active-only summary refresh, which broke later attach by session ID.

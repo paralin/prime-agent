@@ -46,7 +46,8 @@ async function main(): Promise<void> {
 	// Phase 2: the same client instance keeps working once the transport moves.
 	blockSend = false;
 	const response = await client.request({ type: "list" }, 2000);
-	const ok = (response.data as { ok?: boolean } | undefined)?.ok === true;
+	const ok =
+		response.success && (response.data as { ok?: boolean } | undefined)?.ok === true;
 	process.stdout.write(`PHASE2_OK=${ok}\n`);
 	process.stdout.write("ALIVE\n");
 }

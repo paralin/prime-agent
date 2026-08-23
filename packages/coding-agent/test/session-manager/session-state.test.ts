@@ -77,6 +77,35 @@ describe("SessionManager session state", () => {
 		}
 	});
 
+	it("keeps a released agent with durable status live until it is archived", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "session-state-agent-status-"));
+		try {
+			const cwd = join(tempDir, "project");
+			const sessionDir = join(tempDir, "sessions");
+			const session = SessionManager.create(cwd, sessionDir);
+			session.appendAgentStatus({
+				summary: "Finished retained work",
+				taskState: "completed",
+				basedOnMessageCount: 0,
+			});
+			const sessionFile = session.getSessionFile()!;
+
+			const retained = await readSessionInfo(sessionFile);
+			expect(retained).toMatchObject({
+				messageCount: 0,
+				conversationMessageCount: 0,
+				agentStatus: { summary: "Finished retained work", taskState: "completed", basedOnMessageCount: 0 },
+			});
+			expect(inactiveLifecycleForSession(retained!)).toBe("live");
+
+			session.appendSessionState({ status: "archived" });
+			const archived = await readSessionInfo(sessionFile);
+			expect(inactiveLifecycleForSession(archived!)).toBe("archived");
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("persists renamed sessions without assistant messages", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "session-state-rename-empty-"));
 		try {

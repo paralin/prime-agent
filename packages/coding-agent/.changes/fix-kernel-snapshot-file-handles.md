@@ -1,0 +1,1 @@
+- Fixed kernel snapshot restore reopening or truncating files referenced by saved file handles.

@@ -90,6 +90,12 @@ def _prime_agent_snapshot_state():
     class SnapshotSizeLimitExceeded(_b.Exception):
         pass
 
+    class SnapshotPickler(dill.Pickler):
+        def reducer_override(self, obj):
+            if _b.isinstance(obj, io.IOBase):
+                raise _b.TypeError("file and I/O handles are not snapshot-safe")
+            return _b.NotImplemented
+
     class SnapshotBuffer(io.BytesIO):
         def __init__(self, limit):
             io.BytesIO.__init__(self)
@@ -117,7 +123,7 @@ def _prime_agent_snapshot_state():
         buffer = SnapshotBuffer(buffer_limit)
         # Modules are pickled by reference and re-imported on restore.
         try:
-            dill.dump(value, buffer)
+            SnapshotPickler(buffer).dump(value)
             blob = buffer.getvalue()
         except SnapshotSizeLimitExceeded:
             if not identify_oversized and remaining < ${maxVariableBytes}:
@@ -140,7 +146,14 @@ def _prime_agent_snapshot_state():
     try:
         with _b.open(tmp, "wb") as fh:
             dill.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, ${pyStr(outPath)})
+        parent_fd = os.open(os.path.dirname(${pyStr(outPath)}), os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
     except _b.Exception as _err:
         try:
             os.remove(tmp)
@@ -161,11 +174,23 @@ def _prime_agent_snapshot_state():
         "pythonVersion": sys.version.split()[0],
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
+    manifest_tmp = ${pyStr(manifestPath)} + ".tmp"
     try:
-        with _b.open(${pyStr(manifestPath)}, "w") as fh:
+        with _b.open(manifest_tmp, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(manifest_tmp, ${pyStr(manifestPath)})
+        parent_fd = os.open(os.path.dirname(${pyStr(manifestPath)}), os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
     except _b.Exception:
-        pass
+        try:
+            os.remove(manifest_tmp)
+        except _b.Exception:
+            pass
     pruned_ids = {_b.id(ns[name]) for name in pruned}
     while True:
         try:
@@ -205,7 +230,7 @@ export function buildRestoreCode(inPath: string): string {
 	// (list/open/print/…) can't break the restore path.
 	return `
 def _prime_agent_restore_state():
-    import builtins as _b, json, os, sys
+    import builtins as _b, io, json, os, sys
     if not os.path.exists(${pyStr(inPath)}):
         _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": [], "failed": []}))
         return
@@ -215,9 +240,15 @@ def _prime_agent_restore_state():
         _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": [], "failed": [], "error": "dill unavailable: " + _b.str(_err)}))
         return
 
+    class SafeSnapshotUnpickler(dill.Unpickler):
+        def find_class(self, module, name):
+            if module in {"dill._dill", "dill.dill"} and name == "_create_filehandle":
+                raise _b.ValueError("unsafe file-handle reducer")
+            return dill.Unpickler.find_class(self, module, name)
+
     try:
         with _b.open(${pyStr(inPath)}, "rb") as fh:
-            payload = dill.load(fh)
+            payload = SafeSnapshotUnpickler(fh).load()
     except _b.Exception as _err:
         _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": [], "failed": [], "error": "load failed: " + _b.str(_err)}))
         return
@@ -245,7 +276,9 @@ def _prime_agent_restore_state():
     failed = []
     for name, blob in payload.items():
         try:
-            ns[name] = dill.loads(blob)
+            if not _b.isinstance(blob, (_b.bytes, _b.bytearray)):
+                raise _b.TypeError("snapshot value is not a pickle blob")
+            ns[name] = SafeSnapshotUnpickler(io.BytesIO(blob)).load()
             restored.append(name)
         except _b.Exception as _err:
             failed.append({"name": name, "reason": _b.type(_err).__name__ + ": " + _b.str(_err)[:200]})

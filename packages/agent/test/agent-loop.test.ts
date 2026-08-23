@@ -55,6 +55,22 @@ class ThrowingResultStream extends MockAssistantStream {
 	}
 }
 
+class StalledResultStream extends MockAssistantStream {
+	constructor(private readonly stalledResult: Promise<AssistantMessage>) {
+		super();
+	}
+
+	override [Symbol.asyncIterator](): AsyncIterator<AssistantMessageEvent> {
+		return {
+			next: async () => ({ done: true, value: undefined as never }),
+		};
+	}
+
+	override result(): Promise<AssistantMessage> {
+		return this.stalledResult;
+	}
+}
+
 function createUsage() {
 	return {
 		input: 0,
@@ -108,6 +124,392 @@ function createUserMessage(text: string): UserMessage {
 function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter((m) => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
+
+type IteratorCleanup = () => void | Promise<void>;
+
+class ControlledAssistantStream extends MockAssistantStream {
+	readonly returnIterator = vi.fn<IteratorCleanup>();
+	readonly nextCalled: Promise<void>;
+	private markNextCalled = () => {};
+
+	constructor(cleanup: IteratorCleanup = () => {}) {
+		super();
+		this.returnIterator.mockImplementation(cleanup);
+		this.nextCalled = new Promise<void>((resolve) => {
+			this.markNextCalled = resolve;
+		});
+	}
+
+	override [Symbol.asyncIterator](): AsyncIterator<AssistantMessageEvent> {
+		const iterator = super[Symbol.asyncIterator]();
+		return {
+			next: () => {
+				this.markNextCalled();
+				return iterator.next();
+			},
+			return: () => {
+				const cleanup = this.returnIterator();
+				return Promise.resolve(cleanup).then(() => ({ done: true, value: undefined as never }));
+			},
+		};
+	}
+}
+
+function createContext(): AgentContext {
+	return {
+		systemPrompt: "You are helpful.",
+		messages: [],
+		tools: [],
+	};
+}
+
+function startProviderRun(
+	providerStream: MockAssistantStream,
+	signal?: AbortSignal,
+	emit: (event: AgentEvent) => void = () => {},
+): { messages: Promise<AgentMessage[]>; started: Promise<void> } {
+	let markStarted = () => {};
+	const started = new Promise<void>((resolve) => {
+		markStarted = resolve;
+	});
+	const messages = runAgentLoop(
+		[createUserMessage("Hello")],
+		createContext(),
+		{ model: createModel(), convertToLlm: identityConverter },
+		emit,
+		signal,
+		() => {
+			markStarted();
+			return providerStream;
+		},
+	);
+	return { messages, started };
+}
+
+const activityEvents: Array<{
+	name: string;
+	create: (partial: AssistantMessage) => AssistantMessageEvent;
+}> = [
+	{ name: "text_start", create: (partial) => ({ type: "text_start", contentIndex: 0, partial }) },
+	{
+		name: "text_delta",
+		create: (partial) => ({ type: "text_delta", contentIndex: 0, delta: "working", partial }),
+	},
+	{ name: "text_end", create: (partial) => ({ type: "text_end", contentIndex: 0, content: "working", partial }) },
+	{ name: "thinking_start", create: (partial) => ({ type: "thinking_start", contentIndex: 0, partial }) },
+	{
+		name: "thinking_delta",
+		create: (partial) => ({ type: "thinking_delta", contentIndex: 0, delta: "working", partial }),
+	},
+	{
+		name: "thinking_end",
+		create: (partial) => ({ type: "thinking_end", contentIndex: 0, content: "working", partial }),
+	},
+	{ name: "toolcall_start", create: (partial) => ({ type: "toolcall_start", contentIndex: 0, partial }) },
+	{
+		name: "toolcall_delta",
+		create: (partial) => ({ type: "toolcall_delta", contentIndex: 0, delta: "{}", partial }),
+	},
+	{
+		name: "toolcall_end",
+		create: (partial) => ({
+			type: "toolcall_end",
+			contentIndex: 0,
+			toolCall: { type: "toolCall", id: "tool-1", name: "work", arguments: {} },
+			partial,
+		}),
+	},
+];
+
+describe("provider inactivity", () => {
+	it.each([
+		["resolved cleanup", () => {}],
+		["rejected cleanup", () => Promise.reject(new Error("cleanup rejected"))],
+		[
+			"throwing cleanup",
+			() => {
+				throw new Error("cleanup threw");
+			},
+		],
+	] satisfies Array<[string, IteratorCleanup]>)("times out at 180 seconds and contains %s", async (_name, cleanup) => {
+		vi.useFakeTimers();
+		try {
+			const providerStream = new ControlledAssistantStream(cleanup);
+			const caller = new AbortController();
+			const addListener = vi.spyOn(caller.signal, "addEventListener");
+			const removeListener = vi.spyOn(caller.signal, "removeEventListener");
+			const run = startProviderRun(providerStream, caller.signal);
+			let settled = false;
+			void run.messages.then(() => {
+				settled = true;
+			});
+			await run.started;
+
+			await vi.advanceTimersByTimeAsync(179_999);
+			expect(settled).toBe(false);
+			await vi.advanceTimersByTimeAsync(1);
+
+			await expect(run.messages).resolves.toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						stopReason: "error",
+						errorMessage: "Provider produced no output for 180 seconds",
+					}),
+				]),
+			);
+			expect(caller.signal.aborted).toBe(false);
+			expect(providerStream.returnIterator).toHaveBeenCalledOnce();
+			expect(removeListener).toHaveBeenCalledTimes(addListener.mock.calls.length);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not treat the synthetic stream start as provider output", async () => {
+		vi.useFakeTimers();
+		try {
+			const providerStream = new MockAssistantStream();
+			const partial = createAssistantMessage([]);
+			let markMessageStarted = () => {};
+			const messageStarted = new Promise<void>((resolve) => {
+				markMessageStarted = resolve;
+			});
+			const run = startProviderRun(providerStream, undefined, (event) => {
+				if (event.type === "message_start" && event.message.role === "assistant") markMessageStarted();
+			});
+			await run.started;
+			await vi.advanceTimersByTimeAsync(179_999);
+			providerStream.push({ type: "start", partial });
+			await messageStarted;
+			await vi.advanceTimersByTimeAsync(1);
+
+			await expect(run.messages).resolves.toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						stopReason: "error",
+						errorMessage: "Provider produced no output for 180 seconds",
+					}),
+				]),
+			);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it.each(activityEvents)("resets inactivity on $name", async ({ create }) => {
+		vi.useFakeTimers();
+		try {
+			const providerStream = new MockAssistantStream();
+			const partial = createAssistantMessage([{ type: "text", text: "working" }]);
+			const finalMessage = createAssistantMessage([{ type: "text", text: "done" }]);
+			let markMessageStarted = () => {};
+			const messageStarted = new Promise<void>((resolve) => {
+				markMessageStarted = resolve;
+			});
+			let markUpdated = () => {};
+			const updated = new Promise<void>((resolve) => {
+				markUpdated = resolve;
+			});
+			const run = startProviderRun(providerStream, undefined, (event) => {
+				if (event.type === "message_start" && event.message.role === "assistant") markMessageStarted();
+				if (event.type === "message_update") markUpdated();
+			});
+			await run.started;
+			providerStream.push({ type: "start", partial });
+			await messageStarted;
+			await vi.advanceTimersByTimeAsync(179_999);
+			providerStream.push(create(partial));
+			await updated;
+
+			await vi.advanceTimersByTimeAsync(1);
+			let settled = false;
+			void run.messages.then(() => {
+				settled = true;
+			});
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			providerStream.push({ type: "done", reason: "stop", message: finalMessage });
+			await expect(run.messages).resolves.toContainEqual(finalMessage);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("retains partial provider output on timeout", async () => {
+		vi.useFakeTimers();
+		try {
+			const providerStream = new MockAssistantStream();
+			const partial = createAssistantMessage([{ type: "text", text: "working" }]);
+			let markUpdated = () => {};
+			const updated = new Promise<void>((resolve) => {
+				markUpdated = resolve;
+			});
+			const run = startProviderRun(providerStream, undefined, (event) => {
+				if (event.type === "message_update") markUpdated();
+			});
+			await run.started;
+			providerStream.push({ type: "start", partial });
+			providerStream.push({ type: "text_delta", contentIndex: 0, delta: "working", partial });
+			await updated;
+			await vi.advanceTimersByTimeAsync(180_000);
+
+			await expect(run.messages).resolves.toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						content: [{ type: "text", text: "working" }],
+						stopReason: "error",
+						errorMessage: "Provider produced no output for 180 seconds",
+					}),
+				]),
+			);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it.each(["done", "error"] as const)("clears the watchdog on terminal %s", async (terminalType) => {
+		vi.useFakeTimers();
+		try {
+			const providerStream = new ControlledAssistantStream();
+			const caller = new AbortController();
+			const addListener = vi.spyOn(caller.signal, "addEventListener");
+			const removeListener = vi.spyOn(caller.signal, "removeEventListener");
+			const finalMessage = createAssistantMessage(
+				[{ type: "text", text: terminalType }],
+				terminalType === "done" ? "stop" : "error",
+			);
+			if (terminalType === "error") finalMessage.errorMessage = "provider failed";
+			const run = startProviderRun(providerStream, caller.signal);
+			await run.started;
+			providerStream.push(
+				terminalType === "done"
+					? { type: "done", reason: "stop", message: finalMessage }
+					: { type: "error", reason: "error", error: finalMessage },
+			);
+			await expect(run.messages).resolves.toContainEqual(finalMessage);
+
+			expect(vi.getTimerCount()).toBe(0);
+			expect(removeListener).toHaveBeenCalledTimes(addListener.mock.calls.length);
+			expect(providerStream.returnIterator).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(180_000);
+			expect(caller.signal.aborted).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("contains iterator cleanup failure when the caller aborts", async () => {
+		vi.useFakeTimers();
+		try {
+			const providerStream = new ControlledAssistantStream(() => {
+				throw new Error("cleanup threw");
+			});
+			const caller = new AbortController();
+			const run = startProviderRun(providerStream, caller.signal);
+			await run.started;
+			await providerStream.nextCalled;
+			caller.abort();
+
+			await expect(run.messages).resolves.toEqual(
+				expect.arrayContaining([expect.objectContaining({ stopReason: "aborted" })]),
+			);
+			expect(providerStream.returnIterator).toHaveBeenCalledOnce();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("classifies a caller abort first when it collides with the timeout", async () => {
+		vi.useFakeTimers();
+		try {
+			const providerStream = new ControlledAssistantStream();
+			const caller = new AbortController();
+			setTimeout(() => caller.abort(), 180_000);
+			const run = startProviderRun(providerStream, caller.signal);
+			await run.started;
+			await providerStream.nextCalled;
+			await vi.advanceTimersByTimeAsync(180_000);
+
+			await expect(run.messages).resolves.toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ stopReason: "aborted", errorMessage: "Request was aborted" }),
+				]),
+			);
+			expect(providerStream.returnIterator).toHaveBeenCalledOnce();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("times out when result() stalls after the iterator completes", async () => {
+		vi.useFakeTimers();
+		try {
+			const providerStream = new StalledResultStream(new Promise<AssistantMessage>(() => {}));
+			const run = startProviderRun(providerStream);
+			await run.started;
+
+			await vi.advanceTimersByTimeAsync(179_999);
+			let settled = false;
+			void run.messages.then(() => {
+				settled = true;
+			});
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			await vi.advanceTimersByTimeAsync(1);
+
+			await expect(run.messages).resolves.toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						stopReason: "error",
+						errorMessage: "Provider produced no output for 180 seconds",
+					}),
+				]),
+			);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("classifies inactivity when result() rejects with the raw abort reason", async () => {
+		vi.useFakeTimers();
+		try {
+			const messages = runAgentLoop(
+				[createUserMessage("Hello")],
+				createContext(),
+				{ model: createModel(), convertToLlm: identityConverter },
+				() => {},
+				undefined,
+				(_model, _context, options) =>
+					new StalledResultStream(
+						new Promise<AssistantMessage>((_resolve, reject) => {
+							const signal = options?.signal;
+							signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+						}),
+					),
+			);
+
+			await vi.advanceTimersByTimeAsync(179_999);
+			await vi.advanceTimersByTimeAsync(1);
+
+			await expect(messages).resolves.toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						stopReason: "error",
+						errorMessage: "Provider produced no output for 180 seconds",
+					}),
+				]),
+			);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
 
 describe("agentLoop with AgentMessage", () => {
 	it("continues after an unknown provider finish reason", async () => {

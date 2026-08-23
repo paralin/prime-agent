@@ -26,6 +26,8 @@ import type {
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 const ABORT_ERROR_MESSAGE = "Request was aborted";
+const PROVIDER_INACTIVITY_ERROR_MESSAGE = "Provider produced no output for 180 seconds";
+const PROVIDER_INACTIVITY_TIMEOUT_MS = 180_000;
 // Providers occasionally close a stream before producing final content, either
 // without a finish reason or with an empty "stop" response. Continuing the same
 // turn usually lets the model finish, but a provider that never finishes would
@@ -134,9 +136,11 @@ function cloneUsage(usage: AssistantMessage["usage"]): AssistantMessage["usage"]
 	return { ...usage, cost: { ...usage.cost } };
 }
 
-function createAbortedAssistantMessage(
+function createFailedAssistantMessage(
 	config: AgentLoopConfig,
 	partialMessage: AssistantMessage | null,
+	stopReason: "aborted" | "error",
+	errorMessage: string,
 ): AssistantMessage {
 	return {
 		role: "assistant",
@@ -145,8 +149,8 @@ function createAbortedAssistantMessage(
 		provider: partialMessage?.provider ?? config.model.provider,
 		model: partialMessage?.model ?? config.model.id,
 		usage: cloneUsage(partialMessage?.usage ?? EMPTY_USAGE),
-		stopReason: "aborted",
-		errorMessage: ABORT_ERROR_MESSAGE,
+		stopReason,
+		errorMessage,
 		timestamp: Date.now(),
 	};
 }
@@ -483,8 +487,9 @@ async function streamAssistantResponse(
 ): Promise<AssistantMessage> {
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
-	const finishAbortedMessage = async () => {
-		const finalMessage = createAbortedAssistantMessage(config, partialMessage);
+	let inactivityTimedOut = false;
+	const finishFailedMessage = async (stopReason: "aborted" | "error", errorMessage: string) => {
+		const finalMessage = createFailedAssistantMessage(config, partialMessage, stopReason, errorMessage);
 		if (addedPartial) {
 			context.messages[context.messages.length - 1] = finalMessage;
 		} else {
@@ -503,106 +508,146 @@ async function streamAssistantResponse(
 		}
 
 		const llmMessages = await maybePromiseWithAbort(config.convertToLlm(messages), signal);
-
 		const streamFunction = streamFn || streamSimple;
-
 		const resolvedApiKey =
 			(config.getApiKey
 				? await maybePromiseWithAbort(config.getApiKey(config.model.provider), signal)
 				: undefined) || config.apiKey;
-
 		const llmContext: Context = {
 			systemPrompt: config.getSystemPrompt?.() ?? context.systemPrompt,
 			messages: llmMessages,
 			tools: context.tools,
 		};
 
-		const response = await maybePromiseWithAbort(
-			streamFunction(config.model, llmContext, {
-				...config,
-				apiKey: resolvedApiKey,
-				signal,
-			}),
-			signal,
-		);
-		const iterator = response[Symbol.asyncIterator]();
-		const closeIterator = () => {
-			void Promise.resolve(iterator.return?.()).catch(() => undefined);
-		};
-		while (true) {
-			const next = await raceWithAbort<IteratorResult<AssistantMessageEvent>>(
-				iterator.next(),
-				signal,
-				closeIterator,
-			);
-			if (next.done) {
-				break;
+		const requestController = new AbortController();
+		let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
+		const clearInactivityTimer = () => {
+			if (inactivityTimer !== undefined) {
+				clearTimeout(inactivityTimer);
+				inactivityTimer = undefined;
 			}
-			const event = next.value;
-			switch (event.type) {
-				case "start":
-					partialMessage = event.partial;
-					context.messages.push(partialMessage);
-					addedPartial = true;
-					await emit({ type: "message_start", message: { ...partialMessage } });
-					break;
+		};
+		const armInactivityTimer = () => {
+			clearInactivityTimer();
+			inactivityTimer = setTimeout(() => {
+				inactivityTimedOut = true;
+				requestController.abort(new Error(PROVIDER_INACTIVITY_ERROR_MESSAGE));
+			}, PROVIDER_INACTIVITY_TIMEOUT_MS);
+		};
+		const abortRequest = () => requestController.abort(signal?.reason);
+		if (signal?.aborted) {
+			abortRequest();
+		} else {
+			signal?.addEventListener("abort", abortRequest, { once: true });
+		}
+		armInactivityTimer();
 
-				case "text_start":
-				case "text_delta":
-				case "text_end":
-				case "thinking_start":
-				case "thinking_delta":
-				case "thinking_end":
-				case "toolcall_start":
-				case "toolcall_delta":
-				case "toolcall_end":
-					if (partialMessage) {
+		try {
+			const response = await maybePromiseWithAbort(
+				streamFunction(config.model, llmContext, {
+					...config,
+					apiKey: resolvedApiKey,
+					signal: requestController.signal,
+				}),
+				requestController.signal,
+			);
+			const iterator = response[Symbol.asyncIterator]();
+			let iteratorClosed = false;
+			const closeIterator = () => {
+				if (iteratorClosed) return;
+				iteratorClosed = true;
+				try {
+					void Promise.resolve(iterator.return?.()).catch(() => undefined);
+				} catch {
+					// Iterator cleanup is best effort and cannot replace the request result.
+				}
+			};
+			while (true) {
+				const next = await raceWithAbort<IteratorResult<AssistantMessageEvent>>(
+					iterator.next(),
+					requestController.signal,
+					closeIterator,
+				);
+				if (next.done) {
+					break;
+				}
+				const event = next.value;
+				switch (event.type) {
+					case "start":
 						partialMessage = event.partial;
-						context.messages[context.messages.length - 1] = partialMessage;
-						await emit({
-							type: "message_update",
-							assistantMessageEvent: event,
-							message: { ...partialMessage },
-						});
-					}
-					break;
+						context.messages.push(partialMessage);
+						addedPartial = true;
+						await emit({ type: "message_start", message: { ...partialMessage } });
+						break;
 
-				case "done":
-				case "error": {
-					let finalMessage = getTerminalMessage(event);
-					try {
-						finalMessage = await maybePromiseWithAbort(response.result(), signal);
-					} catch (error) {
-						if (!signal?.aborted || !isAbortError(error)) {
-							throw error;
+					case "text_start":
+					case "text_delta":
+					case "text_end":
+					case "thinking_start":
+					case "thinking_delta":
+					case "thinking_end":
+					case "toolcall_start":
+					case "toolcall_delta":
+					case "toolcall_end":
+						armInactivityTimer();
+						if (partialMessage) {
+							partialMessage = event.partial;
+							context.messages[context.messages.length - 1] = partialMessage;
+							await emit({
+								type: "message_update",
+								assistantMessageEvent: event,
+								message: { ...partialMessage },
+							});
 						}
+						break;
+
+					case "done":
+					case "error": {
+						clearInactivityTimer();
+						let finalMessage = getTerminalMessage(event);
+						try {
+							finalMessage = await maybePromiseWithAbort(response.result(), requestController.signal);
+						} catch (error) {
+							if (!requestController.signal.aborted || !isAbortError(error)) {
+								throw error;
+							}
+						}
+						if (addedPartial) {
+							context.messages[context.messages.length - 1] = finalMessage;
+						} else {
+							context.messages.push(finalMessage);
+						}
+						if (!addedPartial) {
+							await emit({ type: "message_start", message: { ...finalMessage } });
+						}
+						await emit({ type: "message_end", message: finalMessage });
+						return finalMessage;
 					}
-					if (addedPartial) {
-						context.messages[context.messages.length - 1] = finalMessage;
-					} else {
-						context.messages.push(finalMessage);
-					}
-					if (!addedPartial) {
-						await emit({ type: "message_start", message: { ...finalMessage } });
-					}
-					await emit({ type: "message_end", message: finalMessage });
-					return finalMessage;
 				}
 			}
-		}
 
-		const finalMessage = await maybePromiseWithAbort(response.result(), signal);
-		if (addedPartial) {
-			context.messages[context.messages.length - 1] = finalMessage;
-		} else {
-			context.messages.push(finalMessage);
-			await emit({ type: "message_start", message: { ...finalMessage } });
+			// Keep the inactivity watchdog armed across result(): a provider whose
+			// iterator completes but whose result() never settles must still hit
+			// the timeout. The finally block below clears the timer on every exit.
+			const finalMessage = await maybePromiseWithAbort(response.result(), requestController.signal);
+			if (addedPartial) {
+				context.messages[context.messages.length - 1] = finalMessage;
+			} else {
+				context.messages.push(finalMessage);
+				await emit({ type: "message_start", message: { ...finalMessage } });
+			}
+			await emit({ type: "message_end", message: finalMessage });
+			return finalMessage;
+		} finally {
+			clearInactivityTimer();
+			signal?.removeEventListener("abort", abortRequest);
 		}
-		await emit({ type: "message_end", message: finalMessage });
-		return finalMessage;
 	} catch (error) {
 		if (signal?.aborted && isAbortError(error)) {
-			return finishAbortedMessage();
+			return finishFailedMessage("aborted", ABORT_ERROR_MESSAGE);
+		}
+		if (inactivityTimedOut && isAbortError(error)) {
+			return finishFailedMessage("error", PROVIDER_INACTIVITY_ERROR_MESSAGE);
 		}
 		throw error;
 	}

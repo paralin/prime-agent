@@ -80,6 +80,32 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.session.isRetrying).toBe(false);
 	});
 
+	it("retries a provider error after partial assistant output", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("partial", {
+				stopReason: "error",
+				errorMessage: "Provider produced no output for 180 seconds",
+			}),
+			fauxAssistantMessage("recovered"),
+		]);
+
+		await harness.session.prompt("test");
+
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1]);
+		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([true]);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "recovered" }],
+		});
+		expect(harness.session.isRetrying).toBe(false);
+		expect(harness.session.messages).not.toContainEqual(
+			expect.objectContaining({ role: "assistant", errorMessage: "Provider produced no output for 180 seconds" }),
+		);
+	});
+
 	it("does not retry rpc-only harness failures when persisted retry is enabled", async () => {
 		const harness = await createHarness({
 			harnessMode: "rpc-only",

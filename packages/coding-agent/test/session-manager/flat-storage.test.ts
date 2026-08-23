@@ -115,22 +115,53 @@ describe("SessionManager flat storage", () => {
 			]);
 			writeRawSession(sessionDir, "aaa111bbb222", cwd, [messageEntry({ role: "user", content: "hello" })]);
 			writeRawSession(sessionDir, "ccc333ddd444", cwd, [messageEntry({ role: "assistant", content: "hi" })]);
+			const retained = SessionManager.create(cwd, sessionDir);
+			retained.appendAgentStatus({
+				summary: "Finished retained work",
+				taskState: "completed",
+				basedOnMessageCount: 0,
+			});
+			const retainedId = retained.getSessionId();
+			const archived = SessionManager.create(cwd, sessionDir);
+			archived.appendAgentStatus({
+				summary: "Archived retained work",
+				taskState: "completed",
+				basedOnMessageCount: 0,
+			});
+			archived.appendSessionState({ status: "archived" });
 
 			const listedFromCallback: string[] = [];
 			const allSessions = await SessionManager.listAll(
 				{ onSession: (session) => listedFromCallback.push(session.id) },
 				sessionDir,
 			);
-			expect(new Set(allSessions.map((session) => session.id))).toEqual(new Set(["aaa111bbb222", "ccc333ddd444"]));
-			expect(listedFromCallback.sort()).toEqual(["aaa111bbb222", "ccc333ddd444"]);
+			expect(new Set(allSessions.map((session) => session.id))).toEqual(
+				new Set(["aaa111bbb222", "ccc333ddd444", retainedId]),
+			);
+			expect(listedFromCallback.sort()).toEqual(["aaa111bbb222", "ccc333ddd444", retainedId].sort());
 
 			const localListed: string[] = [];
 			const localSessions = await SessionManager.list(cwd, sessionDir, {
 				onSession: (session) => localListed.push(session.id),
 			});
-			expect(localSessions.map((session) => session.id).sort()).toEqual(["aaa111bbb222", "ccc333ddd444"]);
-			expect(localListed.sort()).toEqual(["aaa111bbb222", "ccc333ddd444"]);
+			expect(localSessions.map((session) => session.id).sort()).toEqual(
+				["aaa111bbb222", "ccc333ddd444", retainedId].sort(),
+			);
+			expect(localListed.sort()).toEqual(["aaa111bbb222", "ccc333ddd444", retainedId].sort());
 
+			const retainedInfo = await readSessionInfo(retained.getSessionFile()!);
+			expect(retainedInfo).toMatchObject({
+				messageCount: 0,
+				conversationMessageCount: 0,
+				agentStatus: { summary: "Finished retained work", taskState: "completed", basedOnMessageCount: 0 },
+			});
+			const archivedInfo = await readSessionInfo(archived.getSessionFile()!);
+			expect(archivedInfo).toMatchObject({
+				messageCount: 0,
+				conversationMessageCount: 0,
+				state: { status: "archived" },
+				agentStatus: { summary: "Archived retained work", taskState: "completed", basedOnMessageCount: 0 },
+			});
 			const hiddenInfo = await readSessionInfo(hiddenFile);
 			expect(hiddenInfo?.id).toBe("ee0000ff1111");
 			expect(hiddenInfo?.conversationMessageCount).toBe(0);
@@ -150,7 +181,9 @@ describe("SessionManager flat storage", () => {
 			expect(existsSync(hiddenFile)).toBe(false);
 			expect(await readSessionInfo(hiddenFile)).toBeNull();
 			const remaining = await SessionManager.listAll(undefined, sessionDir);
-			expect(new Set(remaining.map((session) => session.id))).toEqual(new Set(["aaa111bbb222", "ccc333ddd444"]));
+			expect(new Set(remaining.map((session) => session.id))).toEqual(
+				new Set(["aaa111bbb222", "ccc333ddd444", retainedId]),
+			);
 			await expect(resolveSessionPath("ee0000ff1111", cwd, sessionDir)).rejects.toBeInstanceOf(
 				SessionSelectorNotFoundError,
 			);

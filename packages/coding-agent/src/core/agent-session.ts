@@ -116,6 +116,8 @@ import {
 } from "./claude-code-runtime.js";
 import type { StartClaudeCodeQuery } from "./claude-code-sdk.js";
 import {
+	buildScratchHandoffRecentContext,
+	buildScratchHandoffResumeMessage,
 	COMPACT_SKILL_NAME,
 	type CompactionResult,
 	calculateContextTokens,
@@ -124,9 +126,17 @@ import {
 	compactNative,
 	estimateContextTokens,
 	generateBranchSummary,
+	latestPersistedScratchHandoffPath,
 	prepareCompaction,
+	readScratchHandoffText,
+	resolveScratchHandoffPath,
+	SCRATCH_HANDOFF_PATH_CUSTOM_TYPE,
+	SCRATCH_HANDOFF_READ_CUSTOM_TYPE,
+	SCRATCH_HANDOFF_WRITE_CUSTOM_TYPE,
+	scratchHandoffRecentContextBudget,
 	serializeConversation,
 	shouldCompact,
+	shouldUseScratchHandoffFallback,
 } from "./compaction/index.js";
 import {
 	type ContextTreeNode,
@@ -233,6 +243,7 @@ import {
 } from "./model-resolver.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
+import { renderScratchHandoffCloseoutMessage, renderScratchHandoffInstructions } from "./prompts/scratch-handoff.js";
 import {
 	type AutoRefineReason,
 	type AutoRefineReview,
@@ -331,6 +342,7 @@ import { THINKING_LEVELS } from "./thinking-levels.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
+import { resolveToCwd } from "./tools/path-utils.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
 import { addAssistantUsage, cloneUsage, emptyUsage, subtractAssistantUsage } from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
@@ -1238,6 +1250,10 @@ export class AgentSession {
 
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+	/** Closeout turn staged before a threshold-triggered scratch compaction. */
+	private _scratchCloseout:
+		| { displayPath: string; baselineWriteCount: number; baselineText: string | undefined }
+		| undefined = undefined;
 	private _compactionOperation: Promise<void> | undefined = undefined;
 	/** One recovery attempt per overflow; "reported" dedups the failure notice. */
 	private _overflowRecovery: "idle" | "attempted" | "reported" = "idle";
@@ -4660,8 +4676,11 @@ export class AgentSession {
 
 		const loaderSystemPrompt = this._resourceLoader.getSystemPrompt();
 		const loaderAppendSystemPrompt = this._resourceLoader.getAppendSystemPrompt();
-		const appendSystemPrompt =
-			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
+		const scratchHandoffPromptBlock = this._scratchHandoffSystemPromptBlock();
+		const appendBlocks = scratchHandoffPromptBlock
+			? [...loaderAppendSystemPrompt, scratchHandoffPromptBlock]
+			: loaderAppendSystemPrompt;
+		const appendSystemPrompt = appendBlocks.length > 0 ? appendBlocks.join("\n\n") : undefined;
 		const loadedSkills = this._modelVisibleSkills();
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
@@ -7886,6 +7905,9 @@ export class AgentSession {
 		const pathEntries = this.sessionManager.getBranch();
 		const settings = this.settingsManager.getCompactionSettings();
 		const supportsNativeCompaction = settings.native && getApiProvider(model.api)?.compact !== undefined;
+		if (!supportsNativeCompaction && this._scratchHandoffRoute()) {
+			return await this._performScratchHandoffCompaction();
+		}
 		const portablePreparation = prepareCompaction(pathEntries, settings);
 		const nativePreparation =
 			supportsNativeCompaction && !customInstructions
@@ -8000,6 +8022,152 @@ export class AgentSession {
 			tokensBefore,
 			details,
 			providerNativeCompaction,
+		};
+	}
+
+	/**
+	 * True when compaction should rebuild from a scratch checkpoint for the
+	 * active model: the native-or-scratch strategy is set, checkpoints are
+	 * enabled, and the provider has no native compaction API.
+	 */
+	private _scratchHandoffRoute(): boolean {
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!this.model) return false;
+		return shouldUseScratchHandoffFallback({
+			strategy: settings.strategy,
+			scratchEnabled: this.settingsManager.getScratchHandoffSettings().enabled,
+			supportsNativeCompaction: settings.native && getApiProvider(this.model.api)?.compact !== undefined,
+		});
+	}
+
+	/** Scratch checkpoint path for this session; persisted read markers pin it. */
+	private _scratchHandoffDisplayPath(): string | undefined {
+		if (!this.settingsManager.getScratchHandoffSettings().enabled) return undefined;
+		const persisted = latestPersistedScratchHandoffPath(this.sessionManager.getBranch());
+		if (persisted) return persisted;
+		return resolveScratchHandoffPath({
+			cwd: this._cwd,
+			rootDir: this.settingsManager.getScratchHandoffSettings().rootDir,
+			sessionId: this.sessionId,
+		}).displayPath;
+	}
+
+	/** Continuity instructions for the system prompt when a checkpoint backs this session. */
+	private _scratchHandoffSystemPromptBlock(): string | undefined {
+		if (!this._scratchHandoffRoute()) return undefined;
+		const displayPath = this._scratchHandoffDisplayPath();
+		if (!displayPath) return undefined;
+		return renderScratchHandoffInstructions({
+			displayPath,
+			sessionId: this.sessionId,
+			exists: existsSync(resolveToCwd(displayPath, this._cwd)),
+		});
+	}
+
+	/** Recorded closeout writes to `displayPath` on the current branch. */
+	private _scratchWriteCount(displayPath: string): number {
+		let count = 0;
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type !== "custom" || entry.customType !== SCRATCH_HANDOFF_WRITE_CUSTOM_TYPE) continue;
+			if ((entry.data as { path?: string } | undefined)?.path === displayPath) count++;
+		}
+		return count;
+	}
+
+	/**
+	 * Stage the pencils-down closeout turn before a threshold-triggered scratch
+	 * compaction. Returns true when a closeout was just queued; the caller lets
+	 * that turn run and compacts after it. A closeout already staged for this
+	 * path means the turn finished, so the caller proceeds.
+	 */
+	private async _maybeStageScratchHandoffCloseout(): Promise<boolean> {
+		if (!this._scratchHandoffRoute()) return false;
+		const displayPath = this._scratchHandoffDisplayPath();
+		if (!displayPath) return false;
+		if (this._scratchCloseout?.displayPath === displayPath) {
+			// Staged but the queued closeout turn has not drained yet. Compacting
+			// now would drop its write and leave a stale turn behind the boundary,
+			// so hold until the steering queue empties.
+			return this.agent.hasQueuedMessages();
+		}
+		let baselineText: string | undefined;
+		try {
+			baselineText = await readScratchHandoffText(resolveToCwd(displayPath, this._cwd));
+		} catch {
+			// Unreadable checkpoint (permissions, I/O): fall back to ordinary
+			// compaction instead of asking the model to overwrite unreadable state.
+			return false;
+		}
+		this._scratchCloseout = {
+			displayPath,
+			baselineWriteCount: this._scratchWriteCount(displayPath),
+			baselineText,
+		};
+		// Pin the path before the turn runs so a crash still resumes onto the
+		// same checkpoint file after a date rollover.
+		if (latestPersistedScratchHandoffPath(this.sessionManager.getBranch()) !== displayPath) {
+			this.sessionManager.appendCustomEntry(SCRATCH_HANDOFF_PATH_CUSTOM_TYPE, { path: displayPath });
+		}
+		await this.steer(renderScratchHandoffCloseoutMessage(displayPath, baselineText === undefined), undefined, {
+			queueKey: "scratch-handoff-closeout",
+			resumeIfIdle: true,
+		});
+		return true;
+	}
+
+	/**
+	 * Rebuild context around the scratch checkpoint instead of running an
+	 * LLM-authored summary. The resume message carries the checkpoint body plus
+	 * a bounded recent-context delta; everything before it leaves the context.
+	 */
+	private async _performScratchHandoffCompaction(): Promise<CompactionResult> {
+		const displayPath = this._scratchHandoffDisplayPath();
+		if (!displayPath) throw new Error("Scratch handoff is not active");
+		// ENOENT means no checkpoint yet; other read failures fail the compaction
+		// visibly instead of rebuilding without existing state.
+		const scratchText = await readScratchHandoffText(resolveToCwd(displayPath, this._cwd));
+
+		const closeout = this._scratchCloseout?.displayPath === displayPath ? this._scratchCloseout : undefined;
+		if (closeout) {
+			if (scratchText !== undefined && scratchText !== closeout.baselineText) {
+				this.sessionManager.appendCustomEntry(SCRATCH_HANDOFF_WRITE_CUSTOM_TYPE, { path: displayPath });
+			}
+			this._scratchCloseout = undefined;
+		}
+
+		const entries = this.sessionManager.getBranch();
+		const delta = buildScratchHandoffRecentContext({
+			entries,
+			scratchPath: displayPath,
+			maxTokens: scratchHandoffRecentContextBudget(this.model?.contextWindow ?? 0),
+		});
+		const tokensBefore = estimateContextTokens(this.agent.state.messages).tokens;
+		const resumeMessage = buildScratchHandoffResumeMessage({
+			displayPath,
+			scratchText,
+			recentContext: delta,
+			contextWindow: this.model?.contextWindow,
+		});
+		const scratchEntryId = this.sessionManager.appendCustomMessageEntry(
+			SCRATCH_HANDOFF_READ_CUSTOM_TYPE,
+			resumeMessage,
+			false,
+			{ path: displayPath },
+		);
+		this.sessionManager.appendCompaction(
+			"Continue from the scratch handoff state preserved after this compaction.",
+			scratchEntryId,
+			tokensBefore,
+		);
+		this.agent.state.messages = this.buildSessionContext().messages;
+
+		await this._notifyKernelStateAfterCompaction();
+		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
+
+		return {
+			summary: `Scratch handoff: rebuilt context around ${displayPath}.`,
+			firstKeptEntryId: scratchEntryId,
+			tokensBefore,
 		};
 	}
 
@@ -8929,6 +9097,7 @@ export class AgentSession {
 		const contextTokens = this._getThresholdContextTokens(assistantMessage, compactionTimestamp);
 		if (contextTokens === undefined) return false;
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
+			if (await this._maybeStageScratchHandoffCloseout()) return false;
 			if (queueAutonomousContinuation && this._queueGoalContinuationForThresholdCompaction(assistantMessage)) {
 				this._continueAfterThresholdCompaction = true;
 			} else if (

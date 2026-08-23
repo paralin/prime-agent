@@ -1,0 +1,1 @@
+- Added scratch-handoff compaction: with `compaction.strategy: native-or-scratch` and `scratchHandoff.enabled`, models whose provider has no native compaction rebuild context around a lazily maintained org checkpoint while provider-native compaction remains available.

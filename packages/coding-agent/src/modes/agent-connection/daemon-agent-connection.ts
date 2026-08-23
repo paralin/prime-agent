@@ -2274,7 +2274,15 @@ export class DaemonAgentConnection implements AgentConnection {
 			);
 		}
 		const sequence = getDaemonMessageSequence(message);
-		return sequence !== undefined && this.lastEventSequence !== undefined && sequence <= this.lastEventSequence;
+		if (sequence === undefined || this.lastEventSequence === undefined) {
+			return false;
+		}
+		if (this.lastEventCursor !== undefined) {
+			// Generation-scoped cursors order events; a legacy sequence counts a
+			// different stream of frames and cannot be compared against it.
+			return false;
+		}
+		return sequence <= this.lastEventSequence;
 	}
 
 	private observeDaemonEventSequence(message: DaemonOutbound): void {
@@ -2290,12 +2298,6 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		this.lastEventSequence =
 			this.lastEventSequence === undefined ? sequence : Math.max(this.lastEventSequence, sequence);
-		if (this.lastEventCursor) {
-			this.lastEventCursor = {
-				...this.lastEventCursor,
-				sequence: Math.max(this.lastEventCursor.sequence, sequence),
-			};
-		}
 	}
 
 	private observeEventCursor(cursor: DaemonEventCursor): void {

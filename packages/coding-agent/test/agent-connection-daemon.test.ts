@@ -3070,6 +3070,7 @@ describe("DaemonAgentConnection", () => {
 				protocol: DAEMON_PROTOCOL_INFO,
 				activeSessionId: "active-1",
 				sequence: 10,
+				cursor: { generation: "generation-active-1", sequence: 10 },
 				emittedAt: "2026-01-01T00:00:00.000Z",
 			},
 		});
@@ -3083,6 +3084,7 @@ describe("DaemonAgentConnection", () => {
 				protocol: DAEMON_PROTOCOL_INFO,
 				activeSessionId: "active-1",
 				sequence: 13,
+				cursor: { generation: "generation-active-1", sequence: 13 },
 				emittedAt: "2026-01-01T00:00:00.000Z",
 			},
 		});
@@ -3099,6 +3101,53 @@ describe("DaemonAgentConnection", () => {
 		await expect(connection.getState()).resolves.toMatchObject({
 			sessionId: "session-new",
 		});
+	});
+
+	it("does not let a legacy cursor-less sequence drop newer generation-scoped events", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.attachResultFactory = (command) =>
+			createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 10);
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		await connection.attach();
+		// A legacy daemon emits sequenced frames without a generation cursor.
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: ["legacy"], followUps: [] },
+			},
+			meta: {
+				id: "active-1:99",
+				protocol: DAEMON_PROTOCOL_INFO,
+				activeSessionId: "active-1",
+				sequence: 99,
+				emittedAt: "2026-01-01T00:00:00.000Z",
+			},
+		});
+		emitSequencedQueueUpdate(fakeClient, "active-1", 11);
+
+		expect(events).toEqual([
+			{
+				type: "session_event",
+				event: {
+					type: "session_action_update",
+					actions: { queuedCount: 0, steering: ["legacy"], followUps: [] },
+				},
+			},
+			{
+				type: "session_event",
+				event: {
+					type: "session_action_update",
+					actions: { queuedCount: 0, steering: [], followUps: [] },
+				},
+			},
+		]);
 	});
 
 	it("uses the long-running request timeout for abort", async () => {
@@ -3513,10 +3562,12 @@ describe("DaemonAgentConnection", () => {
 			activeSessionId: "active-1",
 			clientId: expect.any(String),
 			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"],
+			// A legacy sequenced frame without a cursor never advances the
+			// generation-scoped resume cursor.
 			resumeCursor: {
 				activeSessionId: "active-1",
 				generation: "generation-active-1",
-				sequence: 14,
+				sequence: 12,
 			},
 		});
 
@@ -3528,7 +3579,7 @@ describe("DaemonAgentConnection", () => {
 			resumeCursor: {
 				activeSessionId: "active-1",
 				generation: "generation-active-1",
-				sequence: 14,
+				sequence: 12,
 			},
 		});
 	});

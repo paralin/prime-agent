@@ -1496,7 +1496,9 @@ export class TUI extends Container {
 						tableBottom: region.tableBottom + lineOffset,
 					});
 				}
-				transcript.push(...componentLines);
+				for (const line of componentLines) {
+					transcript.push(line);
+				}
 			}
 			return fullscreen.dock.render(width);
 		});

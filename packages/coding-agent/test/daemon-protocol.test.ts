@@ -27,6 +27,7 @@ import {
 	salvageDaemonCommandId,
 } from "../src/modes/daemon/daemon-protocol.js";
 import {
+	DAEMON_WORKER_COMMAND_COMPATIBILITY,
 	type DaemonWorkerDescriptor,
 	durableDaemonWorkerDescriptor,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
@@ -79,6 +80,12 @@ describe("daemon protocol helpers", () => {
 		expect(JSON.stringify(durable)).not.toContain("secret-");
 	});
 
+	it("gates active-only worker summaries for new-supervisor/old-worker compatibility", () => {
+		expect(DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_list_active_sessions).toEqual({ minSchemaRevision: 23 });
+		// Old supervisors continue using the unchanged public list command against new workers.
+		expect(DAEMON_COMMAND_COMPATIBILITY.list).toEqual({ minProtocol: 7 });
+	});
+
 	it("keeps the advertised schema identity synchronized with wire type shapes", () => {
 		const source = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
 		const commandSource = source.slice(
@@ -125,7 +132,7 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("capability-gates mailbox commands for both compatibility directions", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(22);
+		expect(DAEMON_SCHEMA_REVISION).toBe(23);
 		expect(DAEMON_COMMAND_COMPATIBILITY.agent_message_inbox).toEqual({
 			minProtocol: 7,
 			minSchemaRevision: 17,

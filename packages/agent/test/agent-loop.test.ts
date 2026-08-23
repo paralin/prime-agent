@@ -181,7 +181,7 @@ describe("agentLoop with AgentMessage", () => {
 				const partial = createAssistantMessage([{ type: "text", text: "partial" }]);
 				return stallingStream([
 					{ type: "start", partial },
-					{ type: "text_delta", delta: "partial", partial },
+					{ type: "text_delta", contentIndex: 0, delta: "partial", partial },
 				]);
 			}
 			const stream = new MockAssistantStream();
@@ -195,7 +195,9 @@ describe("agentLoop with AgentMessage", () => {
 			[createUserMessage("Hello")],
 			context,
 			{ model: createModel(), convertToLlm: identityConverter, streamStallTimeoutMs: 20 },
-			(event) => events.push(event),
+			(event) => {
+				events.push(event);
+			},
 			undefined,
 			streamFn,
 		);

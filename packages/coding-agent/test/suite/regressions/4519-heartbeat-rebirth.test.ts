@@ -13,7 +13,7 @@ type AgentDaemonCronInternals = {
 	agentMessageTargetLocks: Map<string, Promise<void>>;
 	cronStore: AgentCronJobStore;
 	cronScheduler: AgentCronScheduler;
-	createRuntime(command: { type: "create"; sessionPath: string }): Promise<ActiveSessionState>;
+	createRuntime(command: { type: "create"; sessionPath?: string }): Promise<ActiveSessionState>;
 	sessions: Map<string, ActiveSessionState>;
 	runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
 	withAgentMessagePreparingGuard(
@@ -284,6 +284,95 @@ describe("ENG-4519 heartbeat rebirth", () => {
 
 		await expect(guardedRun).resolves.toBe(true);
 		expect(promptedSession).toBe(replacement.session);
+	});
+
+	it("keeps a due RLM heartbeat on its durable session when a new session reuses the active id", async () => {
+		const durable = await createHarness({ persistSession: true });
+		const replacement = await createHarness({ persistSession: true });
+		harnesses.push(durable, replacement);
+		durable.sessionManager.appendSessionState({ status: "active" });
+		const sessionFile = durable.session.sessionFile!;
+		const runtimeFor = (session: AgentSession, cwd: string, agentDir: string) => ({
+			session,
+			services: { cwd, agentDir } as never,
+			diagnostics: [] as never,
+			extensionsResult: {} as never,
+		});
+		const openedSessions: AgentSession[] = [];
+		const createRuntime = vi.fn<CreateAgentSessionRuntimeFactory>(async ({ cwd, agentDir, sessionManager }) => {
+			const session = sessionManager.getSessionFile() === sessionFile ? durable.session : replacement.session;
+			openedSessions.push(session);
+			return runtimeFor(session, cwd, agentDir);
+		});
+		const daemon = createDaemon(durable, createRuntime);
+		const internals = daemon as unknown as AgentDaemonCronInternals & {
+			restoreActiveSessionId: string | undefined;
+			closeSession(state: ActiveSessionState, reason: string, waitForAbort?: boolean): Promise<void>;
+		};
+		const connectionActiveId = "514988819da8";
+		internals.restoreActiveSessionId = connectionActiveId;
+
+		const durableState = await internals.createRuntime({ type: "create", sessionPath: sessionFile });
+		expect(durableState.activeSessionId).toBe(connectionActiveId);
+
+		const heartbeat = internals.cronStore.createRlmHeartbeat({
+			activeSessionId: durableState.activeSessionId,
+			sessionId: durable.session.sessionId,
+			sessionFile,
+			cwd: durable.tempDir,
+			runtimeKind: "top-level",
+			scheduleText: "every 10s",
+			prompt: "continue the rlm loop",
+			now: new Date(Date.now() - 20_000),
+		});
+
+		const promptDurable = vi.spyOn(durable.session, "promptHeartbeat").mockResolvedValue();
+		const promptReplacement = vi.spyOn(replacement.session, "promptHeartbeat").mockResolvedValue();
+
+		// The durable worker goes away and a new blank top-level session reuses
+		// the connection-local active session id, like a daemon restart recovery.
+		await internals.closeSession(durableState, "replaced");
+		durable.sessionManager.appendSessionState({ status: "active" });
+		internals.restoreActiveSessionId = connectionActiveId;
+		const replacementState = await internals.createRuntime({ type: "create" });
+		expect(replacementState.activeSessionId).toBe(connectionActiveId);
+
+		expect(internals.cronStore.list().find((job) => job.id === heartbeat.id)).toMatchObject({
+			activeSessionId: connectionActiveId,
+			sessionId: durable.session.sessionId,
+			sessionFile,
+		});
+
+		await expect(internals.cronScheduler.runDue(new Date())).resolves.toBe(1);
+
+		expect(promptReplacement).not.toHaveBeenCalled();
+		expect(promptDurable).toHaveBeenCalledTimes(1);
+		expect(promptDurable).toHaveBeenCalledWith(
+			expect.objectContaining({ id: heartbeat.id, prompt: "continue the rlm loop" }),
+			expect.anything(),
+		);
+		expect(createRuntime).toHaveBeenCalledTimes(3);
+		// Only the two known sessions were ever opened: the durable restore and
+		// the client-created blank session. No cron-created extra session.
+		expect(openedSessions).toEqual([durable.session, replacement.session, durable.session]);
+		const recovered = [...internals.sessions.values()].find(
+			(candidate) => candidate.runtime.session === durable.session,
+		);
+		expect(recovered).toBeDefined();
+		expect(internals.cronStore.list().find((job) => job.id === heartbeat.id)).toMatchObject({
+			runCount: 1,
+			activeSessionId: recovered!.activeSessionId,
+			sessionId: durable.session.sessionId,
+			sessionFile,
+		});
+
+		internals.cronStore.cancel(heartbeat.id);
+		await expect(internals.cronScheduler.runDue(new Date())).resolves.toBe(0);
+		expect(promptDurable).toHaveBeenCalledTimes(1);
+		expect(internals.cronStore.list().find((job) => job.id === heartbeat.id)).toMatchObject({
+			status: "cancelled",
+			runCount: 1,
+		});
 	});
 
 	it("still restores and prompts a session explicitly persisted as active", async () => {

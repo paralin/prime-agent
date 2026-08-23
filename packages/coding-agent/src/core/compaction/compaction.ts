@@ -116,6 +116,7 @@ export interface CompactionSettings {
 	reserveTokens: number;
 	keepRecentTokens: number;
 	native: boolean;
+	strategy?: "default" | "native-or-scratch";
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {

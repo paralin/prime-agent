@@ -1,0 +1,1 @@
+- Changed scratch-handoff compaction to run a pencils-down closeout turn before manual or automatic compaction and rebuild around the checkpoint it writes plus recent work; when the closeout produces no usable checkpoint, standard summarization compaction runs instead of rebuilding around an empty document.

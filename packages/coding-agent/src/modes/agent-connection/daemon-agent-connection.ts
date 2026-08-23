@@ -431,7 +431,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		// getSessionTree() fetches it lazily via get_session_tree on first use.
 		const snapshotCursor = this.lastEventCursor;
 		const snapshotSequence = this.lastEventSequence;
-		const [state, messagesData, sessionContextData] = await Promise.all([
+		const [state, messagesData] = await Promise.all([
 			this.requestData<AgentConnectionState>({
 				type: "get_connection_state",
 				activeSessionId: this.activeSessionId,
@@ -440,17 +440,12 @@ export class DaemonAgentConnection implements AgentConnection {
 				type: "get_messages",
 				activeSessionId: this.activeSessionId,
 			}),
-			this.requestData<{ context: AgentConnectionSessionContext }>({
-				type: "get_session_context",
-				activeSessionId: this.activeSessionId,
-			}),
 		]);
 		const children = this.latestSnapshot?.children;
 		const streamingMessage = this.latestSnapshot?.streamingMessage;
 		this.latestSnapshot = {
 			state,
 			messages: messagesData.messages,
-			sessionContext: sessionContextData.context,
 			...(children ? { children } : {}),
 			...(streamingMessage ? { streamingMessage } : {}),
 		};

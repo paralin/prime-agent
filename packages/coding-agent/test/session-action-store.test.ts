@@ -5,6 +5,7 @@ import {
 	ActionStore,
 	canEvictWorker,
 	canPassivateSession,
+	canPassivateSessionUnderPressure,
 	canSelectSessionAction,
 	type DeliveryPolicy,
 	type RuntimeActivity,
@@ -306,6 +307,12 @@ describe("child passivation capability", () => {
 
 	it("accepts an idle leaf child at the shared inclusive threshold", () => {
 		expect(canPassivateSession(idleChild, 90, now)).toBe(true);
+	});
+
+	it("accepts a recent idle leaf only under resident pressure", () => {
+		const recentChild = { ...idleChild, lastActivityAt: now - 1_000 };
+		expect(canPassivateSession(recentChild, 90, now)).toBe(false);
+		expect(canPassivateSessionUnderPressure(recentChild)).toBe(true);
 	});
 
 	it.each([

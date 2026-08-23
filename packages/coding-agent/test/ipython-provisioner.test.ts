@@ -188,6 +188,38 @@ describe("IpythonKernelProvisioner", () => {
 		expect(provisioner.manager).toBeUndefined();
 	});
 
+	it("hibernates a running kernel and restarts it lazily", async () => {
+		const { python, countRuns } = writeFakePython();
+		const provisioner = new IpythonKernelProvisioner(tempDir, { python });
+		let releaseDispose: () => void = () => {};
+		const disposeGate = new Promise<void>((resolve) => {
+			releaseDispose = resolve;
+		});
+		const dispose = vi.fn(() => disposeGate);
+		const oldManager = { dispose, isRunning: true } as unknown as KernelManager;
+		Object.assign(
+			provisioner as unknown as {
+				managerPromise: Promise<KernelManager>;
+				startedManager: KernelManager;
+			},
+			{
+				managerPromise: Promise.resolve(oldManager),
+				startedManager: oldManager,
+			},
+		);
+
+		const hibernated = provisioner.hibernate();
+		const restarted = provisioner.ensure();
+		expect(provisioner.manager).toBeUndefined();
+		expect(countRuns()).toBe(0);
+
+		releaseDispose();
+		await hibernated;
+		await expect(restarted).rejects.toThrow(/Kernel exited before resolving ports/);
+		expect(dispose).toHaveBeenCalledOnce();
+		expect(countRuns()).toBe(1);
+	});
+
 	it("dispose() before the boot slot prevents the kernel from spawning", async () => {
 		const { python, countRuns } = writeFakePython();
 		let release: () => void = () => {};

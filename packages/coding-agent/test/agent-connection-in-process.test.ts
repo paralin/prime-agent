@@ -287,16 +287,12 @@ describe("InProcessAgentConnection", () => {
 				leafId: "snapshot-leaf",
 			},
 			messages: [userMessage("snapshot context", 1)],
-			sessionContext: {
-				messages: [userMessage("snapshot context", 1)],
-				thinkingLevel: "medium",
-				model: null,
-			},
 			sessionTree: {
 				tree: [],
 				leafId: "snapshot-leaf",
 			},
 		});
+		expect(snapshot.sessionContext).toBeUndefined();
 		messages.push(userMessage("later context", 2));
 		expect(snapshot.messages).toEqual([userMessage("snapshot context", 1)]);
 	});

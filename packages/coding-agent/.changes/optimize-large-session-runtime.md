@@ -1,0 +1,3 @@
+- Improved large-session responsiveness by incrementally indexing transcripts, skipping resident and bookkeeping scans, avoiding duplicate snapshot context, bounding initial UI work, passivating inactive children under resident pressure, and caching unchanged Git context.
+- Reduced large-session memory by keeping superseded provider-native compaction histories on disk until replay requires them.
+- Released completed child IPython processes immediately while preserving lazy snapshot restoration for follow-up work.

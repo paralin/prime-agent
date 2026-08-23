@@ -58,6 +58,21 @@ describe("SessionManager agent status", () => {
 		}
 	});
 
+	it("does not append an unchanged status twice", () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "agent-status-deduplicate-"));
+		try {
+			const session = SessionManager.create(join(tempDir, "p"), join(tempDir, "s"));
+			const status = { summary: "Waiting for input", taskState: "needs_input" as const, basedOnMessageCount: 2 };
+			const firstId = session.appendAgentStatus(status);
+			const secondId = session.appendAgentStatus(status);
+
+			expect(secondId).toBe(firstId);
+			expect(session.getEntries().filter((entry) => entry.type === "agent_status")).toHaveLength(1);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("is ignored by context building so it never reaches the model", () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "agent-status-context-"));
 		try {

@@ -244,6 +244,14 @@ export interface GitContext {
 	branch?: string;
 }
 
+interface GitContextCacheEntry {
+	fingerprint: string;
+	context: GitContext | null;
+}
+
+const GIT_CONTEXT_CACHE_LIMIT = 64;
+const gitContextCache = new Map<string, GitContextCacheEntry>();
+
 export function gitContextsEqual(a: GitContext, b: GitContext): boolean {
 	return a.repoUrl === b.repoUrl && a.commit === b.commit && a.branch === b.branch;
 }
@@ -258,15 +266,56 @@ function runGit(cwd: string, args: string[]): string | null {
 	return result.stdout.trim() || null;
 }
 
+function readFileIfPresent(path: string): string {
+	try {
+		return readFileSync(path, "utf8");
+	} catch {
+		return "";
+	}
+}
+
+function gitContextFingerprint(paths: GitPaths): string {
+	const head = readFileIfPresent(paths.headPath).trim();
+	const ref = head.startsWith("ref: ") ? readFileIfPresent(join(paths.commonGitDir, head.slice(5).trim())).trim() : "";
+	const gitDir = dirname(paths.headPath);
+	return JSON.stringify([
+		head,
+		ref,
+		readFileIfPresent(join(paths.commonGitDir, "packed-refs")),
+		readFileIfPresent(join(paths.commonGitDir, "config")),
+		readFileIfPresent(join(gitDir, "config.worktree")),
+	]);
+}
+
+function cacheGitContext(repoDir: string, entry: GitContextCacheEntry): void {
+	gitContextCache.delete(repoDir);
+	gitContextCache.set(repoDir, entry);
+	if (gitContextCache.size > GIT_CONTEXT_CACHE_LIMIT) {
+		const oldest = gitContextCache.keys().next().value;
+		if (oldest) gitContextCache.delete(oldest);
+	}
+}
+
 export function captureGitContext(cwd: string): GitContext | null {
+	const paths = findGitPaths(cwd);
+	const fingerprint = paths ? gitContextFingerprint(paths) : undefined;
+	const cached = paths ? gitContextCache.get(paths.repoDir) : undefined;
+	if (paths && cached && cached.fingerprint === fingerprint) {
+		cacheGitContext(paths.repoDir, cached);
+		return cached.context ? { ...cached.context } : null;
+	}
 	const commit = runGit(cwd, ["rev-parse", "HEAD"]);
 	const branch = runGit(cwd, ["branch", "--show-current"]);
 	const remote = runGit(cwd, ["remote", "get-url", "origin"]);
-	if (!commit && !branch && !remote) return null;
+	if (!commit && !branch && !remote) {
+		if (paths && fingerprint !== undefined) cacheGitContext(paths.repoDir, { fingerprint, context: null });
+		return null;
+	}
 
 	const context: GitContext = {};
 	if (remote) context.repoUrl = parseGitUrl(remote)?.repo ?? remote;
 	if (commit) context.commit = commit;
 	if (branch) context.branch = branch;
+	if (paths && fingerprint !== undefined) cacheGitContext(paths.repoDir, { fingerprint, context });
 	return context;
 }

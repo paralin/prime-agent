@@ -20,6 +20,7 @@ import {
 	realpathSync,
 	renameSync,
 	rmSync,
+	type Stats,
 	statSync,
 	writeFileSync,
 } from "fs";
@@ -27,7 +28,7 @@ import { readdir, readFile, stat } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
-import { readFirstLineSync, readLinesAsBuffers } from "../utils/file-lines.js";
+import { readFirstLineSync, readLineContainingSync, readLinesAsBuffers } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
 import {
 	type BashExecutionMessage,
@@ -142,7 +143,11 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	customInstructions?: string;
 }
 
+const lazyCompactionProviders = new WeakMap<CompactionEntry, string>();
+
 export function canReplayCompactionWithProvider(compaction: CompactionEntry, provider?: string): boolean {
+	const lazyProvider = lazyCompactionProviders.get(compaction);
+	if (lazyProvider !== undefined) return lazyProvider === provider;
 	return (
 		compaction.providerNativeCompaction === undefined || compaction.providerNativeCompaction.provider === provider
 	);
@@ -923,6 +928,15 @@ function looksLikeMessageEntry(line: string): boolean {
 	return line.includes('"type":"message"') || line.includes('"type": "message"');
 }
 
+function isCatalogIrrelevantBookkeepingEntry(line: string): boolean {
+	return (
+		line.startsWith('{"type":"child_usage_attributed"') ||
+		line.startsWith('{"type":"git_state"') ||
+		line.startsWith('{"type":"act_start"') ||
+		line.startsWith('{"type":"act_terminal"')
+	);
+}
+
 function extractJsonStringPropertyPrefix(
 	text: string,
 	propertyName: string,
@@ -992,9 +1006,24 @@ function extractOversizedMessageSummary(line: string): {
 }
 
 interface SessionInfoCacheEntry {
+	dev: number;
+	ino: number;
 	size: number;
 	mtimeMs: number;
 	info: SessionInfo | null;
+	scan?: SessionInfoScan;
+}
+
+interface SessionInfoScan {
+	header?: SessionHeader;
+	messageCount: number;
+	conversationMessageCount: number;
+	firstMessage: string;
+	allMessagesText: string;
+	name?: string;
+	state?: SessionState;
+	agentStatus?: AgentStatus;
+	lastActivityTime?: number;
 }
 
 // Session files are append-only, so an unchanged (size, mtimeMs) means identical
@@ -1013,7 +1042,7 @@ export function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
 }
 
 async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null> {
-	let stats: Awaited<ReturnType<typeof stat>>;
+	let stats: Stats;
 	try {
 		stats = await stat(filePath);
 	} catch {
@@ -1023,42 +1052,62 @@ async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null
 	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
 		return cached.info;
 	}
-	const info = await scanSessionInfo(filePath, stats);
-	sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, info });
+	const appendCache =
+		cached?.scan && cached.dev === stats.dev && cached.ino === stats.ino && cached.size < stats.size
+			? { scan: cached.scan, size: cached.size }
+			: undefined;
+	const scan = appendCache
+		? await scanSessionInfoRange(filePath, stats, { ...appendCache.scan }, appendCache.size)
+		: await scanSessionInfoRange(filePath, stats, createSessionInfoScan(), 0);
+	const info = sessionInfoFromScan(filePath, stats, scan);
+	sessionInfoCache.set(filePath, {
+		dev: stats.dev,
+		ino: stats.ino,
+		size: stats.size,
+		mtimeMs: stats.mtimeMs,
+		info,
+		...(scan.header ? { scan } : {}),
+	});
 	return info;
 }
 
-async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeof stat>>): Promise<SessionInfo | null> {
-	try {
-		let header: SessionHeader | undefined;
-		let messageCount = 0;
-		let conversationMessageCount = 0;
-		let firstMessage = "";
-		let allMessagesText = "";
-		let name: string | undefined;
-		let state: SessionState | undefined;
-		let agentStatus: AgentStatus | undefined;
-		let lastActivityTime: number | undefined;
+function createSessionInfoScan(): SessionInfoScan {
+	return {
+		messageCount: 0,
+		conversationMessageCount: 0,
+		firstMessage: "",
+		allMessagesText: "",
+	};
+}
 
-		for await (const lineBuffer of readLinesAsBuffers(filePath)) {
+async function scanSessionInfoRange(
+	filePath: string,
+	stats: Stats,
+	scan: SessionInfoScan,
+	start: number,
+): Promise<SessionInfoScan> {
+	try {
+		if (start >= stats.size) return scan;
+		for await (const lineBuffer of readLinesAsBuffers(filePath, { start, end: stats.size - 1 })) {
 			const line = lineBuffer.toString("utf8");
 			if (!line.trim()) continue;
+			if (isCatalogIrrelevantBookkeepingEntry(line)) continue;
 
 			// Large tool-result entries can be many MB. They do not carry the
 			// session-list metadata we need, and parsing them during every refresh
 			// can exhaust the daemon heap.
 			if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
 				if (looksLikeMessageEntry(line)) {
-					messageCount++;
+					scan.messageCount++;
 					const summary = extractOversizedMessageSummary(line);
 					if (summary.role === "user" || summary.role === "assistant") {
-						conversationMessageCount++;
+						scan.conversationMessageCount++;
 					}
 					if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
-						lastActivityTime = Math.max(lastActivityTime ?? 0, summary.timestamp);
+						scan.lastActivityTime = Math.max(scan.lastActivityTime ?? 0, summary.timestamp);
 					}
-					if (summary.role === "user" && !firstMessage) {
-						firstMessage = summary.textPreview || "(large message)";
+					if (summary.role === "user" && !scan.firstMessage) {
+						scan.firstMessage = summary.textPreview || "(large message)";
 					}
 				}
 				continue;
@@ -1074,72 +1123,71 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 
 			if (entry.type === "session_info") {
 				const infoEntry = entry as SessionInfoEntry;
-				name = infoEntry.name?.trim() || undefined;
+				scan.name = infoEntry.name?.trim() || undefined;
 			}
 			if (entry.type === "session_state") {
 				const stateEntry = entry as SessionStateEntry;
 				const status = normalizeSessionStateStatus(stateEntry.state?.status);
 				if (status) {
-					state = { status };
+					scan.state = { status };
 				}
 			}
 			// Keep the latest recap/verdict so off-daemon sessions don't all show as
 			// unjudged in the agents view. Append-only, so last seen wins.
 			if (entry.type === "agent_status") {
-				agentStatus = (entry as AgentStatusEntry).status;
+				scan.agentStatus = (entry as AgentStatusEntry).status;
 			}
 
-			if (!header) {
+			if (!scan.header) {
 				if (entry.type !== "session") {
-					return null;
+					return scan;
 				}
-				header = entry as SessionHeader;
+				scan.header = entry as SessionHeader;
 			}
 
-			lastActivityTime = updateLastActivityTime(lastActivityTime, entry);
+			scan.lastActivityTime = updateLastActivityTime(scan.lastActivityTime, entry);
 
 			if (entry.type !== "message") continue;
-			messageCount++;
+			scan.messageCount++;
 
 			const message = (entry as SessionMessageEntry).message;
 			if (!isMessageWithContent(message)) continue;
 			if (message.role !== "user" && message.role !== "assistant") continue;
-			conversationMessageCount++;
+			scan.conversationMessageCount++;
 
 			const textContent = extractTextContent(message);
 			if (!textContent) continue;
 
-			allMessagesText = appendCappedSearchText(allMessagesText, textContent);
-			if (!firstMessage && message.role === "user") {
-				firstMessage = textContent;
+			scan.allMessagesText = appendCappedSearchText(scan.allMessagesText, textContent);
+			if (!scan.firstMessage && message.role === "user") {
+				scan.firstMessage = textContent;
 			}
 		}
-
-		if (!header) return null;
-		const cwd = typeof header.cwd === "string" ? header.cwd : "";
-		const parentSessionPath = header.parentSession;
-		const rlmDepth = resolveSessionRlmDepth(header, filePath);
-		const modified = getSessionModifiedDateFromLastActivity(lastActivityTime, header, stats.mtime);
-
-		return {
-			path: filePath,
-			id: header.id,
-			cwd,
-			name,
-			state,
-			parentSessionPath,
-			rlmDepth,
-			created: new Date(header.timestamp),
-			modified,
-			messageCount,
-			conversationMessageCount,
-			firstMessage: firstMessage || "(no messages)",
-			allMessagesText,
-			agentStatus,
-		};
+		return scan;
 	} catch {
-		return null;
+		return scan;
 	}
+}
+
+function sessionInfoFromScan(filePath: string, stats: Stats, scan: SessionInfoScan): SessionInfo | null {
+	const header = scan.header;
+	if (!header) return null;
+	return {
+		path: filePath,
+		id: header.id,
+		cwd: typeof header.cwd === "string" ? header.cwd : "",
+		name: scan.name,
+		state: scan.state,
+		parentSessionPath: header.parentSession,
+		rlmDepth: resolveSessionRlmDepth(header, filePath),
+		created: new Date(header.timestamp),
+		modified: getSessionModifiedDateFromLastActivity(scan.lastActivityTime, header, stats.mtime),
+		messageCount: scan.messageCount,
+		conversationMessageCount: scan.conversationMessageCount,
+		firstMessage: scan.firstMessage || "(no messages)",
+		allMessagesText: scan.allMessagesText,
+		agentStatus: scan.agentStatus,
+	};
 }
 
 export type SessionListProgress = (loaded: number, total: number) => void;
@@ -1164,6 +1212,7 @@ async function listSessionsFromDir(
 	callbacks?: SessionListCallbacks,
 	progressOffset = 0,
 	progressTotal?: number,
+	excludedPaths?: ReadonlySet<string>,
 ): Promise<SessionInfo[]> {
 	const sessions: SessionInfo[] = [];
 	if (!existsSync(dir)) {
@@ -1172,10 +1221,14 @@ async function listSessionsFromDir(
 
 	try {
 		const dirEntries = await readdir(dir);
-		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
+		const normalizedExcludedPaths = excludedPaths
+			? new Set([...excludedPaths].map((path) => resolve(path)))
+			: undefined;
+		const presentFiles = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
+		const files = presentFiles.filter((path) => !normalizedExcludedPaths?.has(resolve(path)));
 		const total = progressTotal ?? files.length;
 
-		const present = new Set(files);
+		const present = new Set(presentFiles);
 		for (const key of sessionInfoCache.keys()) {
 			if (dirname(key) === dir && !present.has(key)) {
 				sessionInfoCache.delete(key);
@@ -1268,6 +1321,7 @@ export class SessionManager {
 			}
 
 			this._buildIndex();
+			this._deferHistoricalProviderCompactions();
 			this.flushed = true;
 		} else {
 			const explicitPath = this.sessionFile;
@@ -1353,6 +1407,53 @@ export class SessionManager {
 		}
 	}
 
+	private _deferHistoricalProviderCompactions(): void {
+		if (!this.sessionFile) return;
+		const nativeCompactions = this.fileEntries.filter(
+			(entry): entry is CompactionEntry =>
+				entry.type === "compaction" &&
+				(lazyCompactionProviders.has(entry) || entry.providerNativeCompaction !== undefined),
+		);
+		if (nativeCompactions.length <= 1) return;
+		const retained = nativeCompactions.at(-1);
+		for (const entry of nativeCompactions) {
+			if (entry === retained || lazyCompactionProviders.has(entry)) continue;
+			const provider = entry.providerNativeCompaction?.provider;
+			if (!provider) continue;
+			lazyCompactionProviders.set(entry, provider);
+			Object.defineProperty(entry, "providerNativeCompaction", {
+				configurable: true,
+				enumerable: true,
+				get: () => this._loadDeferredProviderCompaction(entry),
+				set: (value: ProviderNativeCompactionResult | undefined) => {
+					lazyCompactionProviders.delete(entry);
+					Object.defineProperty(entry, "providerNativeCompaction", {
+						configurable: true,
+						enumerable: true,
+						writable: true,
+						value,
+					});
+				},
+			});
+		}
+	}
+
+	private _loadDeferredProviderCompaction(entry: CompactionEntry): ProviderNativeCompactionResult | undefined {
+		let value: ProviderNativeCompactionResult | undefined;
+		if (this.sessionFile) {
+			const line = readLineContainingSync(this.sessionFile, ['"type":"compaction"', `"id":"${entry.id}"`]);
+			if (line) {
+				try {
+					value = (JSON.parse(line) as CompactionEntry).providerNativeCompaction;
+				} catch {
+					value = undefined;
+				}
+			}
+		}
+		entry.providerNativeCompaction = value;
+		return value;
+	}
+
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
@@ -1372,6 +1473,7 @@ export class SessionManager {
 			rmSync(tempPath, { force: true });
 		}
 		this._notifyPersistListeners();
+		this._deferHistoricalProviderCompactions();
 	}
 
 	private _notifyPersistListeners(): void {
@@ -1567,6 +1669,7 @@ export class SessionManager {
 			customInstructions,
 		};
 		this._appendEntry(entry);
+		this._deferHistoricalProviderCompactions();
 		return entry.id;
 	}
 
@@ -1743,6 +1846,20 @@ export class SessionManager {
 	}
 
 	appendAgentStatus(status: AgentStatus): string {
+		let current = this.leafId ? this.byId.get(this.leafId) : undefined;
+		while (current) {
+			if (current.type === "agent_status") {
+				if (
+					current.status.summary === status.summary &&
+					current.status.taskState === status.taskState &&
+					current.status.basedOnMessageCount === status.basedOnMessageCount
+				) {
+					return current.id;
+				}
+				break;
+			}
+			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+		}
 		const entry: AgentStatusEntry = {
 			type: "agent_status",
 			id: generateId(this.byId),
@@ -2263,17 +2380,27 @@ export class SessionManager {
 		return sessions;
 	}
 
-	static async listAll(callbacks?: SessionListCallbacks, sessionDir?: string): Promise<SessionInfo[]> {
+	static async listAll(
+		callbacks?: SessionListCallbacks,
+		sessionDir?: string,
+		excludedPaths?: ReadonlySet<string>,
+	): Promise<SessionInfo[]> {
 		const sessionsDir = sessionDir ?? getSessionsDir();
 		const sessions: SessionInfo[] = [];
-		await listSessionsFromDir(sessionsDir, {
-			onProgress: callbacks?.onProgress,
-			onSession: (session) => {
-				if (!isVisibleInCatalog(session)) return;
-				sessions.push(session);
-				callbacks?.onSession?.(session);
+		await listSessionsFromDir(
+			sessionsDir,
+			{
+				onProgress: callbacks?.onProgress,
+				onSession: (session) => {
+					if (!isVisibleInCatalog(session)) return;
+					sessions.push(session);
+					callbacks?.onSession?.(session);
+				},
 			},
-		});
+			0,
+			undefined,
+			excludedPaths,
+		);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 		return sessions;
 	}

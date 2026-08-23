@@ -34,10 +34,46 @@ export function readFirstLineSync(filePath: string, maxBytes = 64 * 1024): strin
 	return Buffer.concat(chunks).toString("utf8").replace(/\r$/, "");
 }
 
-export async function* readLinesAsBuffers(filePath: string): AsyncGenerator<Buffer> {
+export function readLineContainingSync(filePath: string, fragments: readonly string[]): string | undefined {
+	const fd = openSync(filePath, "r");
+	const needles = fragments.map((fragment) => Buffer.from(fragment));
+	let pending = Buffer.alloc(0);
+
+	try {
+		const buffer = Buffer.alloc(64 * 1024);
+		while (true) {
+			const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
+			if (bytesRead === 0) break;
+			const chunk =
+				pending.length > 0
+					? Buffer.concat([pending, buffer.subarray(0, bytesRead)])
+					: buffer.subarray(0, bytesRead);
+			let start = 0;
+			while (start < chunk.length) {
+				const end = chunk.indexOf(0x0a, start);
+				if (end === -1) break;
+				const line = chunk.subarray(start, end);
+				if (needles.every((needle) => line.includes(needle))) return line.toString("utf8").replace(/\r$/, "");
+				start = end + 1;
+			}
+			pending = Buffer.from(chunk.subarray(start));
+		}
+		if (pending.length > 0 && needles.every((needle) => pending.includes(needle))) {
+			return pending.toString("utf8").replace(/\r$/, "");
+		}
+		return undefined;
+	} finally {
+		closeSync(fd);
+	}
+}
+
+export async function* readLinesAsBuffers(
+	filePath: string,
+	options: { start?: number; end?: number } = {},
+): AsyncGenerator<Buffer> {
 	const pendingParts: Buffer[] = [];
 	let pendingBytes = 0;
-	for await (const chunk of createReadStream(filePath)) {
+	for await (const chunk of createReadStream(filePath, options)) {
 		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 		let start = 0;
 		while (start < buffer.length) {

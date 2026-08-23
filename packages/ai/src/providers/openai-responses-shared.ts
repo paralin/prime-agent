@@ -471,6 +471,24 @@ export async function processResponsesStream<TApi extends Api>(
 						info,
 					);
 				}
+				if (item.summary.some((part) => !part || typeof part !== "object" || typeof part.text !== "string")) {
+					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+					throw new StreamFailureError(
+						streamFailureMessage(info, "output_item.done reasoning summary contained a malformed part"),
+						info,
+					);
+				}
+				if (
+					item.content !== undefined &&
+					(!Array.isArray(item.content) ||
+						item.content.some((part) => !part || typeof part !== "object" || typeof part.text !== "string"))
+				) {
+					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+					throw new StreamFailureError(
+						streamFailureMessage(info, "output_item.done reasoning content contained a malformed part"),
+						info,
+					);
+				}
 				const summaryText = item.summary.map((s) => s.text).join("\n\n") || "";
 				const contentText = item.content?.map((c) => c.text).join("\n\n") || "";
 				currentBlock.thinking = summaryText || contentText || currentBlock.thinking;
@@ -487,6 +505,24 @@ export async function processResponsesStream<TApi extends Api>(
 					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
 					throw new StreamFailureError(
 						streamFailureMessage(info, "output_item.done message carried no content"),
+						info,
+					);
+				}
+				if (
+					item.content.some(
+						(part) =>
+							!part ||
+							typeof part !== "object" ||
+							(part.type === "output_text"
+								? typeof part.text !== "string"
+								: part.type === "refusal"
+									? typeof part.refusal !== "string"
+									: true),
+					)
+				) {
+					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+					throw new StreamFailureError(
+						streamFailureMessage(info, "output_item.done message content contained a malformed part"),
 						info,
 					);
 				}

@@ -1,0 +1,1 @@
+- Fixed malformed nested OpenAI Responses stream elements bypassing malformed-response handling.

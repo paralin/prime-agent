@@ -254,7 +254,10 @@ export class AgentCronJobStore {
 	 * bind jobs stored for its stable session file to the new live session id.
 	 * When a live session switches to another persisted file, move jobs stored for
 	 * its stable active session id to the new file so future restores target the
-	 * current session instead of the previous one.
+	 * current session instead of the previous one. RLM heartbeat jobs are bound to
+	 * their durable creating session: they follow only an exact restore of their
+	 * own sessionId and session file, never a reused active session id, so a new
+	 * top-level session cannot pull them onto its session file.
 	 */
 	rebindSessionJobs(input: {
 		activeSessionId: string;
@@ -265,6 +268,17 @@ export class AgentCronJobStore {
 		const targetSessionFile = resolve(input.sessionFile);
 		const reboundJobs: AgentCronJob[] = [];
 		const jobs = this.readJobs().map((job) => {
+			if (job.source === "rlm_heartbeat") {
+				if (job.sessionId !== input.sessionId || resolve(job.sessionFile) !== targetSessionFile) {
+					return job;
+				}
+				if (job.activeSessionId === input.activeSessionId && job.cwd === input.cwd) {
+					return job;
+				}
+				const restored = { ...job, activeSessionId: input.activeSessionId, cwd: input.cwd };
+				reboundJobs.push(restored);
+				return restored;
+			}
 			if (job.activeSessionId !== input.activeSessionId && resolve(job.sessionFile) !== targetSessionFile) {
 				return job;
 			}

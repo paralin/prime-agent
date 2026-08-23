@@ -25,6 +25,8 @@ import { serializeConversation } from "./utils.js";
 export const SCRATCH_HANDOFF_READ_CUSTOM_TYPE = "scratch-handoff-read";
 /** Custom entry recorded when a closeout turn changed the scratch document. */
 export const SCRATCH_HANDOFF_WRITE_CUSTOM_TYPE = "scratch-handoff-write";
+/** Custom entry pinning the checkpoint path before the first closeout runs. */
+export const SCRATCH_HANDOFF_PATH_CUSTOM_TYPE = "scratch-handoff-path";
 
 export interface ScratchHandoffSettings {
 	enabled?: boolean; // default: false - opt in via settings
@@ -163,13 +165,21 @@ function scratchHandoffDetails(details: unknown): { scratchFile?: string } | und
 	return scratchFile ? { scratchFile } : undefined;
 }
 
-/** Explicit scratch path restored from the latest persisted read marker. */
+/**
+ * Explicit scratch path restored from persisted markers: read markers recorded
+ * at compaction and path pins recorded when a closeout is staged. The pin keeps
+ * a checkpoint written before a crash reachable across a date rollover.
+ */
 export function latestPersistedScratchHandoffPath(entries: readonly SessionEntry[]): string | undefined {
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index];
-		if (entry.type !== "custom_message" || entry.customType !== SCRATCH_HANDOFF_READ_CUSTOM_TYPE) continue;
-		const details = scratchHandoffDetails(entry.details);
-		if (details?.scratchFile) return details.scratchFile;
+		if (entry.type === "custom_message" && entry.customType === SCRATCH_HANDOFF_READ_CUSTOM_TYPE) {
+			const details = scratchHandoffDetails(entry.details);
+			if (details?.scratchFile) return details.scratchFile;
+		} else if (entry.type === "custom" && entry.customType === SCRATCH_HANDOFF_PATH_CUSTOM_TYPE) {
+			const pinned = isRecord(entry.data) ? nonEmptyString(entry.data.path) : undefined;
+			if (pinned) return pinned;
+		}
 	}
 	return undefined;
 }
@@ -222,14 +232,14 @@ export function scratchHandoffBodyPreview(
 /**
  * Size the inline delta carried past a handoff. Everything in the rebuilt
  * context is a new prefix paid at full price, so an unbounded delta re-buys the
- * context the handoff exists to release.
+ * context the handoff exists to release. Never exceeds the window share: small
+ * windows scale down instead of taking the full minimum.
  */
 export function scratchHandoffRecentContextBudget(contextWindow: number): number {
 	if (!Number.isFinite(contextWindow) || contextWindow <= 0) return SCRATCH_HANDOFF_RECENT_CONTEXT_MIN_TOKENS;
-	return Math.max(
-		SCRATCH_HANDOFF_RECENT_CONTEXT_MIN_TOKENS,
-		Math.floor(contextWindow * SCRATCH_HANDOFF_RECENT_CONTEXT_WINDOW_FRACTION),
-	);
+	const share = Math.floor(contextWindow * SCRATCH_HANDOFF_RECENT_CONTEXT_WINDOW_FRACTION);
+	if (share >= SCRATCH_HANDOFF_RECENT_CONTEXT_MIN_TOKENS) return share;
+	return Math.max(share, Math.floor(SCRATCH_HANDOFF_RECENT_CONTEXT_MIN_TOKENS / 8));
 }
 
 /**
@@ -375,8 +385,14 @@ export function buildScratchHandoffResumeMessage(input: {
 	displayPath: string;
 	scratchText: string | undefined;
 	recentContext?: ScratchHandoffDelta;
+	/** Active model context window; bounds the checkpoint preview on small models. */
+	contextWindow?: number;
 }): string {
-	const preview = scratchHandoffBodyPreview(input.scratchText ?? "");
+	const bodyBudget =
+		input.contextWindow !== undefined && Number.isFinite(input.contextWindow) && input.contextWindow > 0
+			? Math.min(SCRATCH_HANDOFF_BODY_MAX_TOKENS, scratchHandoffRecentContextBudget(input.contextWindow))
+			: SCRATCH_HANDOFF_BODY_MAX_TOKENS;
+	const preview = scratchHandoffBodyPreview(input.scratchText ?? "", bodyBudget);
 	return renderScratchHandoffResumeMessage({
 		displayPath: input.displayPath,
 		exists: input.scratchText !== undefined,

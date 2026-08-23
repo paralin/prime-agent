@@ -388,18 +388,27 @@ function isIdleEvictionThresholdMet(
 	);
 }
 
+/** Safety policy for pressure passivation, without an idle-age requirement. */
+export function canPassivateSessionUnderPressure(session: SessionPassivationSnapshot): boolean {
+	return (
+		session.hasParent &&
+		!session.hasNonPassiveDescendants &&
+		!session.isHydrating &&
+		!session.isSessionActive &&
+		session.attachedClients === 0 &&
+		!session.hasRegisteredHeartbeat &&
+		!session.hasRegisteredCronJob &&
+		Number.isFinite(session.lastActivityAt)
+	);
+}
+
 /** Pure per-node residency policy. Roots remain owned by whole-worker eviction. */
 export function canPassivateSession(
 	session: SessionPassivationSnapshot,
 	idleEvictionMinutes: IdleEvictionMinutes,
 	now = Date.now(),
 ): boolean {
-	return (
-		session.hasParent &&
-		!session.hasNonPassiveDescendants &&
-		!session.isHydrating &&
-		isIdleEvictionThresholdMet(session, idleEvictionMinutes, now)
-	);
+	return canPassivateSessionUnderPressure(session) && isIdleEvictionThresholdMet(session, idleEvictionMinutes, now);
 }
 
 /** Pure whole-tree residency policy. Callers must supply supervisor-owned attachment state. */

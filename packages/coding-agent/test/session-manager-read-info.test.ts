@@ -2,7 +2,7 @@ import { appendFileSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { readSessionInfo } from "../src/core/session-manager.js";
+import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 
 const tempDirs: string[] = [];
 
@@ -102,5 +102,36 @@ describe("readSessionInfo", () => {
 		renameSync(replacement, path);
 
 		await expect(readSessionInfo(path)).resolves.toMatchObject({ messageCount: 1, firstMessage: "replacement" });
+	});
+
+	it("excludes resident session paths before catalog scanning", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-session-info-excluded-"));
+		tempDirs.push(directory);
+		const includedPath = join(directory, "included.jsonl");
+		const excludedPath = join(directory, "excluded.jsonl");
+		const writeSession = (path: string, id: string) => {
+			writeFileSync(
+				path,
+				`${JSON.stringify({
+					type: "session",
+					version: 3,
+					id,
+					timestamp: "2026-01-01T00:00:00.000Z",
+					cwd: directory,
+				})}\n${JSON.stringify({
+					type: "message",
+					id: `${id}-message`,
+					parentId: null,
+					timestamp: "2026-01-01T00:00:01.000Z",
+					message: { role: "user", content: id, timestamp: Date.parse("2026-01-01T00:00:01.000Z") },
+				})}\n`,
+			);
+		};
+		writeSession(includedPath, "included");
+		writeSession(excludedPath, "excluded");
+
+		await expect(SessionManager.listAll(undefined, directory, new Set([excludedPath]))).resolves.toEqual([
+			expect.objectContaining({ id: "included", path: includedPath }),
+		]);
 	});
 });

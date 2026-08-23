@@ -1198,6 +1198,7 @@ async function listSessionsFromDir(
 	callbacks?: SessionListCallbacks,
 	progressOffset = 0,
 	progressTotal?: number,
+	excludedPaths?: ReadonlySet<string>,
 ): Promise<SessionInfo[]> {
 	const sessions: SessionInfo[] = [];
 	if (!existsSync(dir)) {
@@ -1206,10 +1207,14 @@ async function listSessionsFromDir(
 
 	try {
 		const dirEntries = await readdir(dir);
-		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
+		const normalizedExcludedPaths = excludedPaths
+			? new Set([...excludedPaths].map((path) => resolve(path)))
+			: undefined;
+		const presentFiles = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
+		const files = presentFiles.filter((path) => !normalizedExcludedPaths?.has(resolve(path)));
 		const total = progressTotal ?? files.length;
 
-		const present = new Set(files);
+		const present = new Set(presentFiles);
 		for (const key of sessionInfoCache.keys()) {
 			if (dirname(key) === dir && !present.has(key)) {
 				sessionInfoCache.delete(key);
@@ -2297,17 +2302,27 @@ export class SessionManager {
 		return sessions;
 	}
 
-	static async listAll(callbacks?: SessionListCallbacks, sessionDir?: string): Promise<SessionInfo[]> {
+	static async listAll(
+		callbacks?: SessionListCallbacks,
+		sessionDir?: string,
+		excludedPaths?: ReadonlySet<string>,
+	): Promise<SessionInfo[]> {
 		const sessionsDir = sessionDir ?? getSessionsDir();
 		const sessions: SessionInfo[] = [];
-		await listSessionsFromDir(sessionsDir, {
-			onProgress: callbacks?.onProgress,
-			onSession: (session) => {
-				if (!isVisibleInCatalog(session)) return;
-				sessions.push(session);
-				callbacks?.onSession?.(session);
+		await listSessionsFromDir(
+			sessionsDir,
+			{
+				onProgress: callbacks?.onProgress,
+				onSession: (session) => {
+					if (!isVisibleInCatalog(session)) return;
+					sessions.push(session);
+					callbacks?.onSession?.(session);
+				},
 			},
-		});
+			0,
+			undefined,
+			excludedPaths,
+		);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 		return sessions;
 	}

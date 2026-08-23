@@ -5568,7 +5568,9 @@ export class AgentDaemon {
 		const activePaths = new Set(
 			localAgents.flatMap((agent) => (agent.sessionPath ? [canonicalSessionPath(agent.sessionPath)] : [])),
 		);
-		const savedRoots = (await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir))
+		const savedRoots = (
+			await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir, activePaths)
+		)
 			.filter(
 				(info) =>
 					(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 &&

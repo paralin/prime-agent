@@ -1,0 +1,1 @@
+- Fixed high daemon CPU and memory use when large RLM agent trees emit frequent child updates.

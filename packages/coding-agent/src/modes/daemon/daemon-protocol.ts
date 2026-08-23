@@ -67,11 +67,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 19 adds daemon-held session input pauses.
 // Revision 20 lets cancellation target a prompt the session owns but has not started.
 // Revision 21 adds capability-gated, session-scoped ACP MCP server replacement.
+// Revision 22 scopes ACP MCP replacement and cleanup to a connection owner.
 // Revision 23 lets workers query the supervisor agent roster on demand.
 // Revision 24 adds the capability-gated agent-roster subscription and push.
 // Revision 25 adds capability-gated direct worker peer transport discovery.
-export const DAEMON_SCHEMA_REVISION = 25;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-25-585ef1102921";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

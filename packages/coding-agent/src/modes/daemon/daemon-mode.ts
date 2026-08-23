@@ -589,6 +589,7 @@ export class AgentDaemon {
 	private rosterFlushScheduled = false;
 	private rosterHeartbeatTimer?: ReturnType<typeof setInterval>;
 	private rlmSpawnLedgerInstance?: RlmSpawnLedger;
+	private passiveRlmSubagentCache?: Promise<PassiveRlmSubagent[]>;
 	/** In-flight admission spawn appends, awaited (and consumed) by createRlmSubagentRuntime. */
 	private readonly pendingRlmSpawnAppends = new Map<string, Promise<void>>();
 
@@ -1006,6 +1007,11 @@ export class AgentDaemon {
 			.catch((error) => {
 				this.log(`failed to append RLM ledger rename: ${error instanceof Error ? error.message : String(error)}`);
 			});
+		this.invalidatePassiveRlmSubagentCache();
+	}
+
+	private invalidatePassiveRlmSubagentCache(): void {
+		this.passiveRlmSubagentCache = undefined;
 	}
 
 	/**
@@ -1049,6 +1055,7 @@ export class AgentDaemon {
 			createdAt?: number;
 		},
 	): boolean {
+		this.invalidatePassiveRlmSubagentCache();
 		const parentSession = parentState.runtime.session;
 		// Spawn admission is the moment the daemon knows the edge firsthand.
 		// The ledger is the only topology store, so the append's outcome is
@@ -1180,6 +1187,7 @@ export class AgentDaemon {
 			);
 			this.scheduleRosterFlush();
 		}
+		this.invalidatePassiveRlmSubagentCache();
 		// Deletion boundary: transcript + display tombstone are the durable
 		// record and stay; the nested artifact dir is a runtime cache and goes.
 		await this.deleteRlmSubagentArtifacts(childId, entry.sessionFile);
@@ -1268,9 +1276,26 @@ export class AgentDaemon {
 	}
 
 	/** List each root's passive (non-resident) descendants from the ledger, without creating runtimes. */
-	private async listPassiveRlmSubagents(
+	private listPassiveRlmSubagents(
 		savedRoots: SessionInfo[] = [],
 		includeResident = false,
+	): Promise<PassiveRlmSubagent[]> {
+		if (savedRoots.length > 0 || includeResident) {
+			return this.loadPassiveRlmSubagents(savedRoots, includeResident);
+		}
+		if (!this.passiveRlmSubagentCache) {
+			const load = this.loadPassiveRlmSubagents([], false);
+			this.passiveRlmSubagentCache = load;
+			void load.catch(() => {
+				if (this.passiveRlmSubagentCache === load) this.passiveRlmSubagentCache = undefined;
+			});
+		}
+		return this.passiveRlmSubagentCache;
+	}
+
+	private async loadPassiveRlmSubagents(
+		savedRoots: SessionInfo[],
+		includeResident: boolean,
 	): Promise<PassiveRlmSubagent[]> {
 		const residentRoots: Array<{ parentState: ActiveSessionState; sessionFile: string }> = [];
 		for (const parentState of this.sessions.values()) {
@@ -1459,6 +1484,7 @@ export class AgentDaemon {
 			clientEnv,
 		};
 		this.sessions.set(state.activeSessionId, state);
+		this.invalidatePassiveRlmSubagentCache();
 		this.bindingSessions.add(state.activeSessionId);
 		let completeBinding!: () => void;
 		const bindingCompletion = new Promise<void>((resolveBinding) => {
@@ -1490,6 +1516,7 @@ export class AgentDaemon {
 		} catch (error) {
 			state.unsubscribe?.();
 			this.sessions.delete(state.activeSessionId);
+			this.invalidatePassiveRlmSubagentCache();
 			await runtime.dispose().catch(() => undefined);
 			throw error;
 		} finally {
@@ -3727,6 +3754,18 @@ export class AgentDaemon {
 					this.write(client, success(command.id, "detach"));
 					return;
 				}
+				case "worker_list_active_sessions":
+					this.writeWorkerSuccess(client, command, {
+						sessions: [...this.sessions.values()].map((state) => summaryForActiveSession(state)),
+					});
+					return;
+				case "worker_sync_agent_peers":
+					this.remoteAgentPeers.clear();
+					for (const peer of command.peers) {
+						this.remoteAgentPeers.set(peer.activeSessionId, peer);
+					}
+					this.writeWorkerSuccess(client, command);
+					return;
 				case "worker_archive_and_shutdown": {
 					// Close sessions first so direct peers read session_closed "killed", not a daemon shutdown.
 					for (const state of [...this.sessions.values()]) {
@@ -4111,6 +4150,7 @@ export class AgentDaemon {
 										`failed to append RLM ledger rename: ${error instanceof Error ? error.message : String(error)}`,
 									);
 								});
+							this.invalidatePassiveRlmSubagentCache();
 						},
 					);
 				}
@@ -6757,6 +6797,7 @@ export class AgentDaemon {
 			this.rosterReporter.removedAgentIds.set(this.rosterAgentIdForState(state), state.runtime.session.sessionId);
 		}
 		this.scheduleRosterFlush();
+		this.invalidatePassiveRlmSubagentCache();
 		if (isEmptyDraftSession) {
 			const sessionFile = state.runtime.session.sessionFile;
 			if (sessionFile) {

@@ -17,24 +17,6 @@ export const DAEMON_WORKER_STARTUP_GATE_FD_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WO
 export const DAEMON_WORKER_STARTUP_GATE_COMMIT = "start\n";
 export type DaemonWorkerLifecycle = "starting" | "ready" | "recovering" | "stopping" | "failed";
 
-// Worker->supervisor roster frames live outside the client-facing DaemonOutbound schema.
-export type DaemonWorkerRosterOutbound =
-	| {
-			type: "roster_delta";
-			entries: WorkerRosterEntry[];
-			removedAgentIds?: string[];
-			snapshot?: true;
-	  }
-	| { type: "roster_heartbeat" };
-
-/** Advertised by new workers in the worker_auth response; absent on legacy workers. */
-export const DAEMON_WORKER_ROSTER_CAPABILITY = "agent_roster";
-
-/** Advertised in the worker_auth response by workers that accept peer transport grants. */
-export const DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY = "peer_transport";
-
-/** Idle keepalive cadence for worker->supervisor roster frames; the supervisor staleness threshold derives from it. */
-export const ROSTER_HEARTBEAT_INTERVAL_MS = 15_000;
 
 export type DaemonWorkerFrameHeader =
 	| {
@@ -116,7 +98,6 @@ export type DaemonWorkerCommand =
 			supportsExtensionUi?: boolean;
 	  }
 	| { id?: string; type: "worker_unsubscribe"; activeSessionId: string }
-	| { id?: string; type: "worker_register_peer_transport"; grant: DaemonWorkerPeerGrant }
 	| { id?: string; type: "worker_archive_and_shutdown" }
 	| {
 			id?: string;

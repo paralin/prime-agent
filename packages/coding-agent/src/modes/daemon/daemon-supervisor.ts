@@ -128,6 +128,7 @@ import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_INSTANCE_ID_ENV,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
+	DAEMON_WORKER_COMMAND_COMPATIBILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
 	DAEMON_WORKER_ROSTER_CAPABILITY,
@@ -313,6 +314,11 @@ interface ResidentWorker {
 	descriptor: DaemonWorkerDescriptor;
 	descriptorPath: string;
 	client?: DaemonWorkerClient;
+	schemaRevision?: number;
+	summaryRefresh?: Promise<void>;
+	summaryRefreshPending?: boolean;
+	summaryRefreshRecovery?: boolean;
+	fullSummaryRefresh?: Promise<void>;
 	heartbeatSnapshot?: AgentConnectionHeartbeat[];
 	heartbeatSnapshotStale?: boolean;
 	summaries: Map<string, SessionSummary>;
@@ -2389,25 +2395,6 @@ export class DaemonSupervisor {
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "list" }>,
 	): Promise<DaemonResponse> {
-		const active: SessionSummary[] = [];
-		const activeByFile = new Map<string, SessionSummary>();
-		let busyClientOwnedSessionCount = 0;
-		for (const entry of this.roster().values()) {
-			if (entry.queuedChild) continue;
-			const worker = entry.workerId !== undefined ? this.workers.get(entry.workerId) : undefined;
-			if (worker === undefined) continue;
-			const summary = this.publicSummary(worker, sessionSummaryFromRosterEntry(entry));
-			if (this.isVisibleWorker(worker)) {
-				active.push(summary);
-				if (summary.sessionFile) activeByFile.set(canonicalSessionPath(summary.sessionFile), summary);
-				continue;
-			}
-			if (summary.sessionFile) activeByFile.set(canonicalSessionPath(summary.sessionFile), summary);
-			if (isSessionSummaryBusy(summary)) busyClientOwnedSessionCount += 1;
-			if (command.includeClientOwned === true && this.isWorkerAccessibleToClient(client, worker)) {
-				active.push(summary);
-			}
-		}
 		const data = {
 			sessions: active,
 			...(command.includeClientOwned ? { busyClientOwnedSessionCount } : {}),
@@ -3114,34 +3101,6 @@ export class DaemonSupervisor {
 			const client = new DaemonWorkerClient(worker.descriptor.socketPath);
 			try {
 				await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
-				await client.waitForHello(1000);
-				// Listen before authenticating: the worker flushes its roster snapshot right after auth succeeds.
-				client.onFrame((frame) => this.handleWorkerFrame(worker, frame, client));
-				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
-				worker.pendingClient = client;
-				try {
-					const authResponse = await client.authenticateWorker(
-						worker.descriptor.authenticationToken,
-						{
-							...this.supervisorAuthenticationClaim(),
-							...(worker.descriptor.workerInstanceId !== undefined
-								? { workerInstanceId: worker.descriptor.workerInstanceId }
-								: {}),
-						},
-						1000,
-					);
-					await this.assertRecoveryAllowed();
-					if (!workerAuthAdvertisesRoster(authResponse.data)) {
-						throw new PreRosterWorkerError("Session worker predates the roster protocol and must be restarted");
-					}
-					worker.peerTransportCapable = workerAuthAdvertisesPeerTransport(authResponse.data);
-					worker.lastFrameAt = Date.now();
-					worker.client?.close();
-					worker.client = client;
-					return client;
-				} finally {
-					if (worker.pendingClient === client) worker.pendingClient = undefined;
-				}
 			} catch (error) {
 				lastError = error;
 				client.close();
@@ -3791,8 +3750,6 @@ export class DaemonSupervisor {
 	private async refreshWorkerSummaries(
 		worker: ResidentWorker,
 		recovery = false,
-		fillGaps = recovery,
-		retried = false,
 	): Promise<void> {
 		if (this.isWorkerStopping(worker)) {
 			throw new Error("Session worker is stopping");
@@ -3800,24 +3757,10 @@ export class DaemonSupervisor {
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
-		const pullSource = worker.client;
-		const epochAtStart = worker.rosterEpoch ?? 0;
-		const response = await pullSource.request({ type: "list" }, 5000);
-		// A frame received mid-pull can remove rows this stale pull would resurrect; re-pull once, then skip the fill.
-		if (fillGaps && (worker.rosterEpoch ?? 0) !== epochAtStart && !retried) {
-			return this.refreshWorkerSummaries(worker, recovery, fillGaps, true);
-		}
 		const summaries = sessionSummariesFromResponse(response);
-		const nextSummaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
-		const root = nextSummaries.get(worker.descriptor.rootActiveSessionId);
-		if (recovery && !root) {
+		worker.summaries = this.mergeWorkerSummaries(worker.summaries, summaries, useActiveOnly);
+		if (recovery && !worker.summaries.has(worker.descriptor.rootActiveSessionId)) {
 			throw new Error(`Session worker omitted its root session during recovery`);
-		}
-		worker.summaries = nextSummaries;
-		if (fillGaps) {
-			await this.chainWorkerRosterApply(worker, pullSource, () => {
-				if ((worker.rosterEpoch ?? 0) === epochAtStart) this.syncRosterFromWorkerSummaries(worker);
-			});
 		}
 		for (const summary of summaries) {
 			const activeSessionId = summary.activeSessionId ?? summary.id;
@@ -3843,6 +3786,40 @@ export class DaemonSupervisor {
 				this.persistWorker(worker);
 			});
 		}
+	}
+
+	/**
+	 * Merge a summary listing into a worker's summary catalog.
+	 *
+	 * A full listing replaces the catalog. An active-only listing reports just
+	 * the worker's live sessions, so it must preserve passive catalog entries:
+	 * refresh active entries, drop active entries the worker stopped reporting,
+	 * and retire the passive twin of a session that became active.
+	 */
+	private mergeWorkerSummaries(
+		previous: ReadonlyMap<string, SessionSummary>,
+		summaries: SessionSummary[],
+		activeOnly: boolean,
+	): Map<string, SessionSummary> {
+		const next = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
+		if (!activeOnly) return next;
+		const passiveKeysBySessionId = new Map<string, string>();
+		for (const [key, summary] of previous) {
+			if (summary.activeSessionId === undefined && summary.sessionId !== undefined) {
+				passiveKeysBySessionId.set(summary.sessionId, key);
+			}
+		}
+		const merged = new Map(previous);
+		for (const [key, existing] of previous) {
+			if (existing.activeSessionId !== undefined && !next.has(key)) merged.delete(key);
+		}
+		for (const [key, summary] of next) {
+			merged.set(key, summary);
+			if (summary.sessionId === undefined) continue;
+			const passiveKey = passiveKeysBySessionId.get(summary.sessionId);
+			if (passiveKey !== undefined && passiveKey !== key) merged.delete(passiveKey);
+		}
+		return merged;
 	}
 
 	private async familyCatalogEntries(): Promise<AgentFamilyCatalogEntry[]> {

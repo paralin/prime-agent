@@ -1016,6 +1016,7 @@ describe("daemon mode helpers", () => {
 					getCurrentState: () => ActiveSessionState | undefined,
 				): AgentSessionMessageController;
 			};
+			expect(await internals.listPassiveRlmSubagents()).toEqual([]);
 			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
 
 			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry)).toContainEqual(

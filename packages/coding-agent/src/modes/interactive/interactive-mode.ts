@@ -5761,6 +5761,13 @@ export class InteractiveMode {
 	}
 
 	private startAssistantStreamingMessage(message: AssistantMessage): void {
+		// A stall retry restarts the stream without ending the previous partial;
+		// replace the abandoned component instead of appending a duplicate fragment.
+		if (this.streamingComponent !== undefined) {
+			this.chatContainer.removeChild(this.streamingComponent);
+			this.resetPendingToolState();
+			this.streamingComponent = undefined;
+		}
 		this.streamingComponent = new AssistantMessageComponent(
 			undefined,
 			this.hideThinkingBlock,

@@ -8,6 +8,7 @@ import {
 	type AssistantMessageEvent,
 	type Context,
 	EventStream,
+	getLogger,
 	streamSimple,
 	type ToolResultMessage,
 	validateToolArguments,
@@ -31,6 +32,15 @@ const ABORT_ERROR_MESSAGE = "Request was aborted";
 // turn usually lets the model finish, but a provider that never finishes would
 // loop forever, so consecutive incomplete responses are capped.
 const MAX_CONSECUTIVE_INCOMPLETE_RESPONSES = 3;
+// Providers sometimes accept a request and then deliver no stream events at all:
+// a hung gateway or a silently dropped connection leaves the socket open while
+// the model produces nothing. Abort the request and retry after this window
+// without model output.
+const STREAM_STALL_TIMEOUT_MS = 180_000;
+// A provider that stalls on every attempt would retry forever, so cap the
+// retries and surface the failure as an error on the final response.
+const MAX_STREAM_STALL_RETRIES = 2;
+const stallLog = getLogger("agent.stream-stall");
 const EMPTY_USAGE: AssistantMessage["usage"] = {
 	input: 0,
 	output: 0,
@@ -102,6 +112,31 @@ function maybePromiseWithAbort<T>(
 	onAbort?: () => void,
 ): Promise<T> {
 	return raceWithAbort(Promise.resolve(operation), signal, onAbort);
+}
+
+class StreamStallError extends Error {
+	constructor(readonly timeoutMs: number) {
+		super(`No model output for ${Math.round(timeoutMs / 1000)}s`);
+		this.name = "StreamStallError";
+	}
+}
+
+/** Rejects with StreamStallError when the operation produces nothing within timeoutMs. */
+function raceWithStallTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new StreamStallError(timeoutMs)), timeoutMs);
+		timer.unref?.();
+		operation.then(
+			(value) => {
+				clearTimeout(timer);
+				resolve(value);
+			},
+			(error: unknown) => {
+				clearTimeout(timer);
+				reject(error);
+			},
+		);
+	});
 }
 
 function isAbortError(error: unknown): boolean {
@@ -481,20 +516,74 @@ async function streamAssistantResponse(
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
 ): Promise<AssistantMessage> {
+	const stallTimeoutMs = config.streamStallTimeoutMs ?? STREAM_STALL_TIMEOUT_MS;
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
-	const finishAbortedMessage = async () => {
-		const finalMessage = createAbortedAssistantMessage(config, partialMessage);
-		if (addedPartial) {
-			context.messages[context.messages.length - 1] = finalMessage;
-		} else {
-			context.messages.push(finalMessage);
-			await emit({ type: "message_start", message: { ...finalMessage } });
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return await streamAssistantAttempt(
+				context,
+				config,
+				signal,
+				emit,
+				streamFn,
+				stallTimeoutMs,
+				(partial, added) => {
+					partialMessage = partial;
+					addedPartial = added;
+				},
+			);
+		} catch (error) {
+			if (!(error instanceof StreamStallError) || signal?.aborted) {
+				throw error;
+			}
+			stallLog.warn("provider stream stalled", {
+				provider: config.model.provider,
+				model: config.model.id,
+				attempt: attempt + 1,
+				maxAttempts: MAX_STREAM_STALL_RETRIES + 1,
+				timeoutMs: stallTimeoutMs,
+			});
+			if (attempt < MAX_STREAM_STALL_RETRIES) {
+				// Roll back the abandoned partial so the retry streams into a clean context.
+				if (addedPartial && context.messages.at(-1) === partialMessage) {
+					context.messages.pop();
+				}
+				continue;
+			}
+			const finalMessage = createAbortedAssistantMessage(config, addedPartial ? partialMessage : null);
+			finalMessage.stopReason = "error";
+			finalMessage.errorMessage = `${error.message}; gave up after ${attempt + 1} attempts`;
+			if (addedPartial && context.messages.at(-1) === partialMessage) {
+				context.messages[context.messages.length - 1] = finalMessage;
+			} else {
+				context.messages.push(finalMessage);
+				await emit({ type: "message_start", message: { ...finalMessage } });
+			}
+			await emit({ type: "message_end", message: finalMessage });
+			return finalMessage;
 		}
-		await emit({ type: "message_end", message: finalMessage });
-		return finalMessage;
-	};
+	}
+}
 
+async function streamAssistantAttempt(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFn: StreamFn | undefined,
+	stallTimeoutMs: number,
+	trackPartial: (partial: AssistantMessage | null, added: boolean) => void,
+): Promise<AssistantMessage> {
+	// The provider request listens on a linked signal so a stall can abort the
+	// underlying HTTP connection while user cancellation keeps using `signal`.
+	const requestController = new AbortController();
+	const forwardAbort = () => requestController.abort();
+	if (signal?.aborted) {
+		requestController.abort();
+	} else {
+		signal?.addEventListener("abort", forwardAbort, { once: true });
+	}
 	try {
 		throwIfAborted(signal);
 		let messages = context.messages;
@@ -517,21 +606,77 @@ async function streamAssistantResponse(
 			tools: context.tools,
 		};
 
-		const response = await maybePromiseWithAbort(
-			streamFunction(config.model, llmContext, {
-				...config,
-				apiKey: resolvedApiKey,
+		try {
+			const response = await maybePromiseWithAbort(
+				raceWithStallTimeout(
+					Promise.resolve(
+						streamFunction(config.model, llmContext, {
+							...config,
+							apiKey: resolvedApiKey,
+							signal: requestController.signal,
+						}),
+					),
+					stallTimeoutMs,
+				),
 				signal,
-			}),
-			signal,
-		);
+			);
+			return await consumeAssistantStream(response, context, config, signal, emit, stallTimeoutMs, trackPartial);
+		} catch (error) {
+			if (error instanceof StreamStallError) {
+				requestController.abort();
+			}
+			throw error;
+		}
+	} catch (error) {
+		if (signal?.aborted && isAbortError(error)) {
+			const finalMessage = createAbortedAssistantMessage(config, null);
+			context.messages.push(finalMessage);
+			await emit({ type: "message_start", message: { ...finalMessage } });
+			await emit({ type: "message_end", message: finalMessage });
+			return finalMessage;
+		}
+		throw error;
+	} finally {
+		signal?.removeEventListener("abort", forwardAbort);
+	}
+}
+
+/**
+ * Consumes one provider stream to completion. Rejects with StreamStallError when
+ * no stream events arrive within stallTimeoutMs; the caller decides whether to
+ * retry or surface the failure.
+ */
+async function consumeAssistantStream(
+	response: Awaited<ReturnType<StreamFn>>,
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	stallTimeoutMs: number,
+	trackPartial: (partial: AssistantMessage | null, added: boolean) => void,
+): Promise<AssistantMessage> {
+	let partialMessage: AssistantMessage | null = null;
+	let addedPartial = false;
+	const finishAbortedMessage = async () => {
+		const finalMessage = createAbortedAssistantMessage(config, partialMessage);
+		if (addedPartial) {
+			context.messages[context.messages.length - 1] = finalMessage;
+		} else {
+			context.messages.push(finalMessage);
+			await emit({ type: "message_start", message: { ...finalMessage } });
+		}
+		await emit({ type: "message_end", message: finalMessage });
+		return finalMessage;
+	};
+
+	try {
 		const iterator = response[Symbol.asyncIterator]();
 		const closeIterator = () => {
 			void Promise.resolve(iterator.return?.()).catch(() => undefined);
 		};
 		while (true) {
 			const next = await raceWithAbort<IteratorResult<AssistantMessageEvent>>(
-				iterator.next(),
+				raceWithStallTimeout(iterator.next(), stallTimeoutMs),
 				signal,
 				closeIterator,
 			);
@@ -544,6 +689,7 @@ async function streamAssistantResponse(
 					partialMessage = event.partial;
 					context.messages.push(partialMessage);
 					addedPartial = true;
+					trackPartial(partialMessage, addedPartial);
 					await emit({ type: "message_start", message: { ...partialMessage } });
 					break;
 
@@ -571,7 +717,10 @@ async function streamAssistantResponse(
 				case "error": {
 					let finalMessage = getTerminalMessage(event);
 					try {
-						finalMessage = await maybePromiseWithAbort(response.result(), signal);
+						finalMessage = await maybePromiseWithAbort(
+							raceWithStallTimeout(response.result(), stallTimeoutMs),
+							signal,
+						);
 					} catch (error) {
 						if (!signal?.aborted || !isAbortError(error)) {
 							throw error;
@@ -591,7 +740,7 @@ async function streamAssistantResponse(
 			}
 		}
 
-		const finalMessage = await maybePromiseWithAbort(response.result(), signal);
+		const finalMessage = await maybePromiseWithAbort(raceWithStallTimeout(response.result(), stallTimeoutMs), signal);
 		if (addedPartial) {
 			context.messages[context.messages.length - 1] = finalMessage;
 		} else {

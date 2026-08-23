@@ -1,0 +1,1 @@
+- Fixed retained agents missing from the agents view until their sessions were woken.

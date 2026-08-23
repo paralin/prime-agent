@@ -2306,6 +2306,18 @@ export class DaemonSupervisor {
 				if ((source.summary.activeSessionId ?? source.summary.id) === targetActiveSessionId) {
 					throw new Error("Agent messaging cannot target the sending session");
 				}
+				const carriesStableIdentity = command.messageId !== undefined || command.replyTo !== undefined;
+				if (
+					carriesStableIdentity &&
+					(target.worker.schemaRevision ?? 0) <
+						DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_deliver_message.minSchemaRevision
+				) {
+					// Fail the delivery instead of downgrading it: an older worker would drop the
+					// mailbox identity and break retry idempotence and reply threading.
+					throw new Error(
+						`worker_deliver_message needs schema revision ${DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_deliver_message.minSchemaRevision} for stable mailbox identity`,
+					);
+				}
 				const targetClient = this.requireAvailableWorkerClient(target.worker);
 				const response = await targetClient.requestWorker(
 					{
@@ -2319,6 +2331,9 @@ export class DaemonSupervisor {
 							runtimeKind: source.summary.runtimeKind ?? "top-level",
 							clientId: client.id,
 						},
+						// Keep the mailbox identity stable so retries and replies survive the hop.
+						...(command.messageId !== undefined ? { messageId: command.messageId } : {}),
+						...(command.replyTo !== undefined ? { replyTo: command.replyTo } : {}),
 					},
 					WORKER_REQUEST_TIMEOUT_MS,
 				);

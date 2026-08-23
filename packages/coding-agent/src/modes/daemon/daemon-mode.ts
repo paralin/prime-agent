@@ -205,6 +205,7 @@ import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } f
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
+	DAEMON_WORKER_COMMAND_COMPATIBILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
 	DAEMON_WORKER_ROSTER_CAPABILITY,
@@ -471,6 +472,22 @@ type PassiveRlmSubagent = PassiveRlmRoot & {
 
 class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
+
+/** The answering supervisor's generation is missing or differs from the authenticated claim. */
+class StaleSupervisorGenerationError extends Error {
+	constructor(readonly answeringGeneration: unknown) {
+		super(`supervisor_generation_stale: answering generation ${String(answeringGeneration)}`);
+		this.name = "StaleSupervisorGenerationError";
+	}
+}
+
+/** The answering supervisor's wire schema predates a field this send requires. */
+class SupervisorSchemaTooOldError extends Error {
+	constructor(readonly requiredSchemaRevision: number) {
+		super(`supervisor_schema_too_old: needs schema revision ${requiredSchemaRevision} for stable mailbox identity`);
+		this.name = "SupervisorSchemaTooOldError";
+	}
+}
 
 export async function runDaemonMode(options: DaemonModeOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
@@ -3817,6 +3834,8 @@ export class AgentDaemon {
 						message: command.message,
 						sender: command.sender,
 						senderKey: command.sender.activeSessionId ?? `client:${command.sender.clientId}`,
+						id: command.messageId,
+						replyTo: command.replyTo,
 						origin: "agent",
 					});
 					this.writeWorkerSuccess(client, command, receipt);
@@ -6072,12 +6091,38 @@ export class AgentDaemon {
 			const candidate = new DaemonClient(supervisorSocketPath);
 			try {
 				await candidate.connect(1000);
-				await candidate.waitForHello(1000);
+				const hello = await candidate.waitForHello(1000);
+				// Never hand a message to a supervisor that is not the authenticated owner of
+				// this worker's supervisor socket: a missing generation or a claim bound to a
+				// different socket means a replacement owner could deliver outside the fence.
+				const boundClaims = [...this.supervisorClaims.values()];
+				if (boundClaims.length > 0) {
+					const boundClaim = boundClaims.find(
+						(claim) => normalizeSocketPath(claim.claim.supervisorSocketPath) === supervisorSocketPath,
+					);
+					if (!boundClaim || hello.supervisorGeneration !== boundClaim.claim.supervisorGeneration) {
+						throw new StaleSupervisorGenerationError(hello.supervisorGeneration);
+					}
+				}
+				// Revision 24 introduced stable mailbox identity on both worker_deliver_message and
+				// send_message; an older supervisor would silently drop identity while forwarding.
+				if (
+					(messageId !== undefined || replyTo !== undefined) &&
+					(hello.schemaRevision ?? 0) <
+						DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_deliver_message.minSchemaRevision
+				) {
+					throw new SupervisorSchemaTooOldError(
+						DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_deliver_message.minSchemaRevision,
+					);
+				}
 				client = candidate;
 				break;
 			} catch (error) {
 				lastError = error;
 				candidate.close();
+				if (error instanceof StaleSupervisorGenerationError || error instanceof SupervisorSchemaTooOldError) {
+					throw error;
+				}
 			}
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
 		}

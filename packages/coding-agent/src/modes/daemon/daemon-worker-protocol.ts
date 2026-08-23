@@ -17,6 +17,12 @@ export const DAEMON_WORKER_STARTUP_GATE_FD_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WO
 export const DAEMON_WORKER_STARTUP_GATE_COMMIT = "start\n";
 export type DaemonWorkerLifecycle = "starting" | "ready" | "recovering" | "stopping" | "failed";
 
+export const DAEMON_WORKER_COMMAND_COMPATIBILITY = {
+	worker_list_active_sessions: { minSchemaRevision: 23 },
+	// Schema revision at which worker_deliver_message carries stable mailbox identity
+	// fields; older workers drop unknown fields, so senders must gate on this revision.
+	worker_deliver_message: { minSchemaRevision: 26 },
+} as const;
 
 export type DaemonWorkerFrameHeader =
 	| {
@@ -113,6 +119,9 @@ export type DaemonWorkerCommand =
 			message: string;
 			sender: AgentSessionMessageSender;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
+			/** Stable mailbox identity carried across cross-worker forwarding. */
+			messageId?: string;
+			replyTo?: string;
 	  }
 	| { id?: string; type: "worker_prepare_update" }
 	| { id?: string; type: "worker_commit_update" }

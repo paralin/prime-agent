@@ -54,7 +54,10 @@ import {
 	failure,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
-import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	DAEMON_WORKER_COMMAND_COMPATIBILITY,
+	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
 
 describe("daemon mode helpers", () => {
@@ -1885,6 +1888,8 @@ describe("daemon mode helpers", () => {
 						fromState: ActiveSessionState,
 						targetSelector: string,
 						message: string,
+						messageId?: string,
+						replyTo?: string,
 					): Promise<unknown>;
 				}
 			).sendRemoteAgentSessionMessage.bind(daemon);
@@ -2122,6 +2127,236 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	interface SupervisorClaimFixture {
+		supervisorGeneration: string;
+		supervisorPid?: number;
+		supervisorSocketPath?: string;
+	}
+
+	async function startSupervisorHelloFixture(
+		tempDir: string,
+		socketPath: string,
+		helloGeneration?: string,
+		helloSchemaRevision: number = DAEMON_SCHEMA_REVISION,
+	): Promise<{
+		receivedCommands: Array<Record<string, unknown>>;
+		bindClaim(claim: SupervisorClaimFixture): void;
+		sendRemote(messageId?: string, replyTo?: string): Promise<unknown>;
+		close(): Promise<void>;
+	}> {
+		const receivedCommands: Array<Record<string, unknown>> = [];
+		const server = createServer((socket) => {
+			// Fail-fast clients may drop the socket while this fake server is mid-write.
+			socket.on("error", () => {});
+			socket.write(
+				`${JSON.stringify({
+					type: "daemon_hello",
+					socketPath,
+					protocol: DAEMON_PROTOCOL_INFO,
+					schemaRevision: helloSchemaRevision,
+					serverCapabilities: [],
+					clientId: "replacement-supervisor",
+					...(helloGeneration !== undefined ? { supervisorGeneration: helloGeneration } : {}),
+				})}\n`,
+			);
+			let buffered = "";
+			socket.on("data", (chunk: Buffer) => {
+				buffered += chunk.toString("utf8");
+				let newline = buffered.indexOf("\n");
+				while (newline !== -1) {
+					const wire = JSON.parse(buffered.slice(0, newline)) as {
+						id?: string;
+						command?: Record<string, unknown>;
+					};
+					receivedCommands.push((wire.command ?? wire) as Record<string, unknown>);
+					socket.write(
+						`${JSON.stringify({
+							type: "response",
+							id: wire.id,
+							command: "send_message",
+							success: true,
+							data: { deliveryStatus: "delivered" },
+						})}\n`,
+					);
+					buffered = buffered.slice(newline + 1);
+					newline = buffered.indexOf("\n");
+				}
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(socketPath, resolve);
+		});
+		const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
+			defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+			createRuntime: vi.fn(),
+			worker: { authenticationToken: "token" },
+		});
+		const internals = daemon as unknown as {
+			supervisorClaims: Map<object, { claim: SupervisorClaimFixture; ownerFingerprint: string }>;
+			sendRemoteAgentSessionMessage(
+				fromState: ActiveSessionState,
+				targetSelector: string,
+				message: string,
+				messageId?: string,
+				replyTo?: string,
+			): Promise<unknown>;
+		};
+		return {
+			receivedCommands,
+			bindClaim(claim: SupervisorClaimFixture): void {
+				internals.supervisorClaims.set({ id: "bound-supervisor" }, { claim, ownerFingerprint: "fingerprint" });
+			},
+			sendRemote: (messageId?: string, replyTo?: string) =>
+				internals.sendRemoteAgentSessionMessage(makeState("source"), "remote", "hello", messageId, replyTo),
+			close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+		};
+	}
+
+	it("refuses remote agent-message sends when the answering supervisor generation is stale", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-stale-gen-"));
+		const socketPath = join(tempDir, "s");
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+		try {
+			const fixture = await startSupervisorHelloFixture(tempDir, socketPath, "gen-new");
+			try {
+				fixture.bindClaim({
+					supervisorGeneration: "gen-old",
+					supervisorPid: 1,
+					supervisorSocketPath: socketPath,
+				});
+				// The retry loop must classify staleness through the typed error, not message text.
+				const rejection = await fixture.sendRemote().then(
+					() => {
+						throw new Error("expected sendRemoteAgentSessionMessage to reject");
+					},
+					(error: unknown) => error,
+				);
+				expect(rejection).toBeInstanceOf(Error);
+				expect((rejection as Error).name).toBe("StaleSupervisorGenerationError");
+				expect((rejection as Error).message).toContain("supervisor_generation_stale");
+				expect(fixture.receivedCommands.filter((command) => command.type === "send_message")).toHaveLength(0);
+			} finally {
+				await fixture.close();
+			}
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses remote agent-message sends when the answering supervisor omits its generation", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-stale-gen-missing-"));
+		const socketPath = join(tempDir, "s");
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+		try {
+			const fixture = await startSupervisorHelloFixture(tempDir, socketPath);
+			try {
+				fixture.bindClaim({
+					supervisorGeneration: "gen-old",
+					supervisorPid: 1,
+					supervisorSocketPath: socketPath,
+				});
+				await expect(fixture.sendRemote()).rejects.toThrow("supervisor_generation_stale");
+				expect(fixture.receivedCommands.filter((command) => command.type === "send_message")).toHaveLength(0);
+			} finally {
+				await fixture.close();
+			}
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses remote agent-message sends when the bound claim names another supervisor socket", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-stale-gen-socket-"));
+		const socketPath = join(tempDir, "s");
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+		try {
+			const fixture = await startSupervisorHelloFixture(tempDir, socketPath, "gen-old");
+			try {
+				fixture.bindClaim({
+					supervisorGeneration: "gen-old",
+					supervisorPid: 1,
+					supervisorSocketPath: join(tempDir, "other-s"),
+				});
+				await expect(fixture.sendRemote()).rejects.toThrow("supervisor_generation_stale");
+				expect(fixture.receivedCommands.filter((command) => command.type === "send_message")).toHaveLength(0);
+			} finally {
+				await fixture.close();
+			}
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("refuses stable-identity agent-message sends to a pre-revision supervisor", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-old-supervisor-"));
+		const socketPath = join(tempDir, "s");
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+		try {
+			const fixture = await startSupervisorHelloFixture(
+				tempDir,
+				socketPath,
+				"gen-old",
+				DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_deliver_message.minSchemaRevision - 1,
+			);
+			try {
+				fixture.bindClaim({
+					supervisorGeneration: "gen-old",
+					supervisorPid: 1,
+					supervisorSocketPath: socketPath,
+				});
+				await expect(fixture.sendRemote("agentmsg-cross-2", "agentmsg-question-2")).rejects.toThrow(
+					"supervisor_schema_too_old",
+				);
+				expect(fixture.receivedCommands.filter((command) => command.type === "send_message")).toHaveLength(0);
+			} finally {
+				await fixture.close();
+			}
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps identity-less agent-message sends compatible with a pre-revision supervisor", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-old-supervisor-plain-"));
+		const socketPath = join(tempDir, "s");
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+		try {
+			const fixture = await startSupervisorHelloFixture(
+				tempDir,
+				socketPath,
+				"gen-old",
+				DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_deliver_message.minSchemaRevision - 1,
+			);
+			try {
+				fixture.bindClaim({
+					supervisorGeneration: "gen-old",
+					supervisorPid: 1,
+					supervisorSocketPath: socketPath,
+				});
+				await expect(fixture.sendRemote()).resolves.toMatchObject({ deliveryStatus: "delivered" });
+				expect(fixture.receivedCommands.filter((command) => command.type === "send_message")).toHaveLength(1);
+			} finally {
+				await fixture.close();
+			}
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 	it("reports queued status when a direct accept races into the queue", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },

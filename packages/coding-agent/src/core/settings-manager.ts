@@ -23,6 +23,17 @@ export interface CompactionSettings {
 	keepRecentTokens?: number; // default: 20000
 	agentCallable?: boolean; // default: true - expose the compact skill so the model can request compaction
 	native?: boolean; // default: true - prefer provider-native compaction when the active API supports it
+	/**
+	 * default: provider-native compaction when supported, local summarization otherwise.
+	 * native-or-scratch: provider-native compaction when supported, scratch-handoff
+	 * rebuild (requires scratchHandoff.enabled) otherwise.
+	 */
+	strategy?: "default" | "native-or-scratch";
+}
+
+export interface ScratchHandoffSettings {
+	enabled?: boolean; // default: false - lazy per-session org checkpoints and continuity instructions
+	rootDir?: string; // default: "agent" - directory for per-session checkpoint files
 }
 
 export interface BranchSummarySettings {
@@ -172,6 +183,7 @@ export interface Settings {
 	followUpMode?: "all" | "one-at-a-time";
 	theme?: string;
 	compaction?: CompactionSettings;
+	scratchHandoff?: ScratchHandoffSettings;
 	autoRefine?: AutoRefineSettings;
 	agentTraces?: AgentTracesSettings;
 	telemetry?: TelemetrySettings;
@@ -1079,12 +1091,30 @@ export class SettingsManager {
 		return this.settings.compaction?.native ?? true;
 	}
 
-	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number; native: boolean } {
+	getCompactionStrategy(): "default" | "native-or-scratch" {
+		return this.settings.compaction?.strategy ?? "default";
+	}
+
+	getScratchHandoffSettings(): { enabled: boolean; rootDir: string } {
+		return {
+			enabled: this.settings.scratchHandoff?.enabled ?? false,
+			rootDir: this.settings.scratchHandoff?.rootDir?.trim() || "agent",
+		};
+	}
+
+	getCompactionSettings(): {
+		enabled: boolean;
+		reserveTokens: number;
+		keepRecentTokens: number;
+		native: boolean;
+		strategy: "default" | "native-or-scratch";
+	} {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
 			native: this.getCompactionNative(),
+			strategy: this.getCompactionStrategy(),
 		};
 	}
 

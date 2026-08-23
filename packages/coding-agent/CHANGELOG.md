@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added scratch-handoff compaction: with `compaction.strategy: native-or-scratch` and `scratchHandoff.enabled`, models whose provider has no native compaction rebuild context around a lazily maintained org checkpoint (closeout turn, resume payload, bounded recent-context delta) while provider-native compaction keeps serving models like OpenAI Codex.
 - Added an RPC-only foreground harness mode with literal prompts, bounded RLM and Act policy, service-tier state, and autonomous-entry isolation.
 
 - Added 30-second elapsed-time hints to provider system context without adding transcript or UI messages.

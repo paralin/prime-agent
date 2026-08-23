@@ -2,9 +2,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { success } from "../src/modes/daemon/daemon-protocol.js";
+import { DAEMON_SCHEMA_REVISION, success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor, idleEvictionSweepIntervalMs } from "../src/modes/daemon/daemon-supervisor.js";
+import { DAEMON_WORKER_COMMAND_COMPATIBILITY } from "../src/modes/daemon/daemon-worker-protocol.js";
 import type { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
 
 interface WorkerFixture {
@@ -23,6 +24,7 @@ interface WorkerFixture {
 		requestWorker: ReturnType<typeof vi.fn>;
 		close: ReturnType<typeof vi.fn>;
 	};
+	schemaRevision?: number;
 	summaries: Map<string, SessionSummary>;
 	intentionalStop: boolean;
 	updateRestartPrepareClient?: object;
@@ -463,6 +465,74 @@ describe("daemon supervisor whole-tree eviction", () => {
 			command: "send_message",
 			data: { deliveryStatus: "delivered" },
 		});
+	});
+
+	it("forwards stable message id and replyTo through cross-worker delivery", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const sourceSummary = makeSummary("source-active", now, { sessionId: "source-session" });
+		const targetSummary = makeSummary("target-active", now, { sessionId: "target-session" });
+		const source = makeWorker("source", [sourceSummary]);
+		const target = makeWorker("target", [targetSummary]);
+		target.schemaRevision = DAEMON_SCHEMA_REVISION;
+		target.client!.requestWorker.mockResolvedValue({
+			type: "response",
+			command: "worker_deliver_message",
+			success: true,
+			data: { deliveryStatus: "delivered" },
+		});
+		supervisor.workers.set("source", source);
+		supervisor.workers.set("target", target);
+		const client = { id: "sender", attachedActiveSessionIds: new Set<string>() };
+
+		const response = await supervisor.handleCommand(client, {
+			id: "message-stable",
+			type: "send_message",
+			targetActiveSessionId: "target-active",
+			fromActiveSessionId: "source-active",
+			message: "hello across workers",
+			messageId: "agentmsg-stable-9",
+			replyTo: "agentmsg-parent-q",
+		});
+
+		expect(target.client?.requestWorker).toHaveBeenCalledWith(
+			expect.objectContaining({
+				type: "worker_deliver_message",
+				targetActiveSessionId: "target-active",
+				message: "hello across workers",
+				messageId: "agentmsg-stable-9",
+				replyTo: "agentmsg-parent-q",
+			}),
+			24 * 60 * 60 * 1000,
+		);
+		expect(response).toMatchObject({ success: true, id: "message-stable", command: "send_message" });
+	});
+
+	it("fails cross-worker delivery carrying stable identity to a pre-revision worker", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const sourceSummary = makeSummary("source-active", now, { sessionId: "source-session" });
+		const targetSummary = makeSummary("target-active", now, { sessionId: "target-session" });
+		const source = makeWorker("source", [sourceSummary]);
+		const target = makeWorker("target", [targetSummary]);
+		target.schemaRevision = DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_deliver_message.minSchemaRevision - 1;
+		target.client!.requestWorker = vi.fn();
+		supervisor.workers.set("source", source);
+		supervisor.workers.set("target", target);
+		const client = { id: "sender", attachedActiveSessionIds: new Set<string>() };
+
+		await expect(
+			supervisor.handleCommand(client, {
+				id: "message-old-worker",
+				type: "send_message",
+				targetActiveSessionId: "target-active",
+				fromActiveSessionId: "source-active",
+				message: "hello across workers",
+				messageId: "agentmsg-stable-10",
+				replyTo: "agentmsg-parent-q",
+			}),
+		).rejects.toThrow("stable mailbox identity");
+		expect(target.client?.requestWorker).not.toHaveBeenCalled();
 	});
 
 	it("fails an unknown agent-message selector without forwarding it back to the worker", async () => {

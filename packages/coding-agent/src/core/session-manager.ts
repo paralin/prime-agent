@@ -20,6 +20,7 @@ import {
 	realpathSync,
 	renameSync,
 	rmSync,
+	type Stats,
 	statSync,
 	writeFileSync,
 } from "fs";
@@ -992,9 +993,24 @@ function extractOversizedMessageSummary(line: string): {
 }
 
 interface SessionInfoCacheEntry {
+	dev: number;
+	ino: number;
 	size: number;
 	mtimeMs: number;
 	info: SessionInfo | null;
+	scan?: SessionInfoScan;
+}
+
+interface SessionInfoScan {
+	header?: SessionHeader;
+	messageCount: number;
+	conversationMessageCount: number;
+	firstMessage: string;
+	allMessagesText: string;
+	name?: string;
+	state?: SessionState;
+	agentStatus?: AgentStatus;
+	lastActivityTime?: number;
 }
 
 // Session files are append-only, so an unchanged (size, mtimeMs) means identical
@@ -1013,7 +1029,7 @@ export function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
 }
 
 async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null> {
-	let stats: Awaited<ReturnType<typeof stat>>;
+	let stats: Stats;
 	try {
 		stats = await stat(filePath);
 	} catch {
@@ -1023,24 +1039,43 @@ async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null
 	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
 		return cached.info;
 	}
-	const info = await scanSessionInfo(filePath, stats);
-	sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, info });
+	const appendCache =
+		cached?.scan && cached.dev === stats.dev && cached.ino === stats.ino && cached.size < stats.size
+			? { scan: cached.scan, size: cached.size }
+			: undefined;
+	const scan = appendCache
+		? await scanSessionInfoRange(filePath, stats, { ...appendCache.scan }, appendCache.size)
+		: await scanSessionInfoRange(filePath, stats, createSessionInfoScan(), 0);
+	const info = sessionInfoFromScan(filePath, stats, scan);
+	sessionInfoCache.set(filePath, {
+		dev: stats.dev,
+		ino: stats.ino,
+		size: stats.size,
+		mtimeMs: stats.mtimeMs,
+		info,
+		...(scan.header ? { scan } : {}),
+	});
 	return info;
 }
 
-async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeof stat>>): Promise<SessionInfo | null> {
-	try {
-		let header: SessionHeader | undefined;
-		let messageCount = 0;
-		let conversationMessageCount = 0;
-		let firstMessage = "";
-		let allMessagesText = "";
-		let name: string | undefined;
-		let state: SessionState | undefined;
-		let agentStatus: AgentStatus | undefined;
-		let lastActivityTime: number | undefined;
+function createSessionInfoScan(): SessionInfoScan {
+	return {
+		messageCount: 0,
+		conversationMessageCount: 0,
+		firstMessage: "",
+		allMessagesText: "",
+	};
+}
 
-		for await (const lineBuffer of readLinesAsBuffers(filePath)) {
+async function scanSessionInfoRange(
+	filePath: string,
+	stats: Stats,
+	scan: SessionInfoScan,
+	start: number,
+): Promise<SessionInfoScan> {
+	try {
+		if (start >= stats.size) return scan;
+		for await (const lineBuffer of readLinesAsBuffers(filePath, { start, end: stats.size - 1 })) {
 			const line = lineBuffer.toString("utf8");
 			if (!line.trim()) continue;
 
@@ -1049,16 +1084,16 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			// can exhaust the daemon heap.
 			if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
 				if (looksLikeMessageEntry(line)) {
-					messageCount++;
+					scan.messageCount++;
 					const summary = extractOversizedMessageSummary(line);
 					if (summary.role === "user" || summary.role === "assistant") {
-						conversationMessageCount++;
+						scan.conversationMessageCount++;
 					}
 					if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
-						lastActivityTime = Math.max(lastActivityTime ?? 0, summary.timestamp);
+						scan.lastActivityTime = Math.max(scan.lastActivityTime ?? 0, summary.timestamp);
 					}
-					if (summary.role === "user" && !firstMessage) {
-						firstMessage = summary.textPreview || "(large message)";
+					if (summary.role === "user" && !scan.firstMessage) {
+						scan.firstMessage = summary.textPreview || "(large message)";
 					}
 				}
 				continue;
@@ -1074,72 +1109,71 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 
 			if (entry.type === "session_info") {
 				const infoEntry = entry as SessionInfoEntry;
-				name = infoEntry.name?.trim() || undefined;
+				scan.name = infoEntry.name?.trim() || undefined;
 			}
 			if (entry.type === "session_state") {
 				const stateEntry = entry as SessionStateEntry;
 				const status = normalizeSessionStateStatus(stateEntry.state?.status);
 				if (status) {
-					state = { status };
+					scan.state = { status };
 				}
 			}
 			// Keep the latest recap/verdict so off-daemon sessions don't all show as
 			// unjudged in the agents view. Append-only, so last seen wins.
 			if (entry.type === "agent_status") {
-				agentStatus = (entry as AgentStatusEntry).status;
+				scan.agentStatus = (entry as AgentStatusEntry).status;
 			}
 
-			if (!header) {
+			if (!scan.header) {
 				if (entry.type !== "session") {
-					return null;
+					return scan;
 				}
-				header = entry as SessionHeader;
+				scan.header = entry as SessionHeader;
 			}
 
-			lastActivityTime = updateLastActivityTime(lastActivityTime, entry);
+			scan.lastActivityTime = updateLastActivityTime(scan.lastActivityTime, entry);
 
 			if (entry.type !== "message") continue;
-			messageCount++;
+			scan.messageCount++;
 
 			const message = (entry as SessionMessageEntry).message;
 			if (!isMessageWithContent(message)) continue;
 			if (message.role !== "user" && message.role !== "assistant") continue;
-			conversationMessageCount++;
+			scan.conversationMessageCount++;
 
 			const textContent = extractTextContent(message);
 			if (!textContent) continue;
 
-			allMessagesText = appendCappedSearchText(allMessagesText, textContent);
-			if (!firstMessage && message.role === "user") {
-				firstMessage = textContent;
+			scan.allMessagesText = appendCappedSearchText(scan.allMessagesText, textContent);
+			if (!scan.firstMessage && message.role === "user") {
+				scan.firstMessage = textContent;
 			}
 		}
-
-		if (!header) return null;
-		const cwd = typeof header.cwd === "string" ? header.cwd : "";
-		const parentSessionPath = header.parentSession;
-		const rlmDepth = resolveSessionRlmDepth(header, filePath);
-		const modified = getSessionModifiedDateFromLastActivity(lastActivityTime, header, stats.mtime);
-
-		return {
-			path: filePath,
-			id: header.id,
-			cwd,
-			name,
-			state,
-			parentSessionPath,
-			rlmDepth,
-			created: new Date(header.timestamp),
-			modified,
-			messageCount,
-			conversationMessageCount,
-			firstMessage: firstMessage || "(no messages)",
-			allMessagesText,
-			agentStatus,
-		};
+		return scan;
 	} catch {
-		return null;
+		return scan;
 	}
+}
+
+function sessionInfoFromScan(filePath: string, stats: Stats, scan: SessionInfoScan): SessionInfo | null {
+	const header = scan.header;
+	if (!header) return null;
+	return {
+		path: filePath,
+		id: header.id,
+		cwd: typeof header.cwd === "string" ? header.cwd : "",
+		name: scan.name,
+		state: scan.state,
+		parentSessionPath: header.parentSession,
+		rlmDepth: resolveSessionRlmDepth(header, filePath),
+		created: new Date(header.timestamp),
+		modified: getSessionModifiedDateFromLastActivity(scan.lastActivityTime, header, stats.mtime),
+		messageCount: scan.messageCount,
+		conversationMessageCount: scan.conversationMessageCount,
+		firstMessage: scan.firstMessage || "(no messages)",
+		allMessagesText: scan.allMessagesText,
+		agentStatus: scan.agentStatus,
+	};
 }
 
 export type SessionListProgress = (loaded: number, total: number) => void;

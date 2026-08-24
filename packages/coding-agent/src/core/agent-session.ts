@@ -230,6 +230,7 @@ import {
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	MANUAL_CONTINUE_CUSTOM_TYPE,
 	MANUAL_CONTINUE_PROMPT,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
@@ -5129,8 +5130,13 @@ export class AgentSession {
 			}
 			const schedule = options?.streamingBehavior ?? "followUp";
 			const prefixMessages = visibleQueued ? this._takePendingNextTurnMessages() : undefined;
-			const action = this._createPreparedTurnAction(schedule, text, undefined, {
-				message,
+			// A manual continue ("." in the composer) that drains queued messages
+			// does not need its own continuation notice: the queued messages are the
+			// turn input, so injecting <system-notice> would be redundant.
+			const dropManualContinueNotice =
+				message.customType === MANUAL_CONTINUE_CUSTOM_TYPE && (prefixMessages?.length ?? 0) > 0;
+			const action = this._createPreparedTurnAction(schedule, dropManualContinueNotice ? "" : text, undefined, {
+				message: dropManualContinueNotice ? undefined : message,
 				prefixMessages,
 				queueKey: options?.followUpQueueKey,
 				previewLabel: injectedMessagePreviewLabel(message),

@@ -185,9 +185,7 @@ describe("agentLoop with AgentMessage", () => {
 				]);
 			}
 			const stream = new MockAssistantStream();
-			queueMicrotask(() =>
-				stream.push({ type: "done", reason: "stop", message: successMessage }),
-			);
+			queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: successMessage }));
 			return stream;
 		};
 
@@ -214,6 +212,40 @@ describe("agentLoop with AgentMessage", () => {
 			(event) => event.type === "message_start" && event.message.role === "assistant",
 		);
 		expect(assistantStarts.length).toBe(2);
+	});
+
+	it("aborts and retries when establishing the provider stream hangs", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const successMessage = createAssistantMessage([{ type: "text", text: "complete" }]);
+		let callCount = 0;
+		const streamFn = () => {
+			callCount += 1;
+			if (callCount === 1) {
+				return new Promise<Awaited<ReturnType<StreamFn>>>(() => undefined);
+			}
+			const stream = new MockAssistantStream();
+			queueMicrotask(() =>
+				stream.push({ type: "done", reason: "stop", message: successMessage }),
+			);
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Hello")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter, streamStallTimeoutMs: 20 },
+			vi.fn(),
+			undefined,
+			streamFn,
+		);
+
+		expect(callCount).toBe(2);
+		const assistants = messages.filter((message) => message.role === "assistant");
+		expect(assistants).toEqual([successMessage]);
 	});
 
 	it("surfaces an error message after repeated stream stalls", async () => {

@@ -8,6 +8,7 @@ import {
 	type AssistantMessageEvent,
 	type Context,
 	EventStream,
+	getLogger,
 	streamSimple,
 	type ToolResultMessage,
 	validateToolArguments,
@@ -39,6 +40,7 @@ const STREAM_STALL_TIMEOUT_MS = 180_000;
 // A provider that stalls on every attempt would retry forever, so cap the
 // retries and surface the failure as an error on the final response.
 const MAX_STREAM_STALL_RETRIES = 2;
+const stallLog = getLogger("agent.stream-stall");
 const EMPTY_USAGE: AssistantMessage["usage"] = {
 	input: 0,
 	output: 0,
@@ -535,6 +537,13 @@ async function streamAssistantResponse(
 			if (!(error instanceof StreamStallError) || signal?.aborted) {
 				throw error;
 			}
+			stallLog.warn("provider stream stalled", {
+				provider: config.model.provider,
+				model: config.model.id,
+				attempt: attempt + 1,
+				maxAttempts: MAX_STREAM_STALL_RETRIES + 1,
+				timeoutMs: stallTimeoutMs,
+			});
 			if (attempt < MAX_STREAM_STALL_RETRIES) {
 				// Roll back the abandoned partial so the retry streams into a clean context.
 				if (addedPartial && context.messages.at(-1) === partialMessage) {
@@ -599,22 +608,17 @@ async function streamAssistantAttempt(
 
 		try {
 			const response = await maybePromiseWithAbort(
-				streamFunction(config.model, llmContext, {
-					...config,
-					apiKey: resolvedApiKey,
-					signal: requestController.signal,
-				}),
+				raceWithStallTimeout(
+					Promise.resolve(streamFunction(config.model, llmContext, {
+						...config,
+						apiKey: resolvedApiKey,
+						signal: requestController.signal,
+					})),
+					stallTimeoutMs,
+				),
 				signal,
 			);
-			return await consumeAssistantStream(
-				response,
-				context,
-				config,
-				signal,
-				emit,
-				stallTimeoutMs,
-				trackPartial,
-			);
+			return await consumeAssistantStream(response, context, config, signal, emit, stallTimeoutMs, trackPartial);
 		} catch (error) {
 			if (error instanceof StreamStallError) {
 				requestController.abort();
@@ -711,7 +715,10 @@ async function consumeAssistantStream(
 				case "error": {
 					let finalMessage = getTerminalMessage(event);
 					try {
-						finalMessage = await maybePromiseWithAbort(response.result(), signal);
+						finalMessage = await maybePromiseWithAbort(
+							raceWithStallTimeout(response.result(), stallTimeoutMs),
+							signal,
+						);
 					} catch (error) {
 						if (!signal?.aborted || !isAbortError(error)) {
 							throw error;
@@ -731,7 +738,10 @@ async function consumeAssistantStream(
 			}
 		}
 
-		const finalMessage = await maybePromiseWithAbort(response.result(), signal);
+		const finalMessage = await maybePromiseWithAbort(
+			raceWithStallTimeout(response.result(), stallTimeoutMs),
+			signal,
+		);
 		if (addedPartial) {
 			context.messages[context.messages.length - 1] = finalMessage;
 		} else {

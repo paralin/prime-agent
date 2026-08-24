@@ -1,10 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
-import { SCRATCH_HANDOFF_READ_CUSTOM_TYPE } from "../src/core/compaction/scratch-handoff.js";
+import { resolveScratchHandoffPath, SCRATCH_HANDOFF_READ_CUSTOM_TYPE } from "../src/core/compaction/scratch-handoff.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { createAgentSession } from "../src/core/sdk.js";
 import { SessionManager } from "../src/core/session-manager.js";
@@ -12,18 +12,30 @@ import { SettingsManager } from "../src/core/settings-manager.js";
 import { createTestResourceLoader } from "./utilities.js";
 
 describe("scratch handoff compaction", () => {
-	it("injects continuity instructions and rebuilds around the checkpoint without an LLM summary", async () => {
+	it("/compact runs the closeout turn and rebuilds around the updated checkpoint", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-scratch-handoff-"));
 		const faux = registerFauxProvider();
 		try {
 			const rootDir = join(tempDir, "scratch");
-			let providerCalls = 0;
-			let providerSystemPrompt = "";
+			const providerCalls: string[] = [];
+			let expectedPath: string | undefined;
 			faux.setResponses([
-				(context) => {
-					providerCalls++;
-					providerSystemPrompt = context.systemPrompt ?? "";
+				(_context) => {
+					providerCalls.push("work");
 					return fauxAssistantMessage("work done");
+				},
+				(context) => {
+					const promptText = JSON.stringify(context.messages);
+					if (!promptText.includes("PENCILS DOWN")) {
+						providerCalls.push("unexpected");
+						return fauxAssistantMessage("not a closeout");
+					}
+					providerCalls.push("closeout");
+					if (expectedPath) {
+						mkdirSync(join(expectedPath, ".."), { recursive: true });
+						writeFileSync(expectedPath, "* TODO Work\n- Objective: Finish\n- Next action: Verify\n");
+					}
+					return fauxAssistantMessage("checkpoint written");
 				},
 			]);
 			const authStorage = AuthStorage.inMemory();
@@ -43,37 +55,32 @@ describe("scratch handoff compaction", () => {
 				noTools: "all",
 				cwd: tempDir,
 			});
+			expectedPath = resolveScratchHandoffPath({
+				cwd: tempDir,
+				rootDir,
+				sessionId: session.sessionId,
+			}).absolutePath;
 
 			await session.prompt("do some work");
 			await session.waitForIdle();
-			expect(providerCalls).toBe(1);
-			expect(providerSystemPrompt).toContain("Scratch continuity:");
-			expect(providerSystemPrompt).toContain(rootDir);
 
-			// No checkpoint yet: the requested compaction still routes to the
-			// scratch rebuild and carries the recent conversation as the delta.
 			const result = await session.compact();
 			expect(result.summary).toContain("Scratch handoff");
+			expect(providerCalls).toEqual(["work", "closeout"]);
 
 			const entries = session.sessionManager.getBranch();
 			const readMarker = [...entries]
 				.reverse()
 				.find((e) => e.type === "custom_message" && e.customType === SCRATCH_HANDOFF_READ_CUSTOM_TYPE);
 			expect(readMarker).toBeDefined();
+			const details = (readMarker as { details?: { path?: string } }).details;
+			expect(details?.path).toBe(expectedPath);
 			const compaction = entries.find((e) => e.type === "compaction" && e.firstKeptEntryId === readMarker!.id);
 			expect(compaction).toBeDefined();
 
-			// The rebuilt context starts at the resume payload; pre-compaction
-			// turns are gone and no summarization request was made.
-			const resumedMessages = session.agent.state.messages;
-			expect(JSON.stringify(resumedMessages)).toContain("No scratch checkpoint exists yet");
-			// The recent turn rides inside the resume payload as the bounded delta.
-			expect(resumedMessages.filter((m) => m.role === "user" || m.role === "assistant").length).toBe(0);
-			expect(providerCalls).toBe(1);
-
-			// The persisted read marker pins the checkpoint path for later sessions.
-			const details = (readMarker as { details?: { path?: string } }).details;
-			expect(details?.path).toContain(rootDir);
+			const resumedText = JSON.stringify(session.agent.state.messages);
+			expect(resumedText).toContain("- Next action: Verify");
+			expect(resumedText).not.toContain('"role":"user"');
 
 			await session.disposeAsync();
 		} finally {
@@ -82,17 +89,42 @@ describe("scratch handoff compaction", () => {
 		}
 	});
 
-	it("records a closeout write marker when the staged turn changed the document", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "pi-scratch-closeout-"));
+	it("/compact falls back to standard summarization when the closeout updates nothing", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-scratch-fallback-"));
 		const faux = registerFauxProvider();
 		try {
-			faux.setResponses([fauxAssistantMessage("ok")]);
+			const rootDir = join(tempDir, "scratch");
+			const providerCalls: string[] = [];
+			faux.setResponses([
+				(_context) => {
+					providerCalls.push("work");
+					return fauxAssistantMessage("work done");
+				},
+				(_context) => {
+					providerCalls.push("work");
+					return fauxAssistantMessage("more work done");
+				},
+				(context) => {
+					providerCalls.push(
+						JSON.stringify(context.messages).includes("PENCILS DOWN") ? "closeout" : "unexpected",
+					);
+					return fauxAssistantMessage("I did not write anything");
+				},
+				(_context) => {
+					providerCalls.push("summarize");
+					return fauxAssistantMessage("Concise summary of the session work.");
+				},
+				// Turn-prefix and branch summarization make further side requests.
+				fauxAssistantMessage("Older turns summarized."),
+				fauxAssistantMessage("Remaining turns summarized."),
+			]);
 			const authStorage = AuthStorage.inMemory();
 			authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
-			const rootDir = join(tempDir, "scratch");
 			const settingsManager = SettingsManager.inMemory();
 			settingsManager.applyOverrides({
-				compaction: { enabled: true, strategy: "native-or-scratch" },
+				// A tiny keep-recent window leaves older turns to summarize on the
+				// fallback path; otherwise the short fixture session has nothing to compact.
+				compaction: { enabled: true, strategy: "native-or-scratch", keepRecentTokens: 10 },
 				scratchHandoff: { enabled: true, rootDir },
 			});
 			const { session } = await createAgentSession({
@@ -105,46 +137,24 @@ describe("scratch handoff compaction", () => {
 				noTools: "all",
 				cwd: tempDir,
 			});
+
+			await session.prompt("first piece of work");
+			await session.waitForIdle();
+			await session.prompt("second piece of work");
 			await session.waitForIdle();
 
-			const internals = session as unknown as {
-				_maybeStageScratchHandoffCloseout(): Promise<boolean>;
-				_scratchCloseout?: { displayPath: string; baselineText: string | undefined };
-			};
-			await expect(internals._maybeStageScratchHandoffCloseout()).resolves.toBe(true);
-			const stagedPath = internals._scratchCloseout!.displayPath;
-
-			// The path pin persists before the closeout turn runs.
-			const pinEntry = session.sessionManager
-				.getBranch()
-				.find((e) => e.type === "custom" && (e as { customType?: string }).customType === "scratch-handoff-path");
-			expect((pinEntry as { data?: { path?: string } } | undefined)?.data?.path).toBe(stagedPath);
-
-			// Simulate the closeout turn writing the checkpoint.
-			const fs = await import("node:fs");
-			fs.mkdirSync(dirname(stagedPath), { recursive: true });
-			fs.writeFileSync(stagedPath, "* TODO Work\n- Objective: Finish\n- Next action: Verify\n");
-
 			const result = await session.compact();
-			expect(result.summary).toContain("Scratch handoff");
 
+			// Closeout turn ran, produced no document, and the runtime fell back
+			// to the ordinary summarization compaction instead of rebuilding
+			// around an empty checkpoint.
+			expect(providerCalls).toEqual(["work", "work", "closeout", "summarize"]);
 			const entries = session.sessionManager.getBranch();
-			const writeMarkers = entries.filter(
-				(e) => e.type === "custom" && (e as { customType?: string }).customType === "scratch-handoff-write",
-			);
-			expect(writeMarkers.length).toBe(1);
 			const readMarker = [...entries]
 				.reverse()
 				.find((e) => e.type === "custom_message" && e.customType === SCRATCH_HANDOFF_READ_CUSTOM_TYPE);
-			expect(readMarker).toBeDefined();
-			const resumedText = JSON.stringify(session.agent.state.messages);
-			expect(resumedText).toContain("- Next action: Verify");
-
-			// While the staged turn is still queued, staging holds compaction.
-			internals._scratchCloseout = undefined;
-			await expect(internals._maybeStageScratchHandoffCloseout()).resolves.toBe(true);
-			await session.waitForIdle();
-			await expect(internals._maybeStageScratchHandoffCloseout()).resolves.toBe(false);
+			expect(readMarker).toBeUndefined();
+			expect(result.summary).toContain("Concise summary of the session work.");
 
 			await session.disposeAsync();
 		} finally {

@@ -133,6 +133,7 @@ import {
 	SCRATCH_HANDOFF_PATH_CUSTOM_TYPE,
 	SCRATCH_HANDOFF_READ_CUSTOM_TYPE,
 	SCRATCH_HANDOFF_WRITE_CUSTOM_TYPE,
+	scratchHandoffHasContent,
 	scratchHandoffRecentContextBudget,
 	serializeConversation,
 	shouldCompact,
@@ -7810,6 +7811,9 @@ export class AgentSession {
 		}
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
 		if (!options.skipAbort && !queuesBehindForegroundAct) await this.abort();
+		// Run the pencils-down closeout turn before the compaction lease: the
+		// lease disconnects from agent events, so the turn must run outside it.
+		await this._runScratchHandoffCloseoutEpisode();
 		return this._rootForeground.run("compaction", () =>
 			this._compactWithLease(customInstructions, hadPostCompactionContinue),
 		);
@@ -7848,6 +7852,7 @@ export class AgentSession {
 				headers,
 				customInstructions,
 				signal: this._compactionAbortController.signal,
+				reason: "manual",
 			});
 
 			this._emit({
@@ -7911,13 +7916,17 @@ export class AgentSession {
 		headers?: Record<string, string>;
 		customInstructions?: string;
 		signal: AbortSignal;
+		reason?: "manual" | "overflow" | "threshold" | "requested";
 	}): Promise<CompactionResult> {
 		const { model, apiKey, headers, customInstructions, signal } = options;
 		const pathEntries = this.sessionManager.getBranch();
 		const settings = this.settingsManager.getCompactionSettings();
 		const supportsNativeCompaction = settings.native && getApiProvider(model.api)?.compact !== undefined;
 		if (!supportsNativeCompaction && this._scratchHandoffRoute()) {
-			return await this._performScratchHandoffCompaction();
+			const scratchResult = await this._performScratchHandoffCompaction(options.reason ?? "manual");
+			// Undefined means the checkpoint produced nothing usable for a
+			// rebuild; fall through to standard summarization.
+			if (scratchResult) return scratchResult;
 		}
 		const portablePreparation = prepareCompaction(pathEntries, settings);
 		const nativePreparation =
@@ -8127,11 +8136,30 @@ export class AgentSession {
 	}
 
 	/**
+	 * Give the model one pencils-down turn to update the scratch checkpoint
+	 * before a compaction rebuild, and wait for it to finish. No-op when the
+	 * scratch route is inactive or a staged closeout already ran.
+	 */
+	private async _runScratchHandoffCloseoutEpisode(): Promise<void> {
+		if (!this._scratchHandoffRoute()) return;
+		const displayPath = this._scratchHandoffDisplayPath();
+		if (!displayPath) return;
+		if (this._scratchCloseout?.displayPath !== displayPath) {
+			await this._maybeStageScratchHandoffCloseout();
+		}
+		if (this.agent.hasQueuedMessages()) {
+			await this.waitForIdle();
+		}
+	}
+
+	/**
 	 * Rebuild context around the scratch checkpoint instead of running an
 	 * LLM-authored summary. The resume message carries the checkpoint body plus
 	 * a bounded recent-context delta; everything before it leaves the context.
 	 */
-	private async _performScratchHandoffCompaction(): Promise<CompactionResult> {
+	private async _performScratchHandoffCompaction(
+		reason: "manual" | "overflow" | "threshold" | "requested",
+	): Promise<CompactionResult | undefined> {
 		const displayPath = this._scratchHandoffDisplayPath();
 		if (!displayPath) throw new Error("Scratch handoff is not active");
 		// ENOENT means no checkpoint yet; other read failures fail the compaction
@@ -8139,8 +8167,16 @@ export class AgentSession {
 		const scratchText = await readScratchHandoffText(resolveToCwd(displayPath, this._cwd));
 
 		const closeout = this._scratchCloseout?.displayPath === displayPath ? this._scratchCloseout : undefined;
+		const wrote = closeout !== undefined && scratchText !== undefined && scratchText !== closeout.baselineText;
+		if (reason !== "overflow" && !wrote && !scratchHandoffHasContent(scratchText ?? "")) {
+			// The closeout produced nothing usable: no document, or the model never
+			// wrote one. Rebuilding around an empty checkpoint would discard the
+			// conversation, so fall back to standard summarization instead.
+			this._scratchCloseout = undefined;
+			return undefined;
+		}
 		if (closeout) {
-			if (scratchText !== undefined && scratchText !== closeout.baselineText) {
+			if (wrote) {
 				this.sessionManager.appendCustomEntry(SCRATCH_HANDOFF_WRITE_CUSTOM_TYPE, { path: displayPath });
 			}
 			this._scratchCloseout = undefined;
@@ -9210,6 +9246,11 @@ export class AgentSession {
 			}
 		};
 
+		// Overflow recovery cannot spare a turn; every other reason gives the
+		// model its pencils-down checkpoint turn before maintenance starts.
+		if (reason !== "overflow") {
+			await this._runScratchHandoffCloseoutEpisode();
+		}
 		this._emit({ type: "compaction_start", reason, customInstructions });
 		this._autoCompactionAbortController = new AbortController();
 
@@ -9237,6 +9278,7 @@ export class AgentSession {
 				headers: authResult.headers,
 				customInstructions,
 				signal: this._autoCompactionAbortController.signal,
+				reason,
 			});
 
 			this._emit({

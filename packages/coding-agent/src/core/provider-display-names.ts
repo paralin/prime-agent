@@ -12,6 +12,7 @@ export const BUILT_IN_PROVIDER_DISPLAY_NAMES: Record<string, string> = {
 	groq: "Groq",
 	huggingface: "Hugging Face",
 	"kimi-coding": "Kimi For Coding",
+	"merge-gateway": "Merge Gateway",
 	mistral: "Mistral",
 	minimax: "MiniMax",
 	"minimax-cn": "MiniMax (China)",

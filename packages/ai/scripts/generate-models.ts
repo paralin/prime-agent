@@ -868,6 +868,54 @@ async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 	}
 }
 
+function getMergeGatewayModels(): Model<"openai-completions">[] {
+	// Merge Gateway's live catalog at GET /v1/models requires an API key, so this list stays static.
+	const baseUrl = "https://api-gateway.merge.dev/v1";
+	const compat: OpenAICompletionsCompat = { supportsReasoningEffort: false };
+
+	return [
+		{
+			id: "anthropic/claude-opus-4-6",
+			name: "Claude Opus 4.6",
+			api: "openai-completions",
+			provider: "merge-gateway",
+			baseUrl,
+			compat,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 2.5, output: 10, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000000,
+			maxTokens: 32768,
+		},
+		{
+			id: "anthropic/claude-sonnet-4-6",
+			name: "Claude Sonnet 4.6",
+			api: "openai-completions",
+			provider: "merge-gateway",
+			baseUrl,
+			compat,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000000,
+			maxTokens: 64000,
+		},
+		{
+			id: "google/gemini-3.5-flash",
+			name: "Gemini 3.5 Flash",
+			api: "openai-completions",
+			provider: "merge-gateway",
+			baseUrl,
+			compat,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1048576,
+			maxTokens: 65536,
+		},
+	];
+}
+
 async function loadModelsDevData(): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from models.dev API...");
@@ -1606,9 +1654,10 @@ async function generateModels() {
 	const modelsDevModels = await loadModelsDevData();
 	const openRouterModels = await fetchOpenRouterModels();
 	const aiGatewayModels = await fetchAiGatewayModels();
+	const mergeGatewayModels = getMergeGatewayModels();
 
 	// Combine models (models.dev has priority)
-	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels].filter(
+	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels, ...mergeGatewayModels].filter(
 		(model) =>
 			!((model.provider === "opencode" || model.provider === "opencode-go") && model.id === "gpt-5.3-codex-spark"),
 	);

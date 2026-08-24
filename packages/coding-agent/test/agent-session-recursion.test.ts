@@ -1475,26 +1475,32 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
-	it("releases a hosted child when its initial task fails", async () => {
+	it("retains a hosted child when its initial task fails", async () => {
 		const child = createSession({ rlmSessionDir: join(tempDir, "host-error-child") });
+		const disposeChild = vi.spyOn(child, "disposeAsync");
 		vi.spyOn(child, "promptAndWait").mockRejectedValue(new Error("child prompt failed"));
 		const releaseRlmSubagentRuntime = vi.fn(async () => {});
+		const deleteRlmSubagentRuntime = vi.fn(async () => {});
 		const root = createSession({
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: child }),
 				releaseRlmSubagentRuntime,
-				deleteRlmSubagentRuntime: async () => {},
+				deleteRlmSubagentRuntime,
 			},
 		});
 
 		const spawned = await root.runRlmChild("fail hosted child");
-		await vi.waitFor(() => {
-			expect(releaseRlmSubagentRuntime).toHaveBeenCalledWith(
-				expect.objectContaining({ session: child }),
-				expect.objectContaining({ id: spawned.rlm_child_id }),
-				"error",
+		await vi.waitFor(async () => {
+			expect((await root.listRlmSubagents()).subagents).toContainEqual(
+				expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "error" }),
 			);
 		});
+		expect(releaseRlmSubagentRuntime).not.toHaveBeenCalled();
+		expect(disposeChild).not.toHaveBeenCalled();
+		expect(root.getRlmChildSession(spawned.rlm_child_id)).toBe(child);
+
+		await root.deleteRlmSubagent(spawned.rlm_child_id);
+		expect(deleteRlmSubagentRuntime).toHaveBeenCalledWith(spawned.rlm_child_id, child);
 	});
 
 	it("strong quiescence waits for a gated child bash activity change", async () => {

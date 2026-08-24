@@ -12399,6 +12399,7 @@ export class AgentSession {
 		// retention, cancellation, and late-startup cleanup.
 		void (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
+			let initialTaskCompleted = false;
 			try {
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
 				const child = childRuntime.session;
@@ -12504,6 +12505,7 @@ export class AgentSession {
 					throw new Error(terminalAssistant.errorMessage ?? "RLM child provider request failed");
 				}
 				run.status = "done";
+				initialTaskCompleted = true;
 				run.durationMs = Date.now() - startedAt;
 				run.activity = undefined;
 				emitChildUpdate();
@@ -12569,7 +12571,15 @@ export class AgentSession {
 						);
 					}
 				}
-				if (!run.detachedDeletion && childSession && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
+				// A failed model turn is not a child-session lifetime boundary. Keep the
+				// published session and its descendants until the parent explicitly deletes it.
+				const retainFailedTask = run.status === "error" && childSession !== undefined && !initialTaskCompleted;
+				if (
+					!retainFailedTask &&
+					!run.detachedDeletion &&
+					childSession &&
+					this._subagentRuntimeHost?.releaseRlmSubagentRuntime
+				) {
 					try {
 						await this._subagentRuntimeHost.releaseRlmSubagentRuntime(
 							childRuntime ?? { session: childSession },
@@ -12583,7 +12593,7 @@ export class AgentSession {
 					} catch {
 						await childSession?.disposeAsync().catch(() => undefined);
 					}
-				} else if (!run.detachedDeletion) {
+				} else if (!retainFailedTask && !run.detachedDeletion) {
 					try {
 						if (childRuntime && this._subagentRuntimeHost) {
 							await this._subagentRuntimeHost.deleteRlmSubagentRuntime(run.id, childRuntime.session);
@@ -12625,10 +12635,6 @@ export class AgentSession {
 							run.session = undefined;
 						} else if (run.status !== "error") {
 							this._removeRlmSubagentTracking(run.id, run);
-						} else {
-							run.unsubscribe?.();
-							run.abort = noopRlmChildAbort;
-							run.unsubscribe = undefined;
 						}
 					}
 					run.settled = true;

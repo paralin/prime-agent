@@ -811,7 +811,7 @@ function normalizeCwd(cwd: string): string {
 	return resolve(cwd);
 }
 
-function sessionInfoMatchesCwd(session: SessionInfo, cwd: string): boolean {
+export function sessionInfoMatchesCwd(session: SessionInfo, cwd: string): boolean {
 	return !!session.cwd && normalizeCwd(session.cwd) === normalizeCwd(cwd);
 }
 
@@ -1203,7 +1203,7 @@ export interface SessionListCallbacks {
 // resolvable by ID and openable through readSessionInfo/listResolvable.
 // conversationMessageCount is undefined in fixtures that predate the scan;
 // only an exact zero hides a session.
-function isVisibleInCatalog(session: SessionInfo): boolean {
+export function isSessionVisibleInCatalog(session: SessionInfo): boolean {
 	if (session.conversationMessageCount !== 0) return true;
 	const status = session.state?.status;
 	return session.agentStatus !== undefined && status !== "archived" && status !== "crash";
@@ -2366,7 +2366,7 @@ export class SessionManager {
 	static async list(cwd: string, sessionDir?: string, callbacks?: SessionListCallbacks): Promise<SessionInfo[]> {
 		const dir = sessionDir ?? getDefaultSessionDir(cwd);
 		const matchesCwd = (session: SessionInfo) => sessionInfoMatchesCwd(session, cwd);
-		const visibleInCwd = (session: SessionInfo) => isVisibleInCatalog(session) && matchesCwd(session);
+		const visibleInCwd = (session: SessionInfo) => isSessionVisibleInCatalog(session) && matchesCwd(session);
 		const sessions = (
 			await listSessionsFromDir(dir, {
 				onProgress: callbacks?.onProgress,
@@ -2395,7 +2395,7 @@ export class SessionManager {
 			{
 				onProgress: callbacks?.onProgress,
 				onSession: (session) => {
-					if (!isVisibleInCatalog(session)) return;
+					if (!isSessionVisibleInCatalog(session)) return;
 					sessions.push(session);
 					callbacks?.onSession?.(session);
 				},

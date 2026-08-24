@@ -48,7 +48,13 @@ import {
 	type WorkerEvictionSnapshot,
 } from "../../core/session-action-store.js";
 import { canonicalSessionPath, getProcessStartId, SessionAlreadyActiveError } from "../../core/session-lease.js";
-import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
+import {
+	getSessionArtifactPathForFile,
+	isSessionVisibleInCatalog,
+	readSessionInfo,
+	type SessionInfo,
+	sessionInfoMatchesCwd,
+} from "../../core/session-manager.js";
 import { looksLikeSessionPath } from "../../core/session-resolver.js";
 import { SettingsManager } from "../../core/settings-manager.js";
 import { isProcessAlive, processIdExists, signalProcessGroupOrProcess } from "../../utils/child-process.js";
@@ -2406,6 +2412,26 @@ export class DaemonSupervisor {
 		}
 	}
 
+	/** Add persisted RLM descendants that the root-only saved-session scan cannot discover. */
+	private async mergeSavedSessionsWithRlmFamily(
+		saved: readonly SessionInfo[],
+		cwd: string | undefined,
+		sessionDir: string | undefined,
+	): Promise<SessionInfo[]> {
+		const agentDir = this.defaultSessionConfig.agentDir;
+		if (!agentDir) return [...saved];
+		const defaultSessionDir = this.defaultSessionConfig.sessionDir ?? getSessionsDir(agentDir);
+		if (resolve(sessionDir ?? defaultSessionDir) !== resolve(defaultSessionDir)) return [...saved];
+
+		const byPath = new Map(saved.map((session) => [canonicalSessionPath(session.path), session]));
+		for (const session of await this.rlmSpawnLedger().family()) {
+			if ((session.rlmDepth ?? 0) === 0 || !isSessionVisibleInCatalog(session)) continue;
+			if (cwd !== undefined && !sessionInfoMatchesCwd(session, cwd)) continue;
+			byPath.set(canonicalSessionPath(session.path), session);
+		}
+		return [...byPath.values()].sort((left, right) => right.modified.getTime() - left.modified.getTime());
+	}
+
 	private async handleList(
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "list" }>,
@@ -2525,7 +2551,9 @@ export class DaemonSupervisor {
 						}),
 				}
 			: undefined;
-		const saved = await this.catalog.list(command.scope === "current" ? cwd : undefined, sessionDir, callbacks);
+		const catalogCwd = command.scope === "current" ? cwd : undefined;
+		const roots = await this.catalog.list(catalogCwd, sessionDir, callbacks);
+		const saved = await this.mergeSavedSessionsWithRlmFamily(roots, catalogCwd, sessionDir);
 		return success(command.id, "list_saved_sessions", { sessions: saved.map(serializeSavedSessionInfo) });
 	}
 

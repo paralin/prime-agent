@@ -16,6 +16,7 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 	SessionAlreadyActiveError,
 } from "../src/core/session-lease.js";
+import type { SessionInfo } from "../src/core/session-manager.js";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { CommandRecoveryJournal } from "../src/modes/daemon/command-recovery-journal.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
@@ -2577,6 +2578,67 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 
 		expect(supervisor.effectiveWorkerState(worker)).toBe("ready");
+	});
+
+	it("adds visible inactive subagents from the durable RLM family to saved sessions", async () => {
+		const session = (id: string, path: string, overrides: Partial<SessionInfo> = {}): SessionInfo => {
+			const { rlmDepth = 0, ...display } = overrides;
+			return {
+				id,
+				path,
+				cwd: "/workspace",
+				created: new Date("2026-08-24T00:00:00Z"),
+				modified: new Date("2026-08-24T00:00:00Z"),
+				messageCount: 1,
+				conversationMessageCount: 1,
+				firstMessage: id,
+				allMessagesText: id,
+				rlmDepth,
+				...display,
+			};
+		};
+		const root = session("root", "/agent/sessions/root.jsonl");
+		const child = session("child", "/agent/session-artifacts/root/sub-child/child.jsonl", {
+			name: "inactive-child",
+			parentSessionPath: root.path,
+			rlmDepth: 1,
+		});
+		const eventOnly = session("event-only", "/agent/session-artifacts/root/sub-event/event-only.jsonl", {
+			parentSessionPath: root.path,
+			rlmDepth: 1,
+			messageCount: 0,
+			conversationMessageCount: 0,
+		});
+		const otherCwd = session("other", "/agent/session-artifacts/root/sub-other/other.jsonl", {
+			cwd: "/other",
+			parentSessionPath: root.path,
+			rlmDepth: 1,
+		});
+		const family = vi.fn(async () => [root, child, eventOnly, otherCwd]);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			defaultSessionConfig: { agentDir: "/agent", sessionDir: "/agent/sessions" },
+			rlmSpawnLedger: () => ({ family }),
+		}) as {
+			mergeSavedSessionsWithRlmFamily(
+				saved: readonly SessionInfo[],
+				cwd: string | undefined,
+				sessionDir: string | undefined,
+			): Promise<SessionInfo[]>;
+		};
+
+		const merged = await supervisor.mergeSavedSessionsWithRlmFamily([root], "/workspace", undefined);
+
+		expect(merged.map((entry) => entry.id)).toEqual(["root", "child"]);
+		expect(merged[1]).toMatchObject({
+			name: "inactive-child",
+			parentSessionPath: root.path,
+			rlmDepth: 1,
+		});
+		expect(family).toHaveBeenCalledOnce();
+		await expect(supervisor.mergeSavedSessionsWithRlmFamily([root], undefined, "/custom/sessions")).resolves.toEqual([
+			root,
+		]);
+		expect(family).toHaveBeenCalledOnce();
 	});
 
 	it("keeps stopping workers listed with an honest state for busy-daemon checks", async () => {

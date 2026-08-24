@@ -760,9 +760,7 @@ describe("daemon supervisor passive subagent topology", () => {
 			sessionId: "passive-child-session",
 			runtimeKind: "subagent",
 		});
-		resident.client.requestWorker.mockResolvedValue(
-			success(undefined, "list", { sessions: [root, attachedChild] }),
-		);
+		resident.client.requestWorker.mockResolvedValue(success(undefined, "list", { sessions: [root, attachedChild] }));
 
 		await supervisor.refreshWorkerSummaries(resident);
 

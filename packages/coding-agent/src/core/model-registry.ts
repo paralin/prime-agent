@@ -29,6 +29,7 @@ import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
+import { fetchMergeGatewayModels } from "./merge-gateway-models.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
 	fetchAuthorizedPrivatePrimeInferenceModelIds,
@@ -126,6 +127,11 @@ const OpenAICompletionsCompatSchema = Type.Object({
 
 const OpenAIResponsesCompatSchema = Type.Object({
 	sendSessionIdHeader: Type.Optional(Type.Boolean()),
+	supportsStore: Type.Optional(Type.Boolean()),
+	supportsPromptCache: Type.Optional(Type.Boolean()),
+	supportsReasoning: Type.Optional(Type.Boolean()),
+	supportsDeveloperRole: Type.Optional(Type.Boolean()),
+	supportsTools: Type.Optional(Type.Boolean()),
 	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
 });
 
@@ -782,8 +788,30 @@ export class ModelRegistry {
 		const previousPrivateModelIds = new Set(this.authorizedPrivatePrimeInferenceModelIds);
 		const previousTeamId = this.authorizedPrivatePrimeInferenceTeamId;
 		this.refresh();
-		await this.refreshPrivatePrimeInferenceAuthorization(previousPrivateModelIds, previousTeamId);
+		await Promise.all([
+			this.refreshPrivatePrimeInferenceAuthorization(previousPrivateModelIds, previousTeamId),
+			this.refreshMergeGatewayModels(),
+		]);
 		return this.getAvailable();
+	}
+
+	private async refreshMergeGatewayModels(): Promise<void> {
+		const seed = this.models.find((model) => model.provider === "merge-gateway");
+		if (!seed || isOfflineModeEnabled()) {
+			return;
+		}
+		const auth = await this.getApiKeyAndHeaders(seed);
+		if (!auth.ok || !auth.apiKey) {
+			return;
+		}
+		try {
+			const discovered = await fetchMergeGatewayModels(auth.apiKey, this.models);
+			const otherProviders = this.models.filter((model) => model.provider !== "merge-gateway");
+			const bootstrap = this.models.filter((model) => model.provider === "merge-gateway");
+			this.models = [...otherProviders, ...this.mergeCustomModels(bootstrap, discovered)];
+		} catch {
+			// Keep the generated catalog when discovery is unavailable.
+		}
 	}
 
 	private async refreshPrivatePrimeInferenceAuthorization(

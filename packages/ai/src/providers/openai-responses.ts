@@ -45,6 +45,11 @@ function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention 
 
 interface ResolvedOpenAIResponsesCompat {
 	sendSessionIdHeader: boolean;
+	supportsStore: boolean;
+	supportsPromptCache: boolean;
+	supportsReasoning: boolean;
+	supportsDeveloperRole: boolean;
+	supportsTools: boolean;
 	supportsLongCacheRetention: boolean;
 	openRouterRouting?: OpenRouterRouting;
 }
@@ -52,6 +57,11 @@ interface ResolvedOpenAIResponsesCompat {
 function getCompat(model: Model<"openai-responses">): ResolvedOpenAIResponsesCompat {
 	return {
 		sendSessionIdHeader: model.compat?.sendSessionIdHeader ?? true,
+		supportsStore: model.compat?.supportsStore ?? true,
+		supportsPromptCache: model.compat?.supportsPromptCache ?? true,
+		supportsReasoning: model.compat?.supportsReasoning ?? true,
+		supportsDeveloperRole: model.compat?.supportsDeveloperRole ?? true,
+		supportsTools: model.compat?.supportsTools ?? true,
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
 		openRouterRouting: model.compat?.openRouterRouting,
 	};
@@ -226,11 +236,13 @@ function createClient(
 	});
 }
 
-function buildParams(model: Model<"openai-responses">, context: Context, options?: OpenAIResponsesOptions) {
-	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS);
+export function buildParams(model: Model<"openai-responses">, context: Context, options?: OpenAIResponsesOptions) {
+	const compat = getCompat(model);
+	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
+		systemRole: compat.supportsDeveloperRole ? undefined : "system",
+	});
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
-	const compat = getCompat(model);
 	const params: ResponseCreateParamsStreaming & {
 		session_id?: string;
 		provider?: OpenRouterRouting;
@@ -238,11 +250,11 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		model: model.id,
 		input: messages,
 		stream: true,
-		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
-		prompt_cache_retention: getPromptCacheRetention(compat, cacheRetention),
+		prompt_cache_key: compat.supportsPromptCache && cacheRetention !== "none" ? options?.sessionId : undefined,
+		prompt_cache_retention: compat.supportsPromptCache ? getPromptCacheRetention(compat, cacheRetention) : undefined,
 		session_id: model.provider === "openrouter" ? options?.sessionId : undefined,
 		provider: model.provider === "openrouter" ? compat.openRouterRouting : undefined,
-		store: false,
+		store: compat.supportsStore ? false : undefined,
 	};
 
 	if (options?.maxTokens) {
@@ -257,11 +269,11 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		params.service_tier = options.serviceTier;
 	}
 
-	if (context.tools && context.tools.length > 0) {
+	if (compat.supportsTools && context.tools && context.tools.length > 0) {
 		params.tools = convertResponsesTools(context.tools);
 	}
 
-	if (model.reasoning) {
+	if (model.reasoning && compat.supportsReasoning) {
 		if (options?.reasoningEffort || options?.reasoningSummary) {
 			const effort = options?.reasoningEffort
 				? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)

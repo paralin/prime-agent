@@ -74,6 +74,7 @@ export interface OpenAIResponsesStreamOptions {
 
 export interface ConvertResponsesMessagesOptions {
 	includeSystemPrompt?: boolean;
+	systemRole?: "developer" | "system";
 }
 
 export interface ConvertResponsesToolsOptions {
@@ -117,7 +118,7 @@ export function convertResponsesMessages<TApi extends Api>(
 
 	const includeSystemPrompt = options?.includeSystemPrompt ?? true;
 	if (includeSystemPrompt && context.systemPrompt) {
-		const role = model.reasoning ? "developer" : "system";
+		const role = options?.systemRole ?? (model.reasoning ? "developer" : "system");
 		messages.push({
 			role,
 			content: sanitizeSurrogates(context.systemPrompt),

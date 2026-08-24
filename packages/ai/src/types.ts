@@ -43,6 +43,7 @@ export type KnownProvider =
 	| "opencode"
 	| "opencode-go"
 	| "kimi-coding"
+	| "merge-gateway"
 	| "cloudflare-workers-ai"
 	| "cloudflare-ai-gateway"
 	| "venice"
@@ -368,6 +369,16 @@ export interface OpenAICompletionsCompat {
 export interface OpenAIResponsesCompat {
 	/** Whether to send the OpenAI `session_id` cache-affinity header from `options.sessionId` when caching is enabled. Default: true. */
 	sendSessionIdHeader?: boolean;
+	/** Whether the provider supports the `store` field. Default: true. */
+	supportsStore?: boolean;
+	/** Whether the provider supports prompt cache request fields. Default: true. */
+	supportsPromptCache?: boolean;
+	/** Whether the provider supports the `reasoning` and encrypted-reasoning request fields. Default: true. */
+	supportsReasoning?: boolean;
+	/** Whether the provider supports the `developer` input role. Default: true. */
+	supportsDeveloperRole?: boolean;
+	/** Whether the provider supports function tools. Default: true. */
+	supportsTools?: boolean;
 	/** Whether the provider supports `prompt_cache_retention: "24h"`. Default: true. */
 	supportsLongCacheRetention?: boolean;
 	/** OpenRouter-specific routing preferences for Responses requests. */

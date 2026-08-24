@@ -185,9 +185,7 @@ describe("agentLoop with AgentMessage", () => {
 				]);
 			}
 			const stream = new MockAssistantStream();
-			queueMicrotask(() =>
-				stream.push({ type: "done", reason: "stop", message: successMessage }),
-			);
+			queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: successMessage }));
 			return stream;
 		};
 
@@ -373,6 +371,79 @@ describe("agentLoop with AgentMessage", () => {
 					event.message.stopReason === "aborted",
 			),
 		).toBe(false);
+	});
+
+	it("preserves the terminal response when result() rejects with the raw abort reason", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const controller = new AbortController();
+		const finalMessage = createAssistantMessage([{ type: "text", text: "complete" }]);
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			Object.defineProperty(stream, "result", {
+				value: () => {
+					controller.abort();
+					return Promise.reject(controller.signal.reason);
+				},
+			});
+			queueMicrotask(() => {
+				stream.push({ type: "done", reason: "stop", message: finalMessage });
+			});
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Hello")],
+			context,
+			config,
+			vi.fn(),
+			controller.signal,
+			streamFn,
+		);
+
+		const assistants = messages.filter((message) => message.role === "assistant");
+		expect(assistants).toEqual([finalMessage]);
+	});
+
+	it("fails over with an error when the stream completes but result() never settles", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		let callCount = 0;
+		const streamFn = () => {
+			callCount += 1;
+			const forever = new Promise<never>(() => undefined);
+			return {
+				[Symbol.asyncIterator]: () => ({
+					next: async () => ({ done: true, value: undefined as never }),
+				}),
+				result: (): Promise<AssistantMessage> => forever,
+			} as unknown as Awaited<ReturnType<StreamFn>>;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Hello")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter, streamStallTimeoutMs: 15 },
+			vi.fn(),
+			undefined,
+			streamFn,
+		);
+
+		expect(callCount).toBe(3);
+		const assistants = messages.filter((message) => message.role === "assistant");
+		expect(assistants.length).toBe(1);
+		expect(assistants[0]?.stopReason).toBe("error");
+		expect(assistants[0]?.errorMessage).toContain("No model output");
 	});
 
 	it("should return an aborted assistant when abort fires before the stream starts", async () => {

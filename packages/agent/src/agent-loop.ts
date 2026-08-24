@@ -606,15 +606,7 @@ async function streamAssistantAttempt(
 				}),
 				signal,
 			);
-			return await consumeAssistantStream(
-				response,
-				context,
-				config,
-				signal,
-				emit,
-				stallTimeoutMs,
-				trackPartial,
-			);
+			return await consumeAssistantStream(response, context, config, signal, emit, stallTimeoutMs, trackPartial);
 		} catch (error) {
 			if (error instanceof StreamStallError) {
 				requestController.abort();
@@ -711,7 +703,10 @@ async function consumeAssistantStream(
 				case "error": {
 					let finalMessage = getTerminalMessage(event);
 					try {
-						finalMessage = await maybePromiseWithAbort(response.result(), signal);
+						finalMessage = await maybePromiseWithAbort(
+							raceWithStallTimeout(response.result(), stallTimeoutMs),
+							signal,
+						);
 					} catch (error) {
 						if (!signal?.aborted || !isAbortError(error)) {
 							throw error;
@@ -731,7 +726,7 @@ async function consumeAssistantStream(
 			}
 		}
 
-		const finalMessage = await maybePromiseWithAbort(response.result(), signal);
+		const finalMessage = await maybePromiseWithAbort(raceWithStallTimeout(response.result(), stallTimeoutMs), signal);
 		if (addedPartial) {
 			context.messages[context.messages.length - 1] = finalMessage;
 		} else {

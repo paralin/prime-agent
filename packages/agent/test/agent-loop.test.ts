@@ -109,6 +109,24 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter((m) => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
 
+/**
+ * A stream response that emits the given events and then hangs forever,
+ * simulating a provider connection that stalls mid-response.
+ */
+function stallingStream(events: AssistantMessageEvent[]): Awaited<ReturnType<StreamFn>> {
+	const forever = new Promise<never>(() => undefined);
+	async function* iterate(): AsyncGenerator<AssistantMessageEvent> {
+		for (const event of events) {
+			yield event;
+		}
+		await forever;
+	}
+	return {
+		[Symbol.asyncIterator]: () => iterate(),
+		result: (): Promise<AssistantMessage> => forever,
+	} as unknown as Awaited<ReturnType<StreamFn>>;
+}
+
 describe("agentLoop with AgentMessage", () => {
 	it("continues after an unknown provider finish reason", async () => {
 		const context: AgentContext = {
@@ -146,6 +164,84 @@ describe("agentLoop with AgentMessage", () => {
 
 		expect(callCount).toBe(2);
 		expect(messages.filter((message) => message.role === "assistant")).toEqual(responses);
+	});
+
+	it("aborts and retries when the provider stream stalls, then succeeds", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const successMessage = createAssistantMessage([{ type: "text", text: "complete" }]);
+		let callCount = 0;
+		const events: AgentEvent[] = [];
+		const streamFn = () => {
+			callCount += 1;
+			if (callCount === 1) {
+				const partial = createAssistantMessage([{ type: "text", text: "partial" }]);
+				return stallingStream([
+					{ type: "start", partial },
+					{ type: "text_delta", contentIndex: 0, delta: "partial", partial },
+				]);
+			}
+			const stream = new MockAssistantStream();
+			queueMicrotask(() =>
+				stream.push({ type: "done", reason: "stop", message: successMessage }),
+			);
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Hello")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter, streamStallTimeoutMs: 20 },
+			(event) => {
+				events.push(event);
+			},
+			undefined,
+			streamFn,
+		);
+
+		expect(callCount).toBe(2);
+		const assistants = messages.filter((message) => message.role === "assistant");
+		expect(assistants).toEqual([successMessage]);
+		// The abandoned partial never finalizes; only the retry does.
+		const assistantEnds = events.filter(
+			(event) => event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(assistantEnds.length).toBe(1);
+		const assistantStarts = events.filter(
+			(event) => event.type === "message_start" && event.message.role === "assistant",
+		);
+		expect(assistantStarts.length).toBe(2);
+	});
+
+	it("surfaces an error message after repeated stream stalls", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		let callCount = 0;
+		const streamFn = () => {
+			callCount += 1;
+			return stallingStream([]);
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Hello")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter, streamStallTimeoutMs: 10 },
+			vi.fn(),
+			undefined,
+			streamFn,
+		);
+
+		expect(callCount).toBe(3);
+		const assistants = messages.filter((message) => message.role === "assistant");
+		expect(assistants.length).toBe(1);
+		expect(assistants[0]?.stopReason).toBe("error");
+		expect(assistants[0]?.errorMessage).toContain("No model output");
 	});
 
 	it("should preserve a terminal response when abort fires after done", async () => {

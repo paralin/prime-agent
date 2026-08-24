@@ -119,6 +119,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
 
 	/**
+	 * Abort and retry the provider stream after this many milliseconds without
+	 * any stream event (default 180000). Past two retries the failure surfaces
+	 * as an error on the assistant message.
+	 */
+	streamStallTimeoutMs?: number;
+
+	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
 	 *
 	 * Each AgentMessage must be converted to a UserMessage, AssistantMessage, or ToolResultMessage

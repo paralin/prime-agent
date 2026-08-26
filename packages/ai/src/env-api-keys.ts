@@ -123,6 +123,7 @@ function getApiKeyEnvVars(provider: string): readonly string[] | undefined {
 		"opencode-go": "OPENCODE_API_KEY",
 		"kimi-coding": "KIMI_API_KEY",
 		"merge-gateway": "MERGE_GATEWAY_API_KEY",
+		runinfra: "RUNINFRA_GATEWAY_KEY",
 		"cloudflare-workers-ai": "CLOUDFLARE_API_KEY",
 		"cloudflare-ai-gateway": "CLOUDFLARE_API_KEY",
 		venice: "VENICE_API_KEY",

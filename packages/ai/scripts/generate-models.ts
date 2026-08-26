@@ -941,6 +941,32 @@ function getMergeGatewayModels(): Model<Api>[] {
 	];
 }
 
+function getRunInfraModels(): Model<"openai-completions">[] {
+	const baseUrl = "https://api.runinfra.ai/v1";
+	const models = [
+		["deepseek-v4-flash", "DeepSeek V4 Flash", 0.13, 0.27, 0.01, 1_048_576, true],
+		["deepseek-v4-pro", "DeepSeek V4 Pro", 0.6, 1.9, 0.03, 1_048_576, false],
+		["qwen3-8-27b", "Qwen3.8 27B", 0.1, 0.4, 0.01, 262_144, true],
+		["qwen3-8-2-4t-a95b", "Qwen3.8 2.4T A95B", 2, 6, 0.2, 262_144, true],
+		["nemotron-3-5-lightning-30b", "Nemotron 3.5 Lightning 30B", 0.05, 0.15, 0.01, 262_144, true],
+		["ornith-1-5-35b", "Ornith 1.5 35B", 0.1, 0.4, 0.01, 262_144, true],
+	] as const;
+
+	return models.map(([id, name, inputCost, outputCost, cacheReadCost, contextWindow, reasoning]) => ({
+		id,
+		name,
+		api: "openai-completions",
+		provider: "runinfra",
+		baseUrl,
+		compat: { maxTokensField: "max_tokens" },
+		reasoning,
+		input: id === "qwen3-8-27b" ? ["text", "image"] : ["text"],
+		cost: { input: inputCost, output: outputCost, cacheRead: cacheReadCost, cacheWrite: 0 },
+		contextWindow,
+		maxTokens: contextWindow,
+	}));
+}
+
 async function loadModelsDevData(): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from models.dev API...");
@@ -1680,9 +1706,10 @@ async function generateModels() {
 	const openRouterModels = await fetchOpenRouterModels();
 	const aiGatewayModels = await fetchAiGatewayModels();
 	const mergeGatewayModels = getMergeGatewayModels();
+	const runInfraModels = getRunInfraModels();
 
 	// Combine models (models.dev has priority)
-	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels, ...mergeGatewayModels].filter(
+	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels, ...mergeGatewayModels, ...runInfraModels].filter(
 		(model) =>
 			!((model.provider === "opencode" || model.provider === "opencode-go") && model.id === "gpt-5.3-codex-spark"),
 	);

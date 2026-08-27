@@ -402,11 +402,11 @@ function openAICodexModelsUrl(baseUrl: string): string {
 	return url.toString();
 }
 
-function readOpenAICodexModelIds(value: unknown): Set<string> {
+function readOpenAICodexModelPage(value: unknown): { modelIds: Set<string>; nextCursor?: string } {
 	if (!value || typeof value !== "object" || !("models" in value) || !Array.isArray(value.models)) {
 		throw new Error("Invalid OpenAI Codex model catalog");
 	}
-	return new Set(
+	const modelIds = new Set(
 		value.models.map((model) => {
 			if (!model || typeof model !== "object" || !("slug" in model) || typeof model.slug !== "string") {
 				throw new Error("Invalid OpenAI Codex model catalog");
@@ -414,6 +414,14 @@ function readOpenAICodexModelIds(value: unknown): Set<string> {
 			return model.slug;
 		}),
 	);
+	if (!("next_cursor" in value) || value.next_cursor === null || value.next_cursor === "") {
+		return { modelIds };
+	}
+	if (typeof value.next_cursor !== "string") {
+		throw new Error("Invalid OpenAI Codex model catalog cursor");
+	}
+	const nextCursor = value.next_cursor.trim();
+	return nextCursor ? { modelIds, nextCursor } : { modelIds };
 }
 
 function filterModelsByOpenAICodexCatalog(models: Model<Api>[], modelIds: Set<string>): Model<Api>[] {
@@ -1016,19 +1024,31 @@ export class ModelRegistry {
 			return availableModels.filter((model) => model.provider !== "openai-codex");
 		}
 		try {
-			const response = await fetch(openAICodexModelsUrl(codexModels[0]!.baseUrl), {
-				headers: {
-					...auth.headers,
-					Authorization: `Bearer ${auth.apiKey}`,
-					"chatgpt-account-id": accountId,
-					originator: "pi",
-				},
-				signal: AbortSignal.timeout(5_000),
-			});
-			if (!response.ok) {
-				throw new Error(`OpenAI Codex model discovery failed with HTTP ${response.status}`);
+			const modelIds = new Set<string>();
+			const seenCursors = new Set<string>();
+			const modelsUrl = new URL(openAICodexModelsUrl(codexModels[0]!.baseUrl));
+			for (;;) {
+				const response = await fetch(modelsUrl.toString(), {
+					headers: {
+						...auth.headers,
+						Authorization: `Bearer ${auth.apiKey}`,
+						"chatgpt-account-id": accountId,
+						originator: "pi",
+					},
+					signal: AbortSignal.timeout(5_000),
+				});
+				if (!response.ok) {
+					throw new Error(`OpenAI Codex model discovery failed with HTTP ${response.status}`);
+				}
+				const page = readOpenAICodexModelPage(await response.json());
+				for (const modelId of page.modelIds) modelIds.add(modelId);
+				if (!page.nextCursor) break;
+				if (seenCursors.has(page.nextCursor)) {
+					throw new Error("OpenAI Codex model discovery repeated its pagination cursor");
+				}
+				seenCursors.add(page.nextCursor);
+				modelsUrl.searchParams.set("cursor", page.nextCursor);
 			}
-			const modelIds = readOpenAICodexModelIds(await response.json());
 			this.openAICodexModelsCache = { authFingerprint, modelIds, refreshedAt: Date.now() };
 			return filterModelsByOpenAICodexCatalog(availableModels, modelIds);
 		} catch {

@@ -111,6 +111,63 @@ describe("ENG-4649 subagent model selection", () => {
 		}
 	});
 
+	it("finds a ChatGPT model on a later catalog page", async () => {
+		const codexProvider = "openai-codex";
+		const harness = await createHarness({
+			provider: codexProvider,
+			models: [{ id: "parent-model" }, { id: "later-model" }],
+		});
+		const fetchModels = vi
+			.fn()
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ models: [{ slug: "parent-model" }], next_cursor: "page-2" }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ models: [{ slug: "later-model" }] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			);
+		vi.stubGlobal("fetch", fetchModels);
+		try {
+			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
+
+			await expect(harness.session.findRlmModels("later", 8)).resolves.toMatchObject({
+				models: [{ selector: `${codexProvider}/later-model` }],
+			});
+			expect(fetchModels).toHaveBeenCalledTimes(2);
+			expect(fetchModels.mock.calls[1]?.[0].toString()).toContain("cursor=page-2");
+		} finally {
+			vi.unstubAllGlobals();
+			harness.cleanup();
+		}
+	});
+
+	it("rejects a repeated ChatGPT model catalog cursor", async () => {
+		const codexProvider = "openai-codex";
+		const harness = await createHarness({ provider: codexProvider, models: [{ id: "parent-model" }] });
+		const fetchModels = vi.fn(
+			async () =>
+				new Response(JSON.stringify({ models: [{ slug: "parent-model" }], next_cursor: "same-page" }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		vi.stubGlobal("fetch", fetchModels);
+		try {
+			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
+
+			await expect(harness.session.findRlmModels("parent", 8)).resolves.toEqual({ models: [] });
+			expect(fetchModels).toHaveBeenCalledTimes(2);
+		} finally {
+			vi.unstubAllGlobals();
+			harness.cleanup();
+		}
+	});
+
 	it("uses configured Codex models when discovery returns an empty catalog", async () => {
 		const codexProvider = "openai-codex";
 		const harness = await createHarness({

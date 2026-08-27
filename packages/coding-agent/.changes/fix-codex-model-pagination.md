@@ -1,0 +1,1 @@
+- Fixed OpenAI Codex model discovery to follow paginated catalogs and reject repeated cursors.

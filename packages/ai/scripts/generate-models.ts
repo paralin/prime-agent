@@ -944,6 +944,7 @@ function getMergeGatewayModels(): Model<Api>[] {
 function getRunInfraModels(): Model<"openai-completions">[] {
 	const baseUrl = "https://api.runinfra.ai/v1";
 	const models = [
+		["glm-5-3-flash", "GLM 5.3 Flash", 0.15, 0.5, 0.03, 1_048_576, true],
 		["deepseek-v4-flash", "DeepSeek V4 Flash", 0.13, 0.27, 0.01, 1_048_576, true],
 		["deepseek-v4-pro", "DeepSeek V4 Pro", 0.6, 1.9, 0.03, 1_048_576, false],
 		["qwen3-8-27b", "Qwen3.8 27B", 0.1, 0.4, 0.01, 262_144, true],

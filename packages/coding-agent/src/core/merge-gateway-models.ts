@@ -107,14 +107,19 @@ export async function fetchMergeGatewayModels(
 		const known =
 			knownModels.find((model) => model.id === id && model.provider === "merge-gateway") ??
 			knownModels.find((model) => model.id === id);
-		const api = known?.provider === "merge-gateway" ? known.api : "openai-completions";
+		const knownMergeModel = known?.provider === "merge-gateway" ? known : undefined;
+		const api = knownMergeModel?.api ?? "openai-completions";
 		return {
 			id,
 			name: entry.name ?? known?.name ?? modelName(id),
 			api,
 			provider: "merge-gateway",
 			baseUrl: MERGE_GATEWAY_BASE_URL,
-			...(api === "openai-completions" ? { compat: MERGE_GATEWAY_COMPAT } : {}),
+			...(knownMergeModel?.compat
+				? { compat: { ...knownMergeModel.compat } }
+				: api === "openai-completions"
+					? { compat: MERGE_GATEWAY_COMPAT }
+					: {}),
 			reasoning: entry.reasoning ?? known?.reasoning ?? true,
 			input: entry.input ?? (known ? [...known.input] : ["text"]),
 			cost: known ? { ...known.cost } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },

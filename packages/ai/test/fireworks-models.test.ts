@@ -32,6 +32,15 @@ describe("Fireworks models", () => {
 		});
 	});
 
+	it("registers the Fire Pass fast router model", () => {
+		const model = getModel("fireworks", "accounts/fireworks/routers/kimi-k3-fast");
+
+		expect(model).toBeDefined();
+		expect(model.api).toBe("anthropic-messages");
+		expect(model.baseUrl).toBe("https://api.fireworks.ai/inference");
+		expect(model.input).toEqual(["text", "image"]);
+	});
+
 	it("resolves FIREWORKS_API_KEY from the environment", () => {
 		process.env.FIREWORKS_API_KEY = "test-fireworks-key";
 

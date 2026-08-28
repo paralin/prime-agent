@@ -63,6 +63,13 @@ describe("Merge Gateway model discovery", () => {
 			api: "openai-responses",
 			provider: "merge-gateway",
 			baseUrl: "https://api-gateway.merge.dev/v1",
+			compat: {
+				sendSessionIdHeader: false,
+				supportsStore: false,
+				supportsReasoning: false,
+				supportsDeveloperRole: false,
+				supportsTools: false,
+			},
 			reasoning: true,
 			input: ["text", "image"],
 			cost: { input: 0.015, output: 0.05, cacheRead: 0, cacheWrite: 0 },
@@ -75,6 +82,13 @@ describe("Merge Gateway model discovery", () => {
 
 		expect(model).toMatchObject({
 			api: "openai-responses",
+			compat: {
+				sendSessionIdHeader: false,
+				supportsStore: false,
+				supportsReasoning: false,
+				supportsDeveloperRole: false,
+				supportsTools: false,
+			},
 			cost: { input: 0.015, output: 0.05 },
 		});
 	});

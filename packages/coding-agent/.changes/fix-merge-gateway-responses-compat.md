@@ -1,0 +1,1 @@
+- Fixed discovered Merge Gateway models losing provider compatibility settings.

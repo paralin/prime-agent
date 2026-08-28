@@ -1,0 +1,1 @@
+- Added `xhigh` and `max` token budgets and model configuration for compatible reasoning-budget servers.

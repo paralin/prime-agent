@@ -45,7 +45,9 @@ When `rlmAllowedServiceTiers` is absent, its effective value contains only `defa
     "minimal": 1024,
     "low": 4096,
     "medium": 10240,
-    "high": 32768
+    "high": 32768,
+    "xhigh": 49152,
+    "max": 65536
   }
 }
 ```

@@ -878,6 +878,7 @@ interface OpenAICompletionsCompat {
   supportsStore?: boolean;           // Whether provider supports the `store` field (default: true)
   supportsDeveloperRole?: boolean;   // Whether provider supports `developer` role vs `system` (default: true)
   supportsReasoningEffort?: boolean; // Whether provider supports `reasoning_effort` (default: true)
+  supportsReasoningBudgetTokens?: boolean; // Whether provider supports `reasoning_budget_tokens` (default: false)
   supportsUsageInStreaming?: boolean; // Whether provider supports `stream_options: { include_usage: true }` (default: true)
   supportsStrictMode?: boolean;      // Whether provider supports `strict` in tool definitions (default: true)
   sendSessionAffinityHeaders?: boolean; // Whether to send `session_id`, `x-client-request-id`, and `x-session-affinity` from `sessionId` when caching is enabled (default: false)

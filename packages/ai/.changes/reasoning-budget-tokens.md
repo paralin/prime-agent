@@ -1,0 +1,1 @@
+- Added per-thinking-level `reasoning_budget_tokens` support for compatible OpenAI completion servers.

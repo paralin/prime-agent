@@ -106,6 +106,8 @@ function decodeReasoningDetails(signature?: string): Record<string, unknown>[] |
 export interface OpenAICompletionsOptions extends StreamOptions {
 	toolChoice?: "auto" | "none" | "required" | { type: "function"; function: { name: string } };
 	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	/** Provider-specific token ceiling for the selected reasoning level. */
+	reasoningBudgetTokens?: number;
 	/** Explicit reasoning toggle. undefined preserves the provider/model default. */
 	reasoningEnabled?: boolean;
 }
@@ -115,8 +117,12 @@ interface OpenAICompatCacheControl {
 	ttl?: string;
 }
 
-type ResolvedOpenAICompletionsCompat = Omit<Required<OpenAICompletionsCompat>, "cacheControlFormat"> & {
+type ResolvedOpenAICompletionsCompat = Omit<
+	Required<OpenAICompletionsCompat>,
+	"cacheControlFormat" | "supportsReasoningBudgetTokens"
+> & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
+	supportsReasoningBudgetTokens?: boolean;
 };
 
 type ChatCompletionInstructionMessageParam = ChatCompletionDeveloperMessageParam | ChatCompletionSystemMessageParam;
@@ -506,10 +512,12 @@ export const streamSimpleOpenAICompletions: StreamFunction<"openai-completions",
 	const reasoningSpecified = requestedReasoning !== undefined;
 	const clampedReasoning = reasoningSpecified ? clampThinkingLevel(model, requestedReasoning) : undefined;
 	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
+	const reasoningBudgetTokens = reasoningEffort ? options?.thinkingBudgets?.[reasoningEffort] : undefined;
 	const toolChoice = (options as OpenAICompletionsOptions | undefined)?.toolChoice;
 	const chatOptions = {
 		...base,
 		reasoningEffort,
+		reasoningBudgetTokens,
 		reasoningEnabled: reasoningSpecified ? clampedReasoning !== "off" : undefined,
 		toolChoice,
 	} satisfies OpenAICompletionsOptions;
@@ -765,6 +773,11 @@ function buildParams(
 
 	if (options?.temperature !== undefined) {
 		params.temperature = options.temperature;
+	}
+
+	if (compat.supportsReasoningBudgetTokens && options?.reasoningBudgetTokens !== undefined) {
+		(params as unknown as { reasoning_budget_tokens: number }).reasoning_budget_tokens =
+			options.reasoningBudgetTokens;
 	}
 
 	if (context.tools && context.tools.length > 0) {
@@ -1344,6 +1357,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		supportsStore: !isNonStandard,
 		supportsDeveloperRole: !isNonStandard,
 		supportsReasoningEffort: !isGrok && !isZai && !isMoonshot && !isCloudflareAiGateway,
+		supportsReasoningBudgetTokens: false,
 		supportsUsageInStreaming: true,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
 		requiresToolResultName: false,
@@ -1379,6 +1393,8 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		supportsStore: model.compat.supportsStore ?? detected.supportsStore,
 		supportsDeveloperRole: model.compat.supportsDeveloperRole ?? detected.supportsDeveloperRole,
 		supportsReasoningEffort: model.compat.supportsReasoningEffort ?? detected.supportsReasoningEffort,
+		supportsReasoningBudgetTokens:
+			model.compat.supportsReasoningBudgetTokens ?? detected.supportsReasoningBudgetTokens,
 		supportsUsageInStreaming: model.compat.supportsUsageInStreaming ?? detected.supportsUsageInStreaming,
 		maxTokensField: model.compat.maxTokensField ?? detected.maxTokensField,
 		requiresToolResultName: model.compat.requiresToolResultName ?? detected.requiresToolResultName,

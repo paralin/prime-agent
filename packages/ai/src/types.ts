@@ -64,6 +64,8 @@ export interface ThinkingBudgets {
 	low?: number;
 	medium?: number;
 	high?: number;
+	xhigh?: number;
+	max?: number;
 }
 
 // Base options all providers share
@@ -336,6 +338,8 @@ export interface OpenAICompletionsCompat {
 	supportsDeveloperRole?: boolean;
 	/** Whether the provider supports `reasoning_effort`. Default: auto-detected from URL. */
 	supportsReasoningEffort?: boolean;
+	/** Whether the provider supports llama.cpp-style `reasoning_budget_tokens`. Default: false. */
+	supportsReasoningBudgetTokens?: boolean;
 	/** Whether the provider supports `stream_options: { include_usage: true }` for token usage in streaming responses. Default: true. */
 	supportsUsageInStreaming?: boolean;
 	/** Which field to use for max tokens. Default: auto-detected from URL. */

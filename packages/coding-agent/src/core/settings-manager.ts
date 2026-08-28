@@ -79,6 +79,8 @@ export interface ThinkingBudgetsSettings {
 	low?: number;
 	medium?: number;
 	high?: number;
+	xhigh?: number;
+	max?: number;
 }
 
 export type MermaidRenderingMode = "off" | "final" | "streaming";

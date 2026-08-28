@@ -80,7 +80,7 @@ function deferredQuery() {
 }
 
 describe("Claude Code RLM admission", () => {
-	it("admits immediately, bypasses native model lookup, and retains a completed registry row", async () => {
+	it("returns after runtime init, bypasses native model lookup, and retains a completed registry row", async () => {
 		const query = deferredQuery();
 		const harness = await createHarness({
 			provider: "faux-claude-rlm",
@@ -111,16 +111,12 @@ describe("Claude Code RLM admission", () => {
 					effort: "high",
 				}),
 			);
-			const handle = await harness.session.runRlmChild("inspect the runtime", {
+			const admission = harness.session.runRlmChild("inspect the runtime", {
 				name: "claude-worker",
 				model: "@claude",
 				thinking: "low",
 			});
-			expect(handle).toMatchObject({
-				name: "claude-worker",
-				model: "claude-code/claude-opus-4-7",
-			});
-			expect(query.start).toHaveBeenCalledOnce();
+			await vi.waitFor(() => expect(query.start).toHaveBeenCalledOnce());
 			expect(query.request()).toMatchObject({
 				allowedTools: expect.arrayContaining(["Read", "Edit", ...CLAUDE_CODE_FAMILY_TOOL_NAMES]),
 				effort: "low",
@@ -132,7 +128,7 @@ describe("Claude Code RLM admission", () => {
 				value: expect.stringContaining("inspect the runtime"),
 			});
 			await expect(harness.session.listRlmSubagents()).resolves.toMatchObject({
-				subagents: [{ rlm_child_id: handle.rlm_child_id, status: "running", session_id: null }],
+				subagents: [{ status: "running", session_id: null }],
 			});
 
 			query.release();
@@ -142,6 +138,11 @@ describe("Claude Code RLM admission", () => {
 				tools: ["Read", "Edit", ...CLAUDE_CODE_FAMILY_TOOL_NAMES],
 				version: "1.0",
 				sessionId: "claude-session-1",
+			});
+			const handle = await admission;
+			expect(handle).toMatchObject({
+				name: "claude-worker",
+				model: "claude-code/claude-opus-4-7",
 			});
 			query.events.push({ kind: "assistant", text: "working", usage });
 			query.events.push({ kind: "result", isError: false, text: "finished", usage });
@@ -221,10 +222,11 @@ describe("Claude Code RLM admission", () => {
 			rlmMaxDepth: 1,
 		});
 		try {
-			const handle = await harness.session.runRlmChild("coordinate with family", {
+			const admission = harness.session.runRlmChild("coordinate with family", {
 				name: "claude-family-worker",
 				model: "claude-code/claude-opus-4-7",
 			});
+			await vi.waitFor(() => expect(query.start).toHaveBeenCalledOnce());
 			await query.input().next();
 			query.release();
 			query.events.push({
@@ -234,6 +236,7 @@ describe("Claude Code RLM admission", () => {
 				version: "1.0",
 				sessionId: "claude-family-session",
 			});
+			const handle = await admission;
 			query.events.push({ kind: "result", isError: false, text: "initial done", usage });
 			await vi.waitFor(async () =>
 				expect((await harness.session.listRlmSubagents()).subagents[0]?.status).toBe("completed"),
@@ -295,7 +298,7 @@ describe("Claude Code RLM admission", () => {
 		}
 	});
 
-	it("admits before startup failure and projects an error registry row", async () => {
+	it("rejects startup failure instead of returning a false admission handle", async () => {
 		const start: StartClaudeCodeQuery = vi.fn(async () => {
 			throw new Error("SDK startup failed");
 		});
@@ -307,16 +310,12 @@ describe("Claude Code RLM admission", () => {
 			rlmMaxDepth: 1,
 		});
 		try {
-			const handle = await harness.session.runRlmChild("fail after admission", {
-				model: "claude-code/claude-opus-4-7",
-			});
-			expect(handle.model).toBe("claude-code/claude-opus-4-7");
-			await vi.waitFor(async () =>
-				expect((await harness.session.listRlmSubagents()).subagents[0]).toMatchObject({
-					rlm_child_id: handle.rlm_child_id,
-					status: "error",
+			await expect(
+				harness.session.runRlmChild("fail before admission", {
+					model: "claude-code/claude-opus-4-7",
 				}),
-			);
+			).rejects.toThrow("SDK startup failed");
+			await expect(harness.session.listRlmSubagents()).resolves.toEqual({ subagents: [] });
 		} finally {
 			harness.cleanup();
 		}
@@ -341,28 +340,25 @@ describe("Claude Code RLM admission", () => {
 		}
 	});
 
-	it("closes a query created after deletion races blocked startup", async () => {
+	it("closes a query created after parent disposal races blocked admission", async () => {
 		const query = deferredQuery();
 		const harness = await createHarness({
-			provider: "faux-claude-delete",
+			provider: "faux-claude-dispose-during-admission",
 			settings: { claudeCode: { executable: "/configured/claude" } },
 			startClaudeCodeQuery: query.start,
 			rlmDepth: 0,
 			rlmMaxDepth: 1,
 		});
-		try {
-			const handle = await harness.session.runRlmChild("delete during startup", {
-				model: "claude-code/claude-sonnet-4-6:medium",
-			});
-			await expect(harness.session.deleteRlmSubagent(handle.rlm_child_id)).resolves.toMatchObject({
-				subagent: { rlm_child_id: handle.rlm_child_id },
-			});
-			await expect(harness.session.listRlmSubagents()).resolves.toEqual({ subagents: [] });
-			query.release();
-			await vi.waitFor(() => expect(query.close).toHaveBeenCalledOnce());
-		} finally {
-			harness.cleanup();
-		}
+		const admission = harness.session.runRlmChild("dispose during admission", {
+			model: "claude-code/claude-sonnet-4-6:medium",
+		});
+		const rejectedAdmission = expect(admission).rejects.toThrow("Parent session disposed");
+		await vi.waitFor(() => expect(query.start).toHaveBeenCalledOnce());
+		harness.session.dispose();
+		query.release();
+		await rejectedAdmission;
+		await vi.waitFor(() => expect(query.close).toHaveBeenCalledOnce());
+		harness.cleanup();
 	});
 
 	it("closes a retained completed query when the parent is disposed", async () => {
@@ -375,7 +371,7 @@ describe("Claude Code RLM admission", () => {
 			rlmDepth: 0,
 			rlmMaxDepth: 1,
 		});
-		const handle = await harness.session.runRlmChild("complete before parent disposal", {
+		const admission = harness.session.runRlmChild("complete before parent disposal", {
 			model: "claude-code/claude-haiku-4-5",
 		});
 		events.push({
@@ -385,6 +381,7 @@ describe("Claude Code RLM admission", () => {
 			version: "1.0",
 			sessionId: "claude-session-dispose",
 		});
+		const handle = await admission;
 		events.push({ kind: "result", isError: false, text: "done", usage });
 		await vi.waitFor(async () =>
 			expect((await harness.session.listRlmSubagents()).subagents[0]).toMatchObject({

@@ -145,11 +145,13 @@ export class ClaudeCodeInputMailbox implements AsyncIterable<string> {
 
 export class ClaudeCodeRuntime {
 	readonly input: ClaudeCodeInputMailbox;
+	readonly admission: Promise<ClaudeCodeRuntimeSnapshot>;
 	readonly initialCompletion: Promise<ClaudeCodeRuntimeSnapshot>;
 	private readonly options: ClaudeCodeRuntimeOptions;
 	private readonly abortController = new AbortController();
 	private readonly listeners = new Set<ClaudeCodeRuntimeListener>();
 	private readonly usage = emptyClaudeCodeUsage();
+	private readonly resolveAdmission: (snapshot: ClaudeCodeRuntimeSnapshot) => void;
 	private readonly resolveInitialCompletion: (snapshot: ClaudeCodeRuntimeSnapshot) => void;
 	private query: ClaudeCodeQuery | undefined;
 	private status: ClaudeCodeRuntimeStatus = "queued";
@@ -160,12 +162,18 @@ export class ClaudeCodeRuntime {
 	private toolUseCount = 0;
 	private runtimeError: string | undefined;
 	private closeAttempted = false;
+	private admissionSettled = false;
 	private initialSettled = false;
 	private eventPump: Promise<void> | undefined;
 
 	constructor(options: ClaudeCodeRuntimeOptions) {
 		this.options = options;
 		this.input = new ClaudeCodeInputMailbox(options.prompt);
+		let resolveAdmission: ((snapshot: ClaudeCodeRuntimeSnapshot) => void) | undefined;
+		this.admission = new Promise((resolve) => {
+			resolveAdmission = resolve;
+		});
+		this.resolveAdmission = (snapshot) => resolveAdmission?.(snapshot);
 		let resolveInitialCompletion: ((snapshot: ClaudeCodeRuntimeSnapshot) => void) | undefined;
 		this.initialCompletion = new Promise((resolve) => {
 			resolveInitialCompletion = resolve;
@@ -240,6 +248,7 @@ export class ClaudeCodeRuntime {
 		if (this.status === "cancelled" || this.closeAttempted) return;
 		this.status = "cancelled";
 		this.runtimeError = reason;
+		this.settleAdmission();
 		this.settleInitial();
 		this.close(reason);
 		this.emit();
@@ -266,6 +275,7 @@ export class ClaudeCodeRuntime {
 					sawInit = true;
 					this.sessionId = event.sessionId;
 					this.status = "running";
+					this.settleAdmission();
 					this.emit();
 					continue;
 				}
@@ -308,9 +318,16 @@ export class ClaudeCodeRuntime {
 	private fail(error: unknown): void {
 		this.status = "error";
 		this.runtimeError = errorMessage(error);
+		this.settleAdmission();
 		this.settleInitial();
 		this.close(this.runtimeError);
 		this.emit();
+	}
+
+	private settleAdmission(): void {
+		if (this.admissionSettled) return;
+		this.admissionSettled = true;
+		this.resolveAdmission(this.snapshot);
 	}
 
 	private settleInitial(): void {

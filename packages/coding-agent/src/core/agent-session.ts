@@ -12006,14 +12006,14 @@ export class AgentSession {
 		return receipt;
 	}
 
-	private _startClaudeCodeRlmChildRun(options: {
+	private async _startClaudeCodeRlmChildRun(options: {
 		prompt: string;
 		selection: Extract<RlmSubagentModelSelection, { runtime: "claude-code" }>;
 		childNodeId: string;
 		sessionName: string;
 		sessionDir: string;
 		startedAt: number;
-	}): RlmSpawnHandle {
+	}): Promise<RlmSpawnHandle> {
 		const { prompt, selection, childNodeId, sessionName, sessionDir, startedAt } = options;
 		const executable = this.settingsManager.getClaudeCodeExecutable();
 		if (!executable)
@@ -12154,11 +12154,23 @@ export class AgentSession {
 		});
 		this._activeRlmChildRuns.set(run.id, run);
 		this._unsettledRlmChildRuns.add(run);
-		run.publication.resolve();
 		emitChildUpdate();
+		try {
+			await runtime.start();
+			const admission = await runtime.admission;
+			if (admission.status !== "running") {
+				throw new Error(admission.error ?? "Claude Code runtime failed before admission");
+			}
+		} catch (error) {
+			runtime.dispose();
+			this._removeRlmSubagentTracking(run.id, run);
+			this._unsettledRlmChildRuns.delete(run);
+			run.settlement.resolve();
+			throw error;
+		}
+		run.publication.resolve();
 
 		void (async () => {
-			await runtime.start();
 			const terminal = await runtime.initialCompletion;
 			if (terminal.status === "done") {
 				if (!run.detachedDeletion && !run.externalRepliedToParent) {

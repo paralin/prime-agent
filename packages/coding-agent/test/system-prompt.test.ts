@@ -295,6 +295,8 @@ describe("buildRlmPrompt", () => {
 		});
 
 		expect(prompt).toContain('await bash("command")');
+		expect(prompt).toContain("external_event.watch_bash(...)");
+		expect(prompt).toContain("Do not leave a retained task without a notification sink");
 	});
 
 	test("documents preferring Python for reading and searching files when ipython is active", () => {

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added event-driven retained Bash jobs that wake their Prime Agent session with structured completion details instead of requiring heartbeat polling.
+
 - Added an optional `timeout=seconds` argument to the IPython `bash()` helper.
 
 - Fixed background (unattributed) kernel output missing from the expanded IPython cell view: it is now surfaced in the tool details and rendered under a "background output (unattributed)" label after stdout/stderr/result.

@@ -1,0 +1,1 @@
+- Added argv-safe SSH transport to the IPython `bash()` helper with exact stdin script delivery, quoted remote cwd/env setup, transport-failure reporting, and existing timeout/job-watch integration.

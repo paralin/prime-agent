@@ -295,6 +295,7 @@ describe("buildRlmPrompt", () => {
 		});
 
 		expect(prompt).toContain('await bash("command")');
+		expect(prompt).toContain('pass `ssh="host"`');
 		expect(prompt).toContain("external_event.watch_bash(...)");
 		expect(prompt).toContain("Do not leave a retained task without a notification sink");
 	});

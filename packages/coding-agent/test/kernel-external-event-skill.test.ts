@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -54,7 +54,7 @@ job = bash("sleep 0.1; printf capture-complete")
 job_id = external_event.watch_bash(job, "video capture", tail_lines=4)
 print(job_id)
 `);
-		expect(started.status).toBe("ok");
+		expect(started.status, JSON.stringify(started.error)).toBe("ok");
 		const jobId = started.stdout.trim();
 		expect(jobId).toMatch(/^[0-9a-f]{32}$/);
 
@@ -79,5 +79,76 @@ print(info.status, info.exit_code, info.notification_status)
 `);
 		expect(listed.stdout.trim()).toBe("completed 0 delivered");
 		expect(requests).toHaveLength(1);
+	});
+
+	it("watches an argv-safe SSH script transport through the live kernel", async () => {
+		const fakeBin = join(tempDir, "bin");
+		mkdirSync(fakeBin, { recursive: true });
+		const fakeSsh = join(fakeBin, "ssh");
+		writeFileSync(
+			fakeSsh,
+			`#!/bin/sh
+while [ "$1" != "--" ]; do shift; done
+shift
+host=$1
+shift
+command=$1
+exec /bin/sh -c "$command"
+`,
+		);
+		chmodSync(fakeSsh, 0o755);
+		let receive!: (payload: Record<string, unknown>) => void;
+		const received = new Promise<Record<string, unknown>>((resolve) => {
+			receive = resolve;
+		});
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledExternalEventSkill()],
+			hostHandlers: {
+				"session.external_event.emit": async (payload) => {
+					receive(payload);
+					return { accepted: true, deliveryStatus: "delivered" };
+				},
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const started = await manager.execute(`
+import os
+os.environ["PATH"] = ${JSON.stringify(fakeBin)} + os.pathsep + os.environ["PATH"]
+script = """set -eu
+quoted='single and \\"double\\"'
+sub=$(printf command-substitution)
+cat <<'PAYLOAD'
+Unicode 雪 and $(literal)
+PAYLOAD
+printf '%s\\n' "$REMOTE_TARGET:$sub:$quoted"
+"""
+remote_job = bash(
+    script,
+    ssh="core@fake-host",
+    cwd=${JSON.stringify(tempDir)},
+    env={"REMOTE_TARGET": "desktop value"},
+)
+remote_job_id = external_event.watch_bash(remote_job, "remote build")
+print(remote_job_id)
+`);
+		expect(started.status, JSON.stringify(started.error)).toBe("ok");
+		const jobId = started.stdout.trim();
+		const event = await Promise.race([
+			received,
+			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("SSH event timed out")), 5_000)),
+		]);
+		expect(event).toMatchObject({
+			name: "bash",
+			event_id: jobId,
+			delivery_policy: "followUp",
+		});
+		expect(event.text).toContain("SSH: core@fake-host");
+		expect(event.text).toContain(`Remote cwd: ${tempDir}`);
+		expect(event.text).toContain("Remote env keys: REMOTE_TARGET");
+		expect(event.text).toContain("Transport: ssh");
+		expect(event.text).toContain("Transport error: no");
+		expect(event.text).toContain("Unicode 雪 and $(literal)");
+		expect(event.text).toContain('desktop value:command-substitution:single and "double"');
 	});
 });

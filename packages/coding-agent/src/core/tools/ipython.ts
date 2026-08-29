@@ -69,7 +69,7 @@ except Exception as _prime_agent_rlm_error:
 
     rlm = _PrimeAgentMissingRlm()
 
-    def bash(command, timeout=None):
+    def bash(command, timeout=None, **kwargs):
         rlm._raise_missing()
 `.trim();
 

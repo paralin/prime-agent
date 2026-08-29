@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from rlm import bash
+from test.test_bash import _fake_ssh
+
+bash_module = sys.modules["rlm.bash"]
 
 SKILL = Path(__file__).parents[2] / "packages/coding-agent/skills/external-event/src/external_event/__init__.py"
 
@@ -85,6 +90,34 @@ class ExternalEventSkillTest(unittest.IsolatedAsyncioTestCase):
             assert self.module._jobs[job_id].task is not None
             await self.module._jobs[job_id].task
         host.assert_awaited_once()
+
+    async def test_watch_bash_reports_ssh_transport(self) -> None:
+        host = AsyncMock(return_value={"deliveryStatus": "delivered"})
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = os.path.join(tmp, "capture")
+            fake = _fake_ssh(tmp)
+            with patch.object(self.module, "host_request", host), patch.object(
+                bash_module, "_ssh_executable", return_value=fake
+            ), patch.dict(os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}):
+                job_id = self.module.watch_bash(
+                    bash("printf remote", ssh="host", cwd=tmp, env={"TARGET": "desktop"}),
+                    "remote build",
+                )
+                assert self.module._jobs[job_id].task is not None
+                await asyncio.wait_for(self.module._jobs[job_id].task, timeout=5)
+        info = self.module.get_job(job_id)
+        self.assertEqual(info.transport, "ssh")
+        self.assertFalse(info.transport_error)
+        self.assertEqual(info.ssh, "host")
+        self.assertEqual(info.remote_cwd, tmp)
+        self.assertEqual(info.remote_env_keys, ("TARGET",))
+        text = host.await_args.args[1]["text"]
+        self.assertIn("SSH: host", text)
+        self.assertIn(f"Remote cwd: {tmp}", text)
+        self.assertIn("Remote env keys: TARGET", text)
+        self.assertNotIn("desktop", text)
+        self.assertIn("Transport: ssh", text)
+        self.assertIn("Transport error: no", text)
 
     async def test_cancel_job_kills_local_group_and_emits(self) -> None:
         emitted = asyncio.Event()

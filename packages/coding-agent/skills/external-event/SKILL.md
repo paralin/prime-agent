@@ -13,8 +13,8 @@ job_id = external_event.watch_bash(job, "video capture")
 ```
 
 End the turn after registration. When the command exits, Prime Agent receives
-one follow-up with the label, command, PID, exit code, duration, and bounded
-output tail.
+one follow-up with the label, command, PID, exit code, duration, transport
+status, remote host/cwd/env-key metadata when present, and bounded output tail.
 
 ## API
 

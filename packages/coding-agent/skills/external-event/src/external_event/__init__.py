@@ -24,9 +24,14 @@ class JobInfo:
     label: str
     pid: int
     command: str
+    ssh: str | None
+    remote_cwd: str | None
+    remote_env_keys: tuple[str, ...]
     status: str
     exit_code: int | None
     duration: float | None
+    transport: str | None
+    transport_error: bool | None
     notification_status: str | None
     notification_error: str | None
 
@@ -51,9 +56,14 @@ class _WatchedJob:
             label=self.label,
             pid=self.handle.pid,
             command=_command_preview(self.handle.command),
+            ssh=self.handle.ssh,
+            remote_cwd=self.handle.remote_cwd,
+            remote_env_keys=self.handle.remote_env_keys,
             status=self.status,
             exit_code=self.result.exit_code if self.result is not None else None,
             duration=self.result.duration if self.result is not None else None,
+            transport=self.result.transport if self.result is not None else None,
+            transport_error=self.result.transport_error if self.result is not None else None,
             notification_status=self.notification_status,
             notification_error=self.notification_error,
         )
@@ -183,9 +193,25 @@ def _completion_text(job: _WatchedJob, error: BaseException | None) -> str:
         f"Job ID: {job.id}",
         f"PID: {job.handle.pid}",
         f"Command: {command}",
-        f"Exit code: {result.exit_code if result is not None else 'unknown'}",
-        f"Duration: {result.duration:.3f}s" if result is not None and math.isfinite(result.duration) else "Duration: unknown",
     ]
+    if job.handle.ssh is not None:
+        fields.extend(
+            (
+                f"SSH: {job.handle.ssh}",
+                f"Remote cwd: {job.handle.remote_cwd or 'default'}",
+                f"Remote env keys: {', '.join(job.handle.remote_env_keys) or 'none'}",
+            )
+        )
+    fields.extend(
+        (
+            f"Exit code: {result.exit_code if result is not None else 'unknown'}",
+            f"Transport: {result.transport if result is not None else 'unknown'}",
+            f"Transport error: {'yes' if result is not None and result.transport_error else 'no'}",
+            f"Duration: {result.duration:.3f}s"
+            if result is not None and math.isfinite(result.duration)
+            else "Duration: unknown",
+        )
+    )
     if error is not None:
         fields.append(f"Error: {type(error).__name__}: {error}")
     if job.tail_lines:

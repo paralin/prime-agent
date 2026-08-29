@@ -143,6 +143,30 @@ class WinJobTest(unittest.TestCase):
         self.assertEqual(proc.pid, 4242)
         self.assertIs(proc.stdout, open_reader.return_value)
 
+    def test_spawn_in_job_can_pipe_parent_input(self):
+        captured = self._wire_spawn_mocks(set_handle=(1, 1, 1))
+        pipe_handles = iter(((101, 102), (104, 105)))
+
+        def create_pipe(read_ptr, write_ptr, _attrs, _size):
+            read_handle, write_handle = next(pipe_handles)
+            ctypes.cast(read_ptr, ctypes.POINTER(wintypes.HANDLE)).contents.value = read_handle
+            ctypes.cast(write_ptr, ctypes.POINTER(wintypes.HANDLE)).contents.value = write_handle
+            return 1
+
+        self.k32.CreatePipe.side_effect = create_pipe
+        with mock.patch.object(_winjob, "_open_reader") as open_reader, mock.patch.object(
+            _winjob, "_open_writer"
+        ) as open_writer:
+            proc = _winjob.spawn_in_job(314, ["ssh.exe", "host"], "C:/work", {}, pipe_stdin=True)
+
+        self.assertEqual(captured["updates"][1][1], (102, 104))
+        self.assertEqual(captured["create"]["hStdInput"], 104)
+        open_reader.assert_called_once_with(101)
+        open_writer.assert_called_once_with(105)
+        self.assertIs(proc.stdin, open_writer.return_value)
+        closed = sorted(call.args[0] for call in self.k32.CloseHandle.call_args_list)
+        self.assertEqual(closed, [102, 103, 104])
+
     def test_spawn_in_job_cleanup_on_failures(self):
         scenarios = (
             ({"create_pipe": 0}, [], False),
@@ -214,6 +238,28 @@ class WinJobTest(unittest.TestCase):
             os.fstat(fd)
         closed = sorted(c.args[0] for c in self.k32.CloseHandle.call_args_list)
         self.assertEqual(closed, [102, 103, 201, 202])
+
+    def test_spawn_in_job_writer_failure_closes_owned_reader(self):
+        captured = self._wire_spawn_mocks(set_handle=(1, 1, 1))
+        pipe_handles = iter(((101, 102), (104, 105)))
+
+        def create_pipe(read_ptr, write_ptr, _attrs, _size):
+            read_handle, write_handle = next(pipe_handles)
+            ctypes.cast(read_ptr, ctypes.POINTER(wintypes.HANDLE)).contents.value = read_handle
+            ctypes.cast(write_ptr, ctypes.POINTER(wintypes.HANDLE)).contents.value = write_handle
+            return 1
+
+        self.k32.CreatePipe.side_effect = create_pipe
+        reader = mock.Mock()
+        with mock.patch.object(_winjob, "_open_reader", return_value=reader), mock.patch.object(
+            _winjob, "_open_writer", side_effect=OSError("writer failed")
+        ):
+            with self.assertRaisesRegex(OSError, "writer failed"):
+                _winjob.spawn_in_job(314, ["ssh.exe", "host"], "C:/work", {}, pipe_stdin=True)
+        reader.close.assert_called_once_with()
+        self.assertEqual(captured["create"]["hStdInput"], 104)
+        closed = sorted(call.args[0] for call in self.k32.CloseHandle.call_args_list)
+        self.assertEqual(closed, [102, 103, 104, 201, 202])
 
     def test_win64_abi_struct_layout(self):
         # Fixed-width fields pin the Win64 layout on every host (LP64 DWORD would be vacuous).

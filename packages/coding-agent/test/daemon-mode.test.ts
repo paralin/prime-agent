@@ -425,11 +425,11 @@ describe("daemon mode helpers", () => {
 		internals.write = vi.fn();
 		const client = makeClient("legacy-supervisor", "active");
 
-		await internals.handleWorkerCommand(client, { id: "legacy-1", type: "worker_sync_agent_peers", peers: [] });
+		await internals.handleWorkerCommand(client, { id: "legacy-1", type: "worker_unknown" });
 
 		expect(internals.write).toHaveBeenCalledWith(
 			client,
-			expect.objectContaining({ id: "legacy-1", command: "worker_sync_agent_peers", success: false }),
+			expect.objectContaining({ id: "legacy-1", command: "worker_unknown", success: false }),
 		);
 	});
 
@@ -2414,7 +2414,7 @@ describe("daemon mode helpers", () => {
 		expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({ streamingBehavior: "steer" });
 	});
 
-	it("rejects an agent message when pause wins core admission", async () => {
+	it("serializes pause after an in-flight agent message admission", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -2448,6 +2448,7 @@ describe("daemon mode helpers", () => {
 			...targetState.runtime,
 			cwd: "/tmp",
 			session: {
+				sessionManager: makeMailboxSessionManager(),
 				sessionId: "session-target",
 				sessionName: "Target",
 				acceptAgentMessagePrompt,
@@ -2471,12 +2472,13 @@ describe("daemon mode helpers", () => {
 			origin: "agent",
 		});
 		await admissionStarted;
-		await internals.handleCommand(makeClient("client-1", targetState.activeSessionId), {
+		const pause = internals.handleCommand(makeClient("client-1", targetState.activeSessionId), {
 			type: "agent_messages_pause",
 		});
 		releaseAdmission();
 
-		await expect(send).rejects.toThrow("Agent messaging is paused");
+		await expect(send).resolves.toMatchObject({ deliveryStatus: "delivered" });
+		await pause;
 	});
 
 	it("ignores a legacy follow-up mode and always steers agent messages", async () => {
@@ -2487,12 +2489,7 @@ describe("daemon mode helpers", () => {
 			},
 		});
 		const targetState = makeState("target");
-		const acceptAgentMessagePrompt = vi.fn(
-			(_message: string, options?: { preflightResult?: (accepted: boolean, queued?: boolean) => void }) => {
-				options?.preflightResult?.(true, true);
-				return Promise.resolve();
-			},
-		);
+		const queueAgentMessagePrompt = vi.fn(async () => true);
 		targetState.runtime = {
 			...targetState.runtime,
 			cwd: "/tmp",
@@ -2505,7 +2502,7 @@ describe("daemon mode helpers", () => {
 				isRetrying: false,
 				isBashRunning: false,
 				unfinishedActionCount: 0,
-				acceptAgentMessagePrompt,
+				queueAgentMessagePrompt,
 			},
 		} as never;
 		const internals = daemon as unknown as {
@@ -2522,12 +2519,10 @@ describe("daemon mode helpers", () => {
 		});
 
 		expect(response).toMatchObject({ data: { deliveryStatus: "queued", deliveryMode: "steer" } });
-		expect(acceptAgentMessagePrompt).toHaveBeenCalledWith(
+		expect(queueAgentMessagePrompt).toHaveBeenCalledWith(
 			expect.stringContaining("do not defer"),
-			expect.objectContaining({
-				streamingBehavior: "steer",
-				customMessage: expect.objectContaining({ customType: "agent_message" }),
-			}),
+			"steer",
+			expect.objectContaining({ customType: "agent_message" }),
 		);
 	});
 

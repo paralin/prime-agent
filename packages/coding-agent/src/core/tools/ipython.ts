@@ -3,6 +3,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { IMAGE_MIME_TYPES } from "../../utils/mime.js";
+import { resolveKernelBashShell } from "../../utils/shell.js";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
 import { withKernelBootPermit } from "../kernel/boot-gate.js";
 import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
@@ -12,8 +13,8 @@ import {
 	type KernelAttachment,
 	KernelBusyAfterInterruptError,
 	type KernelDiffDisplay,
-	KernelManager,
 	type KernelSentAgentMessage,
+	ReplKernelManager,
 } from "../kernel/index.js";
 import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
 import type { RootForegroundLease } from "../root-foreground-lease.js";
@@ -348,8 +349,8 @@ function applyShellSettingsToBashMagicCell(
  * attach mid-flight (a tool call racing a background prewarm()).
  */
 export class IpythonKernelProvisioner {
-	private managerPromise?: Promise<KernelManager>;
-	private startedManager?: KernelManager;
+	private managerPromise?: Promise<ReplKernelManager>;
+	private startedManager?: ReplKernelManager;
 	private readonly startupListeners = new Set<KernelBootstrapProgressHandler>();
 	private lastStartupMessage?: string;
 	private _lastRestore?: RestoreResult;
@@ -362,7 +363,7 @@ export class IpythonKernelProvisioner {
 	) {}
 
 	/** The kernel manager, once a startup has completed successfully. */
-	get manager(): KernelManager | undefined {
+	get manager(): ReplKernelManager | undefined {
 		return this.startedManager;
 	}
 
@@ -407,7 +408,7 @@ export class IpythonKernelProvisioner {
 		if (!pending) return;
 		try {
 			const m = await pending;
-			await m.shutdown({ snapshot: true, drainHostRequests: true });
+			await m.shutdown({ snapshot: true });
 		} catch {
 			// a failed startup already cleaned up after itself
 		}
@@ -419,12 +420,9 @@ export class IpythonKernelProvisioner {
 		const pending = this.managerPromise;
 		this.managerPromise = undefined;
 		this.startedManager = undefined;
-		if (this.options?.kernelManagerRef) {
-			this.options.kernelManagerRef.current = undefined;
-		}
 		if (!pending) return;
 		const gate = pending.then(
-			(manager) => manager.dispose(),
+			(manager) => manager.shutdown({ snapshot: true }).then(() => undefined),
 			() => undefined,
 		);
 		this.restartGate = gate;
@@ -448,7 +446,7 @@ export class IpythonKernelProvisioner {
 		}
 	}
 
-	ensure(onProgress?: KernelBootstrapProgressHandler, signal?: AbortSignal): Promise<KernelManager> {
+	ensure(onProgress?: KernelBootstrapProgressHandler, signal?: AbortSignal): Promise<ReplKernelManager> {
 		if (signal?.aborted) {
 			return Promise.reject(createAbortError());
 		}
@@ -458,12 +456,9 @@ export class IpythonKernelProvisioner {
 		// persisted snapshot. dispose()/kill() cleared the flag on the manager,
 		// so an explicitly torn-down kernel is never resurrected here.
 		const dead = this.startedManager;
-		if (dead && !dead.isRunning && dead.exitedUnexpectedly) {
+		if (dead && !dead.isRunning) {
 			this.managerPromise = undefined;
 			this.startedManager = undefined;
-			if (this.options?.kernelManagerRef?.current === dead) {
-				this.options.kernelManagerRef.current = undefined;
-			}
 		}
 		let cleanupProgressListener: (() => void) | undefined;
 		if (onProgress && !this.startedManager) {
@@ -521,7 +516,7 @@ export class IpythonKernelProvisioner {
 		}
 	}
 
-	private async startKernel(signal?: AbortSignal): Promise<KernelManager> {
+	private async startKernel(signal?: AbortSignal): Promise<ReplKernelManager> {
 		const startupAbort = createLinkedAbortSignal([this.disposeController.signal, signal]);
 		const startupSignal = startupAbort.signal;
 		// Wait for a previous provisioner (e.g. on /reload) to finish disposing — and
@@ -547,10 +542,13 @@ export class IpythonKernelProvisioner {
 			const m = new ReplKernelManager({
 				python: this.options?.python,
 				cwd: this.cwd,
-				env: this.options?.env,
+				env: {
+					...this.options?.env,
+					...(shellPath ? { PRIME_AGENT_BASH_SHELL: shellPath } : {}),
+					...(commandPrefix ? { PRIME_AGENT_BASH_COMMAND_PREFIX: commandPrefix } : {}),
+				},
 				sessionId: this.options?.sessionId,
 				hostHandlers: this.options?.hostHandlers,
-				foregroundLease: this.options?.foregroundLease,
 				pythonSkills: this.options?.pythonSkills,
 				// Only persistent sessions (which have an artifact dir) get a revivable snapshot.
 				snapshot: snapshotDir
@@ -597,7 +595,7 @@ export class IpythonKernelProvisioner {
 				// surface the failure before the teardown (final snapshot flush included)
 				// finished, or a replacement provisioner gated on this dispose could
 				// race the still-flushing kernel over the same snapshot files.
-				await m.shutdown({ snapshot: true, drainHostRequests: true }).catch(() => undefined);
+				await m.shutdown({ snapshot: true }).catch(() => undefined);
 				throw error;
 			}
 			// Only tell the model what was revived once the kernel is actually usable —
@@ -650,7 +648,6 @@ async function executeWithBusyKernelChoice(
 			return {
 				result: await m.execute(code, {
 					signal,
-					outerToolCallId: toolCallId,
 					onStream,
 					onLateSentAgentMessage: onLateSentAgentMessage
 						? (message) => onLateSentAgentMessage(toolCallId, message)

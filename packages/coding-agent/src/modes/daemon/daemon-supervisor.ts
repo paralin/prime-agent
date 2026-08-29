@@ -723,6 +723,7 @@ export class DaemonSupervisor {
 	private commandJournal!: CommandRecoveryJournal;
 	private readonly streamReconstructor = new CompactAssistantStreamReconstructor();
 	private readonly compactCatchupInProgress = new Set<string>();
+	private agentPeerSyncQueue: Promise<void> = Promise.resolve();
 	private readonly pendingSessionNames = new Set<string>();
 	private readonly catalog: DaemonCatalogClient;
 	private readonly settingsManager: SettingsManager;
@@ -4390,6 +4391,35 @@ export class DaemonSupervisor {
 				ignoreSessionId: target.id,
 			},
 		);
+	}
+
+	private syncAgentPeers(): Promise<void> {
+		const sync = this.agentPeerSyncQueue
+			.catch(() => undefined)
+			.then(async () => {
+				const readyWorkers = [...this.workers.values()].filter(
+					(worker): worker is ResidentWorker & { client: DaemonWorkerClient } =>
+						this.isLiveWorker(worker) && worker.descriptor.lifecycle === "ready" && worker.client !== undefined,
+				);
+				await Promise.all(
+					readyWorkers.map(async (worker) => {
+						const peers = [
+							...readyWorkers
+								.filter((candidate) => candidate !== worker)
+								.flatMap((candidate) => {
+									const root = candidate.summaries.get(candidate.descriptor.rootActiveSessionId);
+									return root ? [this.agentPeerSummary(root)] : [];
+								}),
+						];
+						const response = await worker.client.requestWorker({ type: "worker_sync_agent_peers", peers }, 5000);
+						if (!response.success) {
+							throw new Error(response.error);
+						}
+					}),
+				);
+			});
+		this.agentPeerSyncQueue = sync;
+		return sync;
 	}
 
 	private isVisibleWorker(worker: ResidentWorker): boolean {

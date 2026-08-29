@@ -154,18 +154,16 @@ describe("IpythonKernelProvisioner", () => {
 		const { python, countRuns } = writeFakePython();
 		const provisioner = new IpythonKernelProvisioner(tempDir, { python });
 
-		await expect(provisioner.ensure()).rejects.toThrow(/Kernel exited before resolving ports/);
-		await expect(provisioner.ensure()).rejects.toThrow(/Kernel exited before resolving ports/);
+		await expect(provisioner.ensure()).rejects.toThrow(/Kernel exited before ready/);
+		await expect(provisioner.ensure()).rejects.toThrow(/Kernel exited before ready/);
 		expect(countRuns()).toBe(2);
 	});
 
 	it("single-flights replacement after the running kernel exits unexpectedly", async () => {
-		const kernelManagerRef: { current?: KernelManager } = {};
-		const provisioner = new IpythonKernelProvisioner(tempDir, { kernelManagerRef });
+		const provisioner = new IpythonKernelProvisioner(tempDir);
 		const dead = { isRunning: false, exitedUnexpectedly: true } as KernelManager;
 		const fresh = { isRunning: true, exitedUnexpectedly: false } as KernelManager;
 		const startKernel = vi.fn(async () => fresh);
-		kernelManagerRef.current = dead;
 		Object.assign(
 			provisioner as unknown as {
 				managerPromise: Promise<KernelManager>;
@@ -184,7 +182,6 @@ describe("IpythonKernelProvisioner", () => {
 		expect(first).toBe(fresh);
 		expect(second).toBe(fresh);
 		expect(startKernel).toHaveBeenCalledTimes(1);
-		expect(kernelManagerRef.current).toBeUndefined();
 	});
 
 	it("prewarm() swallows the failure and the next ensure() starts fresh", async () => {
@@ -251,8 +248,8 @@ describe("IpythonKernelProvisioner", () => {
 		const disposeGate = new Promise<void>((resolve) => {
 			releaseDispose = resolve;
 		});
-		const dispose = vi.fn(() => disposeGate);
-		const oldManager = { dispose, isRunning: true } as unknown as KernelManager;
+		const shutdown = vi.fn(() => disposeGate);
+		const oldManager = { shutdown, isRunning: true } as unknown as KernelManager;
 		Object.assign(
 			provisioner as unknown as {
 				managerPromise: Promise<KernelManager>;
@@ -271,8 +268,8 @@ describe("IpythonKernelProvisioner", () => {
 
 		releaseDispose();
 		await hibernated;
-		await expect(restarted).rejects.toThrow(/Kernel exited before resolving ports/);
-		expect(dispose).toHaveBeenCalledOnce();
+		await expect(restarted).rejects.toThrow(/Kernel exited before ready/);
+		expect(shutdown).toHaveBeenCalledOnce();
 		expect(countRuns()).toBe(1);
 	});
 
@@ -508,7 +505,7 @@ describe("KernelManager session cleanup during startup", () => {
 			await expect(startup).rejects.toThrow(/Kernel exited before resolving ports|disposed during startup/);
 			expect(manager.isRunning).toBe(false);
 		} finally {
-			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+			await manager.shutdown({ snapshot: true });
 		}
 	});
 });

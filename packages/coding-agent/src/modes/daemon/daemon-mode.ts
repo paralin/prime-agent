@@ -49,6 +49,7 @@ import {
 	type AgentSessionMessageSender,
 	agentFamilyRelationship,
 	assertAgentFamilyReach,
+	assertAgentMessageQueueCapacity,
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
 	buildAgentFamilyRoster,
@@ -62,6 +63,10 @@ import {
 	findAgentSessionMailboxAcceptance,
 	findAgentSessionMailboxHandoff,
 	formatAgentSessionNameUnavailable,
+	matchesAgentSessionMailboxFilter,
+	nextAgentSessionMailboxSequence,
+	normalizeAgentMessageInboxLimit,
+	normalizeAgentMessageWaitTimeout,
 	normalizeAgentSessionMessage,
 	projectAgentSessionMailbox,
 	sessionNameReservationKey,
@@ -569,6 +574,19 @@ export class AgentDaemon {
 	private readonly agentDir: string;
 	private readonly cronScheduler: AgentCronScheduler;
 	private readonly agentMessageRateLimiter = new AgentSessionMessageRateLimiter();
+	private readonly remoteAgentPeers = new Map<string, AgentSessionMessageAgentSummary>();
+	private readonly agentMessagePendingReservations = new Map<string, number>();
+	private readonly agentMessageTargetLocks = new Map<string, Promise<void>>();
+	private readonly agentMessageWaiters = new Map<
+		string,
+		Array<{
+			filter: AgentSessionMailboxFilter;
+			resolve: (result: AgentSessionMailboxWaitResult) => void;
+			reject: (error: Error) => void;
+		}>
+	>();
+	private readonly agentMessageAcceptingTargets = new Set<string>();
+	private readonly agentMessagePreparingTargets = new Map<string, number>();
 	// Sessions inserted into `sessions` but still awaiting extension binding;
 	// visible to host controllers during bind, excluded from targeting.
 	private readonly bindingSessions = new Set<string>();
@@ -5865,13 +5883,57 @@ export class AgentDaemon {
 	}
 
 	private async clearQueuedAgentSessionMessagesForState(state: ActiveSessionState) {
-		return state.runtime.session.clearQueuedAgentMessages();
+		return this.withAgentMessageTargetLock(state.activeSessionId, async () =>
+			state.runtime.session.clearQueuedAgentMessages(),
+		);
 	}
 
 	private async clearQueuedAgentSessionMessagesForAllStates(): Promise<void> {
 		await Promise.all(
 			[...this.sessions.values()].map((state) => this.clearQueuedAgentSessionMessagesForState(state)),
 		);
+	}
+
+	private reserveAgentMessageQueueSlot(targetState: ActiveSessionState): () => void {
+		const activeSessionId = targetState.activeSessionId;
+		const reserved = this.agentMessagePendingReservations.get(activeSessionId) ?? 0;
+		assertAgentMessageQueueCapacity(
+			targetState.runtime.session.unfinishedActionCount + reserved,
+			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+		);
+		this.agentMessagePendingReservations.set(activeSessionId, reserved + 1);
+		let released = false;
+		return () => {
+			if (released) {
+				return;
+			}
+			released = true;
+			const next = (this.agentMessagePendingReservations.get(activeSessionId) ?? 1) - 1;
+			if (next <= 0) {
+				this.agentMessagePendingReservations.delete(activeSessionId);
+			} else {
+				this.agentMessagePendingReservations.set(activeSessionId, next);
+			}
+		};
+	}
+
+	private async withAgentMessageTargetLock<T>(activeSessionId: string, run: () => Promise<T>): Promise<T> {
+		const previous = this.agentMessageTargetLocks.get(activeSessionId) ?? Promise.resolve();
+		let releaseCurrent: () => void = () => {};
+		const current = new Promise<void>((resolve) => {
+			releaseCurrent = resolve;
+		});
+		const next = previous.catch(() => undefined).then(() => current);
+		this.agentMessageTargetLocks.set(activeSessionId, next);
+		await previous.catch(() => undefined);
+		try {
+			return await run();
+		} finally {
+			releaseCurrent();
+			if (this.agentMessageTargetLocks.get(activeSessionId) === next) {
+				this.agentMessageTargetLocks.delete(activeSessionId);
+			}
+		}
 	}
 
 	private agentFamilyEntry(state: ActiveSessionState): AgentFamilyCatalogEntry {
@@ -6057,19 +6119,76 @@ export class AgentDaemon {
 		if (options.origin === "agent" && options.fromState) {
 			this.assertAgentFamilyReachable(options.fromState, targetState);
 		}
+		const payload: AgentSessionMessagePayload = {
+			id: options.id ?? createAgentSessionMessageId(),
+			source: AGENT_MESSAGE_SOURCE,
+			message,
+			...(options.replyTo ? { replyTo: options.replyTo } : {}),
+			from:
+				options.sender ??
+				this.createAgentSessionMessageSender(options.fromState, options.clientId ?? options.origin),
+			fromRelationship: options.fromRelationship ?? this.agentMessageRelationship(options.fromState, targetState),
+			target: this.createAgentSessionMessageEndpoint(targetState),
+		};
+		const messageId = options.id;
+		if (messageId) {
+			const prior = await this.withAgentMessageTargetLock(targetState.activeSessionId, async () => {
+				const entries = targetState.runtime.session.sessionManager.getEntries();
+				const acceptance = findAgentSessionMailboxAcceptance(
+					entries,
+					messageId,
+					targetState.runtime.session.sessionId,
+				);
+				const handoff = acceptance
+					? findAgentSessionMailboxHandoff(entries, messageId, targetState.runtime.session.sessionId)
+					: undefined;
+				return { acceptance, handoff };
+			});
+			if (prior.acceptance && prior.handoff) {
+				return createAgentSessionMessageReceipt(prior.acceptance, prior.handoff.deliveryStatus, undefined, {
+					acceptedAt: prior.acceptance.acceptedAt,
+					sequence: prior.acceptance.sequence,
+					handoff: "retry",
+				});
+			}
+		}
+		const releaseQueueSlot = this.reserveAgentMessageQueueSlot(targetState);
 		const senderKey =
 			options.senderKey ?? options.fromState?.activeSessionId ?? `client:${options.clientId ?? "unknown"}`;
 		const rateLimitKey = `${senderKey}->${targetState.activeSessionId}`;
 		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
 		if (!rateLimit.ok) {
+			releaseQueueSlot();
 			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
 		}
 		try {
-			const { status } = await this.acceptAgentSessionMessage(targetState, payload);
-			return createAgentSessionMessageReceipt(payload, status);
+			const result = await this.withAgentMessageTargetLock(targetState.activeSessionId, async () => {
+				if (this.agentMessagesPaused) {
+					throw new Error("Agent messaging is paused");
+				}
+				if (
+					!this.sessions.has(targetState.activeSessionId) ||
+					this.closingSessions.has(targetState.activeSessionId)
+				) {
+					throw new Error("Target session is closing before agent message delivery");
+				}
+				if (targetState.runtime.session.sessionId !== payload.target.sessionId) {
+					throw new Error("Target session changed before agent message delivery");
+				}
+				return this.acceptAgentSessionMessage(targetState, payload, releaseQueueSlot);
+			});
+			if (result.handoff === "retry") this.agentMessageRateLimiter.refund(rateLimitKey);
+			return createAgentSessionMessageReceipt(result.acceptance, result.status, undefined, {
+				acceptedAt: result.acceptance.acceptedAt,
+				sequence: result.acceptance.sequence,
+				handoff: result.handoff,
+			});
 		} catch (error) {
 			this.agentMessageRateLimiter.refund(rateLimitKey);
 			throw error;
+		} finally {
+			// Error-path backstop; success paths release inside acceptAgentSessionMessage.
+			releaseQueueSlot();
 		}
 	}
 
@@ -6157,38 +6276,97 @@ export class AgentDaemon {
 	private async acceptAgentSessionMessage(
 		targetState: ActiveSessionState,
 		payload: AgentSessionMessagePayload,
-	): Promise<{ status: AgentSessionMessageDeliveryStatus }> {
-		const message = createAgentSessionMessage(payload);
+		releaseReservation: () => void,
+	): Promise<{
+		status: AgentSessionMessageDeliveryStatus;
+		acceptance: AgentSessionMailboxEnvelope;
+		handoff: AgentSessionMessageHandoff;
+	}> {
+		const session = targetState.runtime.session;
+		const entries = session.sessionManager.getEntries();
+		const prior = findAgentSessionMailboxAcceptance(entries, payload.id, targetState.runtime.session.sessionId);
+		const priorHandoff = prior
+			? findAgentSessionMailboxHandoff(entries, payload.id, targetState.runtime.session.sessionId)
+			: undefined;
+		if (prior && priorHandoff) {
+			releaseReservation();
+			return {
+				status: priorHandoff.deliveryStatus,
+				acceptance: prior,
+				handoff: "retry",
+			};
+		}
+		const reserved = this.agentMessagePendingReservations.get(targetState.activeSessionId) ?? 0;
+		const otherReservations = Math.max(0, reserved - 1);
+		assertAgentMessageQueueCapacity(
+			session.unfinishedActionCount + otherReservations,
+			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+		);
+		const acceptance: AgentSessionMailboxEnvelope = prior ?? {
+			...payload,
+			acceptedAt: new Date().toISOString(),
+			sequence: nextAgentSessionMailboxSequence(entries, targetState.runtime.session.sessionId),
+		};
+		if (!prior) {
+			session.sessionManager.appendCustomMessageEntryWithRollback(AGENT_MESSAGE_ACCEPTED_CUSTOM_TYPE, "", false, {
+				envelope: acceptance,
+			});
+		}
+		const resolveWaiter = this.claimAgentMessageWaiter(targetState, acceptance);
+		if (resolveWaiter) {
+			this.appendAgentMessageHandoff(targetState, acceptance, "waiter", "delivered");
+			releaseReservation();
+			resolveWaiter();
+			return { status: "delivered", acceptance, handoff: "waiter" };
+		}
+
+		const shouldQueue =
+			this.agentMessageAcceptingTargets.has(targetState.activeSessionId) ||
+			this.agentMessagePreparingTargets.has(targetState.activeSessionId) ||
+			session.isStreaming ||
+			session.isCompacting ||
+			session.isRetrying ||
+			session.isBashRunning ||
+			session.unfinishedActionCount > 0;
+		const streamingBehavior = "steer";
+		const message = createAgentSessionMessage(acceptance);
+		const prompt = message.content;
+
+		if (shouldQueue) {
+			const didQueue = await session.queueAgentMessagePrompt(prompt, streamingBehavior, message);
+			if (!didQueue) throw new Error("Agent message was not queued");
+			this.appendAgentMessageHandoff(targetState, acceptance, "queue", "queued");
+			releaseReservation();
+			return { status: "queued", acceptance, handoff: "queue" };
+		}
+
+		this.agentMessageAcceptingTargets.add(targetState.activeSessionId);
 		let preflightFailed = false;
 		let preflightQueued = false;
-		await targetState.runtime.session.acceptAgentMessagePrompt(message.content, {
-			expandPromptTemplates: false,
-			streamingBehavior: "steer",
-			queueIfBusy: true,
-			customMessage: message,
-			admissionCommitted: () => {
-				if (this.agentMessagesPaused) {
-					throw new Error("Agent messaging is paused");
-				}
-				if (
-					!this.sessions.has(targetState.activeSessionId) ||
-					this.closingSessions.has(targetState.activeSessionId)
-				) {
-					throw new Error("Target session is closing before agent message delivery");
-				}
-				if (targetState.runtime.session.sessionId !== payload.target.sessionId) {
-					throw new Error("Target session changed before agent message delivery");
-				}
-			},
-			preflightResult: (didSucceed, didQueue) => {
-				preflightFailed = !didSucceed;
-				preflightQueued = didSucceed && didQueue === true;
-			},
-		});
-		if (preflightFailed) {
-			throw new Error("Agent message was not accepted");
+		try {
+			const promptOptions: PromptOptions = {
+				expandPromptTemplates: false,
+				streamingBehavior,
+				queueIfBusy: true,
+				preflightResult: (didSucceed, didQueue) => {
+					preflightFailed = !didSucceed;
+					preflightQueued = didSucceed && didQueue === true;
+				},
+			};
+			if (typeof session.acceptAgentMessagePrompt === "function") {
+				await session.acceptAgentMessagePrompt(prompt, { ...promptOptions, customMessage: message });
+			} else {
+				await session.prompt(prompt, promptOptions);
+			}
+			if (preflightFailed) throw new Error("Agent message was not accepted");
+			const status = preflightQueued ? "queued" : "delivered";
+			const handoff = preflightQueued ? "queue" : "context";
+			this.appendAgentMessageHandoff(targetState, acceptance, handoff, status);
+			releaseReservation();
+			return { status, acceptance, handoff };
+		} finally {
+			this.agentMessageAcceptingTargets.delete(targetState.activeSessionId);
 		}
-		return { status: preflightQueued ? "queued" : "delivered" };
 	}
 
 	private appendAgentMessageHandoff(

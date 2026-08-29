@@ -1,4 +1,5 @@
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
+import type { RootForegroundLease } from "../root-foreground-lease.js";
 import type { KernelBootstrapProgressHandler, KernelPythonSkill } from "./bootstrap.js";
 import type { RestoreResult, SnapshotResult } from "./state-snapshot.js";
 
@@ -8,6 +9,7 @@ export const KERNEL_SHUTDOWN_TIMEOUT_MS = 5000;
 export const DEFAULT_SNAPSHOT_DEBOUNCE_MS = 1500;
 export const SNAPSHOT_EXECUTION_TIMEOUT_MS = 5000;
 export const KERNEL_ABORT_GRACE_MS = 1000;
+export const ACT_CELL_INTERRUPT_GRACE_MS = 100;
 export const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 export const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
 export const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
@@ -21,11 +23,24 @@ export class KernelBusyAfterInterruptError extends Error {
 	}
 }
 
-/**
- * Handles one typed request from Python code running in the kernel.
- * The returned record is delivered verbatim to the Python caller.
- */
-export type HostRequestHandler = (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
+/** HostRequestChannel carries one duplex request between the Python runtime and its host handler. */
+export interface HostRequestChannel {
+	readonly signal: AbortSignal;
+	/** Tool-call id of the execution that opened this host request. */
+	readonly outerToolCallId?: string;
+	/** Aborts when the correlated execution requests an inner-cell interrupt. */
+	readonly interruptSignal?: AbortSignal;
+	send(event: Record<string, unknown>): Promise<void>;
+	receive(signal?: AbortSignal): Promise<Record<string, unknown>>;
+	interruptAfterGrace?(graceMs?: number): void;
+}
+
+/** HostRequestHandler handles one typed request from Python runtime code. */
+export type HostRequestHandler = (
+	payload: Record<string, unknown>,
+	signal?: AbortSignal,
+	channel?: HostRequestChannel,
+) => Promise<Record<string, unknown>>;
 
 /** Host request handlers keyed by request type (e.g. "rlm.run", "goal.complete"). */
 export type HostRequestHandlers = Record<string, HostRequestHandler>;
@@ -51,6 +66,7 @@ export interface KernelManagerOptions {
 	env?: Record<string, string>;
 	sessionId?: string;
 	hostHandlers?: HostRequestHandlers;
+	foregroundLease?: RootForegroundLease;
 	pythonSkills?: readonly KernelPythonSkill[];
 	/** Persist/revive the user namespace across kernel restarts and session resume. */
 	snapshot?: KernelSnapshotConfig;
@@ -66,6 +82,8 @@ export interface KernelStartOptions {
 export interface ExecuteOptions {
 	/** Aborting interrupts the kernel out-of-band. */
 	signal?: AbortSignal;
+	/** Root tool call correlated with this execution. */
+	outerToolCallId?: string;
 	onStream?: (chunk: string, name: "stdout" | "stderr") => void;
 	onLateSentAgentMessage?: (message: KernelSentAgentMessage) => void;
 	/** Cap stdout / stderr / result at this many characters. Default 65536. */

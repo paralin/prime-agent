@@ -10,6 +10,7 @@ import {
 	type HostRequestHandlers,
 	ReplKernelManager,
 } from "../src/core/kernel/index.js";
+import { buildRlmBootstrapCode } from "../src/core/tools/ipython.js";
 
 function resolveReplPython(): string | null {
 	const candidates = [
@@ -120,6 +121,70 @@ describeIf("ReplKernelManager execute (real runtime)", () => {
 		const unknown = await manager.execute("import rlm\nawait rlm.host_request('test.unknown')");
 		expect(unknown.status).toBe("error");
 		expect(unknown.error?.evalue).toContain('host request type "test.unknown" is not available');
+	}, 30_000);
+
+	it("runs Act cells in the live REPL namespace and returns the exact value", async () => {
+		const responses: Record<string, unknown>[] = [];
+		const hostHandlers: HostRequestHandlers = {
+			"rlm.act": async (_payload, _signal, channel) => {
+				if (!channel) throw new Error("missing duplex channel");
+				await channel.send({ type: "cell", code: "original = object()\nprint('inner-output')\noriginal" });
+				responses.push(await channel.receive());
+				await channel.send({ type: "cell", code: "rlm.done(original)\nafter_done = True" });
+				responses.push(await channel.receive());
+				return { outcome: "done" };
+			},
+		};
+		manager = new ReplKernelManager({ python: python as string, cwd: dir, hostHandlers });
+		expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
+
+		const result = await manager.execute("returned = await rlm.act('use the shared value')\nreturned is original", {
+			outerToolCallId: "tool-1",
+		});
+
+		expect(result.status, JSON.stringify(result)).toBe("ok");
+		expect(result.result).toBe("True");
+		expect(result.stdout).toContain("inner-output");
+		expect(responses[0]).toMatchObject({ type: "cell_result", result: expect.stringContaining("object") });
+		expect(responses[1]).toEqual({ type: "done" });
+		const afterDone = await manager.execute("'after_done' in globals()");
+		expect(afterDone.result).toBe("False");
+	}, 30_000);
+
+	it("cancels an active Act cell and keeps the REPL reusable", async () => {
+		const controller = new AbortController();
+		let markCellSent: () => void = () => {};
+		const cellSent = new Promise<void>((resolve) => {
+			markCellSent = resolve;
+		});
+		const hostHandlers: HostRequestHandlers = {
+			"rlm.act": async (_payload, _signal, channel) => {
+				if (!channel) throw new Error("missing duplex channel");
+				channel.interruptSignal?.addEventListener("abort", () => channel.interruptAfterGrace?.(), { once: true });
+				await channel.send({ type: "cell", code: "act_started = True\nawait asyncio.sleep(60)" });
+				markCellSent();
+				try {
+					await channel.receive(channel.signal);
+				} catch {
+					return { outcome: "cancelled" };
+				}
+				return { outcome: "cancelled" };
+			},
+		};
+		manager = new ReplKernelManager({ python: python as string, cwd: dir, hostHandlers });
+		expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
+
+		const active = manager.execute("await rlm.act('wait')", {
+			signal: controller.signal,
+			outerToolCallId: "tool-cancel",
+		});
+		await cellSent;
+		controller.abort();
+
+		expect((await active).status).toBe("aborted");
+		const reused = await manager.execute("6 * 7");
+		expect(reused.status).toBe("ok");
+		expect(reused.result).toBe("42");
 	}, 30_000);
 
 	it("dispose sends the protocol shutdown so live bash children die with the kernel", async () => {

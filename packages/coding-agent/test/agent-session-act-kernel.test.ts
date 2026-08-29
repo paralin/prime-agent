@@ -25,7 +25,11 @@ function resolveKernelPython(): string | null {
 	].filter((path): path is string => Boolean(path));
 	for (const python of candidates) {
 		if (!existsSync(python)) continue;
-		if (spawnSync(python, ["-c", "import ipykernel, IPython"], { encoding: "utf8" }).status === 0) return python;
+		if (
+			spawnSync(python, ["-c", "import rlm.repl; assert rlm.repl.PROTOCOL_VERSION == 4"], { encoding: "utf8" })
+				.status === 0
+		)
+			return python;
 	}
 	return null;
 }
@@ -52,15 +56,12 @@ const runtimeSource = join(import.meta.dirname, "../../../prime-agent-runtime/sr
 describeIfKernel("AgentSession Act integration", { tags: ["kernel-heavy"] }, () => {
 	let priorPython: string | undefined;
 	let priorPythonPath: string | undefined;
-	let priorForkserver: string | undefined;
 
 	beforeAll(() => {
 		priorPython = process.env.PRIME_AGENT_KERNEL_PYTHON;
 		priorPythonPath = process.env.PYTHONPATH;
-		priorForkserver = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
 		process.env.PRIME_AGENT_KERNEL_PYTHON = python as string;
 		process.env.PYTHONPATH = [runtimeSource, priorPythonPath].filter(Boolean).join(delimiter);
-		process.env.PRIME_AGENT_KERNEL_FORKSERVER = "0";
 	});
 
 	afterAll(() => {
@@ -68,8 +69,6 @@ describeIfKernel("AgentSession Act integration", { tags: ["kernel-heavy"] }, () 
 		else process.env.PRIME_AGENT_KERNEL_PYTHON = priorPython;
 		if (priorPythonPath === undefined) delete process.env.PYTHONPATH;
 		else process.env.PYTHONPATH = priorPythonPath;
-		if (priorForkserver === undefined) delete process.env.PRIME_AGENT_KERNEL_FORKSERVER;
-		else process.env.PRIME_AGENT_KERNEL_FORKSERVER = priorForkserver;
 	});
 
 	it("wakes an idle session from a background kernel external event", async () => {
@@ -651,10 +650,7 @@ print(replacement_marker is replacement_marker, "replacement-reused")`,
 				),
 				fauxAssistantMessage(
 					fauxToolCall("shared_ipython", {
-						code: `%%bash
-sleep 60 &
-echo $! > ${childPidPath}
-wait $!`,
+						code: `await bash(${JSON.stringify(`sleep 60 &\necho $! > ${childPidPath}\nwait $!`)})`,
 					}),
 					{ stopReason: "toolUse" },
 				),
@@ -806,12 +802,7 @@ while True:
 					label: "bash",
 					effectPath: join(directory, "bash.effects"),
 					code: (effectPath: string) =>
-						`%%bash
-echo once >> ${effectPath}
-echo $$ > ${bashPidPath}
-sleep 60 &
-echo $! > ${childPidPath}
-wait`,
+						`await bash(${JSON.stringify(`echo once >> ${effectPath}\necho $$ > ${bashPidPath}\nsleep 60 &\necho $! > ${childPidPath}\nwait`)})`,
 				},
 			];
 			for (const [index, cancellation] of cases.entries()) {
@@ -1043,13 +1034,7 @@ except rlm.ActCancelledError:
 			harness.setResponses([
 				fauxAssistantMessage(
 					fauxToolCall("shared_ipython", {
-						code: `%%bash
-echo $$ > ${bashPidPath}
-sleep 60 &
-echo $! > ${childPidPath}
-echo bash-act-started
-wait
-echo completed > ${completedPath}`,
+						code: `await bash(${JSON.stringify(`echo $$ > ${bashPidPath}\nsleep 60 &\necho $! > ${childPidPath}\necho bash-act-started\nwait\necho completed > ${completedPath}`)})`,
 					}),
 					{ stopReason: "toolUse" },
 				),

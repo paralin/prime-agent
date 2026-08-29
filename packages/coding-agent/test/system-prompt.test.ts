@@ -102,7 +102,7 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain("Installed Python-backed skill modules (pre-imported): `websearch`.");
 		expect(prompt).toContain("A callable `rlm` is already in your global namespace");
 		expect(prompt).toContain("IPython is Prime Agent's persistent Python control environment");
-		expect(prompt).toContain("Each `%%bash` cell starts a new subshell");
+		expect(prompt).toContain("Each `bash(...)` call starts a new subshell");
 	});
 
 	test("offers Act only to the root IPython actor", () => {
@@ -294,7 +294,7 @@ describe("buildRlmPrompt", () => {
 			allowRecursion: false,
 		});
 
-		expect(prompt).toContain("must be the first line of the cell");
+		expect(prompt).toContain('await bash("command")');
 	});
 
 	test("documents preferring Python for reading and searching files when ipython is active", () => {

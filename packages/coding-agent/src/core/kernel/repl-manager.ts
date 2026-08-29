@@ -5,8 +5,10 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { v4 as uuid } from "uuid";
 import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
+import type { RootForegroundHandle } from "../root-foreground-lease.js";
 import { ensureKernelPython } from "./bootstrap.js";
 import {
+	ACT_CELL_INTERRUPT_GRACE_MS,
 	AGENT_MESSAGE_DISPLAY_MIME,
 	ATTACHMENT_DISPLAY_MIME,
 	createDeferred,
@@ -18,6 +20,7 @@ import {
 	type ExecuteResult,
 	errorMessage,
 	HOST_REQUEST_SHUTDOWN_TIMEOUT_MS,
+	type HostRequestChannel,
 	installSignalHandlersOnce,
 	isRecord,
 	KERNEL_ABORT_GRACE_MS,
@@ -47,7 +50,7 @@ import {
 	type SnapshotResult,
 } from "./state-snapshot.js";
 
-const REPL_PROTOCOL_VERSION = 3;
+const REPL_PROTOCOL_VERSION = 4;
 const READY_TIMEOUT_MS = 30_000;
 const REPAIR_STEP_TIMEOUT_MS = 30_000;
 // Runtime-minted host-request ids never repeat; the bound only guards a
@@ -81,6 +84,9 @@ interface ActiveExecution {
 	backgroundOutputTruncated: boolean;
 	error?: ExecuteResult["error"];
 	status: ExecuteResult["status"];
+	interruptOwnerHostRequestId?: string;
+	foregroundToken?: symbol;
+	actForegroundExits: Set<() => void>;
 	doneFields?: Record<string, unknown>;
 	settled: boolean;
 	resolve: (result: InternalExecuteResult) => void;
@@ -96,6 +102,7 @@ const PROTOCOL_EVENT_KINDS = new Set([
 	"result",
 	"display",
 	"host_request",
+	"host_message",
 	"error",
 	"done",
 ]);
@@ -111,12 +118,82 @@ function invalidProtocolFrameReason(event: Record<string, unknown>): string | un
 		return "unknown protocol event";
 	}
 	if (
-		(event.event === "done" || event.event === "host_request") &&
+		(event.event === "done" || event.event === "host_request" || event.event === "host_message") &&
 		(typeof event.id !== "string" || event.id === "")
 	) {
 		return `${event.event} frame without id`;
 	}
 	return undefined;
+}
+
+class ReplHostRequestChannel implements HostRequestChannel {
+	private readonly messages: Record<string, unknown>[] = [];
+	private readonly waiters: ReturnType<typeof createDeferred<Record<string, unknown>>>[] = [];
+	private closedError: Error | undefined;
+
+	constructor(
+		readonly signal: AbortSignal,
+		readonly outerToolCallId: string | undefined,
+		readonly interruptSignal: AbortSignal | undefined,
+		private readonly sendMessage: (event: Record<string, unknown>) => Promise<void>,
+		private readonly interruptCorrelatedExecution: () => Promise<void>,
+		private readonly trackGraceInterrupt: (completion: Promise<void>) => void,
+	) {
+		signal.addEventListener("abort", () => this.close(new Error("host request channel aborted")), { once: true });
+	}
+
+	interruptAfterGrace(graceMs = ACT_CELL_INTERRUPT_GRACE_MS): void {
+		let resolveCompletion: () => void = () => {};
+		const completion = new Promise<void>((resolve) => {
+			resolveCompletion = resolve;
+		});
+		this.trackGraceInterrupt(completion);
+		const timer = globalThis.setTimeout(() => {
+			void this.interruptCorrelatedExecution()
+				.catch(() => undefined)
+				.finally(resolveCompletion);
+		}, graceMs);
+		timer.unref?.();
+	}
+
+	async send(event: Record<string, unknown>): Promise<void> {
+		if (this.closedError) throw this.closedError;
+		await this.sendMessage(event);
+	}
+
+	receive(signal?: AbortSignal): Promise<Record<string, unknown>> {
+		if (signal?.aborted) return Promise.reject(new Error("host request channel receive aborted"));
+		const message = this.messages.shift();
+		if (message) return Promise.resolve(message);
+		if (this.closedError) return Promise.reject(this.closedError);
+		const waiter = createDeferred<Record<string, unknown>>();
+		const abort = () => {
+			const index = this.waiters.indexOf(waiter);
+			if (index >= 0) this.waiters.splice(index, 1);
+			waiter.reject(new Error("host request channel receive aborted"));
+		};
+		signal?.addEventListener("abort", abort, { once: true });
+		this.waiters.push(waiter);
+		return waiter.promise.finally(() => signal?.removeEventListener("abort", abort));
+	}
+
+	deliver(value: unknown): void {
+		if (this.closedError) return;
+		if (!isRecord(value)) {
+			this.close(new Error("host request channel message must be an object"));
+			return;
+		}
+		const waiter = this.waiters.shift();
+		if (waiter) waiter.resolve(value);
+		else this.messages.push(value);
+	}
+
+	close(error = new Error("host request channel closed")): void {
+		if (this.closedError) return;
+		this.closedError = error;
+		for (const waiter of this.waiters.splice(0)) waiter.reject(error);
+		this.messages.length = 0;
+	}
 }
 
 function asStringArray(value: unknown): string[] {
@@ -136,7 +213,15 @@ function asReasonArray(value: unknown): { name: string; reason: string }[] {
 export class ReplKernelManager {
 	private readonly options: Pick<
 		KernelManagerOptions,
-		"python" | "cwd" | "env" | "sessionId" | "hostHandlers" | "pythonSkills" | "snapshot" | "bootstrapCode"
+		| "python"
+		| "cwd"
+		| "env"
+		| "sessionId"
+		| "hostHandlers"
+		| "foregroundLease"
+		| "pythonSkills"
+		| "snapshot"
+		| "bootstrapCode"
 	>;
 	private readonly handledHostRequestIds = new Set<string>();
 	private child?: ChildProcess;
@@ -157,6 +242,9 @@ export class ReplKernelManager {
 	private pendingBackgroundOutput = "";
 	private pendingBackgroundOutputTruncated = false;
 	private readonly inFlightHostRequests = new Set<Promise<void>>();
+	private readonly hostRequestAbortControllers = new Map<string, AbortController>();
+	private readonly hostRequestChannels = new Map<string, ReplHostRequestChannel>();
+	private readonly pendingGraceInterrupts = new Set<Promise<void>>();
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
 	/** Bumped by every teardown so a stale in-flight doStart can never touch a newer kernel. */
 	private startGeneration = 0;
@@ -190,6 +278,7 @@ export class ReplKernelManager {
 			env: options.env,
 			sessionId: options.sessionId,
 			hostHandlers: options.hostHandlers,
+			foregroundLease: options.foregroundLease,
 			pythonSkills: options.pythonSkills,
 			snapshot: options.snapshot,
 			bootstrapCode: options.bootstrapCode,
@@ -636,6 +725,10 @@ export class ReplKernelManager {
 			if (typeof event.id === "string") this.startHostRequest(event.id, event.data);
 			return;
 		}
+		if (type === "host_message") {
+			if (typeof event.id === "string") this.hostRequestChannels.get(event.id)?.deliver(event.data);
+			return;
+		}
 
 		const id = typeof event.id === "string" ? event.id : undefined;
 		const execution = this.activeExecution;
@@ -717,8 +810,36 @@ export class ReplKernelManager {
 	}
 
 	async execute(code: string, opts: ExecuteOptions = {}): Promise<ExecuteResult> {
+		const foreground = this.options.foregroundLease;
+		if (!foreground || opts.signal?.aborted) return this.executeWithForeground(code, opts);
+		const started = Date.now();
+		let handle: RootForegroundHandle;
+		try {
+			handle = await foreground.acquire("root-cell", opts.signal);
+		} catch (error) {
+			if (opts.signal?.aborted) {
+				return { stdout: "", stderr: "", status: "aborted", durationMs: Date.now() - started };
+			}
+			throw error;
+		}
+		try {
+			return await handle.run(() => this.executeWithForeground(code, opts));
+		} finally {
+			if (handle.owned && this.activeExecution?.opts === opts) {
+				this.activeExecutionIdleWaiters.add(handle.release);
+			} else {
+				handle.release();
+			}
+		}
+	}
+
+	private async executeWithForeground(code: string, opts: ExecuteOptions): Promise<ExecuteResult> {
 		await this.waitForProtocolRepair(opts.signal);
 		const result = await this.enqueueExecute(code, opts);
+		const active = this.activeExecution;
+		if (active?.opts === opts && active.actForegroundExits.size > 0) {
+			await this.waitForActiveExecutionIdle();
+		}
 		// Refresh the on-disk snapshot after real work so a later resume (or a
 		// crash before graceful shutdown) revives the most recent namespace.
 		if (result.status === "ok") {
@@ -838,6 +959,8 @@ export class ReplKernelManager {
 			backgroundOutput: this.pendingBackgroundOutput,
 			backgroundOutputTruncated: this.pendingBackgroundOutputTruncated,
 			status: "ok",
+			foregroundToken: this.options.foregroundLease?.currentToken,
+			actForegroundExits: new Set(),
 			settled: false,
 			resolve: result.resolve,
 			reject: result.reject,
@@ -861,7 +984,7 @@ export class ReplKernelManager {
 			this.resolveExecution(execution, { clearActive: false });
 		};
 		const onAbort = () => {
-			void this.interrupt().catch(() => undefined);
+			if (!execution.interruptOwnerHostRequestId) void this.interrupt().catch(() => undefined);
 			clearAbortTimer();
 			abortTimer = globalThis.setTimeout(forceAbort, KERNEL_ABORT_GRACE_MS);
 			if (abortTimer && typeof abortTimer === "object" && "unref" in abortTimer) {
@@ -974,6 +1097,8 @@ export class ReplKernelManager {
 			});
 		}
 		if (didClearActive) {
+			for (const exitAct of execution.actForegroundExits) exitAct();
+			execution.actForegroundExits.clear();
 			this.notifyActiveExecutionIdle();
 		}
 	}
@@ -1013,6 +1138,8 @@ export class ReplKernelManager {
 			return;
 		}
 		this.activeExecution = undefined;
+		for (const exitAct of execution.actForegroundExits) exitAct();
+		execution.actForegroundExits.clear();
 		execution.reject(error);
 		this.notifyActiveExecutionIdle();
 	}
@@ -1022,6 +1149,17 @@ export class ReplKernelManager {
 			resolve();
 		}
 		this.activeExecutionIdleWaiters.clear();
+	}
+
+	private waitForActiveExecutionIdle(): Promise<void> {
+		if (!this.activeExecution) return Promise.resolve();
+		return new Promise<void>((resolve) => {
+			this.activeExecutionIdleWaiters.add(resolve);
+			if (!this.activeExecution) {
+				this.activeExecutionIdleWaiters.delete(resolve);
+				resolve();
+			}
+		});
 	}
 
 	private waitForActiveExecutionToClear(signal: AbortSignal | undefined, timeoutMs: number): Promise<boolean> {
@@ -1086,9 +1224,41 @@ export class ReplKernelManager {
 			this.handledHostRequestIds.delete(oldest);
 		}
 
+		const controller = new AbortController();
+		this.hostRequestAbortControllers.set(requestId, controller);
+		const execution = this.activeExecution;
+		const claimsInterrupt =
+			isRecord(data) && data.type === "rlm.act" && execution !== undefined && !execution.interruptOwnerHostRequestId;
+		if (claimsInterrupt) execution.interruptOwnerHostRequestId = requestId;
+		const exitActForeground =
+			claimsInterrupt && execution?.foregroundToken
+				? this.options.foregroundLease?.enterAct(execution.foregroundToken)
+				: undefined;
+		if (exitActForeground) execution?.actForegroundExits.add(exitActForeground);
+		const executionSignal = execution?.opts.signal;
+		const channel = new ReplHostRequestChannel(
+			controller.signal,
+			execution?.opts.outerToolCallId,
+			executionSignal,
+			async (event) => {
+				await this.writeLine({ type: "host_message", id: requestId, data: { ...event, status: "event" } });
+			},
+			async () => {
+				if (this.activeExecution === execution) await this.interrupt();
+			},
+			(completion) => {
+				this.pendingGraceInterrupts.add(completion);
+				void completion.finally(() => this.pendingGraceInterrupts.delete(completion));
+			},
+		);
+		this.hostRequestChannels.set(requestId, channel);
+		const abortFromExecution = () => controller.abort();
+		executionSignal?.addEventListener("abort", abortFromExecution, { once: true });
+		if (executionSignal?.aborted) abortFromExecution();
+
 		const task = (async () => {
 			try {
-				const result = await this.handleHostRequest(data);
+				const result = await this.handleHostRequest(data, controller.signal, channel);
 				try {
 					await this.writeLine({ type: "host_reply", id: requestId, data: { status: "ok", result } });
 				} catch (replyError) {
@@ -1114,10 +1284,23 @@ export class ReplKernelManager {
 		this.inFlightHostRequests.add(task);
 		void task.finally(() => {
 			this.inFlightHostRequests.delete(task);
+			if (execution?.interruptOwnerHostRequestId === requestId) {
+				execution.interruptOwnerHostRequestId = undefined;
+			}
+			executionSignal?.removeEventListener("abort", abortFromExecution);
+			channel.close();
+			if (this.hostRequestChannels.get(requestId) === channel) this.hostRequestChannels.delete(requestId);
+			if (this.hostRequestAbortControllers.get(requestId) === controller) {
+				this.hostRequestAbortControllers.delete(requestId);
+			}
 		});
 	}
 
-	private async handleHostRequest(data: unknown): Promise<Record<string, unknown>> {
+	private async handleHostRequest(
+		data: unknown,
+		signal: AbortSignal,
+		channel: HostRequestChannel,
+	): Promise<Record<string, unknown>> {
 		if (!isRecord(data)) {
 			throw new Error("host request payload must be an object");
 		}
@@ -1133,7 +1316,7 @@ export class ReplKernelManager {
 		// the in-flight execution; detached spawns (asyncio.create_task) fire after
 		// the scheduling cell goes idle, so fall back to that last cell's source.
 		const cellSourceCode = this.activeExecution?.code ?? this.lastCellCode;
-		return handler({ ...data, cellSourceCode });
+		return handler({ ...data, cellSourceCode }, signal, channel);
 	}
 
 	private async interrupt(): Promise<void> {
@@ -1144,6 +1327,7 @@ export class ReplKernelManager {
 
 	private cleanupResources(killSignal: NodeJS.Signals = "SIGTERM"): void {
 		this.startGeneration++; // any teardown invalidates in-flight starts
+		this.abortHostRequests();
 		this.clearSnapshotTimer();
 		this.lateSentAgentMessageHandlers.clear();
 		this.pendingDoneWaiters.clear();
@@ -1172,6 +1356,13 @@ export class ReplKernelManager {
 			if (pid !== undefined) reapKernelOrphanProcesses(pid);
 		}
 		this.startPromise = undefined;
+	}
+
+	private abortHostRequests(): void {
+		for (const channel of this.hostRequestChannels.values()) channel.close();
+		this.hostRequestChannels.clear();
+		for (const controller of this.hostRequestAbortControllers.values()) controller.abort();
+		this.hostRequestAbortControllers.clear();
 	}
 
 	private async waitForKernelExit(): Promise<void> {
@@ -1228,6 +1419,7 @@ export class ReplKernelManager {
 			this.cleanupResources();
 			return true;
 		}
+		await Promise.allSettled([...this.pendingGraceInterrupts]);
 		// Captured before any await: teardowns and newer starts bump the counter.
 		const generation = this.startGeneration;
 		if (opts.snapshot) {

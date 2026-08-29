@@ -31,7 +31,7 @@ from typing import Any
 
 from .bash import _kill_live_handles
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
@@ -49,9 +49,13 @@ _serve_task: asyncio.Task[Any] | None = None
 # detached task spawned by a cell keeps writing under that cell's id after
 # the cell finishes. Threads start with a fresh context and emit id null.
 _current_cell: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_cell", default=None)
+_captured_output: contextvars.ContextVar[dict[str, list[str]] | None] = contextvars.ContextVar(
+    "_captured_output", default=None
+)
+_user_namespace: dict[str, Any] | None = None
 _active: dict[str, Any] = {"task": None, "rid": None, "interrupted": False}
 _cell_counter = 0
-_pending_host: dict[str, "asyncio.Future[dict[str, Any]]"] = {}
+_pending_host: dict[str, "HostExchange"] = {}
 # Set on the loop thread once stdin hits EOF or a shutdown request arrives; no
 # host reply can arrive after that, so waiting (and future) host_request calls fail.
 _host_closed = False
@@ -98,20 +102,59 @@ def is_active() -> bool:
     return _protocol_fd >= 0
 
 
+class HostExchange:
+    """One runtime-minted duplex request to a TypeScript host handler."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        if _loop is None:
+            raise RuntimeError("repl runtime is not serving")
+        if _host_closed:
+            raise RuntimeError("host connection closed; host_request cannot be answered")
+        self.id = uuid.uuid4().hex
+        self._messages: asyncio.Queue[dict[str, Any] | BaseException] = asyncio.Queue()
+        self._closed = False
+        _pending_host[self.id] = self
+        _send({"event": "host_request", "id": self.id, "data": data})
+
+    async def receive(self) -> dict[str, Any]:
+        message = await self._messages.get()
+        if isinstance(message, BaseException):
+            raise message
+        return message
+
+    def send(self, data: dict[str, Any]) -> None:
+        if self._closed:
+            raise RuntimeError("host request channel is closed")
+        _send({"event": "host_message", "id": self.id, "data": data})
+
+    def deliver(self, data: dict[str, Any]) -> None:
+        if not self._closed:
+            self._messages.put_nowait(data)
+
+    def fail(self, error: BaseException) -> None:
+        if not self._closed:
+            self._messages.put_nowait(error)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if _pending_host.get(self.id) is self:
+            _pending_host.pop(self.id, None)
+
+
+def open_host_exchange(data: dict[str, Any]) -> HostExchange:
+    """Open a duplex host request in the serving REPL process."""
+    return HostExchange(data)
+
+
 async def host_request(data: dict[str, Any]) -> dict[str, Any]:
     """Send one typed request to the host and await its raw reply dict."""
-    if _loop is None:
-        raise RuntimeError("repl runtime is not serving")
-    if _host_closed:
-        raise RuntimeError("host connection closed; host_request cannot be answered")
-    rid = uuid.uuid4().hex
-    future: asyncio.Future[dict[str, Any]] = _loop.create_future()
-    _pending_host[rid] = future
+    exchange = open_host_exchange(data)
     try:
-        _send({"event": "host_request", "id": rid, "data": data})
-        return await future
+        return await exchange.receive()
     finally:
-        _pending_host.pop(rid, None)
+        exchange.close()
 
 
 def _fail_pending_host_requests() -> None:
@@ -119,19 +162,18 @@ def _fail_pending_host_requests() -> None:
     awaiting cell must unblock or the queued shutdown would never be served."""
     global _host_closed
     _host_closed = True
-    for future in _pending_host.values():
-        if not future.done():
-            future.set_exception(RuntimeError("host connection closed; host_request cannot be answered"))
+    for exchange in tuple(_pending_host.values()):
+        exchange.fail(RuntimeError("host connection closed; host_request cannot be answered"))
 
 
-def _resolve_host_reply(rid: str, data: dict[str, Any]) -> None:
-    """Reader-thread half of the host bridge; late/unknown replies are dropped."""
+def _deliver_host_message(rid: str, data: dict[str, Any]) -> None:
+    """Reader-thread half of the host bridge; late/unknown messages are dropped."""
     assert _loop is not None
 
     def deliver() -> None:
-        future = _pending_host.get(rid)
-        if future is not None and not future.done():
-            future.set_result(data)
+        exchange = _pending_host.get(rid)
+        if exchange is not None:
+            exchange.deliver(data)
 
     _loop.call_soon_threadsafe(deliver)
 
@@ -273,6 +315,9 @@ class _TaggedWriter(io.TextIOBase):
         if not isinstance(text, str):
             raise TypeError(f"write() argument must be str, not {type(text).__name__}")
         if text:
+            captured = _captured_output.get()
+            if captured is not None:
+                captured[self._stream].append(text)
             _send({"event": self._stream, "id": _current_cell.get(), "text": text})
         return len(text)
 
@@ -501,6 +546,27 @@ async def _run_codes(codes: list[types.CodeType], ns: dict[str, Any]) -> Any:
     return value
 
 
+async def _run_shared_cell(code: str) -> tuple[Any, bool, str, str, BaseException | None]:
+    """Execute one nested Act cell in the live user namespace."""
+    global _cell_counter
+    if _user_namespace is None:
+        raise RuntimeError("repl runtime is not serving")
+    _cell_counter += 1
+    filename = f"<cell-{_cell_counter}>"
+    codes, has_trailing = _compile_cell(code, filename)
+    captured = {"stdout": [], "stderr": []}
+    token = _captured_output.set(captured)
+    value: Any = None
+    error: BaseException | None = None
+    try:
+        value = await _run_codes(codes, _user_namespace)
+    except BaseException as exc:  # noqa: BLE001 - Act reports cell failures to its worker
+        error = exc
+    finally:
+        _captured_output.reset(token)
+    return value, has_trailing, "".join(captured["stdout"]), "".join(captured["stderr"]), error
+
+
 async def _run_guarded(task: asyncio.Task[Any], rid: str) -> tuple[str, Any, dict[str, Any] | None]:
     """Await a request task; returns (status, value, error event or None)."""
     with _interrupt_lock:
@@ -622,6 +688,12 @@ def _snapshot_state(
         return {"error": f"dill unavailable: {err}"}
     dill.settings["recurse"] = True
 
+    class SnapshotPickler(dill.Pickler):
+        def reducer_override(self, obj: Any) -> Any:
+            if isinstance(obj, io.IOBase):
+                raise TypeError("file and I/O handles are not snapshot-safe")
+            return NotImplemented
+
     payload: dict[str, bytes] = {}
     skipped: list[dict[str, str]] = []
     oversized: list[str] = []
@@ -639,7 +711,7 @@ def _snapshot_state(
         limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, remaining)
         buffer = _SnapshotBuffer(limit)
         try:
-            dill.dump(value, buffer)
+            SnapshotPickler(buffer).dump(value)
             blob = buffer.getvalue()
         except _SnapshotSizeLimitExceeded:
             if not prune_oversized and remaining < max_variable_bytes:
@@ -679,6 +751,13 @@ def _snapshot_state(
                 os.remove(stale)
             except OSError:
                 pass
+
+    def fsync_parent(target: str) -> None:
+        parent_fd = os.open(os.path.dirname(target) or ".", os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
 
     # Stage both temps before replacing anything: any failure up to the first
     # replace leaves the previous payload+manifest pair fully intact.
@@ -720,6 +799,8 @@ def _snapshot_state(
             fh, tmp = stage_temp(path, "wb")
             with fh:
                 fh.write(serialized_payload)
+                fh.flush()
+                os.fsync(fh.fileno())
             bytes_written = len(serialized_payload)
             saved = sorted(payload.keys())
             pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
@@ -736,6 +817,8 @@ def _snapshot_state(
             fh, manifest_tmp = stage_temp(manifest_path, "w")
             with fh:
                 json.dump(manifest, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
         except BaseException as err:  # noqa: BLE001 - Exception -> error dict, rest propagates
             if not isinstance(err, Exception):
                 raise  # e.g. KeyboardInterrupt: clean up (outer finally), then propagate
@@ -748,10 +831,12 @@ def _snapshot_state(
         handler_installed = True
         try:
             os.replace(tmp, path)
+            fsync_parent(path)
         except OSError as err:
             return {"error": f"write failed: {err}"}
         try:
             os.replace(manifest_tmp, manifest_path)
+            fsync_parent(manifest_path)
         except OSError as err:
             # Fail before the prune deletions so a bad manifest path never destroys state.
             return {"error": f"manifest write failed: {err}"}
@@ -778,6 +863,16 @@ def _snapshot_state(
     return result
 
 
+def _safe_snapshot_load(stream: Any, dill_module: Any) -> Any:
+    class SafeSnapshotUnpickler(dill_module.Unpickler):
+        def find_class(self, module: str, name: str) -> Any:
+            if module in {"dill._dill", "dill.dill"} and name == "_create_filehandle":
+                raise ValueError("unsafe file-handle reducer")
+            return super().find_class(module, name)
+
+    return SafeSnapshotUnpickler(stream).load()
+
+
 def _restore_state(
     ns: dict[str, Any], path: str, committed: list[dict[str, Any]] | None = None
 ) -> dict[str, Any]:
@@ -787,9 +882,10 @@ def _restore_state(
         import dill
     except Exception as err:  # noqa: BLE001
         return {"error": f"dill unavailable: {err}"}
+
     try:
         with open(path, "rb") as fh:
-            payload = dill.load(fh)
+            payload = _safe_snapshot_load(fh, dill)
     except Exception as err:  # noqa: BLE001 - a corrupt snapshot yields an empty restore
         return {"error": f"load failed: {_safe_str(err)}"}
     if not isinstance(payload, dict):
@@ -801,7 +897,9 @@ def _restore_state(
         if name in _RESTORE_SKIP:
             continue
         try:
-            staged[name] = dill.loads(blob)
+            if not isinstance(blob, (bytes, bytearray)):
+                raise TypeError("snapshot value is not a pickle blob")
+            staged[name] = _safe_snapshot_load(io.BytesIO(blob), dill)
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
             failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
     result = {"restored": sorted(staged), "failed": failed}
@@ -982,15 +1080,15 @@ def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> No
             return
         _request_interrupt(req.get("id"))
         return
-    if rtype == "host_reply":
+    if rtype in ("host_reply", "host_message"):
         # Bypass the FIFO queue: the awaiting cell IS the in-flight
         # execute, so a queued reply would deadlock behind it.
         rid = req.get("id")
         data = req.get("data")
         if isinstance(rid, str) and isinstance(data, dict):
-            _resolve_host_reply(rid, data)
+            _deliver_host_message(rid, data)
         else:
-            _protocol_error("host_reply request needs string id and dict data")
+            _protocol_error(f"{rtype} request needs string id and dict data")
         return
     if not isinstance(rtype, str) or rtype not in _REQUIRED_FIELDS:
         _protocol_error(f"unknown request type: {rtype!r}")
@@ -1130,7 +1228,7 @@ def _setup_fds() -> int:
 
 
 def main() -> None:
-    global _loop, _serve_task
+    global _loop, _serve_task, _user_namespace
     stdin_fd = _setup_fds()
     _start_owner_watchdog()
 
@@ -1141,6 +1239,7 @@ def main() -> None:
     user_module = types.ModuleType("__main__")
     user_module.__dict__["__builtins__"] = __builtins__
     sys.modules["__main__"] = user_module
+    _user_namespace = user_module.__dict__
 
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)

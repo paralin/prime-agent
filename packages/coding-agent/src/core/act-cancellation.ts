@@ -10,7 +10,7 @@ export function actCancellationPromptBoundary(platform: NodeJS.Platform = proces
 	if (actCancellationCapability(platform) === "cooperative-only") {
 		return "Act cancellation stops provider work and cooperative awaited Python. On native Windows, synchronous Python and blocking shell work have no prompt-stop guarantee; do not claim they stopped until they return.";
 	}
-	return "Act cancellation stops provider work and cooperative awaited Python. On POSIX, a still-active synchronous inner cell receives one correlated interrupt, and managed `%%bash` process groups are terminated. Detached, daemonized, remote, and completed effects remain outside that guarantee.";
+	return "Act cancellation stops provider work and cooperative awaited Python. On POSIX, a still-active synchronous inner cell receives one correlated interrupt, and process groups from an immediately awaited `bash(...)` call are terminated. Detached, daemonized, remote, and completed effects remain outside that guarantee.";
 }
 
 /** Context-tree label visible through in-process and daemon clients. */

@@ -11,19 +11,8 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from ._act import _ActCellResult, _ActInterrupted, _run_cells, done
+from .bash import BashHandle, BashResult, bash
 from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
-
-try:
-    from ipykernel.comm import Comm
-except Exception:  # pragma: no cover - depends on ipykernel version
-    Comm = None  # type: ignore[assignment]
-
-try:
-    from IPython import get_ipython
-except Exception:  # pragma: no cover - only available in kernels
-    get_ipython = None  # type: ignore[assignment]
-
-HOST_COMM_TARGET = "host.request"
 ACT_CANCELLATION_CAPABILITY = "posix-managed" if os.name == "posix" else "cooperative-only"
 RLM_SERVICE_TIERS = ("auto", "default", "flex", "scale", "priority")
 
@@ -71,20 +60,6 @@ class RLMSubagent:
     status: str
 
 
-def _install_control_comm_handlers() -> None:
-    """Let comm replies arrive on the control channel during an execute_request."""
-    if get_ipython is None:
-        return
-    shell = get_ipython()
-    kernel = getattr(shell, "kernel", None)
-    comm_manager = getattr(kernel, "comm_manager", None)
-    control_handlers = getattr(kernel, "control_handlers", None)
-    if comm_manager is None or not isinstance(control_handlers, dict):
-        return
-    control_handlers.setdefault("comm_msg", comm_manager.comm_msg)
-    control_handlers.setdefault("comm_close", comm_manager.comm_close)
-
-
 def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
     if not isinstance(payload, dict):
         raise RuntimeError("rlm.run returned an invalid spawn handle")
@@ -100,6 +75,137 @@ def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
         session_dir=Path(session_dir),
         model=model,
     )
+
+
+class _ActExchange:
+    def __init__(self, prompt: str, model: str | None = None) -> None:
+        from . import repl
+
+        payload: dict[str, str] = {"prompt": prompt, "type": "rlm.act"}
+        if model is not None:
+            payload["model"] = model
+        self._exchange = repl.open_host_exchange(payload)
+        self._messages: asyncio.Queue[dict[str, Any] | BaseException] = asyncio.Queue()
+        self._cancelled = asyncio.Event()
+        self._closed = False
+        self._reader = asyncio.create_task(self._read_messages())
+
+    async def _read_messages(self) -> None:
+        try:
+            while True:
+                message = await self._exchange.receive()
+                result = message.get("result")
+                if message.get("status") == "ok" and isinstance(result, dict):
+                    message = {"status": "ok", **result}
+                if message.get("status") == "aborted" or (
+                    message.get("status") == "ok" and message.get("outcome") == "cancelled"
+                ):
+                    self._cancelled.set()
+                self._messages.put_nowait(message)
+        except BaseException as error:
+            self._cancelled.set()
+            self._messages.put_nowait(error)
+
+    async def _receive(self) -> dict[str, Any]:
+        message = await self._messages.get()
+        if isinstance(message, BaseException):
+            raise message
+        return message
+
+    async def wait_cancelled(self) -> None:
+        await self._cancelled.wait()
+
+    async def cells(self) -> AsyncIterator[str]:
+        while True:
+            message = await self._receive()
+            status = message.get("status")
+            if status == "event" and message.get("type") == "cell":
+                code = message.get("code")
+                if not isinstance(code, str):
+                    raise ActError("Act returned a cell event without string code")
+                yield code
+                continue
+            if status == "ok":
+                if message.get("outcome") == "cancelled":
+                    self._cancelled.set()
+                    raise _ActInterrupted
+                return
+            if status == "error":
+                raise ActError(str(message.get("error") or "Act host failed"))
+            if status == "aborted":
+                self._cancelled.set()
+                raise _ActInterrupted
+            raise ActError(f"Act returned an unexpected message: {message!r}")
+
+    async def send_cell_result(self, result: _ActCellResult) -> None:
+        self._exchange.send(
+            {
+                "type": "cell_result",
+                "durationMs": result.duration_ms,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "result": result.result,
+                "error": result.error,
+            }
+        )
+
+    async def acknowledge_done(self) -> None:
+        self._exchange.send({"type": "done"})
+        message = await self._receive()
+        status = message.get("status")
+        if status == "ok" and message.get("outcome") == "done":
+            return
+        if status == "ok" and message.get("outcome") == "cancelled":
+            raise _ActInterrupted
+        if status == "error":
+            raise ActError(str(message.get("error") or "Act completion failed"))
+        if status == "aborted":
+            raise _ActInterrupted
+        raise ActError(f"Act completion returned an unexpected message: {message!r}")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._reader.cancel()
+        self._exchange.close()
+
+
+async def act(prompt: str, model: str | None = None) -> Any:
+    """Run one retained low-level task in the serving REPL's live namespace.
+
+    Cancellation always aborts provider work and cooperative awaited Python.
+    ``ACT_CANCELLATION_CAPABILITY == "posix-managed"`` additionally covers a
+    correlated synchronous inner-cell interrupt and managed ``bash()`` process
+    groups. ``"cooperative-only"`` does not promise to stop synchronous Python
+    or blocking shell work before it returns.
+    """
+    if not isinstance(prompt, str):
+        raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
+    if not prompt.strip():
+        raise ValueError("prompt must not be empty")
+    if model is not None and not isinstance(model, str):
+        raise TypeError(f"model must be str or None, got {type(model).__name__}")
+    if isinstance(model, str):
+        model = model.strip()
+        if not model:
+            raise ValueError("model must not be empty")
+    exchange = _ActExchange(prompt, model)
+    try:
+        return await _run_cells(
+            exchange.cells(),
+            cancel=exchange.wait_cancelled(),
+            on_cell_result=exchange.send_cell_result,
+            on_done=exchange.acknowledge_done,
+        )
+    except _ActInterrupted as error:
+        raise ActCancelledError("Act was cancelled") from error
+    except ActError:
+        raise
+    except RuntimeError as error:
+        raise ActError(str(error)) from error
+    finally:
+        exchange.close()
 
 
 def _parse_host_reply(request_type: str, reply: dict[str, Any]) -> dict[str, Any]:
@@ -123,53 +229,18 @@ async def host_request(request_type: str, payload: dict[str, Any] | None = None)
         raise TypeError("request_type must be a non-empty str")
     if payload is not None and not isinstance(payload, dict):
         raise TypeError(f"payload must be a dict or None, got {type(payload).__name__}")
-    if Comm is None:
-        raise RuntimeError("Jupyter comm support is unavailable in this kernel")
-    _install_control_comm_handlers()
+    from . import repl
 
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[dict[str, Any]] = loop.create_future()
-    comm = Comm(target_name=HOST_COMM_TARGET, primary=False)
-
-    def _on_msg(msg: dict[str, Any]) -> None:
-        content = msg.get("content", {})
-        reply = content.get("data", {}) if isinstance(content, dict) else {}
-        if not isinstance(reply, dict):
-            return
-
-        status = reply.get("status")
-        if status == "ok":
-            def _resolve_result() -> None:
-                if not future.done():
-                    future.set_result({k: v for k, v in reply.items() if k != "status"})
-
-            loop.call_soon_threadsafe(_resolve_result)
-            return
-        if status == "error":
-            message = reply.get("error") or f"host request {request_type} failed"
-            def _resolve_error() -> None:
-                if not future.done():
-                    future.set_exception(RuntimeError(str(message)))
-
-            loop.call_soon_threadsafe(_resolve_error)
-            return
-
-        unexpected = f"host request {request_type} returned unexpected status: {status!r}"
-        def _resolve_unexpected() -> None:
-            if not future.done():
-                future.set_exception(RuntimeError(unexpected))
-
-        loop.call_soon_threadsafe(_resolve_unexpected)
-
-    comm.on_msg(_on_msg)
     # request_type goes last so a payload "type" key cannot reroute the request.
-    comm.open(data={**(payload or {}), "type": request_type})
-    try:
-        return await future
-    finally:
-        if not future.done():
-            future.cancel()
-        comm.close()
+    reply = await repl.host_request({**(payload or {}), "type": request_type})
+    return _parse_host_reply(request_type, reply)
+
+
+def emit(data: dict[str, Any]) -> None:
+    """Ship one display event to the host."""
+    from . import repl
+
+    repl.emit(data)
 
 
 async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:
@@ -281,9 +352,8 @@ async def delete_subagent(target: str | RLMSubagent) -> RLMSubagent:
 class _HarnessProxy:
     """Resolve the harness state against the current environment on every access.
 
-    The kernel forkserver preimports rlm in a template process before per-session
-    env vars exist; a state bound at import time would freeze that (env-less)
-    resolution into every forked kernel. Resolving per access picks up the env
+    Session env vars may be applied after import, so a state bound at import
+    time could freeze an env-less resolution. Resolving per access picks up the env
     applied after fork. Resolution must never raise (a failure inside the kernel
     namespace would take down the kernel). When the local store is genuinely
     unconfigured (no session env, e.g. --no-session) reads see an empty view but
@@ -369,6 +439,8 @@ __all__ = [
     "ACT_CANCELLATION_CAPABILITY",
     "ActCancelledError",
     "ActError",
+    "BashHandle",
+    "BashResult",
     "HarnessEntry",
     "HarnessScope",
     "HarnessState",
@@ -380,8 +452,10 @@ __all__ = [
     "RLMSubagent",
     "RefinementEvent",
     "act",
+    "bash",
     "delete_subagent",
     "done",
+    "emit",
     "find_models",
     "get_harness_state",
     "harness",

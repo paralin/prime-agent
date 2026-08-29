@@ -465,8 +465,8 @@ export function formatHarnessStateForPrompt(
 		includeIpythonExamples
 			? "Call contract: read an installed Python-backed skill's SKILL.md and call its documented callable. Use a shell CLI only when that skill documents one. For a saved skill entry, use the stored reference only when the referenced callable exists. For a saved subagent specification, compose a concise task and call `handle = await rlm('sub-task')`; the handle confirms admission and never contains the answer. Results arrive through explicit `agent_message` replies or files. A retained spawn handle uses `handle.name` for follow-up. A registry entry returned by `await rlm.list_subagents()` uses `child.session_name`."
 			: options.includeShellExamples
-				? "Call contract: use an installed skill as a shell command only when its SKILL.md documents a CLI. In a session without IPython, Continual Harness entries provide routing and context; do not emit Python `await`, `asyncio`, or `rlm` examples."
-				: "Call contract: in a session without IPython or shell access, Continual Harness entries provide routing and context only. Do not emit Python, `rlm`, or shell invocation examples.",
+				? "Call contract: use an installed skill as a shell command only when its SKILL.md documents a CLI. In a session without the Python REPL, Continual Harness entries provide routing and context; do not emit Python `await`, `asyncio`, or `rlm` examples."
+				: "Call contract: in a session without the Python REPL or shell access, Continual Harness entries provide routing and context only. Do not emit Python, `rlm`, or shell invocation examples.",
 		"",
 	];
 

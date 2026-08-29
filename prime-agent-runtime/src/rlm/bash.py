@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import json
+import math
 import os
 import secrets
 import selectors
@@ -115,8 +116,9 @@ class BashHandle:
     handle; later awaits only wait and cancelling them leaves it running.
     """
 
-    def __init__(self, command: str) -> None:
+    def __init__(self, command: str, timeout: float | None = None) -> None:
         self.command = command
+        self.timeout = timeout
         self._buffer = _BoundedBuffer()
         self._done = threading.Event()
         self._eof = threading.Event()
@@ -130,6 +132,8 @@ class BashHandle:
         self._result: BashResult | None = None
         self._callbacks: list[Callable[[], None]] = []
         self._callback_lock = threading.Lock()
+        self._timed_out = False
+        self._timeout_timer: threading.Timer | None = None
         # Serializes kill/reap so a pid fallback can never outlive the process handle.
         self._kill_lock = threading.Lock()
         self._started = time.monotonic()
@@ -235,6 +239,10 @@ class BashHandle:
         threading.Thread(target=self._pump, daemon=True).start()
         threading.Thread(target=self._report, daemon=True).start()
         threading.Thread(target=self._watch, daemon=True).start()
+        if timeout is not None:
+            self._timeout_timer = threading.Timer(timeout, self._expire)
+            self._timeout_timer.daemon = True
+            self._timeout_timer.start()
 
     @property
     def pid(self) -> int:
@@ -497,6 +505,8 @@ class BashHandle:
         with self._callback_lock:
             if self._done.is_set():
                 return
+            if self._timeout_timer is not None:
+                self._timeout_timer.cancel()
             self._result = BashResult(
                 exit_code=exit_code,
                 output=self._buffer.text() if output is None else output,
@@ -507,6 +517,13 @@ class BashHandle:
             self._callbacks = []
         for callback in callbacks:
             callback()
+
+    def _expire(self) -> None:
+        with self._callback_lock:
+            if self._done.is_set():
+                return
+            self._timed_out = True
+        self.kill(grace=_CANCEL_TERM_GRACE)
 
     def _add_done_callback(self, callback: Callable[[], None]) -> None:
         with self._callback_lock:
@@ -530,6 +547,9 @@ class BashHandle:
         self._add_done_callback(_wake)
         await fut
         assert self._result is not None
+        if self._timed_out:
+            await self._confirm_group_exit()
+            raise TimeoutError(f"bash command timed out after {self.timeout} seconds")
         return self._result
 
     async def _wait_owned(self) -> BashResult:
@@ -649,8 +669,12 @@ class BashHandle:
         return f"<BashHandle pid={self._pid} {state} command={self.command!r}>"
 
 
-def bash(command: str) -> BashHandle:
+def bash(command: str, timeout: float | None = None) -> BashHandle:
     """Start a shell command immediately; await the handle for the result.
+
+    When timeout is set, the command's process group is terminated after that
+    many seconds and awaiting the handle raises TimeoutError. With no timeout,
+    the command runs until it exits or the caller cancels or kills it.
 
     `await bash(cmd)` is a one-shot: cancelling the await (e.g. an interrupt)
     kills the command's process group. `h = bash(cmd)` used as a background
@@ -666,8 +690,16 @@ def bash(command: str) -> BashHandle:
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
+    if timeout is not None:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise TypeError("timeout must be a positive number or None")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be a finite positive number")
+        timeout = float(timeout)
     _install_shutdown_hook()
-    return BashHandle(command)
+    if timeout is None:
+        return BashHandle(command)
+    return BashHandle(command, timeout)
 
 
 def _shell() -> str:

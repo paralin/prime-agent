@@ -55,6 +55,22 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         awaited = await handle
         self.assertEqual(handle.poll(), awaited)
 
+    async def test_timeout_terminates_command_and_raises(self):
+        started = time.monotonic()
+        handle = bash("sleep 30", timeout=0.1)
+        with self.assertRaisesRegex(TimeoutError, "timed out after 0.1 seconds"):
+            await handle
+        self.assertFalse(handle.running)
+        self.assertLess(time.monotonic() - started, 5)
+
+    async def test_timeout_validation(self):
+        for timeout in (0, -1, float("inf"), float("nan")):
+            with self.assertRaises(ValueError):
+                bash("echo no", timeout=timeout)
+        for timeout in (True, "1"):
+            with self.assertRaises(TypeError):
+                bash("echo no", timeout=timeout)
+
     async def test_status_pipe_survives_high_fds_and_strict_posix_shell(self):
         # Regression: dash rejects multi-digit fds in redirections at parse
         # time, so the script must never reference the raw status-pipe fd.

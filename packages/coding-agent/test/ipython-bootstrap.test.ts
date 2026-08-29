@@ -26,7 +26,7 @@ describe("RLM bootstrap", () => {
 	it("binds bash from the runtime with a missing-runtime stub fallback", () => {
 		const code = buildRlmBootstrapCode();
 		expect(code).toContain("bash = _prime_agent_rlm_module.bash");
-		expect(code).toContain("def bash(command):");
+		expect(code).toContain("def bash(command, timeout=None):");
 		expect(code).toContain("rlm._raise_missing()");
 	});
 

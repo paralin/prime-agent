@@ -75,6 +75,7 @@ export interface OpenAIResponsesStreamOptions {
 export interface ConvertResponsesMessagesOptions {
 	includeSystemPrompt?: boolean;
 	systemRole?: "developer" | "system";
+	requiresStringMessageContent?: boolean;
 }
 
 export interface ConvertResponsesToolsOptions {
@@ -120,6 +121,7 @@ export function convertResponsesMessages<TApi extends Api>(
 	if (includeSystemPrompt && context.systemPrompt) {
 		const role = options?.systemRole ?? (model.reasoning ? "developer" : "system");
 		messages.push({
+			type: options?.requiresStringMessageContent ? "message" : undefined,
 			role,
 			content: sanitizeSurrogates(context.systemPrompt),
 		});
@@ -137,8 +139,11 @@ export function convertResponsesMessages<TApi extends Api>(
 			}
 			if (typeof msg.content === "string") {
 				messages.push({
+					type: options?.requiresStringMessageContent ? "message" : undefined,
 					role: "user",
-					content: [{ type: "input_text", text: sanitizeSurrogates(msg.content) }],
+					content: options?.requiresStringMessageContent
+						? sanitizeSurrogates(msg.content)
+						: [{ type: "input_text", text: sanitizeSurrogates(msg.content) }],
 				});
 			} else {
 				const content: ResponseInputContent[] = msg.content.map((item): ResponseInputContent => {
@@ -155,9 +160,15 @@ export function convertResponsesMessages<TApi extends Api>(
 					} satisfies ResponseInputImage;
 				});
 				if (content.length === 0) continue;
+				const stringContent = options?.requiresStringMessageContent
+					? content.every((item) => item.type === "input_text")
+						? content.map((item) => item.text).join("\n")
+						: undefined
+					: undefined;
 				messages.push({
+					type: options?.requiresStringMessageContent ? "message" : undefined,
 					role: "user",
-					content,
+					content: stringContent ?? content,
 				});
 			}
 		} else if (msg.role === "assistant") {

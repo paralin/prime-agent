@@ -930,6 +930,8 @@ function getMergeGatewayModels(): Model<Api>[] {
 				supportsReasoning: false,
 				supportsDeveloperRole: false,
 				supportsTools: false,
+				requiresStringMessageContent: true,
+				includeRoutingMetadata: true,
 				supportsLongCacheRetention: false,
 			},
 			reasoning: true,

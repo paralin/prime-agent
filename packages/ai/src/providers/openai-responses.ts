@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
 import { getEnvApiKey } from "../env-api-keys.js";
-import { clampThinkingLevel } from "../models.js";
+import { calculateCost, clampThinkingLevel } from "../models.js";
 import type {
 	Api,
 	AssistantMessage,
@@ -12,6 +12,8 @@ import type {
 	SimpleStreamOptions,
 	StreamFunction,
 	StreamOptions,
+	TextContent,
+	ThinkingContent,
 	Usage,
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
@@ -50,6 +52,8 @@ interface ResolvedOpenAIResponsesCompat {
 	supportsReasoning: boolean;
 	supportsDeveloperRole: boolean;
 	supportsTools: boolean;
+	requiresStringMessageContent: boolean;
+	includeRoutingMetadata: boolean;
 	supportsLongCacheRetention: boolean;
 	openRouterRouting?: OpenRouterRouting;
 }
@@ -62,9 +66,104 @@ function getCompat(model: Model<"openai-responses">): ResolvedOpenAIResponsesCom
 		supportsReasoning: model.compat?.supportsReasoning ?? true,
 		supportsDeveloperRole: model.compat?.supportsDeveloperRole ?? true,
 		supportsTools: model.compat?.supportsTools ?? true,
+		requiresStringMessageContent: model.compat?.requiresStringMessageContent ?? false,
+		includeRoutingMetadata: model.compat?.includeRoutingMetadata ?? false,
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
 		openRouterRouting: model.compat?.openRouterRouting,
 	};
+}
+
+interface MergeGatewayStreamEvent {
+	object?: string;
+	id?: string;
+	output?: Array<{
+		finish_reason?: string | null;
+		content?: Array<{ type?: string; thinking?: string; text?: string }>;
+	}>;
+	usage?: {
+		input_tokens?: number;
+		output_tokens?: number;
+		total_tokens?: number;
+		cache_read_input_tokens?: number | null;
+	};
+}
+
+async function processMergeGatewayStream(
+	responseStream: AsyncIterable<unknown>,
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	model: Model<"openai-responses">,
+): Promise<void> {
+	let thinkingBlock: ThinkingContent | undefined;
+	let textBlock: TextContent | undefined;
+	for await (const rawEvent of responseStream) {
+		const event = rawEvent as MergeGatewayStreamEvent;
+		if (event.object !== "response.stream" && event.object !== "response.done") continue;
+		if (event.id) output.responseId = event.id;
+		const message = event.output?.[0];
+		for (const part of message?.content ?? []) {
+			if (part.type === "thinking" && typeof part.thinking === "string") {
+				if (!thinkingBlock) {
+					thinkingBlock = { type: "thinking", thinking: "" };
+					output.content.push(thinkingBlock);
+					stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
+				}
+				const delta = part.thinking.startsWith(thinkingBlock.thinking)
+					? part.thinking.slice(thinkingBlock.thinking.length)
+					: part.thinking;
+				thinkingBlock.thinking = part.thinking;
+				if (delta)
+					stream.push({
+						type: "thinking_delta",
+						contentIndex: output.content.indexOf(thinkingBlock),
+						delta,
+						partial: output,
+					});
+			} else if (part.type === "text" && typeof part.text === "string") {
+				if (!textBlock) {
+					textBlock = { type: "text", text: "" };
+					output.content.push(textBlock);
+					stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
+				}
+				const delta = part.text.startsWith(textBlock.text) ? part.text.slice(textBlock.text.length) : part.text;
+				textBlock.text = part.text;
+				if (delta)
+					stream.push({
+						type: "text_delta",
+						contentIndex: output.content.indexOf(textBlock),
+						delta,
+						partial: output,
+					});
+			}
+		}
+		if (event.object === "response.done") {
+			const cacheRead = event.usage?.cache_read_input_tokens ?? 0;
+			output.usage = {
+				input: (event.usage?.input_tokens ?? 0) - cacheRead,
+				output: event.usage?.output_tokens ?? 0,
+				cacheRead,
+				cacheWrite: 0,
+				totalTokens: event.usage?.total_tokens ?? 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			};
+			calculateCost(model, output.usage);
+			output.stopReason = message?.finish_reason === "length" ? "length" : "stop";
+		}
+	}
+	if (thinkingBlock)
+		stream.push({
+			type: "thinking_end",
+			contentIndex: output.content.indexOf(thinkingBlock),
+			content: thinkingBlock.thinking,
+			partial: output,
+		});
+	if (textBlock)
+		stream.push({
+			type: "text_end",
+			contentIndex: output.content.indexOf(textBlock),
+			content: textBlock.text,
+			partial: output,
+		});
 }
 
 function getPromptCacheRetention(
@@ -126,10 +225,14 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			const requestId = response.headers.get("x-request-id") ?? undefined;
 			stream.push({ type: "start", partial: output });
 
-			await processResponsesStream(openaiStream, output, stream, model, {
-				serviceTier: options?.serviceTier,
-				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
-			});
+			if (model.provider === "merge-gateway") {
+				await processMergeGatewayStream(openaiStream, output, stream, model);
+			} else {
+				await processResponsesStream(openaiStream, output, stream, model, {
+					serviceTier: options?.serviceTier,
+					applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+				});
+			}
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -240,12 +343,14 @@ export function buildParams(model: Model<"openai-responses">, context: Context, 
 	const compat = getCompat(model);
 	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
 		systemRole: compat.supportsDeveloperRole ? undefined : "system",
+		requiresStringMessageContent: compat.requiresStringMessageContent,
 	});
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 	const params: ResponseCreateParamsStreaming & {
 		session_id?: string;
 		provider?: OpenRouterRouting;
+		include_routing_metadata?: boolean;
 	} = {
 		model: model.id,
 		input: messages,
@@ -255,6 +360,7 @@ export function buildParams(model: Model<"openai-responses">, context: Context, 
 		session_id: model.provider === "openrouter" ? options?.sessionId : undefined,
 		provider: model.provider === "openrouter" ? compat.openRouterRouting : undefined,
 		store: compat.supportsStore ? false : undefined,
+		include_routing_metadata: compat.includeRoutingMetadata || undefined,
 	};
 
 	if (options?.maxTokens) {

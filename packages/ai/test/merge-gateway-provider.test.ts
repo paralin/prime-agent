@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { findEnvKeys, getEnvApiKey } from "../src/env-api-keys.js";
 import { getModel } from "../src/models.js";
 import { streamOpenAICompletions } from "../src/providers/openai-completions.js";
-import { buildParams } from "../src/providers/openai-responses.js";
+import { buildParams, streamOpenAIResponses } from "../src/providers/openai-responses.js";
 import type { AssistantMessageEvent, Context, Model } from "../src/types.js";
 
 const MERGE_GATEWAY_API_KEY = "mg-test-secret-1234";
@@ -155,8 +155,9 @@ describe("Merge Gateway provider", () => {
 				buildParams(
 					model,
 					{
-						systemPrompt: "Use tools when available.",
 						...context,
+						systemPrompt: "Use tools when available.",
+						messages: [{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: 0 }],
 						tools: [{ name: "read", description: "Read a file", parameters: { type: "object" } }],
 					},
 					{ sessionId: "session-1", reasoningEffort: "high" },
@@ -167,6 +168,7 @@ describe("Merge Gateway provider", () => {
 		expect(payload).toMatchObject({
 			model: "zai/glm-5.3-flash",
 			stream: true,
+			include_routing_metadata: true,
 		});
 		expect(payload).not.toHaveProperty("store");
 		expect(payload).not.toHaveProperty("prompt_cache_key");
@@ -175,9 +177,37 @@ describe("Merge Gateway provider", () => {
 		expect(payload).not.toHaveProperty("include");
 		expect(payload).not.toHaveProperty("tools");
 		expect(payload.input).toEqual([
-			{ role: "system", content: "Use tools when available." },
-			{ role: "user", content: [{ type: "input_text", text: "hello" }] },
+			{ type: "message", role: "system", content: "Use tools when available." },
+			{ type: "message", role: "user", content: "hello" },
 		]);
+	});
+
+	it("reads Merge Gateway cumulative Responses streams", async () => {
+		const model = getModel("merge-gateway", "zai/glm-5.3-flash");
+		if (!model || model.api !== "openai-responses") throw new Error("expected Merge Responses model");
+		const { server, url } = await startMergeGatewayMock((_request, response) => {
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			response.end(
+				sse([
+					{ object: "response.stream", output: [{ content: [{ type: "text", text: "O" }] }] },
+					{ object: "response.stream", output: [{ content: [{ type: "text", text: "OK" }] }] },
+					{
+						object: "response.done",
+						output: [{ finish_reason: "stop", content: [{ type: "text", text: "OK" }] }],
+						usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+					},
+				]),
+			);
+		});
+		try {
+			const result = await streamOpenAIResponses({ ...model, baseUrl: `${url}/v1` }, context, {
+				apiKey: MERGE_GATEWAY_API_KEY,
+			}).result();
+			expect(result.stopReason).toBe("stop");
+			expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "OK" }));
+		} finally {
+			await closeServer(server);
+		}
 	});
 
 	it("resolves the generated default model", () => {

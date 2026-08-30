@@ -384,6 +384,10 @@ export interface OpenAIResponsesCompat {
 	supportsDeveloperRole?: boolean;
 	/** Whether the provider supports function tools. Default: true. */
 	supportsTools?: boolean;
+	/** Whether text messages require string content instead of typed content parts. Default: false. */
+	requiresStringMessageContent?: boolean;
+	/** Whether to request provider routing metadata. Default: false. */
+	includeRoutingMetadata?: boolean;
 	/** Whether the provider supports `prompt_cache_retention: "24h"`. Default: true. */
 	supportsLongCacheRetention?: boolean;
 	/** OpenRouter-specific routing preferences for Responses requests. */

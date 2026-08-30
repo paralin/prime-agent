@@ -3814,6 +3814,7 @@ export class DaemonSupervisor {
 				this.streamReconstructor.clear(activeSessionId);
 			}
 		}
+		const root = worker.summaries.get(worker.descriptor.rootActiveSessionId);
 		if (root) {
 			if (recovery) {
 				await this.assertRecoveryAllowed();

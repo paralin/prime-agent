@@ -6751,7 +6751,8 @@ export class InteractiveMode {
 	}
 
 	private handleCtrlC(): void {
-		const hasQueuedMessages = this.connectionQueue.steering.length + this.connectionQueue.followUp.length > 0;
+		const connectionQueue = this.getConnectionQueue();
+		const hasQueuedMessages = connectionQueue.steering.length + connectionQueue.followUp.length > 0;
 		if (this.editor.getText().length > 0 && (!this.hasInterruptibleWork() || !hasQueuedMessages)) {
 			this.clearInputBar();
 			return;

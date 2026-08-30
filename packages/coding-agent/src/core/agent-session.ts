@@ -4394,7 +4394,7 @@ export class AgentSession {
 		if (!this._disposeAsyncPromise) {
 			const childSessions = new Set([
 				...[...this._activeRlmChildRuns.values()].flatMap((run) => (run.session ? [run.session] : [])),
-				...this._rlmChildSessions.values(),
+				...[...this._rlmChildSessions.values()].map(({ session }) => session),
 			]);
 			this._disposeAsyncPromise = (async () => {
 				if (actTeardown) await actTeardown;
@@ -12028,6 +12028,7 @@ export class AgentSession {
 			model: this.model!,
 			status: "queued",
 			settled: false,
+			toolUseCount: 0,
 			abort: () => runtime.abort("RLM child cancelled"),
 			publication: createAgentMessageDeferred(),
 			settlement: createAgentMessageDeferred(),

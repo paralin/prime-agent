@@ -240,7 +240,7 @@ export class AssistantMessageComponent extends Container {
 			`hide:${this.hideThinkingBlock}`,
 			`label:${this.hiddenThinkingLabel}`,
 			`expanded:${this.expanded}`,
-		// In the signature so the streaming->final transition rebuilds (mermaid renders differently).
+			// In the signature so the streaming->final transition rebuilds (mermaid renders differently).
 			`streaming:${this.isStreaming}`,
 			`elapsed-streaming:${this.streaming}`,
 			`stop:${message.stopReason ?? ""}`,

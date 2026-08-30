@@ -286,7 +286,7 @@ function findPreferredDefaultModel(availableModels: Model<Api>[]): Model<Api> | 
  *    - If suffix is valid thinking level, use it and recurse on prefix
  *    - If suffix is invalid, warn and recurse on prefix with "off"
  */
-export function parseModelPattern(
+function parseModelPattern(
 	pattern: string,
 	availableModels: Model<Api>[],
 	options?: { allowInvalidThinkingLevelFallback?: boolean },

@@ -7,7 +7,7 @@ import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js
 import type { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import type { FileChangeSummary } from "../src/modes/interactive/components/edit-summary.js";
 import { createMermaidMarkdownTransform } from "../src/modes/interactive/components/mermaid.js";
-import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.js";
 

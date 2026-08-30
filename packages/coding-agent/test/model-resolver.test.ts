@@ -3,7 +3,6 @@ import { describe, expect, test, vi } from "vitest";
 import {
 	defaultModelPerProvider,
 	findInitialModel,
-	parseModelPattern,
 	parseRlmRuntimeCandidate,
 	resolveCliModel,
 	resolveModelScopeFromModels,

@@ -24,6 +24,7 @@ describe("RunInfra provider", () => {
 		expect(getModels("runinfra").map((model) => model.id)).toEqual([
 			"deepseek-v4-flash",
 			"deepseek-v4-pro",
+			"glm-5-3-flash",
 			"nemotron-3-5-lightning-30b",
 			"ornith-1-5-35b",
 			"qwen3-8-2-4t-a95b",
@@ -75,6 +76,52 @@ describe("RunInfra provider", () => {
 			expect(requestPath).toBe("/v1/chat/completions");
 			expect(authorization).toBe(`Bearer ${RUNINFRA_GATEWAY_KEY}`);
 			expect(requestBody?.model).toBe("deepseek-v4-flash");
+			expect(events.at(-1)?.type).toBe("done");
+		} finally {
+			server.closeAllConnections();
+			server.close();
+			if (server.listening) await once(server, "close");
+		}
+	});
+
+	it("sends the system prompt as the system role for reasoning models", async () => {
+		process.env.RUNINFRA_GATEWAY_KEY = RUNINFRA_GATEWAY_KEY;
+		let requestBody: Record<string, unknown> | undefined;
+		const server = http.createServer((request, response) => {
+			let body = "";
+			request.on("data", (chunk) => {
+				body += chunk;
+			});
+			request.on("end", () => {
+				requestBody = JSON.parse(body);
+				response.writeHead(200, { "content-type": "text/event-stream" });
+				response.end(
+					'data: {"id":"chatcmpl-runinfra","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n' +
+						'data: {"id":"chatcmpl-runinfra","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n' +
+						"data: [DONE]\n\n",
+				);
+			});
+		});
+		server.listen(0, "127.0.0.1");
+		await once(server, "listening");
+		const { port } = server.address() as AddressInfo;
+		const model: Model<"openai-completions"> = {
+			...getModel("runinfra", "glm-5-3-flash"),
+			baseUrl: `http://127.0.0.1:${port}/v1`,
+		};
+		const context: Context = {
+			systemPrompt: "be terse",
+			messages: [{ role: "user", content: "hello", timestamp: 0 }],
+		};
+
+		try {
+			const events: AssistantMessageEvent[] = [];
+			for await (const event of streamOpenAICompletions(model, context)) events.push(event);
+
+			const messages = requestBody?.messages as Array<{ role: string }>;
+			// The gateway rejects OpenAI-only roles such as "developer".
+			expect(messages[0]).toEqual({ role: "system", content: "be terse" });
+			expect(messages.some((message) => message.role === "developer")).toBe(false);
 			expect(events.at(-1)?.type).toBe("done");
 		} finally {
 			server.closeAllConnections();

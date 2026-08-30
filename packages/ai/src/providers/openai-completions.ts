@@ -1329,6 +1329,9 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 	const isCloudflareWorkersAI = provider === "cloudflare-workers-ai" || baseUrl.includes("api.cloudflare.com");
 	const isCloudflareAiGateway = provider === "cloudflare-ai-gateway" || baseUrl.includes("gateway.ai.cloudflare.com");
 	const isPrimeInference = provider === "prime-inference" || baseUrl.includes("api.pinference.ai");
+	// RunInfra's gateway serves GLM and other backends that reject OpenAI-only
+	// roles such as "developer".
+	const isRunInfra = provider === "runinfra" || baseUrl.includes("runinfra.ai");
 
 	const isNonStandard =
 		provider === "cerebras" ||
@@ -1343,7 +1346,8 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		baseUrl.includes("opencode.ai") ||
 		isCloudflareWorkersAI ||
 		isCloudflareAiGateway ||
-		isPrimeInference;
+		isPrimeInference ||
+		isRunInfra;
 
 	const useMaxTokens = baseUrl.includes("chutes.ai") || isMoonshot || isCloudflareAiGateway || isPrimeInference;
 

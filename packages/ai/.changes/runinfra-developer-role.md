@@ -1,0 +1,1 @@
+- Fixed RunInfra reasoning models sending the system prompt as the OpenAI-only "developer" role, which the gateway rejects.

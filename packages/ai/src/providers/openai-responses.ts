@@ -14,6 +14,7 @@ import type {
 	StreamOptions,
 	TextContent,
 	ThinkingContent,
+	ToolCall,
 	Usage,
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
@@ -78,7 +79,14 @@ interface MergeGatewayStreamEvent {
 	id?: string;
 	output?: Array<{
 		finish_reason?: string | null;
-		content?: Array<{ type?: string; thinking?: string; text?: string }>;
+		content?: Array<{
+			type?: string;
+			thinking?: string;
+			text?: string;
+			id?: string;
+			name?: string;
+			input?: Record<string, unknown>;
+		}>;
 	}>;
 	usage?: {
 		input_tokens?: number;
@@ -96,6 +104,7 @@ async function processMergeGatewayStream(
 ): Promise<void> {
 	let thinkingBlock: ThinkingContent | undefined;
 	let textBlock: TextContent | undefined;
+	const toolCalls = new Map<string, ToolCall>();
 	for await (const rawEvent of responseStream) {
 		const event = rawEvent as MergeGatewayStreamEvent;
 		if (event.object !== "response.stream" && event.object !== "response.done") continue;
@@ -134,6 +143,21 @@ async function processMergeGatewayStream(
 						delta,
 						partial: output,
 					});
+			} else if (
+				part.type === "tool_use" &&
+				typeof part.id === "string" &&
+				typeof part.name === "string" &&
+				part.input !== undefined
+			) {
+				let toolCall = toolCalls.get(part.id);
+				if (!toolCall) {
+					toolCall = { type: "toolCall", id: part.id, name: part.name, arguments: part.input };
+					toolCalls.set(part.id, toolCall);
+					output.content.push(toolCall);
+					stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+				} else {
+					toolCall.arguments = part.input;
+				}
 			}
 		}
 		if (event.object === "response.done") {
@@ -147,7 +171,7 @@ async function processMergeGatewayStream(
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			};
 			calculateCost(model, output.usage);
-			output.stopReason = message?.finish_reason === "length" ? "length" : "stop";
+			output.stopReason = message?.finish_reason === "length" ? "length" : toolCalls.size > 0 ? "toolUse" : "stop";
 		}
 	}
 	if (thinkingBlock)
@@ -164,6 +188,14 @@ async function processMergeGatewayStream(
 			content: textBlock.text,
 			partial: output,
 		});
+	for (const toolCall of toolCalls.values()) {
+		stream.push({
+			type: "toolcall_end",
+			contentIndex: output.content.indexOf(toolCall),
+			toolCall,
+			partial: output,
+		});
+	}
 }
 
 function getPromptCacheRetention(
@@ -344,6 +376,7 @@ export function buildParams(model: Model<"openai-responses">, context: Context, 
 	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
 		systemRole: compat.supportsDeveloperRole ? undefined : "system",
 		requiresStringMessageContent: compat.requiresStringMessageContent,
+		mergeGatewayToolFormat: model.provider === "merge-gateway",
 	});
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);

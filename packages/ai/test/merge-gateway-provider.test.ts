@@ -175,7 +175,7 @@ describe("Merge Gateway provider", () => {
 		expect(payload).not.toHaveProperty("prompt_cache_retention");
 		expect(payload).not.toHaveProperty("reasoning");
 		expect(payload).not.toHaveProperty("include");
-		expect(payload).not.toHaveProperty("tools");
+		expect(payload).toHaveProperty("tools.0.name", "read");
 		expect(payload.input).toEqual([
 			{ type: "message", role: "system", content: "Use tools when available." },
 			{ type: "message", role: "user", content: "hello" },
@@ -205,6 +205,42 @@ describe("Merge Gateway provider", () => {
 			}).result();
 			expect(result.stopReason).toBe("stop");
 			expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "OK" }));
+		} finally {
+			await closeServer(server);
+		}
+	});
+
+	it("reads Merge Gateway tool calls", async () => {
+		const model = getModel("merge-gateway", "zai/glm-5.3-flash");
+		if (!model || model.api !== "openai-responses") throw new Error("expected Merge Responses model");
+		const { server, url } = await startMergeGatewayMock((_request, response) => {
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			response.end(
+				sse([
+					{
+						object: "response.done",
+						output: [
+							{
+								finish_reason: "tool_use",
+								content: [{ type: "tool_use", id: "call_1", name: "read", input: { path: "README.md" } }],
+							},
+						],
+						usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+					},
+				]),
+			);
+		});
+		try {
+			const result = await streamOpenAIResponses({ ...model, baseUrl: `${url}/v1` }, context, {
+				apiKey: MERGE_GATEWAY_API_KEY,
+			}).result();
+			expect(result.stopReason).toBe("toolUse");
+			expect(result.content).toContainEqual({
+				type: "toolCall",
+				id: "call_1",
+				name: "read",
+				arguments: { path: "README.md" },
+			});
 		} finally {
 			await closeServer(server);
 		}

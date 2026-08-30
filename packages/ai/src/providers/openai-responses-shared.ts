@@ -76,6 +76,7 @@ export interface ConvertResponsesMessagesOptions {
 	includeSystemPrompt?: boolean;
 	systemRole?: "developer" | "system";
 	requiresStringMessageContent?: boolean;
+	mergeGatewayToolFormat?: boolean;
 }
 
 export interface ConvertResponsesToolsOptions {
@@ -172,6 +173,21 @@ export function convertResponsesMessages<TApi extends Api>(
 				});
 			}
 		} else if (msg.role === "assistant") {
+			if (options?.mergeGatewayToolFormat) {
+				const content: Array<Record<string, unknown>> = [];
+				for (const block of msg.content) {
+					if (block.type === "text" && block.text) {
+						content.push({ type: "text", text: sanitizeSurrogates(block.text) });
+					} else if (block.type === "toolCall") {
+						content.push({ type: "tool_use", id: block.id, name: block.name, input: block.arguments });
+					}
+				}
+				if (content.length > 0) {
+					messages.push({ type: "message", role: "assistant", content } as unknown as ResponseInput[number]);
+				}
+				msgIndex++;
+				continue;
+			}
 			const output: ResponseInput = [];
 			const assistantMsg = msg as AssistantMessage;
 			const isDifferentModel =
@@ -227,6 +243,19 @@ export function convertResponsesMessages<TApi extends Api>(
 			if (output.length === 0) continue;
 			messages.push(...output);
 		} else if (msg.role === "toolResult") {
+			if (options?.mergeGatewayToolFormat) {
+				const content = msg.content
+					.filter((block): block is TextContent => block.type === "text")
+					.map((block) => block.text)
+					.join("\n");
+				messages.push({
+					type: "tool_result",
+					tool_use_id: msg.toolCallId,
+					content: sanitizeSurrogates(content),
+				} as unknown as ResponseInput[number]);
+				msgIndex++;
+				continue;
+			}
 			const textResult = msg.content
 				.filter((c): c is TextContent => c.type === "text")
 				.map((c) => c.text)

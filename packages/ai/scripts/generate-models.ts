@@ -929,7 +929,6 @@ function getMergeGatewayModels(): Model<Api>[] {
 				supportsPromptCache: false,
 				supportsReasoning: false,
 				supportsDeveloperRole: false,
-				supportsTools: false,
 				requiresStringMessageContent: true,
 				includeRoutingMetadata: true,
 				supportsLongCacheRetention: false,

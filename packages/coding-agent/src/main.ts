@@ -257,11 +257,21 @@ export interface AgentsViewStartupDecision {
 	resume?: true | string;
 	continue?: boolean;
 	fork?: string;
+	/** True when this launch carries an initial prompt; it must open a chat directly. */
+	hasStartupPrompt?: boolean;
 }
 
 export function shouldOpenAgentsViewForDaemonInteractive(options: AgentsViewStartupDecision): boolean {
 	const bareResume = options.resume === true;
-	const requestsAgentsView = bareResume || (options.explicitAgentsView && !options.needsOnboarding);
+	// A bare launch is the launcher: it opens the agents view instead of the most
+	// recently running agent. An initial prompt still opens a chat directly.
+	const bareLaunch =
+		options.resume === undefined &&
+		!options.continue &&
+		!options.fork &&
+		!options.hasStartupPrompt &&
+		!options.needsOnboarding;
+	const requestsAgentsView = bareResume || bareLaunch || (options.explicitAgentsView && !options.needsOnboarding);
 	return (
 		options.useDaemonInteractive &&
 		// A selector, continuation, or fork must open its target directly rather than the agents view.
@@ -723,6 +733,7 @@ export function resolveRuntimeSessionOptions(
 		rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,
 		rlmParentNodeId: runtimeSessionOptions?.rlmParentNodeId,
 		rlmParentAgent: runtimeSessionOptions?.rlmParentAgent,
+		rlmModelCandidates: runtimeSessionOptions?.rlmModelCandidates,
 		subagentRuntimeHost: runtimeSessionOptions?.subagentRuntimeHost,
 	};
 }
@@ -1476,6 +1487,7 @@ export async function main(args: string[], options?: MainOptions) {
 				resume: parsed.resume,
 				continue: parsed.continue,
 				fork: parsed.fork,
+				hasStartupPrompt: initialMessage !== undefined || initialImages !== undefined || parsed.messages.length > 0,
 			})
 		) {
 			daemonReady = (await awaitDaemonReady(daemonReady)).ready;

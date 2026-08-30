@@ -1,0 +1,1 @@
+- Running `prime-agent` with a running daemon opens the agents view instead of the most recently running agent. A launch with an initial prompt still opens a chat directly.

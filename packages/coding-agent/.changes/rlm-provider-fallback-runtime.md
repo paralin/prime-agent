@@ -1,0 +1,1 @@
+- Fixed daemon-hosted RLM model roles retrying only their first provider instead of advancing through the configured fallback chain.

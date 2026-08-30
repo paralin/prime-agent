@@ -519,6 +519,8 @@ export interface AgentConnectionExecuteBashOptions {
 
 export interface AgentConnectionNewSessionOptions {
 	parentSession?: string;
+	/** Working directory for the new session; defaults to the current session's cwd. */
+	cwd?: string;
 }
 
 export interface AgentConnectionForkOptions {

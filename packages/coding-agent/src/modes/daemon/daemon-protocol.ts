@@ -676,7 +676,7 @@ export type DaemonCommand =
 	| { id?: string; type: "abort_retry"; activeSessionId: string }
 	| { id?: string; type: "execute_bash_and_wait"; activeSessionId: string; command: string }
 	| { id?: string; type: "reload"; activeSessionId: string }
-	| { id?: string; type: "new_session"; activeSessionId: string; parentSession?: string }
+	| { id?: string; type: "new_session"; activeSessionId: string; parentSession?: string; cwd?: string }
 	| { id?: string; type: "switch_session"; activeSessionId: string; sessionPath: string; cwdOverride?: string }
 	| { id?: string; type: "fork"; activeSessionId: string; entryId: string; position?: "before" | "at" }
 	| {

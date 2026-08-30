@@ -9871,7 +9871,9 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		};
 		let created = false;
 		try {
-			const result = await this.agentConnection.newSession();
+			// /new starts the session in this TUI process's working directory, not the
+			// attached session's directory.
+			const result = await this.agentConnection.newSession({ cwd: process.cwd() });
 			if (result.cancelled) {
 				restorePrompt();
 				return;

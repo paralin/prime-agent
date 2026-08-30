@@ -5066,7 +5066,15 @@ export class AgentDaemon {
 
 			case "new_session": {
 				const state = this.getSessionState(command.activeSessionId);
-				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
+				// The socket peer is untrusted: only honor a cwd that exists.
+				const cwd = command.cwd && existsSync(command.cwd) ? command.cwd : undefined;
+				const options =
+					command.parentSession || cwd
+						? {
+								...(command.parentSession ? { parentSession: command.parentSession } : {}),
+								...(cwd ? { cwd } : {}),
+							}
+						: undefined;
 				const result = await state.runtime.newSession(options);
 				this.rebindCronJobsToState(state);
 				return success(command.id, "new_session", result);

@@ -118,4 +118,21 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const leaseRoot = join(runtimeHost.services.agentDir, "session-leases");
 		expect(readdirSync(leaseRoot).filter((entry) => entry.endsWith(".lock"))).toHaveLength(1);
 	});
+
+	it("creates the /new replacement session in the requested cwd", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => {});
+		const otherDir = join(tmpdir(), `pi-runtime-events-cwd-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(otherDir, { recursive: true });
+		cleanups.push(async () => {
+			if (existsSync(otherDir)) {
+				rmSync(otherDir, { recursive: true, force: true });
+			}
+		});
+
+		await runtimeHost.newSession({ cwd: otherDir });
+
+		const sessionManager = runtimeHost.session.sessionManager;
+		expect(sessionManager.getCwd()).toBe(otherDir);
+		expect(runtimeHost.session.extensionRunner.createContext().cwd).toBe(otherDir);
+	});
 });

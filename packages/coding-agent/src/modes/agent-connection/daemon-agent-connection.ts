@@ -1348,6 +1348,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			type: "new_session",
 			activeSessionId: this.activeSessionId,
 			parentSession: options?.parentSession,
+			cwd: options?.cwd,
 		});
 	}
 

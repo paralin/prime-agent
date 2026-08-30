@@ -1,0 +1,1 @@
+- `/new` now creates the new session in the terminal process working directory instead of the attached session directory.

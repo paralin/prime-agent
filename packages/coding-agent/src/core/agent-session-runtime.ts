@@ -465,6 +465,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	async newSession(options?: {
 		parentSession?: string;
+		/** Working directory for the new session; defaults to the current session's cwd. */
+		cwd?: string;
 		setup?: (sessionManager: SessionManager) => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	}): Promise<{ cancelled: boolean }> {
@@ -474,8 +476,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 
 		const previousSessionFile = this.session.sessionFile;
+		const cwd = options?.cwd ?? this.cwd;
 		const sessionDir = this.session.sessionManager.getSessionDir();
-		const sessionManager = SessionManager.create(this.cwd, sessionDir);
+		const sessionManager = SessionManager.create(cwd, sessionDir);
 		if (options?.parentSession) {
 			sessionManager.newSession({
 				parentSession: options.parentSession,
@@ -489,7 +492,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			() =>
 				this.scopedBuild(() =>
 					this.createRuntime({
-						cwd: this.cwd,
+						cwd,
 						agentDir: this.services.agentDir,
 						sessionManager,
 						sessionStartEvent: {

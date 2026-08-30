@@ -324,8 +324,12 @@ async function openAgentsViewSession(
 ): Promise<OpenedAgentsViewSession> {
 	const socketPath = options.socketPath;
 	if (!socketPath) throw new Error("Agents view daemon socket is not configured");
-	let client = await connectAgentsViewDaemonClient(socketPath);
-	if (summary.activeSessionId) {
+	const client = await connectAgentsViewDaemonClient(socketPath);
+	if (!summary.sessionFile) {
+		if (!summary.activeSessionId) {
+			client.close();
+			throw new Error("Cannot open agent without an active runtime or saved session file");
+		}
 		try {
 			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
 				closeClientOnDispose: true,
@@ -336,19 +340,15 @@ async function openAgentsViewSession(
 			return { connection, summary };
 		} catch (error) {
 			client.close();
-			if (!summary.sessionFile || !isUnknownActiveSessionError(error)) {
-				throw error;
-			}
-			client = await connectAgentsViewDaemonClient(socketPath);
+			throw error;
 		}
 	}
 
-	if (!summary.sessionFile) {
-		client.close();
-		throw new Error("Cannot open agent without an active runtime or saved session file");
-	}
-
 	try {
+		// The file is the durable session identity. /new reuses the runtime id for
+		// another file, so attaching through a stale summary can open that new
+		// session instead of the selected one. The daemon's create-by-path call is
+		// idempotent when this file is still resident.
 		const resumed = await resumeSavedAgentsViewSession(client, options.config, summary);
 		const connection = await DaemonAgentConnection.attach(client, resumed.activeSessionId, {
 			closeClientOnDispose: true,

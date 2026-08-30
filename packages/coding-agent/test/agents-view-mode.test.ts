@@ -26,7 +26,7 @@ const modeMocks = vi.hoisted(() => ({
 	teardownSessionUi: vi.fn(async () => undefined),
 	dispose: vi.fn(async () => undefined),
 	connectionPrompt: vi.fn(async () => undefined),
-	clientRequest: vi.fn<() => Promise<unknown>>(),
+	clientRequest: vi.fn<(command: unknown) => Promise<unknown>>(),
 }));
 
 vi.mock("../src/config.js", async (importOriginal) => {
@@ -95,7 +95,16 @@ const settingsManager = {
 
 describe("AgentsViewMode", () => {
 	beforeAll(() => setKeybindings(new KeybindingsManager()));
-	beforeEach(() => vi.clearAllMocks());
+	beforeEach(() => {
+		vi.clearAllMocks();
+		modeMocks.clientRequest.mockImplementation(async (command: unknown) => {
+			const request = command as { type?: string; sessionPath?: string };
+			if (request.type === "create") {
+				return { success: true, data: summary({ sessionFile: request.sessionPath }) };
+			}
+			return undefined;
+		});
+	});
 
 	it("keeps the selection chosen by row rebuilding when the query changes", () => {
 		const self = {
@@ -283,6 +292,41 @@ describe("AgentsViewMode", () => {
 			streamingBehavior: "steer",
 		});
 		expect(DaemonAgentConnection.attach).not.toHaveBeenCalled();
+	});
+
+	it("opens the selected file instead of a runtime id reused by /new", async () => {
+		const oldSession = summary({
+			id: "worker-one",
+			activeSessionId: "worker-one",
+			sessionId: "session-old",
+			sessionFile: "/tmp/old.jsonl",
+		});
+		const resumedOldSession = { ...oldSession, id: "worker-old", activeSessionId: "worker-old" };
+		const runView = vi
+			.spyOn(AgentsViewMode.prototype, "run")
+			.mockResolvedValueOnce({ type: "open", summary: oldSession })
+			.mockResolvedValueOnce({ type: "exit" });
+		modeMocks.clientRequest.mockResolvedValueOnce({ success: true, data: resumedOldSession });
+		modeMocks.interactiveRun.mockRejectedValueOnce(new Error("stop after open"));
+
+		await runAgentsViewMode({
+			socketPath: "/tmp/fake-daemon.sock",
+			config: { cwd: "/tmp" } as never,
+			uiServices: {
+				settingsManager: settingsManager as never,
+				modelRegistry: {} as never,
+				getInitialCwd: () => "/tmp",
+				getInitialSessionName: () => undefined,
+				getThemes: () => [],
+			},
+		});
+
+		expect(modeMocks.clientRequest).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "create", sessionPath: "/tmp/old.jsonl" }),
+		);
+		expect(DaemonAgentConnection.attach).toHaveBeenCalledWith(expect.anything(), "worker-old", expect.anything());
+		expect(DaemonAgentConnection.attach).not.toHaveBeenCalledWith(expect.anything(), "worker-one", expect.anything());
+		runView.mockRestore();
 	});
 
 	it("uses the opened session as the crash-path back target", async () => {

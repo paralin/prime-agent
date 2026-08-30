@@ -1,0 +1,1 @@
+- Fixed the agents view opening the new session when selecting the previous session after `/new`.

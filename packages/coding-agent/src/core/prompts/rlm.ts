@@ -13,7 +13,6 @@ export interface RlmPromptOptions {
 }
 
 const LONG_RUNNING_WORK_PROMPT = [
-	"For slow or independently completing work, use event-driven completion: start the work, register its handle with `external_event.watch_bash(...)`, record the returned job ID, then end your turn. The completion event wakes this session with the exit status and bounded output tail. Use `external_event.emit(...)` for custom asyncio completion. Do not leave a retained task without a notification sink.",
 	"When delegation is available and useful, assign independent substantive tasks to separate workers. Start independent workers without waiting for each one sequentially, and let them run in parallel.",
 	"Do not keep the turn open by polling with `time.sleep()` or shell `sleep`, and do not replace polling with a long blocking `await`. Await only the short operation needed to start work or inspect a result that is already available; otherwise end the turn.",
 ].join("\n");
@@ -33,7 +32,11 @@ const IPYTHON_CONTROL_PROMPT = [
 	"",
 	"A repository, package, service, dataset, paper, website, benchmark, or API may have its own runtime and normal interface. Run and evaluate that external system through its own environment. Use IPython to coordinate the work and inspect the results.",
 	"",
+	"The kernel preloads `asyncio`, `bash`, `rg`, `rsync`, callable `rlm`, and `mcp`, plus any installed Python-backed skill modules named later. Use `help(...)`, `dir(...)`, and `inspect.signature(...)` when you need the exact live API instead of guessing it.",
+	"Configured MCP servers are accessed through `await mcp.list_tools(server)` and `await mcp.call_tool(server, tool, arguments)`.",
+	"",
 	'Run shell commands from Python with `await bash("command")`. Pass `timeout=seconds` to terminate a command after a finite positive duration; omit it to allow the command to run until it exits or is cancelled. For a remote POSIX host, pass `ssh="host"`; the system OpenSSH client receives argv-safe options and streams the script on stdin, while optional `cwd` and `env` become a strictly quoted remote prelude. Use one command string for shell steps that depend on the same `cd`, environment variables, shell variables, or sourced files.',
+	'Use `rg(pattern, *paths, options=(), timeout=None)` for argv-safe ripgrep searches and `rsync(*paths, options=("-a",), timeout=None)` for argv-safe synchronization. Both return the same live `BashHandle` as `bash()`, so they support `.pid`, `.running`, `.output()`, `.tail()`, `.poll()`, `.kill()`, `await`, and installed BashHandle completion watchers. `rsync()` enables protected arguments by default; set `protect_args=False` only for an older peer.',
 	"",
 	"`bash(command)` starts a shell command in the background and returns a handle immediately: `h = bash('npm test')`. Use `h.pid` / `h.running` for liveness, `h.tail(n)` / `h.output()` for combined stdout+stderr so far, `h.poll()` for a non-blocking result, `h.kill()` to terminate (SIGTERM, escalating to SIGKILL; on Windows kill() uses taskkill /T and detached or reparented descendants may survive), and `await h` (or `await bash('cmd')`) for the completed result with exit_code, output, and duration. Prefer bash() for long-running commands so the turn keeps working. Run shell commands with `bash()`, not `subprocess`/`os.system`: subprocess calls block the kernel, show the user nothing while they run, and spawn processes the harness cannot see or stop.",
 	"Do not install project dependencies into the IPython kernel merely to make an external project import or run. Use the project's documented command and environment, such as `uv run ...`, `.venv/bin/python ...`, or the active project interpreter from the repository root. A failure in that environment is the relevant result.",
@@ -106,6 +109,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		...(depth === 0 ? [USER_PROGRESS_PROMPT, ""] : []),
 		SIMPLIFIED_TECHNICAL_ENGLISH_PROMPT,
 		"",
+		...(hasIpython ? [IPYTHON_CONTROL_PROMPT, ""] : []),
 		`Working directory: ${cwd}`,
 		`Conversation log: ${messagesPath}`,
 		`Recursive agent depth: ${depth}`,
@@ -137,6 +141,11 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		if (canRunShellSkills) {
 			skillLines.push(
 				"Run a skill CLI only under the command documented in its SKILL.md. Read `<documented-command> --help` before relying on flags that the skill does not state.",
+			);
+		}
+		if (hasIpython && installedSkills.includes("external_event")) {
+			skillLines.push(
+				"For slow or independently completing work, register its retained BashHandle with `external_event.watch_bash(...)`, record the job ID, then end the turn. The completion event wakes this session with terminal status and a bounded output tail. Use `external_event.emit(...)` for custom asyncio completion. Do not leave a retained task without a notification sink.",
 			);
 		}
 		if (hasIpython && installedSkills.includes("edit")) {
@@ -191,7 +200,6 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	}
 
 	if (hasIpython) {
-		parts.push("", IPYTHON_CONTROL_PROMPT);
 		if (depth === 0) {
 			parts.push(
 				"",

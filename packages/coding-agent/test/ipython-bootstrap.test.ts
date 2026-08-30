@@ -23,10 +23,14 @@ describe("RLM bootstrap", () => {
 		expect(buildRlmBootstrapCode()).toContain('_prime_agent_os.environ["NO_COLOR"] = "1"');
 	});
 
-	it("binds bash from the runtime with a missing-runtime stub fallback", () => {
+	it("binds process helpers from the runtime with missing-runtime stub fallbacks", () => {
 		const code = buildRlmBootstrapCode();
 		expect(code).toContain("bash = _prime_agent_rlm_module.bash");
+		expect(code).toContain("rg = _prime_agent_rlm_module.rg");
+		expect(code).toContain("rsync = _prime_agent_rlm_module.rsync");
 		expect(code).toContain("def bash(command, timeout=None, **kwargs):");
+		expect(code).toContain("def rg(pattern, *paths, options=(), timeout=None):");
+		expect(code).toContain('def rsync(*paths, options=("-a",), timeout=None, protect_args=True):');
 		expect(code).toContain("rlm._raise_missing()");
 	});
 

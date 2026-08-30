@@ -63,6 +63,11 @@ class BashResult:
 
 
 @dataclass(frozen=True)
+class _ArgvTransport:
+    argv: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _SshTransport:
     argv: tuple[str, ...]
     script: bytes
@@ -121,7 +126,7 @@ class _BoundedBuffer:
 
 
 class BashHandle:
-    """Live handle to a shell command; await it for the BashResult.
+    """Live handle to a managed shell or argv process; await it for BashResult.
 
     A handle awaited before any other API use (the `await bash(cmd)` one-shot
     form, including `h = bash(cmd)` awaited immediately) owns the command:
@@ -136,10 +141,14 @@ class BashHandle:
         timeout: float | None = None,
         *,
         ssh_transport: _SshTransport | None = None,
+        argv_transport: _ArgvTransport | None = None,
     ) -> None:
         self.command = command
         self.timeout = timeout
         self._ssh_transport = ssh_transport
+        self._argv_transport = argv_transport
+        if ssh_transport is not None and argv_transport is not None:
+            raise ValueError("a BashHandle process can have only one transport")
         self._buffer = _BoundedBuffer()
         self._done = threading.Event()
         self._eof = threading.Event()
@@ -184,6 +193,8 @@ class BashHandle:
                     completion_token[token_midpoint:],
                 ),
             ]
+        elif argv_transport is not None:
+            pass
         elif _IS_POSIX:
             # Full-duplex status channel: the child end rides in as stdin (fd 0)
             # and the script remaps it to _STATUS_FD before swapping in /dev/null
@@ -211,7 +222,7 @@ class BashHandle:
                 completion_token[:token_midpoint],
                 completion_token[token_midpoint:],
             )
-        else:
+        elif argv_transport is None:
             # Windows lacks a foreground-status channel, so its exit drain stays best-effort.
             script = _with_prefix(command)
         if not _IS_POSIX:
@@ -221,7 +232,17 @@ class BashHandle:
                 raise RuntimeError("bash(): Windows job containment could not be established")
         try:
             self._proc: subprocess.Popen[bytes] | _winjob.JobProcess
-            if ssh_transport is not None and _IS_POSIX:
+            if argv_transport is not None and _IS_POSIX:
+                self._proc = subprocess.Popen(
+                    [sys.executable, os.path.join(os.path.dirname(__file__), "_exec.py"), *argv_transport.argv],
+                    cwd=os.getcwd(),
+                    env=_child_env(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            elif ssh_transport is not None and _IS_POSIX:
                 self._proc = subprocess.Popen(
                     ssh_argv,
                     cwd=os.getcwd(),
@@ -240,6 +261,10 @@ class BashHandle:
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                     stdin=status_write,
+                )
+            elif argv_transport is not None:
+                self._proc = _winjob.spawn_in_job(
+                    self._job, list(argv_transport.argv), cwd=os.getcwd(), env=_child_env()
                 )
             elif ssh_transport is not None:
                 self._proc = _winjob.spawn_in_job(
@@ -273,7 +298,17 @@ class BashHandle:
                 "bash(): orphan-journal enrollment failed (journal configured but the "
                 "pid could not be recorded); the spawned process was killed"
             )
-        if _IS_POSIX and ssh_transport is None:
+        if _IS_POSIX and argv_transport is not None:
+            stream = self._proc.stdin
+            assert stream is not None
+            try:
+                stream.write(b"\n")
+                stream.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            finally:
+                stream.close()
+        elif _IS_POSIX and ssh_transport is None:
             # Journal first, then open the gate: the child does not run the user
             # command until this byte arrives. A failed write means the child
             # already died; the status/EOF paths report that normally.
@@ -289,7 +324,9 @@ class BashHandle:
                 self._abort_spawn()
                 raise RuntimeError("bash(): Windows job containment could not be established")
         threading.Thread(target=self._pump, daemon=True).start()
-        if ssh_transport is not None:
+        if argv_transport is not None:
+            threading.Thread(target=self._watch_argv, daemon=True).start()
+        elif ssh_transport is not None:
             threading.Thread(
                 target=self._feed_stdin, args=(ssh_transport.script,), daemon=True
             ).start()
@@ -397,7 +434,10 @@ class BashHandle:
                         chunk = os.read(fd, _READ_CHUNK)
                         if not chunk:
                             break
-                        self._consume_output(chunk)
+                        if self._completion_marker is None:
+                            self._buffer.write(chunk)
+                        else:
+                            self._consume_output(chunk)
                     finally:
                         self._pump_transfer = False
         except (OSError, ValueError):
@@ -465,6 +505,20 @@ class BashHandle:
             if output is None:
                 self._drain_grace()
             self._finalize(status, output)
+
+    def _watch_argv(self) -> None:
+        exit_code = self._proc.wait()
+        self._eof.wait()
+        with self._kill_lock:
+            delivered = self._reap_group()
+            self._reaped = True
+            if not _IS_POSIX:
+                cast("_winjob.JobProcess", self._proc).close()
+        if delivered:
+            _record_journal(self._pid, active=False)
+        self._finalize(exit_code)
+        with _live_lock:
+            _live_handles.discard(self)
 
     def _feed_stdin(self, data: bytes) -> None:
         stream = self._proc.stdin
@@ -967,6 +1021,16 @@ def _ssh_transport(
     )
 
 
+def _validated_timeout(timeout: float | None) -> float | None:
+    if timeout is None:
+        return None
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise TypeError("timeout must be a positive number or None")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be a finite positive number")
+    return float(timeout)
+
+
 def bash(
     command: str,
     timeout: float | None = None,
@@ -1003,12 +1067,7 @@ def bash(
         raise TypeError("command must be a non-empty str")
     if "\0" in command:
         raise ValueError("command cannot contain NUL")
-    if timeout is not None:
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
-            raise TypeError("timeout must be a positive number or None")
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("timeout must be a finite positive number")
-        timeout = float(timeout)
+    timeout = _validated_timeout(timeout)
     transport = None
     if ssh is None:
         if cwd is not None or env is not None or ssh_options is not None or tty or ssh_shell != "bash":
@@ -1023,6 +1082,104 @@ def bash(
     if timeout is None:
         return BashHandle(command, ssh_transport=transport)
     return BashHandle(command, timeout, ssh_transport=transport)
+
+
+def _argv_values(values: Sequence[str | os.PathLike[str]], label: str) -> list[str]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{label} must be a sequence of argv values, not a string")
+    result: list[str] = []
+    for index, value in enumerate(values):
+        if not isinstance(value, (str, os.PathLike)):
+            raise TypeError(f"{label}[{index}] must be str or PathLike, got {type(value).__name__}")
+        argument = os.fspath(value)
+        if not isinstance(argument, str) or not argument or "\0" in argument:
+            raise ValueError(f"{label}[{index}] must be a non-empty path or argument without NUL")
+        result.append(argument)
+    return result
+
+
+def _tool_path(name: str, environment_name: str) -> str:
+    configured = os.environ.get(environment_name, name)
+    executable = shutil.which(configured)
+    if executable is None:
+        raise RuntimeError(f"{name}() requires the {name} executable; install it or set {environment_name}")
+    return executable
+
+
+def _argv_handle(argv: Sequence[str], timeout: float | None) -> BashHandle:
+    normalized_timeout = _validated_timeout(timeout)
+    display = shlex.join(argv)
+    transport = _ArgvTransport(tuple(argv))
+    if normalized_timeout is None:
+        return BashHandle(display, argv_transport=transport)
+    return BashHandle(display, normalized_timeout, argv_transport=transport)
+
+
+def rg(
+    pattern: str,
+    *paths: str | os.PathLike[str],
+    options: Sequence[str] = (),
+    timeout: float | None = None,
+) -> BashHandle:
+    """Search paths with ripgrep through the existing BashHandle process owner.
+
+    Paths default to the current directory. ``options`` contains individual
+    ripgrep argv entries; no argument passes through a shell. The returned
+    handle has the same await, cancellation, timeout, output, and external-event
+    behavior as ``bash()``.
+    """
+    if not isinstance(pattern, str):
+        raise TypeError(f"pattern must be str, got {type(pattern).__name__}")
+    if not pattern or "\0" in pattern:
+        raise ValueError("pattern must be a non-empty str without NUL")
+    arguments = _argv_values(options, "options")
+    if "--" in arguments:
+        raise ValueError("rg options must not contain the end-of-options marker")
+    if any(option == "--pre" or option.startswith("--pre=") for option in arguments):
+        raise ValueError("rg --pre conflicts with direct argv process custody")
+    requested_paths = _argv_values(paths or (".",), "paths")
+    argv = [_tool_path("rg", "PRIME_AGENT_RG"), *arguments, "-e", pattern, "--", *requested_paths]
+    return _argv_handle(argv, timeout)
+
+
+_RSYNC_FORBIDDEN_OPTIONS = ("-e", "--daemon", "--rsh", "--rsync-path")
+
+
+def _validate_rsync_options(options: Sequence[str]) -> list[str]:
+    arguments = _argv_values(options, "options")
+    if "--" in arguments:
+        raise ValueError("rsync options must not contain the end-of-options marker")
+    for option in arguments:
+        if option == "-e" or (option.startswith("-") and not option.startswith("--") and "e" in option[1:]):
+            raise ValueError(f"rsync option {option!r} can replace the remote shell")
+        if any(option == forbidden or option.startswith(f"{forbidden}=") for forbidden in _RSYNC_FORBIDDEN_OPTIONS[1:]):
+            raise ValueError(f"rsync option {option!r} conflicts with managed process custody")
+    return arguments
+
+
+def rsync(
+    *paths: str | os.PathLike[str],
+    options: Sequence[str] = ("-a",),
+    timeout: float | None = None,
+    protect_args: bool = True,
+) -> BashHandle:
+    """Synchronize two or more paths through the existing BashHandle process owner.
+
+    Archive mode and rsync's protected-arguments protocol are enabled by
+    default. Pass ``options=()`` or ``protect_args=False`` only when the peer's
+    contract requires native rsync defaults or a pre-3.0 remote. Remote paths
+    retain rsync's standard ``host:path`` syntax; remote-shell replacement
+    options are rejected.
+    """
+    if len(paths) < 2:
+        raise ValueError("rsync requires at least one source and one destination")
+    if not isinstance(protect_args, bool):
+        raise TypeError(f"protect_args must be bool, got {type(protect_args).__name__}")
+    arguments = _validate_rsync_options(options)
+    requested_paths = _argv_values(paths, "paths")
+    protected = ["--protect-args"] if protect_args else []
+    argv = [_tool_path("rsync", "PRIME_AGENT_RSYNC"), *arguments, *protected, "--", *requested_paths]
+    return _argv_handle(argv, timeout)
 
 
 def _shell() -> str:

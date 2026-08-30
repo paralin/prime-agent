@@ -291,13 +291,30 @@ describe("buildRlmPrompt", () => {
 			cwd: "/repo",
 			messagesPath: "/repo/.pi/sessions/session.jsonl",
 			activeTools: ["ipython"],
+			installedSkills: ["external_event"],
 			allowRecursion: false,
 		});
 
 		expect(prompt).toContain('await bash("command")');
 		expect(prompt).toContain('pass `ssh="host"`');
+		expect(prompt).toContain("The kernel preloads `asyncio`, `bash`, `rg`, `rsync`, callable `rlm`, and `mcp`");
+		expect(prompt).toContain("rg(pattern, *paths, options=(), timeout=None)");
+		expect(prompt).toContain('rsync(*paths, options=("-a",), timeout=None)');
+		expect(prompt).toContain("await mcp.list_tools(server)");
 		expect(prompt).toContain("external_event.watch_bash(...)");
 		expect(prompt).toContain("Do not leave a retained task without a notification sink");
+		expect(prompt.indexOf("The kernel preloads")).toBeLessThan(prompt.indexOf("Working directory: /repo"));
+	});
+
+	test("mentions external-event completion only when that skill is installed", () => {
+		const withoutExternalEvent = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/.pi/sessions/session.jsonl",
+			activeTools: ["ipython"],
+			installedSkills: [],
+			allowRecursion: false,
+		});
+		expect(withoutExternalEvent).not.toContain("external_event.watch_bash(...)");
 	});
 
 	test("documents preferring Python for reading and searching files when ipython is active", () => {
@@ -896,7 +913,8 @@ describe("createIpythonToolDefinition", () => {
 
 		expect(tool.description).toContain("persistent Python REPL");
 		expect(tool.description).toContain("target project's own environment");
-		expect(tool.promptSnippet).toContain("bash() orchestration");
+		expect(tool.promptSnippet).toContain("preloaded process, RLM, MCP, and skill APIs");
+		expect(tool.description).toContain("argv-safe rg() and rsync()");
 		const codeSchema = tool.parameters.properties.code;
 		const codeDescription =
 			"description" in codeSchema && typeof codeSchema.description === "string" ? codeSchema.description : "";

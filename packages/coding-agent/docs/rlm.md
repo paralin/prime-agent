@@ -50,7 +50,9 @@ result = await bash("npm run check")
 print(result.output)
 ```
 
-Each `bash()` call is its own process, while Python state, `os.chdir(...)`, and `os.environ[...]` changes persist in the kernel and apply to later `bash()` calls. Prime Agent extensions may intentionally add custom tools, but the built-in RLM design does not require a separate model tool for every capability.
+Each `bash()` call is its own process, while Python state, `os.chdir(...)`, and `os.environ[...]` changes persist in the kernel and apply to later `bash()` calls. The preloaded `rg(pattern, *paths, options=())` and `rsync(*paths, options=("-a",))` helpers pass every argument directly to ripgrep or rsync without a shell. They return the same live `BashHandle`, including timeout, cancellation, bounded output, and completion-watch behavior. `rsync()` protects remote arguments by default and rejects options that replace its remote shell.
+
+The kernel also preloads `asyncio`, callable `rlm`, `mcp`, and installed Python-backed skill modules. Inspect the live API with `help(...)`, `dir(...)`, or `inspect.signature(...)`; skill-specific calls remain documented in each skill's `SKILL.md`. Prime Agent extensions may intentionally add custom tools, but the built-in RLM design does not require a separate model tool for every capability.
 
 ### 2. Subagents are native RLM calls
 

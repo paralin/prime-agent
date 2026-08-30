@@ -4,6 +4,7 @@ import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { IMAGE_MIME_TYPES } from "../../utils/mime.js";
 import { resolveKernelBashShell } from "../../utils/shell.js";
+import { getToolPath } from "../../utils/tools-manager.js";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
 import { withKernelBootPermit } from "../kernel/boot-gate.js";
 import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
@@ -33,6 +34,8 @@ try:
     import rlm as _prime_agent_rlm_module
     rlm = _prime_agent_rlm_module.rlm
     bash = _prime_agent_rlm_module.bash
+    rg = _prime_agent_rlm_module.rg
+    rsync = _prime_agent_rlm_module.rsync
     import rlm.mcp as mcp
 except Exception as _prime_agent_rlm_error:
     _PRIME_AGENT_RLM_IMPORT_ERROR = str(_prime_agent_rlm_error)
@@ -70,6 +73,12 @@ except Exception as _prime_agent_rlm_error:
     rlm = _PrimeAgentMissingRlm()
 
     def bash(command, timeout=None, **kwargs):
+        rlm._raise_missing()
+
+    def rg(pattern, *paths, options=(), timeout=None):
+        rlm._raise_missing()
+
+    def rsync(*paths, options=("-a",), timeout=None, protect_args=True):
         rlm._raise_missing()
 `.trim();
 
@@ -513,6 +522,7 @@ export class IpythonKernelProvisioner {
 			// without bash, where the runtime's teaching error fires instead).
 			const shellPath = resolveKernelBashShell(this.options?.shellPath);
 			const commandPrefix = this.options?.commandPrefix;
+			const rgPath = getToolPath("rg");
 			const bootstrapCode = buildRlmBootstrapCode(this.options?.pythonSkills);
 			const m = new ReplKernelManager({
 				python: this.options?.python,
@@ -520,6 +530,7 @@ export class IpythonKernelProvisioner {
 				env: {
 					...this.options?.env,
 					...(shellPath ? { PRIME_AGENT_BASH_SHELL: shellPath } : {}),
+					...(rgPath ? { PRIME_AGENT_RG: rgPath } : {}),
 					...(commandPrefix ? { PRIME_AGENT_BASH_COMMAND_PREFIX: commandPrefix } : {}),
 				},
 				sessionId: this.options?.sessionId,
@@ -670,8 +681,9 @@ export function createIpythonToolDefinition(
 		name: "ipython",
 		label: "ipython",
 		description:
-			"Execute Python code in a persistent Python REPL. Top-level `await` is supported. Variables, imports, and loaded data persist across calls, and are revived on a best-effort basis when a session is resumed (objects that cannot be serialized are dropped and reported). Run shell commands with `bash('cmd')` / `await bash('cmd')`. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
-		promptSnippet: "ipython - persistent Python REPL for code, state, and bash() orchestration",
+			"Execute Python code in a persistent Python REPL. Top-level `await` is supported. Variables, imports, and loaded data persist across calls, and are revived on a best-effort basis when a session is resumed (objects that cannot be serialized are dropped and reported). The kernel preloads bash(), argv-safe rg() and rsync(), callable rlm, mcp, and installed Python skills. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
+		promptSnippet:
+			"ipython - persistent Python REPL with retained state and preloaded process, RLM, MCP, and skill APIs",
 		// The kernel is single-threaded — pi must not run two ipython calls in parallel within a batch.
 		executionMode: "sequential",
 		parameters: ipythonSchema,

@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from rlm import bash
+from rlm import bash, rg
 from test.test_bash import _fake_ssh
 
 bash_module = sys.modules["rlm.bash"]
@@ -67,6 +67,23 @@ class ExternalEventSkillTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info.status, "completed")
         self.assertEqual(info.exit_code, 0)
         self.assertEqual(self.module.list_jobs(), [info])
+
+    async def test_watch_bash_accepts_an_rg_handle(self) -> None:
+        host = AsyncMock(return_value={"deliveryStatus": "delivered"})
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp, "rg")
+            executable.write_text("#!/bin/sh\nprintf watched-rg\n", encoding="utf-8")
+            executable.chmod(0o755)
+            with patch.object(self.module, "host_request", host), patch.dict(
+                os.environ, {"PRIME_AGENT_RG": str(executable)}
+            ):
+                job_id = self.module.watch_bash(rg("needle"), "search")
+                assert self.module._jobs[job_id].task is not None
+                await asyncio.wait_for(self.module._jobs[job_id].task, timeout=5)
+        info = self.module.get_job(job_id)
+        self.assertEqual(info.status, "completed")
+        self.assertEqual(info.exit_code, 0)
+        self.assertIn("watched-rg", host.await_args.args[1]["text"])
 
     async def test_timed_out_bash_still_emits_terminal_result(self) -> None:
         host = AsyncMock(return_value={"deliveryStatus": "delivered"})

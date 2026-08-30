@@ -17,7 +17,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
-from rlm import bash
+from rlm import bash, rg, rsync
 
 # The package re-exports the bash() function under the same name, so reach the
 # module through sys.modules for internals.
@@ -270,6 +270,114 @@ pwd
             bash("echo no", ssh="-host")
         with self.assertRaisesRegex(ValueError, "remote-user tilde"):
             bash("echo no", ssh="host", cwd="~other/build")
+
+    async def test_argv_transport_preserves_arguments_without_a_shell(self):
+        argument = "literal $HOME * ' quote"
+        result = await bash_module._argv_handle(
+            [sys.executable, "-c", "import sys; print(sys.argv[1])", argument], None
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.output.strip(), argument)
+
+    async def test_argv_transport_marks_its_journal_record_inactive_after_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = os.path.join(tmp, "journal.jsonl")
+            with mock.patch.dict(
+                os.environ, {"PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL": journal}
+            ):
+                result = await bash_module._argv_handle(
+                    [sys.executable, "-c", "print('journaled')"], None
+                )
+                records = await _poll_journal(journal, 2)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual([record["active"] for record in records], [True, False])
+        self.assertEqual(records[0]["pid"], records[1]["pid"])
+
+    async def test_argv_transport_timeout_terminates_the_process_group(self):
+        handle = bash_module._argv_handle(
+            [sys.executable, "-c", "import time; time.sleep(30)"], 0.1
+        )
+        with self.assertRaises(TimeoutError):
+            await handle
+        self.assertFalse(handle.running)
+
+    async def test_argv_transport_journal_failure_prevents_target_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "ran")
+            bad_journal = os.path.join(tmp, "missing", "journal.jsonl")
+            with mock.patch.dict(
+                os.environ, {"PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL": bad_journal}
+            ):
+                with self.assertRaisesRegex(RuntimeError, "orphan-journal enrollment failed"):
+                    bash_module._argv_handle(
+                        [sys.executable, "-c", "from pathlib import Path; Path(__import__('sys').argv[1]).touch()", marker],
+                        None,
+                    )
+            self.assertFalse(os.path.exists(marker))
+
+    def test_rg_builds_an_argv_search_and_reuses_bash_handle_custody(self):
+        handle = object()
+        with mock.patch.object(bash_module, "_tool_path", return_value="/tools/rg"), mock.patch.object(
+            bash_module, "_argv_handle", return_value=handle
+        ) as runner:
+            result = rg("single ' quote", "dir with space", options=("--hidden",), timeout=3)
+        self.assertIs(result, handle)
+        runner.assert_called_once_with(
+            ["/tools/rg", "--hidden", "-e", "single ' quote", "--", "dir with space"], 3
+        )
+
+    def test_rg_defaults_to_the_current_directory_and_validates_argv(self):
+        with mock.patch.object(bash_module, "_tool_path", return_value="/tools/rg"), mock.patch.object(
+            bash_module, "_argv_handle", return_value=object()
+        ) as runner:
+            rg("needle")
+        runner.assert_called_once_with(["/tools/rg", "-e", "needle", "--", "."], None)
+        with self.assertRaises(TypeError):
+            rg(3)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            rg("needle", "bad\0path")
+        with self.assertRaises(ValueError):
+            rg("needle", options=("--",))
+        with self.assertRaises(ValueError):
+            rg("needle", options=("--pre=cat",))
+        with mock.patch.dict(os.environ, {"PRIME_AGENT_RG": "/missing/rg"}), mock.patch.object(
+            bash_module.shutil, "which", return_value=None
+        ):
+            with self.assertRaisesRegex(RuntimeError, "PRIME_AGENT_RG"):
+                rg("needle")
+
+    def test_rsync_builds_a_protected_archive_argv_and_reuses_bash_handle_custody(self):
+        handle = object()
+        with mock.patch.object(bash_module, "_tool_path", return_value="/tools/rsync"), mock.patch.object(
+            bash_module, "_argv_handle", return_value=handle
+        ) as runner:
+            result = rsync("source dir/", "host:target dir/", timeout=9)
+        self.assertIs(result, handle)
+        runner.assert_called_once_with(
+            [
+                "/tools/rsync",
+                "-a",
+                "--protect-args",
+                "--",
+                "source dir/",
+                "host:target dir/",
+            ],
+            9,
+        )
+
+    def test_rsync_allows_native_defaults_and_rejects_unsafe_or_incomplete_calls(self):
+        with mock.patch.object(bash_module, "_tool_path", return_value="/tools/rsync"), mock.patch.object(
+            bash_module, "_argv_handle", return_value=object()
+        ) as runner:
+            rsync("source", "target", options=(), protect_args=False)
+        runner.assert_called_once_with(["/tools/rsync", "--", "source", "target"], None)
+        with self.assertRaises(ValueError):
+            rsync("source")
+        with self.assertRaises(TypeError):
+            rsync("source", "target", protect_args="yes")  # type: ignore[arg-type]
+        for options in (("-e", "ssh -J jump"), ("-avze",), ("--rsh=ssh",), ("--daemon",), ("--",)):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                rsync("source", "target", options=options)
 
     async def test_status_pipe_survives_high_fds_and_strict_posix_shell(self):
         # Regression: dash rejects multi-digit fds in redirections at parse
@@ -918,6 +1026,27 @@ pwd
                     handle._job = None
                     handle.kill(signal.SIGKILL)
                     await asyncio.wait_for(handle, timeout=5)
+
+    async def test_windows_argv_spawn_uses_the_existing_job_container(self):
+        spawned = []
+        with mock.patch.object(bash_module, "_IS_POSIX", False), mock.patch.object(
+            bash_module._winjob, "create_job", return_value=5150
+        ), mock.patch.object(
+            bash_module._winjob, "spawn_in_job", _win_spawn(spawned)
+        ), mock.patch.object(
+            bash_module._winjob, "terminate", return_value=True
+        ), mock.patch.object(
+            bash_module._winjob, "close"
+        ), mock.patch.object(
+            bash_module, "_record_journal", return_value=True
+        ):
+            result = await bash_module._argv_handle(
+                [sys.executable, "-c", "print('windows-argv')"], None
+            )
+
+        self.assertEqual(result.output.strip(), "windows-argv")
+        self.assertEqual(spawned[0].spawn_argv, [sys.executable, "-c", "print('windows-argv')"])
+        self.assertIsNone(spawned[0].stdin)
 
     async def test_windows_ssh_spawn_uses_job_contained_stdin_pipe(self):
         with tempfile.TemporaryDirectory() as tmp:

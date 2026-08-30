@@ -1,0 +1,1 @@
+- Added argv-safe `rg()` and `rsync()` helpers to the persistent IPython kernel.

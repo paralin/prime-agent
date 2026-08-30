@@ -8,6 +8,7 @@ import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js"
 import {
 	countDirectSubagentStatuses,
 	countRosterSubagentStatuses,
+	countSubagentTreeStatuses,
 	SubagentSummaryLine,
 } from "../src/modes/interactive/components/subagent-summary-line.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
@@ -79,7 +80,7 @@ describe("SubagentSummaryLine", () => {
 		}
 	});
 
-	it("counts only direct children using running, idle, and inactive status projections", () => {
+	it("counts direct trees using their most active descendant status", () => {
 		const children = [
 			child("running", "running"),
 			child("queued", "queued"),
@@ -93,11 +94,25 @@ describe("SubagentSummaryLine", () => {
 			child("grandchild", "running", { parentId: "running" }),
 		];
 
-		expect(countDirectSubagentStatuses(children, undefined, new Set(["heartbeat-session"]))).toEqual({
+		expect(countSubagentTreeStatuses(children, undefined, new Set(["heartbeat-session"]))).toEqual({
 			total: 8,
 			running: 4,
 			idle: 2,
 			inactive: 2,
+		});
+	});
+
+	it("shows an idle parent as running while its nested agent is active", () => {
+		const children = [
+			child("parent", "done", { activeSessionId: "parent-session" }),
+			child("nested", "running", { parentId: "parent" }),
+		];
+
+		expect(countSubagentTreeStatuses(children, undefined, new Set())).toEqual({
+			total: 1,
+			running: 1,
+			idle: 0,
+			inactive: 0,
 		});
 	});
 

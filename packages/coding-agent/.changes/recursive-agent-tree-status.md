@@ -1,0 +1,1 @@
+- Fixed the agent status line to show a direct agent as running while work continues in its nested agent tree.

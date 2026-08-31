@@ -4966,6 +4966,15 @@ export class AgentSession {
 			options.preflightResult?.(queued, queued);
 			return;
 		}
+		if (this._sessionInputPumpSuspended && !this._isBusyForSessionInput("preflight") && customMessage) {
+			// An aborted parent keeps queued-input admission suspended so late
+			// results cannot start turns, but the child's message must still
+			// arrive: park it as next-turn context for the resumed session.
+			admissionCommitted();
+			this._pendingNextTurnMessages.push(cloneCustomMessage(customMessage));
+			options?.preflightResult?.(true, true);
+			return;
+		}
 		await this._prompt(text, {
 			...options,
 			resumeIfIdle: false,

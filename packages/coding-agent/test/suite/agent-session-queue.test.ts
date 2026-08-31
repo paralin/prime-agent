@@ -2925,6 +2925,38 @@ describe("AgentSession queue characterization", () => {
 		expect(getUserTexts(harness)).toEqual([]);
 	});
 
+	it("defers a child message across an abort and delivers it with the resumed turn", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.session.requestAbort();
+		const payload: AgentSessionMessagePayload = {
+			id: "agentmsg_deferred",
+			source: AGENT_MESSAGE_SOURCE,
+			message: "child result after parent abort",
+			target: { activeSessionId: "worker-active", sessionId: "worker-session" },
+		};
+		let preflight: { accepted: boolean; queued: boolean } | undefined;
+		await harness.session.acceptAgentMessagePrompt(agentPromptText(payload.id, payload.message), {
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+			customMessage: createAgentSessionMessage(payload),
+			preflightResult: (didSucceed, didQueue) => {
+				preflight = { accepted: didSucceed, queued: didQueue === true };
+			},
+		});
+		expect(preflight).toEqual({ accepted: true, queued: true });
+
+		harness.setResponses([fauxAssistantMessage("resumed")]);
+		await harness.session.prompt("explicit user resume");
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual(["explicit user resume"]);
+		expect(
+			harness.session.messages.some(
+				(message) =>
+					message.role === "custom" && String(message.content).includes("child result after parent abort"),
+			),
+		).toBe(true);
+	});
 	it("waitForIdle resolves when the queue is cleared while the pump is suspended", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

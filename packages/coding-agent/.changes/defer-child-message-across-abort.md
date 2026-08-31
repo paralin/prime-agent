@@ -1,0 +1,1 @@
+- A child agent's message to a parent that was just aborted is now parked and delivered as context on the parent's next turn, instead of failing with "Cannot admit a session action while queued session input is suspended". The child receives a queued receipt.

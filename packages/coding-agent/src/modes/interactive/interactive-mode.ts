@@ -291,7 +291,7 @@ const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
 const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
 const FEATURE_HINT_DELAY_MS = 5_000;
 /** Distinct slow idle spinner for the waiting-for-background-events state. */
-const IDLE_WATCH_SPINNER_FRAMES = ["◜", "◠", "◝", "◞", "◡", "◟"];
+const IDLE_WATCH_SPINNER_FRAMES = ["⠀⠶⠀", "⠰⣿⠆", "⢾⣉⡷", "⣏⠀⣹", "⡁⠀⢈"];
 
 export const START_HINTS = [
 	'Try "refactor @<filepath>"',
@@ -2561,7 +2561,7 @@ export class InteractiveMode {
 				(spinner) => theme.fg("muted", spinner),
 				(text) => theme.fg("dim", text),
 				label,
-				{ frames: IDLE_WATCH_SPINNER_FRAMES, intervalMs: 240 },
+				{ frames: IDLE_WATCH_SPINNER_FRAMES, intervalMs: 180 },
 			);
 			this.statusContainer.addChild(this.idleWatchLoader);
 		}

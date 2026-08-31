@@ -174,7 +174,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			"",
 			"A callable `rlm` is already in your global namespace. `handle = await rlm('sub-task')` spawns a child agent and returns an `RLMSpawnHandle` immediately after admission. The handle has `rlm_child_id`, `name`, `session_dir`, and `model`; it never contains the child's answer.",
 			"Choose a stable child name with `handle = await rlm('sub-task', name='api-reviewer')`. Names must be unique among siblings. If omitted, the host generates a readable unique name.",
-			"A child inherits your model, thinking level, and service tier when those options are omitted. Set `thinking` to a supported level to override the selected child runtime. If a different model is explicitly requested, use `await rlm.find_models(...)` and an exact returned selector. An unavailable requested model fails spawn; decide whether to retry or omit `model`.",
+			"When the user or `agent-routing.org` names a model or role for the child, pass it explicitly: `handle = await rlm('task', model='@opus')`. Role selectors like `@opus` are passed verbatim as the `model` value; do not silently drop them. A child inherits your model, thinking level, and service tier when `model` is omitted. Set `thinking` to a supported level to override the selected child runtime. If a different concrete model is requested (not a `@role`), use `await rlm.find_models(...)` and an exact returned selector. An unavailable requested model fails spawn; decide whether to retry or omit `model`.",
 			"`service_tier` may be `auto`, `default`, `flex`, `scale`, `priority`, or `None`, but only values in the `rlmAllowedServiceTiers` settings array are accepted. When that setting is absent, only `defaultServiceTier` is allowed. `priority` is clamped to `default` when the selected child model does not support fast mode.",
 		);
 		if (hasAgentMessage) {
@@ -237,6 +237,7 @@ export function buildSubagentGuidance(
 		"Hand independent work to a colleague when a separate context helps: parallel research, an isolated implementation, or a bounded review. Do a single known lookup, edit, or command yourself.",
 		"Spawn a child with `handle = await rlm('task', name='worker')`. The call returns after admission, not completion. Keep the handle when later follow-up or cleanup may need its `name` or `rlm_child_id`.",
 		"Set `service_tier` only to a value present in `rlmAllowedServiceTiers`; omit it to inherit the parent tier. When that setting is absent, only `defaultServiceTier` is allowed. Explicit `priority` remains subject to child-model fast-mode clamping.",
+		"When the user or `agent-routing.org` names a model or role for the child, pass it explicitly: `handle = await rlm('task', model='@opus')`. Role selectors like `@opus` are passed verbatim as the `model` value; do not silently drop them.",
 	];
 	if (options.hasAgentMessage) {
 		lines.push(

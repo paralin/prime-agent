@@ -4710,6 +4710,13 @@ export class AgentDaemon {
 				});
 			}
 
+			case "list_watches": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "list_watches", {
+					watches: state.runtime.session.listExternalEventWatches(),
+				});
+			}
+
 			case "get_rlm_children": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_rlm_children", {

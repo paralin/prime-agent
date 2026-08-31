@@ -1,0 +1,1 @@
+- Added background event watches to the session status surfaces: a tray label and `/watches` menu next to heartbeats, and a distinct slow idle spinner when the agent is idle but watched jobs or heartbeats can still wake it.

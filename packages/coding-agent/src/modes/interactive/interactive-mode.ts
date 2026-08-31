@@ -85,6 +85,7 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
 } from "../../core/extensions/index.js";
+import type { ExternalEventWatch } from "../../core/external-events.js";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.js";
 import { emptyGoalState, formatGoalUsage, GOAL_CONTEXT_PREVIEW_LABEL, type GoalState } from "../../core/goals.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
@@ -289,6 +290,8 @@ const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS = 15_000;
 const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
 const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
 const FEATURE_HINT_DELAY_MS = 5_000;
+/** Distinct slow idle spinner for the waiting-for-background-events state. */
+const IDLE_WATCH_SPINNER_FRAMES = ["◜", "◠", "◝", "◞", "◡", "◟"];
 
 export const START_HINTS = [
 	'Try "refactor @<filepath>"',
@@ -948,6 +951,8 @@ export class InteractiveMode {
 	private connectionState: AgentConnectionState | undefined;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
 	private heartbeatCatalog: AgentConnectionHeartbeat[] = [];
+	private watchCatalog: ExternalEventWatch[] = [];
+	private idleWatchLoader: Loader | undefined;
 	private heartbeatRefreshPromise: Promise<void> | undefined;
 	private heartbeatRefreshRequested = false;
 	private heartbeatManager: HeartbeatManagerComponent | undefined;
@@ -2498,6 +2503,91 @@ export class InteractiveMode {
 		return scopeHeartbeatsToSession(this.heartbeatCatalog, this.connectionState, this.subagentSnapshots.values());
 	}
 
+	private applyWatchCatalog(watches: ExternalEventWatch[]): void {
+		this.watchCatalog = watches;
+		this.syncIdleWatchLoader();
+		this.ui.requestRender();
+	}
+
+	private getActiveWatchCount(): number {
+		return (this.watchCatalog ?? []).filter((watch) => watch.status === "running").length;
+	}
+
+	/**
+	 * Idle wake-up indicator: the turn ended and the agent is idle, but watched
+	 * background jobs (or active heartbeats) can still deliver a follow-up and
+	 * resume the session. Uses a distinct slow spinner so idle-with-wakeups never
+	 * looks like an active turn.
+	 */
+	private syncIdleWatchLoader(): void {
+		const watchCount = this.getActiveWatchCount();
+		const heartbeatCount = this.getScopedHeartbeats().filter((heartbeat) => heartbeat.job.status === "active").length;
+		const shouldShow =
+			!this.isAgentStreaming() &&
+			!this.loadingAnimation &&
+			!this.autoCompactionLoader &&
+			!this.retryLoader &&
+			!this.refineLoader &&
+			(watchCount > 0 || heartbeatCount > 0);
+		if (!shouldShow) {
+			if (this.idleWatchLoader) {
+				this.idleWatchLoader.stop();
+				if (this.statusContainer.children.includes(this.idleWatchLoader)) {
+					this.statusContainer.removeChild(this.idleWatchLoader);
+				}
+				this.idleWatchLoader = undefined;
+				this.ui.requestRender();
+			}
+			return;
+		}
+		const parts: string[] = ["Waiting for background events"];
+		if (watchCount > 0) {
+			parts.push(`${watchCount} watch${watchCount === 1 ? "" : "es"}`);
+		}
+		if (heartbeatCount > 0) {
+			parts.push(`${heartbeatCount} heartbeat${heartbeatCount === 1 ? "" : "s"}`);
+		}
+		const label = parts.join(" · ");
+		if (this.idleWatchLoader && this.statusContainer.children.includes(this.idleWatchLoader)) {
+			this.idleWatchLoader.setMessage(label);
+		} else {
+			if (this.idleWatchLoader) {
+				// Another owner cleared the status container; rebuild rather than
+				// setMessage on an orphaned loader.
+				this.idleWatchLoader.stop();
+			}
+			this.idleWatchLoader = new Loader(
+				this.ui,
+				(spinner) => theme.fg("muted", spinner),
+				(text) => theme.fg("dim", text),
+				label,
+				{ frames: IDLE_WATCH_SPINNER_FRAMES, intervalMs: 240 },
+			);
+			this.statusContainer.addChild(this.idleWatchLoader);
+		}
+		this.ui.requestRender();
+	}
+
+	private async showWatchesSelector(): Promise<void> {
+		if (this.watchCatalog.length === 0) {
+			try {
+				this.applyWatchCatalog(await this.agentConnection.listExternalEventWatches());
+			} catch {
+				// The mirror may be unavailable on older daemons; the empty status stands.
+			}
+		}
+		if (this.watchCatalog.length === 0) {
+			this.showStatus("No background event watches");
+			return;
+		}
+		const options = this.watchCatalog.map((watch) => {
+			const target = watch.ssh ? ` · ${watch.ssh}` : "";
+			return `${watch.label} — ${watch.status}${target}`;
+		});
+		// Read-only: selection acknowledges and closes the menu.
+		await this.showExtensionSelector("Background event watches", options);
+	}
+
 	private applyConnectionStateSnapshot(state: AgentConnectionState): void {
 		this.bindPromptStashSession(state.sessionId);
 		this.connectionState = state;
@@ -2618,6 +2708,10 @@ export class InteractiveMode {
 				break;
 			case "goal_update":
 				this.patchConnectionState({ goal: event.goal });
+				break;
+			case "external_event_watches_changed":
+				this.watchCatalog = [...event.watches];
+				this.syncIdleWatchLoader();
 				break;
 			case "bash_start":
 				this.patchConnectionState({ isBashRunning: true });
@@ -2743,6 +2837,11 @@ export class InteractiveMode {
 		this.refreshQueueSelectionFromState();
 		this.updatePendingMessagesDisplay();
 		await this.refreshHeartbeatCatalog().catch(() => undefined);
+		try {
+			this.applyWatchCatalog(await this.agentConnection.listExternalEventWatches());
+		} catch {
+			// Older daemons have no watch mirror; the tray simply stays empty.
+		}
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
@@ -3451,6 +3550,7 @@ export class InteractiveMode {
 		} else if (this.loadingAnimation) {
 			this.stopWorkingLoader();
 		}
+		this.syncIdleWatchLoader();
 		this.ui.requestRender();
 	}
 
@@ -4142,6 +4242,9 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
 		});
+		this.defaultEditor.onAction("app.watches.open", () => {
+			void this.showWatchesSelector();
+		});
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
 		this.defaultEditor.onAction("app.prompt.stash", () => this.handlePromptStash());
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
@@ -4761,6 +4864,11 @@ export class InteractiveMode {
 					await this.showHeartbeatManager();
 					return;
 				}
+				if (commandName === "watches" && !commandArgs) {
+					this.editor.setText("");
+					await this.showWatchesSelector();
+					return;
+				}
 				if (commandName === "changelog" && !commandArgs) {
 					this.echoLocalCommand(text);
 					this.handleChangelogCommand();
@@ -5373,6 +5481,10 @@ export class InteractiveMode {
 			case "service_tier_changed":
 				this.footer.invalidate();
 				this.subagentSummaryLine.invalidate();
+				break;
+
+			case "external_event_watches_changed":
+				this.applyWatchCatalog([...event.watches]);
 				break;
 
 			case "bash_start": {
@@ -6130,12 +6242,25 @@ export class InteractiveMode {
 	private getTrayContextLabel(): string | undefined {
 		const goalLabel = this.getTrayGoalLabel();
 		const heartbeatLabel = this.getTrayHeartbeatLabel();
+		const watchLabel = this.getTrayWatchLabel();
 		const usage = this.getConnectionContextUsage();
 		const contextLabel =
 			usage && typeof usage.tokens === "number" && typeof usage.percent === "number"
 				? `${formatTokenCount(usage.tokens)} (${Math.round(usage.percent)}%)`
 				: undefined;
-		return [goalLabel, heartbeatLabel, contextLabel].filter((label) => label !== undefined).join(" · ") || undefined;
+		return (
+			[goalLabel, heartbeatLabel, watchLabel, contextLabel].filter((label) => label !== undefined).join(" · ") ||
+			undefined
+		);
+	}
+
+	private getTrayWatchLabel(): string | undefined {
+		const count = this.getActiveWatchCount();
+		if (count === 0) {
+			return undefined;
+		}
+		const shortcut = keyText("app.watches.open");
+		return `${count} watch${count === 1 ? "" : "es"}${shortcut ? ` (${shortcut})` : ""}`;
 	}
 
 	private getTrayHeartbeatLabel(): string | undefined {

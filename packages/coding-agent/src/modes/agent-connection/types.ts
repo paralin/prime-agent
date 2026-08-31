@@ -15,6 +15,7 @@ import type {
 } from "../../core/cron-jobs.js";
 import type { ReplayBuiltInToolName } from "../../core/extensions/index.js";
 import type { InputSource } from "../../core/extensions/types.js";
+import type { ExternalEventWatch } from "../../core/external-events.js";
 import type { GoalState } from "../../core/goals.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
@@ -644,7 +645,8 @@ export type AgentConnectionSessionEvent =
 			runId?: string;
 	  }
 	| { type: "refine_complete"; result: RefinementResult }
-	| { type: "refine_failed"; error: string };
+	| { type: "refine_failed"; error: string }
+	| { type: "external_event_watches_changed"; watches: ExternalEventWatch[] };
 
 export type AgentConnectionEvent =
 	| { type: "session_event"; event: AgentConnectionSessionEvent }
@@ -703,6 +705,7 @@ export interface AgentConnection {
 	acquireSessionInputPause(leaseKey: string): Promise<AgentConnectionSessionInputPause>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;
 	listHeartbeats(): Promise<AgentConnectionHeartbeat[]>;
+	listExternalEventWatches(): Promise<ExternalEventWatch[]>;
 	manageHeartbeat(
 		activeSessionId: string,
 		jobId: string,

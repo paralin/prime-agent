@@ -677,6 +677,7 @@ export type DaemonCommand =
 	| { id?: string; type: "execute_bash_and_wait"; activeSessionId: string; command: string }
 	| { id?: string; type: "reload"; activeSessionId: string }
 	| { id?: string; type: "new_session"; activeSessionId: string; parentSession?: string; cwd?: string }
+	| { id?: string; type: "list_watches"; activeSessionId: string }
 	| { id?: string; type: "switch_session"; activeSessionId: string; sessionPath: string; cwdOverride?: string }
 	| { id?: string; type: "fork"; activeSessionId: string; entryId: string; position?: "before" | "at" }
 	| {
@@ -870,6 +871,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	execute_bash_and_wait: CURRENT_DAEMON_COMMAND,
 	reload: LEGACY_DAEMON_COMMAND,
 	new_session: LEGACY_DAEMON_COMMAND,
+	list_watches: CURRENT_DAEMON_COMMAND,
 	switch_session: LEGACY_DAEMON_COMMAND,
 	fork: LEGACY_DAEMON_COMMAND,
 	navigate_tree: LEGACY_DAEMON_COMMAND,

@@ -15,6 +15,7 @@ import type {
 	AgentHeartbeatManagementAction,
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
+import type { ExternalEventWatch } from "../../core/external-events.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
@@ -810,6 +811,14 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	async listHeartbeats(): Promise<AgentConnectionHeartbeat[]> {
 		return listDaemonHeartbeats(this.client, this.options.ownedSession ? this.activeSessionId : undefined);
+	}
+
+	async listExternalEventWatches(): Promise<ExternalEventWatch[]> {
+		const data = await this.requestData<{ watches: ExternalEventWatch[] }>({
+			type: "list_watches",
+			activeSessionId: this.activeSessionId,
+		});
+		return data.watches;
 	}
 
 	async manageHeartbeat(

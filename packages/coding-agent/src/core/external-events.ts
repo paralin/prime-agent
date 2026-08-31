@@ -19,6 +19,28 @@ export const EXTERNAL_EVENT_MAX_TEXT_CHARS = DEFAULT_AGENT_MESSAGE_MAX_CHARS;
 export const EXTERNAL_EVENT_MAX_RETAINED_IDS = 1_024;
 /** EXTERNAL_EVENT_MAX_PENDING bounds unfinished external-event actions. */
 export const EXTERNAL_EVENT_MAX_PENDING = 128;
+/** EXTERNAL_EVENT_MAX_WATCHES bounds the published watch registry size. */
+export const EXTERNAL_EVENT_MAX_WATCHES = 128;
+/** EXTERNAL_EVENT_MAX_WATCH_COMMAND_CHARS bounds one watch command preview. */
+export const EXTERNAL_EVENT_MAX_WATCH_COMMAND_CHARS = 2_000;
+
+/** ExternalEventWatchStatus is the lifecycle state of one watched kernel job. */
+export type ExternalEventWatchStatus = "running" | "completed" | "failed" | "timed_out" | "cancelled";
+
+/**
+ * ExternalEventWatch is one kernel-owned retained job published to the session.
+ * The kernel registry is the source of truth; the session only mirrors it for
+ * status surfaces such as the TUI watch menu and idle spinner.
+ */
+export interface ExternalEventWatch {
+	id: string;
+	label: string;
+	pid: number | undefined;
+	command: string | undefined;
+	ssh: string | undefined;
+	status: ExternalEventWatchStatus;
+	deliveryPolicy: ExternalEventDeliveryPolicy;
+}
 
 /** ExternalEventDeliveryPolicy selects the existing busy-session delivery lane. */
 export type ExternalEventDeliveryPolicy = "followUp" | "steer";
@@ -140,6 +162,72 @@ function deliveryPolicy(payload: Record<string, unknown>): ExternalEventDelivery
 		throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} delivery_policy must be "followUp" or "steer"`);
 	}
 	return value;
+}
+
+const WATCH_STATUSES: ReadonlySet<string> = new Set(["running", "completed", "failed", "timed_out", "cancelled"]);
+
+/**
+ * normalizeExternalEventWatchList validates one full watch-registry publication
+ * from the kernel. The payload replaces the previous list wholesale: the kernel
+ * registry is authoritative and survives model turns, so every mutation
+ * publishes the complete list.
+ */
+export function normalizeExternalEventWatchList(payload: Record<string, unknown>): ExternalEventWatch[] {
+	const jobs = payload.jobs;
+	if (!Array.isArray(jobs)) {
+		throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} watches must carry a jobs array`);
+	}
+	if (jobs.length > EXTERNAL_EVENT_MAX_WATCHES) {
+		throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} watches cannot exceed ${EXTERNAL_EVENT_MAX_WATCHES} jobs`);
+	}
+	const watches: ExternalEventWatch[] = [];
+	const seen = new Set<string>();
+	for (const job of jobs) {
+		if (typeof job !== "object" || job === null) {
+			throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} watch entries must be objects`);
+		}
+		const record = job as Record<string, unknown>;
+		const id = boundedField(record, "id", EXTERNAL_EVENT_MAX_ID_CHARS);
+		if (seen.has(id)) {
+			throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} watches must not repeat job id ${id}`);
+		}
+		seen.add(id);
+		const label = boundedField(record, "label", EXTERNAL_EVENT_MAX_NAME_CHARS);
+		const statusValue = record.status;
+		if (typeof statusValue !== "string" || !WATCH_STATUSES.has(statusValue)) {
+			throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} watch ${id} has an unknown status`);
+		}
+		const policy = record.delivery_policy;
+		if (policy !== "followUp" && policy !== "steer") {
+			throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} watch ${id} has an invalid delivery policy`);
+		}
+		const command = record.command;
+		if (
+			command !== undefined &&
+			command !== null &&
+			(typeof command !== "string" || command.length > EXTERNAL_EVENT_MAX_WATCH_COMMAND_CHARS)
+		) {
+			throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} watch ${id} command is too long`);
+		}
+		const ssh = record.ssh;
+		if (ssh !== undefined && ssh !== null && typeof ssh !== "string") {
+			throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} watch ${id} ssh must be a string`);
+		}
+		const pid = record.pid;
+		if (pid !== undefined && pid !== null && (typeof pid !== "number" || !Number.isInteger(pid))) {
+			throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} watch ${id} pid must be an integer`);
+		}
+		watches.push({
+			id,
+			label,
+			pid: typeof pid === "number" ? pid : undefined,
+			command: typeof command === "string" ? command : undefined,
+			ssh: typeof ssh === "string" ? ssh : undefined,
+			status: statusValue as ExternalEventWatchStatus,
+			deliveryPolicy: policy,
+		});
+	}
+	return watches;
 }
 
 /**

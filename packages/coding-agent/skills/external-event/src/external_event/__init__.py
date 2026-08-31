@@ -72,6 +72,36 @@ class _WatchedJob:
 _jobs: dict[str, _WatchedJob] = {}
 
 
+def _watch_record(job: _WatchedJob) -> dict[str, Any]:
+    return {
+        "id": job.id,
+        "label": job.label,
+        "pid": job.handle.pid,
+        "command": _command_preview(job.handle.command),
+        "ssh": job.handle.ssh,
+        "status": job.status,
+        "delivery_policy": job.delivery_policy,
+    }
+
+
+def _publish_watches() -> None:
+    """Best-effort mirror of the registry to the session for status surfaces."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    records = [_watch_record(job) for job in _jobs.values()]
+
+    async def publish() -> None:
+        try:
+            await host_request("session.external_event.watch_update", {"jobs": records})
+        except Exception:
+            # Status mirroring must never break watching or wake-up delivery.
+            pass
+
+    loop.create_task(publish(), name="external-event-watch-publish")
+
+
 def _field(value: Any, name: str, max_chars: int) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{name} must be str, got {type(value).__name__}")
@@ -142,6 +172,7 @@ def watch_bash(
     job_id = secrets.token_hex(16)
     watched = _WatchedJob(job_id, label, job, tail_lines, policy)
     _jobs[job_id] = watched
+    _publish_watches()
     # Reading pid deliberately marks the handle as retained/background before
     # the watcher starts, so cancellation of this task cannot abandon ownership.
     watched.info()
@@ -176,6 +207,7 @@ async def _finish(job: _WatchedJob) -> None:
     except Exception as caught:
         job.notification_error = f"{type(caught).__name__}: {caught}"
     finally:
+        _publish_watches()
         _trim_completed()
 
 

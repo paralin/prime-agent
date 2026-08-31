@@ -4,6 +4,7 @@ import {
 	EXTERNAL_EVENT_MAX_RETAINED_IDS,
 	EXTERNAL_EVENT_MAX_TEXT_CHARS,
 	ExternalEventRegistry,
+	normalizeExternalEventWatchList,
 } from "../src/core/external-events.js";
 
 describe("external event host registry", () => {
@@ -77,5 +78,65 @@ describe("external event host registry", () => {
 
 		await expect(handler(payload)).resolves.toMatchObject({ deliveryStatus: "delivered" });
 		expect(emit).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("external event watch mirror", () => {
+	it("normalizes one full registry publication", () => {
+		const watches = normalizeExternalEventWatchList({
+			jobs: [
+				{
+					id: "job-1",
+					label: "video capture",
+					pid: 4242,
+					command: "ffmpeg ...",
+					ssh: null,
+					status: "running",
+					delivery_policy: "followUp",
+				},
+				{ id: "job-2", label: "sync", status: "completed", delivery_policy: "steer" },
+			],
+		});
+		expect(watches).toEqual([
+			{
+				id: "job-1",
+				label: "video capture",
+				pid: 4242,
+				command: "ffmpeg ...",
+				ssh: undefined,
+				status: "running",
+				deliveryPolicy: "followUp",
+			},
+			{
+				id: "job-2",
+				label: "sync",
+				pid: undefined,
+				command: undefined,
+				ssh: undefined,
+				status: "completed",
+				deliveryPolicy: "steer",
+			},
+		]);
+	});
+
+	it("accepts an empty publication so a fresh kernel clears the mirror", () => {
+		expect(normalizeExternalEventWatchList({ jobs: [] })).toEqual([]);
+	});
+
+	it("rejects malformed publications", () => {
+		expect(() => normalizeExternalEventWatchList({ jobs: "nope" })).toThrow("must carry a jobs array");
+		expect(() =>
+			normalizeExternalEventWatchList({ jobs: [{ label: "x", status: "running", delivery_policy: "followUp" }] }),
+		).toThrow("id must be a string");
+		expect(() =>
+			normalizeExternalEventWatchList({
+				jobs: [{ id: "a", label: "x", status: "dancing", delivery_policy: "followUp" }],
+			}),
+		).toThrow("unknown status");
+		expect(() =>
+			normalizeExternalEventWatchList({
+				jobs: [{ id: "a", label: "x", status: "running", delivery_policy: "later" }],
+			}),
+		).toThrow("invalid delivery policy");
 	});
 });

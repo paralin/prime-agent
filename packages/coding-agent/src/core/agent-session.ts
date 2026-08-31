@@ -190,8 +190,10 @@ import {
 	type ExternalEventInput,
 	type ExternalEventReceipt,
 	ExternalEventRegistry,
+	type ExternalEventWatch,
 	externalEventQueueKey,
 	isExternalEventQueueKey,
+	normalizeExternalEventWatchList,
 } from "./external-events.js";
 import {
 	createGoalContextMessage,
@@ -450,7 +452,8 @@ export type AgentSessionEvent =
 			runId?: string;
 	  }
 	| { type: "refine_complete"; result: RefinementResult }
-	| { type: "refine_failed"; error: string };
+	| { type: "refine_failed"; error: string }
+	| { type: "external_event_watches_changed"; watches: ExternalEventWatch[] };
 
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 
@@ -1232,6 +1235,8 @@ export class AgentSession {
 	private readonly _externalEventHostHandler = createExternalEventHostHandler(this._externalEventRegistry, (event) =>
 		this._admitExternalEvent(event),
 	);
+	/** Mirror of the kernel watch registry; the kernel publishes the full list on every mutation. */
+	private _externalEventWatches: ExternalEventWatch[] = [];
 	private _sessionInputPump: Promise<void> = Promise.resolve();
 	private _sessionInputPumpRequested = false;
 	// Invalidates preparation when a branch pause starts and finishes before its next await resumes.
@@ -9823,6 +9828,11 @@ export class AgentSession {
 			// reload can't restore from a snapshot the old kernel is still writing.
 			const previousDispose = this._ipythonKernelProvisioner?.dispose();
 			this._ipythonKernelSnapshotDir = this.sessionManager.getSessionArtifactDir();
+			// A fresh kernel starts with an empty watch registry; drop the stale mirror.
+			if (this._externalEventWatches.length > 0) {
+				this._externalEventWatches = [];
+				this._emit({ type: "external_event_watches_changed", watches: [] });
+			}
 			// Only surface the "revived from your previous session" notice on the first
 			// build (a genuine resume). A later rebuild (/reload) restores state silently
 			// for continuity — the conversation is unchanged, so there's nothing to flag.
@@ -10464,6 +10474,19 @@ export class AgentSession {
 		return this._externalEventHostHandler(payload);
 	}
 
+	/** listExternalEventWatches returns the mirrored kernel watch registry. */
+	listExternalEventWatches(): readonly ExternalEventWatch[] {
+		return this._externalEventWatches;
+	}
+
+	/** handleExternalEventWatchUpdate replaces the mirrored watch list from the kernel. */
+	async handleExternalEventWatchUpdate(payload: Record<string, unknown>): Promise<{ accepted: true; count: number }> {
+		const watches = normalizeExternalEventWatchList(payload);
+		this._externalEventWatches = watches;
+		this._emit({ type: "external_event_watches_changed", watches });
+		return { accepted: true, count: watches.length };
+	}
+
 	/** _admitExternalEvent delivers one validated event through the existing session input owner. */
 	private async _admitExternalEvent(event: ExternalEventInput): Promise<ExternalEventDeliveryStatus> {
 		const disposition = await this._promptInjectedMessage(
@@ -10511,6 +10534,8 @@ export class AgentSession {
 				: {
 						"session.external_event.emit": async (payload: Record<string, unknown>) =>
 							this.handleExternalEventHostRequest(payload),
+						"session.external_event.watch_update": async (payload: Record<string, unknown>) =>
+							this.handleExternalEventWatchUpdate(payload),
 					}),
 		};
 		if (this._rlmDepth === 0 && this._actEnabled) {

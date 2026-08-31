@@ -191,6 +191,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		takesArgument: true,
 	},
 	{ name: "heartbeats", description: "View and manage all user and agent heartbeats" },
+	{ name: "watches", description: "List active background event watches" },
 	{
 		name: "resume",
 		description: "Open the agents view, or resume a session by id or path",

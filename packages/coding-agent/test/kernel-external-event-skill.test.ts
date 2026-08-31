@@ -37,6 +37,7 @@ describe("external-event skill over the kernel host bridge", { tags: ["kernel-he
 		const received = new Promise<Record<string, unknown>>((resolve) => {
 			receive = resolve;
 		});
+		const watchPublications: Array<Array<Record<string, unknown>>> = [];
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledExternalEventSkill()],
 			hostHandlers: {
@@ -44,6 +45,11 @@ describe("external-event skill over the kernel host bridge", { tags: ["kernel-he
 					requests.push(payload);
 					receive(payload);
 					return { accepted: true, deliveryStatus: "delivered" };
+				},
+				"session.external_event.watch_update": async (payload) => {
+					const jobs = (payload as { jobs?: Array<Record<string, unknown>> }).jobs ?? [];
+					watchPublications.push(jobs);
+					return { accepted: true, count: jobs.length };
 				},
 			},
 		});
@@ -79,6 +85,12 @@ print(info.status, info.exit_code, info.notification_status)
 `);
 		expect(listed.stdout.trim()).toBe("completed 0 delivered");
 		expect(requests).toHaveLength(1);
+
+		// The registry mirrors itself to the session: once on registration with the
+		// job running, and again after completion with the terminal status.
+		expect(watchPublications.length).toBeGreaterThanOrEqual(2);
+		expect(watchPublications[0]).toMatchObject([{ id: jobId, label: "video capture", status: "running" }]);
+		expect(watchPublications.at(-1)).toMatchObject([{ id: jobId, status: "completed" }]);
 	});
 
 	it("watches an argv-safe SSH script transport through the live kernel", async () => {

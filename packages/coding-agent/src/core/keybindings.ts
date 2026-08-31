@@ -27,6 +27,7 @@ export interface AppKeybindings {
 	"app.subagents.focus": true;
 	"app.heartbeats.open": true;
 	"app.heartbeats.openSelected": true;
+	"app.watches.open": true;
 	"app.editor.external": true;
 	"app.prompt.stash": true;
 	"app.message.followUp": true;
@@ -110,6 +111,10 @@ export const KEYBINDINGS = {
 	"app.heartbeats.openSelected": {
 		defaultKeys: "right",
 		description: "Open selected heartbeat",
+	},
+	"app.watches.open": {
+		defaultKeys: "ctrl+w",
+		description: "List background watches",
 	},
 	"app.editor.external": {
 		defaultKeys: "ctrl+g",

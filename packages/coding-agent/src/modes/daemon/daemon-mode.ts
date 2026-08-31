@@ -106,7 +106,12 @@ import {
 } from "../../core/cron-jobs.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
-import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
+import type {
+	CreateRlmSubagentRuntimeOptions,
+	ExternalRlmSubagentTranscript,
+	ExternalRlmSubagentTranscriptOptions,
+	SubagentRuntimeHost,
+} from "../../core/rlm-runtime.js";
 import {
 	canPassivateSession,
 	canPassivateSessionUnderPressure,
@@ -1083,7 +1088,7 @@ export class AgentDaemon {
 			sessionDir: string;
 			sessionFile: string;
 			rlmDepth: number;
-			rlmMaxDepth: number;
+			rlmMaxDepth?: number;
 			rlmParentNodeId?: string;
 			prompt?: string;
 			spawnCode?: string;
@@ -1133,6 +1138,131 @@ export class AgentDaemon {
 			);
 			return false;
 		}
+	}
+
+	/**
+	 * Durable artifacts for a child that runs outside the daemon session
+	 * runtime (claude-code). Native subagents get their session file from the
+	 * hosted runtime; an external child has none, so write one: a real session
+	 * file the passive registry walk requires, the spawn ledger edge, and the
+	 * per-child display file. The returned transcript appends the child's
+	 * messages as the runtime streams them.
+	 */
+	private async createExternalRlmSubagentTranscript(
+		parentState: ActiveSessionState,
+		options: ExternalRlmSubagentTranscriptOptions,
+	): Promise<ExternalRlmSubagentTranscript> {
+		const parentSession = parentState.runtime.session;
+		const parentFile = parentSession.sessionFile;
+		if (!parentFile) {
+			throw new Error("An in-memory session cannot own persisted subagent transcripts");
+		}
+		mkdirSync(options.sessionDir, { recursive: true });
+		const sessionId = randomUUID();
+		const sessionFile = join(options.sessionDir, `${sessionId}.jsonl`);
+		const timestamp = new Date().toISOString();
+		const [provider, ...modelParts] = options.modelLabel.split("/");
+		const header: Record<string, unknown> = {
+			type: "session",
+			version: 3,
+			id: sessionId,
+			timestamp,
+			cwd: parentSession.sessionManager.getCwd(),
+			parentSession: parentFile,
+			rlmDepth: options.rlmDepth,
+		};
+		const modelChange: Record<string, unknown> = {
+			type: "model_change",
+			id: randomUUID().slice(0, 8),
+			parentId: null,
+			timestamp,
+			provider,
+			modelId: modelParts.join("/"),
+		};
+		writeFileSync(sessionFile, `${JSON.stringify(header)}\n${JSON.stringify(modelChange)}\n`, { flag: "wx" });
+		await this.rlmSpawnLedger().appendSpawn({
+			childId: options.childId,
+			parent: parentFile,
+			child: sessionFile,
+			depth: options.rlmDepth,
+			name: options.sessionName,
+		});
+		this.invalidatePassiveRlmSubagentCache();
+		this.recordRlmSubagentState(parentState, {
+			childId: options.childId,
+			sessionName: options.sessionName,
+			sessionDir: options.sessionDir,
+			sessionFile,
+			rlmDepth: options.rlmDepth,
+			rlmParentNodeId: options.rlmParentNodeId,
+			prompt: options.prompt.length <= 4096 ? options.prompt : undefined,
+			spawnCode: options.spawnCode,
+			model: provider && modelParts.length > 0 ? { provider, modelId: modelParts.join("/") } : undefined,
+			status: "running",
+			createdAt: Date.now(),
+		});
+		const entryId = () => randomUUID().slice(0, 8);
+		const appendMessage = (message: Record<string, unknown>): void => {
+			const entry: Record<string, unknown> = {
+				type: "message",
+				id: entryId(),
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				message,
+			};
+			// Append-only catalog source; a failed append loses a message but
+			// must not corrupt earlier entries.
+			try {
+				writeFileSync(sessionFile, `${JSON.stringify(entry)}\n`, { flag: "a" });
+			} catch (error) {
+				this.log(
+					`failed to append external subagent transcript: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		};
+		const userMessage = (text: string): Record<string, unknown> => ({
+			role: "user",
+			content: [{ type: "text", text }],
+			timestamp: Date.now(),
+		});
+		const assistantMessage = (text: string): Record<string, unknown> => ({
+			role: "assistant",
+			provider,
+			model: modelParts.join("/"),
+			content: [{ type: "text", text }],
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		const transcript: ExternalRlmSubagentTranscript = {
+			sessionFile,
+			appendUserMessage: (text) => appendMessage(userMessage(text)),
+			appendAssistantMessage: (text) => appendMessage(assistantMessage(text)),
+			complete: () => {
+				this.recordRlmSubagentState(parentState, {
+					childId: options.childId,
+					sessionName: options.sessionName,
+					sessionDir: options.sessionDir,
+					sessionFile,
+					rlmDepth: options.rlmDepth,
+					rlmMaxDepth: options.parentSession.rlmMaxDepth,
+					rlmParentNodeId: options.rlmParentNodeId,
+					spawnCode: options.spawnCode,
+					model: provider && modelParts.length > 0 ? { provider, modelId: modelParts.join("/") } : undefined,
+					status: "completed",
+					createdAt: Date.now(),
+				});
+			},
+		};
+		transcript.appendUserMessage(options.prompt);
+		return transcript;
 	}
 
 	private async recordRlmSubagentDeletion(
@@ -2405,6 +2535,8 @@ export class AgentDaemon {
 	private createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost {
 		return {
 			createRlmSubagentRuntime: async (options) => this.createRlmSubagentRuntime(parentState, options),
+			createExternalRlmSubagentTranscript: async (options) =>
+				this.createExternalRlmSubagentTranscript(parentState, options),
 			completeRlmSubagentRuntime: (childId, session) => {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>

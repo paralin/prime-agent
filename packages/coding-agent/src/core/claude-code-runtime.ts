@@ -54,6 +54,8 @@ export interface ClaudeCodeRuntimeOptions {
 	mcpServers?: ClaudeCodeQueryRequest["mcpServers"];
 	requiredTools?: readonly string[];
 	startQuery?: StartClaudeCodeQuery;
+	/** Observe raw runtime events (assistant text, tool progress, result). */
+	onEvent?: (event: ClaudeCodeEvent) => void;
 }
 
 export type ClaudeCodeRuntimeListener = (snapshot: ClaudeCodeRuntimeSnapshot) => void;
@@ -264,6 +266,7 @@ export class ClaudeCodeRuntime {
 		try {
 			for await (const event of events) {
 				if (this.closeAttempted) return;
+				this.options.onEvent?.(event);
 				if (event.kind === "init") {
 					const denied = CLAUDE_CODE_DENIED_TOOLS.filter((tool) => event.tools.includes(tool));
 					const missing = (this.options.requiredTools ?? []).filter((tool) => !event.tools.includes(tool));

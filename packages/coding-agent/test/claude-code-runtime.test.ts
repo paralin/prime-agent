@@ -59,7 +59,7 @@ const usage = {
 	requests: 1,
 };
 
-function runtimeHarness() {
+function runtimeHarness(options: { onEvent?: (event: ClaudeCodeEvent) => void } = {}) {
 	const events = new EventSource();
 	let request: ClaudeCodeQueryRequest | undefined;
 	let input: AsyncIterator<string> | undefined;
@@ -71,6 +71,7 @@ function runtimeHarness() {
 		executable: "/opt/claude",
 		cwd: "/work",
 		tools: ["Read", "Edit"],
+		onEvent: options.onEvent,
 		startQuery: async (nextRequest) => {
 			request = nextRequest;
 			input = nextRequest.prompt[Symbol.asyncIterator]();
@@ -279,5 +280,24 @@ describe("Claude Code runtime", () => {
 			error: "deleted",
 		});
 		expect(cancelled.close).toHaveBeenCalledOnce();
+	});
+
+	it("forwards raw events to the onEvent observer", async () => {
+		const events: ClaudeCodeEvent[] = [];
+		const harness = runtimeHarness({ onEvent: (event) => events.push(event) });
+		await harness.runtime.start();
+		harness.events.push({
+			kind: "init",
+			model: "claude-opus-4-7",
+			tools: ["Read"],
+			version: "1.0",
+			sessionId: "session-1",
+		});
+		harness.events.push({ kind: "assistant", text: "working", usage });
+		harness.events.push({ kind: "result", isError: false, text: "done", usage });
+		harness.events.end();
+		await harness.runtime.initialCompletion;
+		// close arrives only after closeAttempted, so the observer never sees it.
+		expect(events.map((event) => event.kind)).toEqual(["init", "assistant", "result"]);
 	});
 });

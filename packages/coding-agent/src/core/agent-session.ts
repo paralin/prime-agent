@@ -117,7 +117,7 @@ import {
 	type ClaudeCodeRuntimeSnapshot,
 	claudeCodeNativeTools,
 } from "./claude-code-runtime.js";
-import type { StartClaudeCodeQuery } from "./claude-code-sdk.js";
+import type { ClaudeCodeEvent, StartClaudeCodeQuery } from "./claude-code-sdk.js";
 import {
 	buildScratchHandoffRecentContext,
 	buildScratchHandoffResumeMessage,
@@ -1020,6 +1020,8 @@ interface RlmChildRun {
 	suppressTerminalNotice?: boolean;
 	/** Excluded from future strong barriers after an authoritative cancellation cut. */
 	abandonedForQuiescence?: boolean;
+	/** Display model reference for external runtimes that have no Model object. */
+	modelOverride?: string;
 	/** Selector snapshot for an admitted explicit delete. */
 	detachedDeletion?: RlmSubagentRegistryEntry;
 	/** Shared physical runtime cleanup owned by the explicit-delete path. */
@@ -11487,7 +11489,7 @@ export class AgentSession {
 			id: run.id,
 			parentId: this._rlmParentNodeId,
 			sessionName: child?.sessionName ?? run.sessionName,
-			model: `${model.provider}/${model.id}`,
+			model: run.modelOverride ?? `${model.provider}/${model.id}`,
 			label: rlmChildLabel(run.prompt),
 			status: run.status,
 			durationMs: run.durationMs,
@@ -12038,6 +12040,7 @@ export class AgentSession {
 		sessionName: string;
 		sessionDir: string;
 		startedAt: number;
+		spawnCode?: string;
 	}): Promise<RlmSpawnHandle> {
 		const { prompt, selection, childNodeId, sessionName, sessionDir, startedAt } = options;
 		const executable = this.settingsManager.getClaudeCodeExecutable();
@@ -12045,12 +12048,42 @@ export class AgentSession {
 			throw new Error(`Requested subagent runtime "${selection.selector}" has no configured executable`);
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		let runtime: ClaudeCodeRuntime;
+		// External children have no hosted session file; the host writes the
+		// ledger edge, display file, and transcript the agents view needs.
+		// Admission fails when the spawn record cannot be made durable, the
+		// same gate hosted runtimes apply.
+		const transcriptHost = this._subagentRuntimeHost?.createExternalRlmSubagentTranscript;
+		const transcript = transcriptHost
+			? await transcriptHost.call(this._subagentRuntimeHost, {
+					parentSession: this,
+					childId: childNodeId,
+					sessionName,
+					sessionDir,
+					rlmDepth: this._rlmDepth,
+					rlmParentNodeId: this._rlmParentNodeId,
+					prompt,
+					spawnCode: options.spawnCode,
+					modelLabel: `claude-code/${selection.model}`,
+				})
+			: undefined;
+		let lastAppendedMessage: string | undefined;
+		const onRuntimeEvent = (event: ClaudeCodeEvent): void => {
+			if (!transcript) return;
+			const text =
+				(event.kind === "assistant" && event.text) ||
+				(event.kind === "result" && !event.isError && event.text) ||
+				undefined;
+			if (!text || text === lastAppendedMessage) return;
+			lastAppendedMessage = text;
+			transcript.appendAssistantMessage(text);
+		};
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
 			sessionName,
 			sessionDir,
 			model: this.model!,
+			modelOverride: `claude-code/${selection.model}`,
 			status: "queued",
 			settled: false,
 			toolUseCount: 0,
@@ -12088,6 +12121,7 @@ export class AgentSession {
 			mcpServers: { [CLAUDE_CODE_MCP_SERVER_NAME]: mcpServer },
 			requiredTools: CLAUDE_CODE_FAMILY_TOOL_NAMES,
 			startQuery: this._startClaudeCodeQuery,
+			onEvent: onRuntimeEvent,
 		});
 		let latest = runtime.snapshot;
 		let durationMs: number | undefined;
@@ -12171,6 +12205,7 @@ export class AgentSession {
 			run.error = snapshot.error;
 			if (snapshot.status === "done" || snapshot.status === "error" || snapshot.status === "cancelled") {
 				durationMs = Date.now() - startedAt;
+				transcript?.complete();
 			}
 			if (snapshot.status === "error" || snapshot.status === "cancelled") {
 				familyMailbox.close(snapshot.error);
@@ -12341,6 +12376,7 @@ export class AgentSession {
 				sessionName,
 				sessionDir: childSessionDir,
 				startedAt,
+				spawnCode,
 			});
 		}
 		const parentAssistantForUsage = this._findLastAssistantMessage();

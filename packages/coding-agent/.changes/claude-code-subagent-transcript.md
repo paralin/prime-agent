@@ -1,0 +1,1 @@
+- Claude Code-backed subagents (opus, fable) now persist the same spawn ledger edge, display file, and session transcript as native subagents, so they appear in the agents view subagent list, stay selectable and openable, and survive daemon restarts. Their roster model label now shows the actual child model instead of the parent's.

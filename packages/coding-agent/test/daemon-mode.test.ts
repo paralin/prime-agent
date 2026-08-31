@@ -1006,6 +1006,114 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("persists an external claude-code child for passive discovery, roster, and listing", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-external-child-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const parentManager = SessionManager.create(tempDir, sessionDir);
+			parentManager.newSession();
+			parentManager.appendSessionInfo("parent");
+			const parentSessionFile = parentManager.getSessionFile();
+			if (!parentSessionFile) throw new Error("Missing parent session file");
+			const childSessionDir = join(parentManager.getSessionArtifactDir()!, "child-cc");
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => ({
+				session: makeRuntimeSession(options.sessionManager),
+				extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+					ReturnType<CreateAgentSessionRuntimeFactory>
+				>["extensionsResult"],
+				services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+					ReturnType<CreateAgentSessionRuntimeFactory>
+				>["services"],
+				diagnostics: [],
+			}));
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
+				createRuntime,
+			});
+			const internals = daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost;
+				listPassiveRlmSubagents(): Promise<Array<{ entry: { childId: string; status: string } }>>;
+				buildSessionListWithPassiveRlmSubagents(
+					active: ActiveSessionState[],
+					saved: Awaited<ReturnType<typeof SessionManager.listAll>>,
+					jobs: AgentCronJob[],
+				): Promise<Array<{ sessionFile?: string; rlmChildId?: string; runtimeKind?: string }>>;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: parentSessionFile });
+			Object.assign(parentState.runtime.session, {
+				isSessionActive: false,
+				isStreaming: false,
+				isCompacting: false,
+				isBashRunning: false,
+				state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+				thinkingLevel: "off" as const,
+				hasRunningRlmChildren: () => false,
+				getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+			});
+			const host = internals.createSubagentRuntimeHost(parentState);
+			if (!host.createExternalRlmSubagentTranscript) throw new Error("Missing external transcript hook");
+
+			const transcript = await host.createExternalRlmSubagentTranscript({
+				parentSession: parentState.runtime.session,
+				childId: "child-cc",
+				sessionName: "opus-second-opinion",
+				sessionDir: childSessionDir,
+				rlmDepth: 1,
+				rlmParentNodeId: "child-cc",
+				prompt: "give a second opinion on the kernel patch",
+				modelLabel: "claude-code/opus",
+			});
+			transcript.appendAssistantMessage("The patch clears drvdata too early; defer the release.");
+			transcript.complete();
+
+			const passive = await internals.listPassiveRlmSubagents();
+			expect(passive.map(({ entry }) => entry.childId)).toContain("child-cc");
+			expect(passive.find(({ entry }) => entry.childId === "child-cc")?.entry.status).toBe("completed");
+			const listed = await internals.buildSessionListWithPassiveRlmSubagents(
+				[parentState],
+				await SessionManager.listAll(undefined, sessionDir),
+				[],
+			);
+			expect(listed).toContainEqual(
+				expect.objectContaining({
+					sessionFile: transcript.sessionFile,
+					rlmChildId: "child-cc",
+					runtimeKind: "subagent",
+				}),
+			);
+
+			// The transcript is a real session file: the info scan and the saved
+			// catalog read the prompt as the first message.
+			const info = await readSessionInfo(transcript.sessionFile);
+			expect(info?.firstMessage).toBe("give a second opinion on the kernel patch");
+			const lines = readFileSync(transcript.sessionFile, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as Record<string, unknown>);
+			expect(lines[0]).toMatchObject({ type: "session", parentSession: parentSessionFile, rlmDepth: 1 });
+			expect(lines.at(-1)).toMatchObject({
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "The patch clears drvdata too early; defer the release." }],
+				},
+			});
+			const display = JSON.parse(readFileSync(join(childSessionDir, "rlm-subagent.json"), "utf8")) as Record<
+				string,
+				unknown
+			>;
+			expect(display).toMatchObject({
+				childId: "child-cc",
+				sessionName: "opus-second-opinion",
+				status: "completed",
+				model: { provider: "claude-code", modelId: "opus" },
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("discovers a non-resident child left running in the persisted registry", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-orphan-running-child-"));
 		try {

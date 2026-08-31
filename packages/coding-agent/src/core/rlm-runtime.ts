@@ -288,6 +288,35 @@ export interface SubagentRuntimeHost {
 		status: "done" | "error" | "cancelled",
 	) => Promise<void>;
 	/** Close or remove the host-owned child; session is absent when a persisted child is still passive. */
+	/**
+	 * Durable artifacts for a child that runs outside the daemon session
+	 * runtime (claude-code): ledger edge, display file, and an appendable
+	 * session transcript so listing, selection, and reopen work unchanged.
+	 */
+	createExternalRlmSubagentTranscript?(
+		options: ExternalRlmSubagentTranscriptOptions,
+	): Promise<ExternalRlmSubagentTranscript>;
 	deleteRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<void>;
 	disposeRlmSubagentRuntimes?(): Promise<void>;
+}
+
+export interface ExternalRlmSubagentTranscriptOptions {
+	parentSession: AgentSession;
+	childId: string;
+	sessionName: string;
+	sessionDir: string;
+	rlmDepth: number;
+	rlmParentNodeId?: string;
+	prompt: string;
+	spawnCode?: string;
+	/** Display model reference, e.g. "claude-code/opus". */
+	modelLabel: string;
+}
+
+export interface ExternalRlmSubagentTranscript {
+	sessionFile: string;
+	appendUserMessage(text: string): void;
+	appendAssistantMessage(text: string): void;
+	/** Mark the child completed in the display file after its final message. */
+	complete(): void;
 }

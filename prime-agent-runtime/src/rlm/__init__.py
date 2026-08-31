@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from ._act import _ActCellResult, _ActInterrupted, _run_cells, done
-from .bash import BashHandle, BashResult, bash, rg, rsync
+from .bash import BashHandle, BashResult, bash, rg, rsync, ssh_forward
 from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
 ACT_CANCELLATION_CAPABILITY = "posix-managed" if os.name == "posix" else "cooperative-only"
 RLM_SERVICE_TIERS = ("auto", "default", "flex", "scale", "priority")
@@ -455,6 +455,7 @@ __all__ = [
     "bash",
     "rg",
     "rsync",
+    "ssh_forward",
     "delete_subagent",
     "done",
     "emit",

@@ -75,6 +75,8 @@ class _SshTransport:
     host: str
     cwd: str | None
     env_keys: tuple[str, ...]
+    hosts: tuple[str, ...] = ()
+    options: tuple[str, ...] = ()
 
 
 class _BoundedBuffer:
@@ -185,14 +187,27 @@ class BashHandle:
             self._completion_marker = (
                 _COMPLETION_PREFIX + completion_token.encode("ascii") + _COMPLETION_SUFFIX
             )
-            ssh_argv = [
-                *ssh_transport.argv,
-                _ssh_remote_command(
-                    ssh_transport.shell,
-                    completion_token[:token_midpoint],
-                    completion_token[token_midpoint:],
-                ),
-            ]
+            remote_command = _ssh_remote_command(
+                ssh_transport.shell,
+                completion_token[:token_midpoint],
+                completion_token[token_midpoint:],
+            )
+            # Each intermediate hop's shell reparses the next ssh invocation, so
+            # the innermost remote command is quoted once per enclosing hop.
+            for hop in reversed(ssh_transport.hosts[1:]):
+                inner = " ".join(
+                    [
+                        shlex.quote(ssh_transport.argv[0]),
+                        "-oBatchMode=yes",
+                        *(shlex.quote(option) for option in ssh_transport.options),
+                        "-T",
+                        "--",
+                        shlex.quote(hop),
+                        shlex.quote(remote_command),
+                    ]
+                )
+                remote_command = inner
+            ssh_argv = [*ssh_transport.argv, remote_command]
         elif argv_transport is not None:
             pass
         elif _IS_POSIX:
@@ -987,19 +1002,36 @@ def _ssh_remote_command(shell: str, completion_a: str, completion_b: str) -> str
     return f"exec {quoted_shell} -c {shlex.quote(wrapper)}"
 
 
+def _ssh_destination(value: object, label: str = "ssh") -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be str, got {type(value).__name__}")
+    if not value or value.startswith("-") or any(character in value for character in "\0\n\r"):
+        raise ValueError(f"{label} must be a non-empty host or user@host argv value")
+    return value
+
+
+def _ssh_host_chain(ssh: str | Sequence[str]) -> tuple[str, ...]:
+    """Normalize the ssh parameter into a proxy chain ending at the target host."""
+    if isinstance(ssh, str):
+        return (_ssh_destination(ssh),)
+    if isinstance(ssh, (bytes, bytearray)) or not isinstance(ssh, Sequence):
+        raise TypeError("ssh must be a host string or a sequence of host strings")
+    hosts = [_ssh_destination(host, "ssh hop") for host in ssh]
+    if not hosts:
+        raise ValueError("ssh chain must name at least the destination host")
+    return tuple(hosts)
+
+
 def _ssh_transport(
     command: str,
-    host: str,
+    host: str | Sequence[str],
     cwd: str | None,
     env: Mapping[str, str] | None,
     ssh_options: Sequence[str] | None,
     tty: bool,
     shell: str,
 ) -> _SshTransport:
-    if not isinstance(host, str):
-        raise TypeError(f"ssh must be str, got {type(host).__name__}")
-    if not host or host.startswith("-") or any(character in host for character in "\0\n\r"):
-        raise ValueError("ssh must be a non-empty host or user@host argv value")
+    hosts = _ssh_host_chain(host)
     if not isinstance(tty, bool):
         raise TypeError(f"tty must be bool, got {type(tty).__name__}")
     if tty:
@@ -1009,15 +1041,17 @@ def _ssh_transport(
     if not shell or shell.startswith("-") or any(character in shell for character in "\0\n\r"):
         raise ValueError("ssh_shell must be a non-empty single-line executable path")
     options = _validate_ssh_options(ssh_options)
-    argv = (_ssh_executable(), "-oBatchMode=yes", *options, "-T", "--", host)
+    argv = (_ssh_executable(), "-oBatchMode=yes", *options, "-T", "--", hosts[0])
     env_keys = tuple(env.keys()) if env is not None else ()
     return _SshTransport(
         argv=argv,
         script=_remote_script(command, cwd, env),
         shell=shell,
-        host=host,
+        host=hosts[-1],
         cwd=cwd,
         env_keys=env_keys,
+        hosts=hosts,
+        options=tuple(options),
     )
 
 
@@ -1035,7 +1069,7 @@ def bash(
     command: str,
     timeout: float | None = None,
     *,
-    ssh: str | None = None,
+    ssh: str | Sequence[str] | None = None,
     cwd: str | None = None,
     env: Mapping[str, str] | None = None,
     ssh_options: Sequence[str] | None = None,
@@ -1049,6 +1083,10 @@ def bash(
     remote prelude. No PTY is allocated. Exit 255 without the private remote
     completion fence is reported as transport_error for any exit code; an
     explicit remote ``exit 255`` retains transport_error=False.
+
+    ssh also accepts a sequence of hosts as a proxy chain: each hop runs the
+    next ssh through the previous one, and the script streams to the final
+    host. ssh_options apply to every hop.
 
     Cancellation and timeout terminate the local SSH client. OpenSSH then closes
     its remote session, but work that daemonizes, disowns, or starts a new remote
@@ -1120,6 +1158,9 @@ def rg(
     *paths: str | os.PathLike[str],
     options: Sequence[str] = (),
     timeout: float | None = None,
+    ssh: str | Sequence[str] | None = None,
+    ssh_options: Sequence[str] | None = None,
+    cwd: str | None = None,
 ) -> BashHandle:
     """Search paths with ripgrep through the existing BashHandle process owner.
 
@@ -1127,6 +1168,10 @@ def rg(
     ripgrep argv entries; no argument passes through a shell. The returned
     handle has the same await, cancellation, timeout, output, and external-event
     behavior as ``bash()``.
+
+    With ``ssh`` set, the same argv is quoted and run on the remote host with
+    the remote ``rg`` from PATH; paths and ``cwd`` name remote locations and
+    ``ssh_options`` passes extra OpenSSH argv entries exactly like ``bash()``.
     """
     if not isinstance(pattern, str):
         raise TypeError(f"pattern must be str, got {type(pattern).__name__}")
@@ -1138,8 +1183,13 @@ def rg(
     if any(option == "--pre" or option.startswith("--pre=") for option in arguments):
         raise ValueError("rg --pre conflicts with direct argv process custody")
     requested_paths = _argv_values(paths or (".",), "paths")
-    argv = [_tool_path("rg", "PRIME_AGENT_RG"), *arguments, "-e", pattern, "--", *requested_paths]
-    return _argv_handle(argv, timeout)
+    if ssh is None:
+        if cwd is not None or ssh_options is not None:
+            raise ValueError("cwd and ssh_options require ssh=...")
+        argv = [_tool_path("rg", "PRIME_AGENT_RG"), *arguments, "-e", pattern, "--", *requested_paths]
+        return _argv_handle(argv, timeout)
+    remote_argv = ["rg", *arguments, "-e", pattern, "--", *requested_paths]
+    return bash(shlex.join(remote_argv), timeout, ssh=ssh, ssh_options=ssh_options, cwd=cwd)
 
 
 _RSYNC_FORBIDDEN_OPTIONS = ("-e", "--daemon", "--rsh", "--rsync-path")
@@ -1162,6 +1212,8 @@ def rsync(
     options: Sequence[str] = ("-a",),
     timeout: float | None = None,
     protect_args: bool = True,
+    ssh: str | Sequence[str] | None = None,
+    ssh_options: Sequence[str] | None = None,
 ) -> BashHandle:
     """Synchronize two or more paths through the existing BashHandle process owner.
 
@@ -1170,16 +1222,80 @@ def rsync(
     contract requires native rsync defaults or a pre-3.0 remote. Remote paths
     retain rsync's standard ``host:path`` syntax; remote-shell replacement
     options are rejected.
+
+    ``ssh`` sets the remote shell rsync uses for ``host:path`` operands to the
+    system OpenSSH client with BatchMode and the given ``ssh_options``, so
+    remote transfers use the same transport rules as ``bash()`` instead of
+    whatever ``ssh`` resolves in the environment. A sequence of hosts becomes a
+    ProxyJump chain (``-J hop1,hop2``); the ``host:path`` operand names the
+    final host.
     """
     if len(paths) < 2:
         raise ValueError("rsync requires at least one source and one destination")
     if not isinstance(protect_args, bool):
         raise TypeError(f"protect_args must be bool, got {type(protect_args).__name__}")
+    if ssh is None and ssh_options is not None:
+        raise ValueError("ssh_options require ssh=...")
     arguments = _validate_rsync_options(options)
+    if ssh is not None:
+        if isinstance(ssh, str):
+            hosts: Sequence[str] = (ssh,)
+        else:
+            hosts = _ssh_host_chain(ssh)
+        remote_shell_parts = ["ssh", "-oBatchMode=yes", *(_validate_ssh_options(ssh_options))]
+        if len(hosts) > 1:
+            remote_shell_parts += ["-J", ",".join(hosts[1:])]
+        remote_shell = " ".join(shlex.quote(part) for part in remote_shell_parts)
+        arguments = [*arguments, "-e", remote_shell]
     requested_paths = _argv_values(paths, "paths")
     protected = ["--protect-args"] if protect_args else []
     argv = [_tool_path("rsync", "PRIME_AGENT_RSYNC"), *arguments, *protected, "--", *requested_paths]
     return _argv_handle(argv, timeout)
+
+
+def ssh_forward(
+    destination: str,
+    *forwards: str,
+    ssh_options: Sequence[str] | None = None,
+) -> BashHandle:
+    """Start a background SSH forwarding session; stop it later with handle.kill().
+
+    Each forward is one argv value:
+
+    - ``"8080:db.internal:5432"`` — local forward (``-L``)
+    - ``"R:9090:localhost:3000"`` — remote forward (``-R``)
+    - ``"D:1080"`` — SOCKS dynamic forward (``-D``)
+
+    The session runs ``ssh -N -oExitOnForwardFailure=yes`` immediately in the
+    background and outlives the current cell; kill the returned handle to close
+    the session and its forwarded connections. ``handle.tail()`` shows ssh
+    diagnostics such as bind conflicts. Exit-on-forward-failure means a busy
+    listen port settles the handle with that error instead of hanging.
+    """
+    destination = _ssh_destination(destination, "destination")
+    if not forwards:
+        raise ValueError("ssh_forward requires at least one forward")
+    forward_args: list[str] = []
+    for forward in forwards:
+        if not isinstance(forward, str) or not forward or "\0" in forward or "\n" in forward or "\r" in forward:
+            raise TypeError("each forward must be a non-empty single-line str")
+        if forward.startswith("R:"):
+            forward_args += ["-R", forward[2:]]
+        elif forward.startswith("D:"):
+            forward_args += ["-D", forward[2:]]
+        else:
+            forward_args += ["-L", forward]
+    argv = [
+        _ssh_executable(),
+        "-oBatchMode=yes",
+        *_validate_ssh_options(ssh_options),
+        "-N",
+        "-oExitOnForwardFailure=yes",
+        *forward_args,
+        "--",
+        destination,
+    ]
+    return _argv_handle(argv, None)
 
 
 def _shell() -> str:

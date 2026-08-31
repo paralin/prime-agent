@@ -20,6 +20,14 @@ and `new` from file slices already inspected. The call returns a short
 confirmation. It raises an error when `old_str` is missing or matches more than
 once. Widen the inspected snippet until it is unique.
 
+For a file on a remote host, pass `ssh="host"` (and optional `ssh_options`), the
+same transport as `rlm.bash`. `path` is then a remote path and the host needs
+`python3`:
+
+```python
+await edit(path="srv/config.toml", old_str=old, new_str=new, ssh="core@thumper")
+```
+
 When the skill's shell command is available, run it in a shell cell:
 
 ```python

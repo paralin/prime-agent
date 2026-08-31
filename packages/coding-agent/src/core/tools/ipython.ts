@@ -36,6 +36,7 @@ try:
     bash = _prime_agent_rlm_module.bash
     rg = _prime_agent_rlm_module.rg
     rsync = _prime_agent_rlm_module.rsync
+    ssh_forward = _prime_agent_rlm_module.ssh_forward
     import rlm.mcp as mcp
 except Exception as _prime_agent_rlm_error:
     _PRIME_AGENT_RLM_IMPORT_ERROR = str(_prime_agent_rlm_error)
@@ -79,6 +80,9 @@ except Exception as _prime_agent_rlm_error:
         rlm._raise_missing()
 
     def rsync(*paths, options=("-a",), timeout=None, protect_args=True):
+        rlm._raise_missing()
+
+    def ssh_forward(destination, *forwards, ssh_options=None):
         rlm._raise_missing()
 `.trim();
 

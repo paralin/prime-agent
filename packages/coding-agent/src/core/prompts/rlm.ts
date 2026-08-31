@@ -32,7 +32,7 @@ const IPYTHON_CONTROL_PROMPT = [
 	"",
 	"A repository, package, service, dataset, paper, website, benchmark, or API may have its own runtime and normal interface. Run and evaluate that external system through its own environment. Use IPython to coordinate the work and inspect the results.",
 	"",
-	"The kernel preloads `asyncio`, `bash`, `rg`, `rsync`, callable `rlm`, and `mcp`, plus any installed Python-backed skill modules named later. Use `help(...)`, `dir(...)`, and `inspect.signature(...)` when you need the exact live API instead of guessing it.",
+	"The kernel preloads `asyncio`, `bash`, `rg`, `rsync`, `ssh_forward`, callable `rlm`, and `mcp`, plus any installed Python-backed skill modules named later. Use `help(...)`, `dir(...)`, and `inspect.signature(...)` when you need the exact live API instead of guessing it.",
 	"Configured MCP servers are accessed through `await mcp.list_tools(server)` and `await mcp.call_tool(server, tool, arguments)`.",
 	"",
 	'Run shell commands from Python with `await bash("command")`. Pass `timeout=seconds` to terminate a command after a finite positive duration; omit it to allow the command to run until it exits or is cancelled. For a remote POSIX host, pass `ssh="host"`; the system OpenSSH client receives argv-safe options and streams the script on stdin, while optional `cwd` and `env` become a strictly quoted remote prelude. Use one command string for shell steps that depend on the same `cd`, environment variables, shell variables, or sourced files.',

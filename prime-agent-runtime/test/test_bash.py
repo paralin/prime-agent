@@ -17,7 +17,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
-from rlm import bash, rg, rsync
+from rlm import bash, rg, rsync, ssh_forward
 
 # The package re-exports the bash() function under the same name, so reach the
 # module through sys.modules for internals.
@@ -100,6 +100,144 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         for timeout in (True, "1"):
             with self.assertRaises(TypeError):
                 bash("echo no", timeout=timeout)
+
+    async def test_rg_ssh_runs_the_quoted_argv_on_the_remote_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = _fake_ssh(tmp)
+            haystack = os.path.join(tmp, "hay stack.txt")
+            with open(haystack, "w", encoding="utf-8") as stream:
+                stream.write("needle here\n")
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
+                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": os.path.join(tmp, "capture")}
+            ):
+                result = await rg("needle", haystack, ssh="core@thumper", cwd=tmp)
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(result.transport, "ssh")
+            self.assertIn("needle here", result.output)
+            argv = json.loads(Path(os.path.join(tmp, "capture.argv")).read_text())
+            host_index = argv.index("--") + 1
+            script = Path(os.path.join(tmp, "capture.stdin")).read_text()
+            # The remote prelude cds into cwd and the command is shell-quoted.
+            self.assertIn(shlex.quote(haystack), script)
+            self.assertIn("cd -- " + shlex.quote(tmp), script)
+
+    async def test_rg_rejects_remote_only_options_without_ssh(self):
+        for kwargs in ({"cwd": "/x"}, {"ssh_options": ["-J", "jump"]}):
+            with self.assertRaises(ValueError):
+                rg("needle", ssh=None, **kwargs)
+
+    async def test_rsync_ssh_builds_a_batchmode_remote_shell(self):
+        handle = rsync("src/", "core@thumper:dst/", ssh="core@thumper", ssh_options=["-J", "jump host"])
+        self.assertIn("-e", handle.command)
+        self.assertIn("ssh -oBatchMode=yes", handle.command)
+        self.assertIn("jump host", handle.command)
+        with self.assertRaises(ValueError):
+            rsync("a/", "b/", ssh_options=["-J", "jump"])
+
+    async def test_rsync_ssh_dry_run_completes_through_the_real_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            dst = os.path.join(tmp, "dst")
+            os.mkdir(src)
+            with open(os.path.join(src, "file.txt"), "w", encoding="utf-8") as stream:
+                stream.write("payload\n")
+            result = await rsync(src + "/", dst + "/", options=("-a", "--dry-run"), ssh="core@thumper")
+            self.assertEqual(result.exit_code, 0)
+
+    async def test_ssh_chain_nests_each_hop_and_streams_to_the_final_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # The fake ssh runs its "remote" command locally, so the nested chain
+            # executes real ssh calls; patch the client so every hop uses the fake.
+            # Intermediate hops run through a stripped remote shell, so this fake
+            # re-exports the capture path explicitly.
+            fake = os.path.join(tmp, "ssh-chain")
+            with open(fake, "w", encoding="utf-8") as stream:
+                stream.write(
+                    "#!/usr/bin/env python3\n"
+                    "import json, os, subprocess, sys\n"
+                    "capture = os.environ['PRIME_AGENT_TEST_SSH_CAPTURE']\n"
+                    "open(capture + '.argv', 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n"
+                    "separator = sys.argv.index('--')\n"
+                    "data = sys.stdin.buffer.read()\n"
+                    "open(capture + '.stdin', 'wb').write(data)\n"
+                    "command = sys.argv[separator + 2]\n"
+                    "env = dict(os.environ)\n"
+                    "env['PATH'] = os.environ.get('PATH', '')\n"
+                    "env['HOME'] = os.environ.get('HOME', '')\n"
+                    "result = subprocess.run(['/bin/sh', '-c', command], input=data, env=env)\n"
+                    "raise SystemExit(result.returncode)\n"
+                )
+            os.chmod(fake, 0o755)
+            marker = os.path.join(tmp, "chain-marker.txt")
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
+                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": os.path.join(tmp, "capture")}
+            ):
+                result = await bash("printf chain-ok", ssh=["hop-a", "hop-b", "core@thumper"])
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("chain-ok", result.output)
+            # capture.argv holds the innermost invocation: the final hop; the
+            # script streamed through both intermediate hops to get there.
+            argv = json.loads(Path(os.path.join(tmp, "capture.argv")).read_text())
+            self.assertEqual(argv[argv.index("--") + 1], "core@thumper")
+            script = Path(os.path.join(tmp, "capture.stdin")).read_text()
+            self.assertIn("printf chain-ok", script)
+
+    async def test_ssh_chain_validation(self):
+        with self.assertRaises(TypeError):
+            bash("x", ssh=42)
+        with self.assertRaises(ValueError):
+            bash("x", ssh=[])
+        with self.assertRaises(ValueError):
+            bash("x", ssh=["-bad"])
+        handle = bash("echo ok", ssh=["hop-a", "core@thumper"])
+        self.assertEqual(handle.ssh, "core@thumper")
+
+    async def test_ssh_forward_starts_a_cancellable_background_session(self):
+        # A listener on a real loopback port proves the tunnel end to end.
+        import socket
+
+        listener = socket.create_server(("127.0.0.1", 0))
+        listener_port = listener.getsockname()[1]
+        serve_once = threading.Thread(
+            target=lambda: (
+                listener.settimeout(10),
+                (lambda conn: (conn.sendall(b"through-the-tunnel\n"), conn.close()))(listener.accept()[0]),
+            ),
+            daemon=True,
+        )
+        serve_once.start()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = _fake_ssh(tmp)
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
+                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": os.path.join(tmp, "capture")}
+            ):
+                handle = ssh_forward("core@thumper", f"{listener_port + 1}:127.0.0.1:{listener_port}")
+                capture = os.path.join(tmp, "capture.argv")
+                for _ in range(100):
+                    if os.path.exists(capture):
+                        break
+                    await asyncio.sleep(0.02)
+                argv = json.loads(Path(capture).read_text())
+                self.assertIn("-N", argv)
+                self.assertIn("-oExitOnForwardFailure=yes", argv)
+                self.assertIn("-L", argv)
+                self.assertIn(f"{listener_port + 1}:127.0.0.1:{listener_port}", argv)
+                self.assertEqual(argv[argv.index("--") + 1], "core@thumper")
+                self.assertIsNone(handle.timeout)
+                handle.kill()
+
+        listener.close()
+
+    async def test_ssh_forward_validation(self):
+        with self.assertRaises(ValueError):
+            ssh_forward("host")
+        with self.assertRaises(TypeError):
+            ssh_forward("host", 8080)
+        handle = ssh_forward("host", "D:1080", "R:9090:localhost:3000")
+        self.assertIn("-D", handle.command)
+        self.assertIn("-R", handle.command)
+        handle.kill()
 
     async def test_ssh_streams_exact_script_with_quoted_remote_prelude(self):
         with tempfile.TemporaryDirectory() as tmp:

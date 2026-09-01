@@ -1,0 +1,1 @@
+- Fixed a running session keeping "Authentication failed ... Run /login" after a successful /login until restart: the request path now re-reads auth.json when another process rewrites it.

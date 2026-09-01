@@ -63,12 +63,14 @@ import {
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
 	createAgentMessageHostHandlers,
+	createAgentSessionMessage,
 	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 	isAgentSessionMessagePrompt,
 	normalizeAgentSessionMessage,
 	parseAgentSessionMessagePromptId,
+	SYSTEM_SIBLING_AGENT_NAME,
 	startsAgentRun,
 } from "./agent-messages.js";
 import {
@@ -186,7 +188,6 @@ import {
 	EXTERNAL_EVENT_MAX_PENDING,
 	EXTERNAL_EVENT_PREVIEW_LABEL,
 	type ExternalEventDeliveryStatus,
-	type ExternalEventDetails,
 	type ExternalEventInput,
 	type ExternalEventReceipt,
 	ExternalEventRegistry,
@@ -5973,6 +5974,10 @@ export class AgentSession {
 		if (
 			options.restore !== true &&
 			action.payload.kind === "turn" &&
+			// External events are agent messages from the kernel's "system"
+			// sibling, but they are bounded by EXTERNAL_EVENT_MAX_PENDING below;
+			// the peer-message capacity must not drop job-completion wake-ups.
+			!isExternalEventQueueKey(action.queueKey) &&
 			isAgentSessionMessage(primaryDeliveryRecord(action).message)
 		) {
 			assertAgentMessageQueueCapacity(
@@ -10498,30 +10503,34 @@ export class AgentSession {
 		return { accepted: true, count: watches.length };
 	}
 
-	/** _admitExternalEvent delivers one validated event through the existing session input owner. */
+	/**
+	 * _admitExternalEvent delivers one validated event through the existing session input owner.
+	 *
+	 * External events are steers from the kernel's "system" sibling agent: they
+	 * arrive with the same disposition as received agent messages and render
+	 * through the agent-message component.
+	 */
 	private async _admitExternalEvent(event: ExternalEventInput): Promise<ExternalEventDeliveryStatus> {
-		const disposition = await this._promptInjectedMessage(
-			event.text,
-			{
-				role: "custom",
-				customType: EXTERNAL_EVENT_CUSTOM_TYPE,
-				content: event.text,
-				display: true,
-				timestamp: Date.now(),
-				details: {
-					name: event.name,
-					eventId: event.eventId,
-				} satisfies ExternalEventDetails,
+		const message = createAgentSessionMessage({
+			id: `agentmsg_external_${event.name}_${event.eventId}`,
+			source: "agent_message",
+			message: event.text,
+			from: { sessionName: SYSTEM_SIBLING_AGENT_NAME },
+			fromRelationship: "sibling",
+			target: {
+				activeSessionId: this.sessionId,
+				sessionId: this.sessionId,
+				sessionName: this.sessionName,
 			},
-			{
-				streamingBehavior: event.deliveryPolicy,
-				followUpQueueKey: externalEventQueueKey(event.name, event.eventId),
-				resumeIfIdle: true,
-				returnAfterAccepted: true,
-				queueIfBusy: true,
-				suppressAutonomousContinuation: true,
-			},
-		);
+		});
+		const disposition = await this._promptInjectedMessage(event.text, message, {
+			streamingBehavior: "steer",
+			followUpQueueKey: externalEventQueueKey(event.name, event.eventId),
+			resumeIfIdle: true,
+			returnAfterAccepted: true,
+			queueIfBusy: true,
+			suppressAutonomousContinuation: true,
+		});
 		if (disposition === undefined) throw new Error("External event was not admitted into the session action store.");
 		return disposition === "starts_when_admitted" ? "delivered" : "queued";
 	}

@@ -72,7 +72,6 @@ print(job_id)
 			type: "session.external_event.emit",
 			name: "bash",
 			event_id: jobId,
-			delivery_policy: "followUp",
 		});
 		expect(event.text).toContain("video capture");
 		expect(event.text).toContain("Exit code: 0");
@@ -153,7 +152,6 @@ print(remote_job_id)
 		expect(event).toMatchObject({
 			name: "bash",
 			event_id: jobId,
-			delivery_policy: "followUp",
 		});
 		expect(event.text).toContain("SSH: core@fake-host");
 		expect(event.text).toContain(`Remote cwd: ${tempDir}`);

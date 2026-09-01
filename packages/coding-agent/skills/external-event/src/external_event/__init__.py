@@ -6,11 +6,10 @@ import asyncio
 import math
 import secrets
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 from rlm import BashHandle, BashResult, host_request
 
-DeliveryPolicy = Literal["followUp", "steer"]
 _MAX_COMPLETED_JOBS = 256
 _MAX_ACTIVE_JOBS = 128
 _MAX_LABEL_CHARS = 128
@@ -42,7 +41,6 @@ class _WatchedJob:
     label: str
     handle: BashHandle
     tail_lines: int
-    delivery_policy: DeliveryPolicy
     task: asyncio.Task[None] | None = None
     status: str = "running"
     result: BashResult | None = None
@@ -80,7 +78,6 @@ def _watch_record(job: _WatchedJob) -> dict[str, Any]:
         "command": _command_preview(job.handle.command),
         "ssh": job.handle.ssh,
         "status": job.status,
-        "delivery_policy": job.delivery_policy,
     }
 
 
@@ -113,20 +110,7 @@ def _field(value: Any, name: str, max_chars: int) -> str:
     return value
 
 
-def _policy(value: Any) -> DeliveryPolicy:
-    if not isinstance(value, str):
-        raise TypeError(f"delivery_policy must be str, got {type(value).__name__}")
-    if value not in {"followUp", "steer"}:
-        raise ValueError('delivery_policy must be "followUp" or "steer"')
-    return value
-
-
-async def emit(
-    name: str,
-    event_id: str,
-    text: str,
-    delivery_policy: DeliveryPolicy = "followUp",
-) -> dict[str, Any]:
+async def emit(name: str, event_id: str, text: str) -> dict[str, Any]:
     """Admit one identified event and wake this session through its input owner."""
     name = _field(name, "name", _MAX_LABEL_CHARS)
     event_id = _field(event_id, "event_id", 512)
@@ -142,7 +126,6 @@ async def emit(
             "name": name,
             "event_id": event_id,
             "text": text,
-            "delivery_policy": _policy(delivery_policy),
         },
     )
 
@@ -152,7 +135,6 @@ def watch_bash(
     label: str,
     *,
     tail_lines: int = 40,
-    delivery_policy: DeliveryPolicy = "followUp",
 ) -> str:
     """Retain a BashHandle and emit one bounded terminal event after it exits."""
     if not isinstance(job, BashHandle):
@@ -162,7 +144,6 @@ def watch_bash(
         raise TypeError(f"tail_lines must be int, got {type(tail_lines).__name__}")
     if tail_lines < 0 or tail_lines > 1_000:
         raise ValueError("tail_lines must be between 0 and 1000")
-    policy = _policy(delivery_policy)
     for watched in _jobs.values():
         if watched.handle is job:
             raise ValueError(f"job is already watched as {watched.id}")
@@ -170,7 +151,7 @@ def watch_bash(
         raise RuntimeError(f"too many active watched jobs: maximum is {_MAX_ACTIVE_JOBS}")
     loop = asyncio.get_running_loop()
     job_id = secrets.token_hex(16)
-    watched = _WatchedJob(job_id, label, job, tail_lines, policy)
+    watched = _WatchedJob(job_id, label, job, tail_lines)
     _jobs[job_id] = watched
     _publish_watches()
     # Reading pid deliberately marks the handle as retained/background before
@@ -201,7 +182,7 @@ async def _finish(job: _WatchedJob) -> None:
         job.status = "completed"
 
     try:
-        receipt = await emit("bash", job.id, _completion_text(job, error), job.delivery_policy)
+        receipt = await emit("bash", job.id, _completion_text(job, error))
         status = receipt.get("deliveryStatus")
         job.notification_status = status if isinstance(status, str) else "accepted"
     except Exception as caught:

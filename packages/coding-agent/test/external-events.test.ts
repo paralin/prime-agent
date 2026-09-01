@@ -16,7 +16,6 @@ describe("external event host registry", () => {
 			name: "matrix",
 			event_id: "$event operator",
 			text: "operator message",
-			delivery_policy: "steer",
 		};
 
 		await expect(handler(payload)).resolves.toMatchObject({ deliveryStatus: "queued" });
@@ -34,13 +33,12 @@ describe("external event host registry", () => {
 		const registry = new ExternalEventRegistry();
 		const emit = vi.fn(async () => "delivered" as const);
 		const handler = createExternalEventHostHandler(registry, emit);
-		const payload = { name: "watch", event_id: "event", text: "message", delivery_policy: "followUp" };
+		const payload = { name: "watch", event_id: "event", text: "message" };
 
 		await expect(handler({ ...payload, name: " " })).rejects.toThrow("name cannot be empty");
 		await expect(handler({ ...payload, text: "x".repeat(EXTERNAL_EVENT_MAX_TEXT_CHARS + 1) })).rejects.toThrow(
 			"text is too long",
 		);
-		await expect(handler({ ...payload, delivery_policy: "next" })).rejects.toThrow("delivery_policy must be");
 		expect(emit).not.toHaveBeenCalled();
 	});
 
@@ -64,7 +62,7 @@ describe("external event host registry", () => {
 		});
 		const emit = vi.fn().mockReturnValueOnce(firstAdmission).mockResolvedValueOnce("delivered");
 		const handler = createExternalEventHostHandler(registry, emit);
-		const payload = { name: "watch", event_id: "retry", text: "event", delivery_policy: "followUp" };
+		const payload = { name: "watch", event_id: "retry", text: "event" };
 
 		const first = handler(payload);
 		const duplicate = handler({ ...payload, text: "duplicate" });
@@ -92,9 +90,8 @@ describe("external event watch mirror", () => {
 					command: "ffmpeg ...",
 					ssh: null,
 					status: "running",
-					delivery_policy: "followUp",
 				},
-				{ id: "job-2", label: "sync", status: "completed", delivery_policy: "steer" },
+				{ id: "job-2", label: "sync", status: "completed" },
 			],
 		});
 		expect(watches).toEqual([
@@ -105,7 +102,6 @@ describe("external event watch mirror", () => {
 				command: "ffmpeg ...",
 				ssh: undefined,
 				status: "running",
-				deliveryPolicy: "followUp",
 			},
 			{
 				id: "job-2",
@@ -114,7 +110,6 @@ describe("external event watch mirror", () => {
 				command: undefined,
 				ssh: undefined,
 				status: "completed",
-				deliveryPolicy: "steer",
 			},
 		]);
 	});
@@ -125,18 +120,14 @@ describe("external event watch mirror", () => {
 
 	it("rejects malformed publications", () => {
 		expect(() => normalizeExternalEventWatchList({ jobs: "nope" })).toThrow("must carry a jobs array");
+		expect(() => normalizeExternalEventWatchList({ jobs: [{ label: "x", status: "running" }] })).toThrow(
+			"id must be a string",
+		);
+		expect(() => normalizeExternalEventWatchList({ jobs: [{ id: "a", label: "x", status: "dancing" }] })).toThrow(
+			"unknown status",
+		);
 		expect(() =>
-			normalizeExternalEventWatchList({ jobs: [{ label: "x", status: "running", delivery_policy: "followUp" }] }),
-		).toThrow("id must be a string");
-		expect(() =>
-			normalizeExternalEventWatchList({
-				jobs: [{ id: "a", label: "x", status: "dancing", delivery_policy: "followUp" }],
-			}),
-		).toThrow("unknown status");
-		expect(() =>
-			normalizeExternalEventWatchList({
-				jobs: [{ id: "a", label: "x", status: "running", delivery_policy: "later" }],
-			}),
-		).toThrow("invalid delivery policy");
+			normalizeExternalEventWatchList({ jobs: [{ id: "a", label: "x", status: "running" }] }),
+		).not.toThrow();
 	});
 });

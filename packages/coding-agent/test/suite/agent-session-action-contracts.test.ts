@@ -64,7 +64,6 @@ describe("AgentSession action contracts", () => {
 			name: "matrix",
 			event_id: "$idle",
 			text: " /compact wake now",
-			delivery_policy: "followUp",
 		});
 		await gate.reached;
 		let duplicateSettled = false;
@@ -73,7 +72,6 @@ describe("AgentSession action contracts", () => {
 				name: "matrix",
 				event_id: "$idle",
 				text: "duplicate body",
-				delivery_policy: "steer",
 			})
 			.finally(() => {
 				duplicateSettled = true;
@@ -92,17 +90,21 @@ describe("AgentSession action contracts", () => {
 		expect(getUserTexts(harness)).toEqual([]);
 		expect(
 			harness.session.messages.filter(
-				(message) => message.role === "custom" && message.customType === "external_event",
+				(message) => message.role === "custom" && message.customType === "agent_message",
 			),
 		).toEqual([
 			expect.objectContaining({
-				content: " /compact wake now",
-				details: { name: "matrix", eventId: "$idle" },
+				content: expect.stringContaining(" /compact wake now"),
+				details: expect.objectContaining({
+					message: " /compact wake now",
+					from: { sessionName: "system" },
+					fromRelationship: "sibling",
+				}),
 			}),
 		]);
 	});
 
-	it("applies declared external-event delivery while busy", async () => {
+	it("steers external events while busy", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		withStreaming(harness, true);
@@ -112,7 +114,6 @@ describe("AgentSession action contracts", () => {
 				name: "watch",
 				event_id: "steer-1",
 				text: "steer event",
-				delivery_policy: "steer",
 			}),
 		).resolves.toMatchObject({ deliveryStatus: "queued" });
 		await expect(
@@ -120,11 +121,10 @@ describe("AgentSession action contracts", () => {
 				name: "watch",
 				event_id: "follow-1",
 				text: "follow event",
-				delivery_policy: "followUp",
 			}),
 		).resolves.toMatchObject({ deliveryStatus: "queued" });
-		expect(harness.session.getSteeringMessages()).toEqual(["steer event"]);
-		expect(harness.session.getFollowUpMessages()).toEqual(["follow event"]);
+		expect(harness.session.getSteeringMessages()).toEqual(["steer event", "follow event"]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
 		withStreaming(harness, false);
 		harness.session.clearQueue();
 	});
@@ -138,7 +138,6 @@ describe("AgentSession action contracts", () => {
 				name: "bounded",
 				event_id: String(index),
 				text: `event ${index}`,
-				delivery_policy: "followUp",
 			});
 		}
 		await expect(
@@ -146,7 +145,6 @@ describe("AgentSession action contracts", () => {
 				name: "bounded",
 				event_id: "overflow",
 				text: "overflow",
-				delivery_policy: "followUp",
 			}),
 		).rejects.toThrow("queue is full");
 		withStreaming(harness, false);
@@ -157,7 +155,6 @@ describe("AgentSession action contracts", () => {
 				name: "bounded",
 				event_id: "after-dispose",
 				text: "after disposal",
-				delivery_policy: "steer",
 			}),
 		).rejects.toThrow("session was disposed");
 		await disposing;

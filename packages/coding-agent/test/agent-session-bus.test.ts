@@ -212,6 +212,15 @@ describe("agent session bus", () => {
 			}),
 		).rejects.toThrow("broadcast cannot be combined with receiver_role/receiver_name");
 		expect(sendAgentMessage).not.toHaveBeenCalled();
+
+		await expect(
+			handlers["agent_message.send"]!({
+				message: "hello",
+				receiver_role: "sibling",
+				receiver_name: "system",
+			}),
+		).rejects.toThrow('cannot target "system"');
+		expect(sendAgentMessage).not.toHaveBeenCalled();
 	});
 
 	it("rejects non-all string targets at the host boundary", async () => {

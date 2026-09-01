@@ -39,11 +39,8 @@ export interface ExternalEventWatch {
 	command: string | undefined;
 	ssh: string | undefined;
 	status: ExternalEventWatchStatus;
-	deliveryPolicy: ExternalEventDeliveryPolicy;
 }
 
-/** ExternalEventDeliveryPolicy selects the existing busy-session delivery lane. */
-export type ExternalEventDeliveryPolicy = "followUp" | "steer";
 /** ExternalEventDeliveryStatus reports whether admission delivered, queued, or coalesced the event. */
 export type ExternalEventDeliveryStatus = "coalesced" | "delivered" | "queued";
 
@@ -52,7 +49,6 @@ export interface ExternalEventInput {
 	name: string;
 	eventId: string;
 	text: string;
-	deliveryPolicy: ExternalEventDeliveryPolicy;
 }
 
 /** ExternalEventDetails carries producer provenance in the admitted custom message. */
@@ -155,15 +151,6 @@ function boundedField(payload: Record<string, unknown>, field: string, maxChars:
 	return value;
 }
 
-/** deliveryPolicy validates the delivery lane named by an external producer. */
-function deliveryPolicy(payload: Record<string, unknown>): ExternalEventDeliveryPolicy {
-	const value = payload.delivery_policy;
-	if (value !== "followUp" && value !== "steer") {
-		throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} delivery_policy must be "followUp" or "steer"`);
-	}
-	return value;
-}
-
 const WATCH_STATUSES: ReadonlySet<string> = new Set(["running", "completed", "failed", "timed_out", "cancelled"]);
 
 /**
@@ -197,10 +184,6 @@ export function normalizeExternalEventWatchList(payload: Record<string, unknown>
 		if (typeof statusValue !== "string" || !WATCH_STATUSES.has(statusValue)) {
 			throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} watch ${id} has an unknown status`);
 		}
-		const policy = record.delivery_policy;
-		if (policy !== "followUp" && policy !== "steer") {
-			throw new Error(`${EXTERNAL_EVENT_HOST_REQUEST_TYPE} watch ${id} has an invalid delivery policy`);
-		}
 		const command = record.command;
 		if (
 			command !== undefined &&
@@ -224,7 +207,6 @@ export function normalizeExternalEventWatchList(payload: Record<string, unknown>
 			command: typeof command === "string" ? command : undefined,
 			ssh: typeof ssh === "string" ? ssh : undefined,
 			status: statusValue as ExternalEventWatchStatus,
-			deliveryPolicy: policy,
 		});
 	}
 	return watches;
@@ -242,10 +224,7 @@ export function createExternalEventHostHandler(
 		const name = boundedField(payload, "name", EXTERNAL_EVENT_MAX_NAME_CHARS).trim();
 		const eventId = boundedField(payload, "event_id", EXTERNAL_EVENT_MAX_ID_CHARS).trim();
 		const text = boundedField(payload, "text", EXTERNAL_EVENT_MAX_TEXT_CHARS);
-		const policy = deliveryPolicy(payload);
-		const deliveryStatus = await registry.admit(name, eventId, () =>
-			emit({ name, eventId, text, deliveryPolicy: policy }),
-		);
+		const deliveryStatus = await registry.admit(name, eventId, () => emit({ name, eventId, text }));
 		return { accepted: true, deliveryStatus, name, eventId } satisfies ExternalEventReceipt;
 	};
 }

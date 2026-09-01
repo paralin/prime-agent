@@ -79,7 +79,7 @@ describeIfKernel("AgentSession Act integration", { tags: ["kernel-heavy"] }, () 
 			const delivered = new Promise<void>((resolve) => {
 				unsubscribe = harness.session.subscribe((event) => {
 					if (event.type !== "message_start" || event.message.role !== "custom") return;
-					if (event.message.customType !== "external_event") return;
+					if (event.message.customType !== "agent_message") return;
 					unsubscribe();
 					resolve();
 				});
@@ -95,7 +95,6 @@ async def _emit_external_event():
         "name": "matrix",
         "event_id": "$idle",
         "text": "wake from Matrix",
-        "delivery_policy": "followUp",
     })
 asyncio.create_task(_emit_external_event())
 print("armed")`,
@@ -105,11 +104,10 @@ print("armed")`,
 			await harness.session.waitForIdle();
 			expect(
 				harness.session.messages.find(
-					(message) => message.role === "custom" && message.customType === "external_event",
+					(message) => message.role === "custom" && message.customType === "agent_message",
 				),
 			).toMatchObject({
-				content: "wake from Matrix",
-				details: { name: "matrix", eventId: "$idle" },
+				details: { message: "wake from Matrix", from: { sessionName: "system" }, fromRelationship: "sibling" },
 			});
 		} finally {
 			unsubscribe();

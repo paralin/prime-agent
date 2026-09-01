@@ -6,6 +6,8 @@ import { HEARTBEAT_PROMPT_CUSTOM_TYPE } from "./messages.js";
 import { canonicalSessionPath } from "./session-lease.js";
 
 export const AGENT_MESSAGE_CUSTOM_TYPE = "agent_message";
+/** SYSTEM_SIBLING_AGENT_NAME is the reserved sibling identity that carries kernel external events. */
+export const SYSTEM_SIBLING_AGENT_NAME = "system";
 export const AGENT_MESSAGE_SKILL_NAME = "agent-message";
 export const AGENT_MESSAGE_IMPORT_NAME = "agent_message";
 export const AGENT_MESSAGE_SOURCE = "agent_message";
@@ -679,6 +681,11 @@ export function createAgentMessageHostHandlers(
 				}
 				if (!controller.roster) throw new Error("agent family roster is not available in this session");
 				const selector = typeof receiverName === "string" ? receiverName.trim() : undefined;
+				if (selector === SYSTEM_SIBLING_AGENT_NAME) {
+					throw new Error(
+						`agent_message.send cannot target "${SYSTEM_SIBLING_AGENT_NAME}": it is the reserved sibling that delivers external events`,
+					);
+				}
 				const publishedId =
 					role === "child" && selector && controller.awaitPendingChildPublication
 						? await controller.awaitPendingChildPublication(selector)

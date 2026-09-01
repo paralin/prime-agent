@@ -10,7 +10,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from rlm import bash, rg
-from test.test_bash import _fake_ssh
+
+try:
+    from test.test_bash import _fake_ssh
+except ModuleNotFoundError:
+    # Discovered as top-level modules when the start directory is on sys.path.
+    from test_bash import _fake_ssh
 
 bash_module = sys.modules["rlm.bash"]
 
@@ -24,6 +29,17 @@ def _load_skill():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _emit_host(payloads: list[dict], hook=None):
+    """A host_request mock that records only event emissions, not watch-mirror publications."""
+    async def host(_request_type, payload):
+        if "jobs" not in payload:
+            payloads.append(payload)
+            if hook is not None:
+                hook()
+        return {"deliveryStatus": "delivered"}
+    return host
 
 
 class ExternalEventSkillTest(unittest.IsolatedAsyncioTestCase):
@@ -47,11 +63,7 @@ class ExternalEventSkillTest(unittest.IsolatedAsyncioTestCase):
     async def test_watch_bash_emits_once_and_retains_result(self) -> None:
         emitted = asyncio.Event()
         payloads = []
-
-        async def host(_request_type, payload):
-            payloads.append(payload)
-            emitted.set()
-            return {"deliveryStatus": "delivered"}
+        host = _emit_host(payloads, hook=lambda: emitted.set())
 
         with patch.object(self.module, "host_request", host):
             job_id = self.module.watch_bash(bash("printf 'first\nsecond\n'"), "capture", tail_lines=1)
@@ -68,7 +80,8 @@ class ExternalEventSkillTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.module.list_jobs(), [info])
 
     async def test_watch_bash_accepts_an_rg_handle(self) -> None:
-        host = AsyncMock(return_value={"deliveryStatus": "delivered"})
+        payloads: list[dict] = []
+        host = _emit_host(payloads)
         with tempfile.TemporaryDirectory() as tmp:
             executable = Path(tmp, "rg")
             executable.write_text("#!/bin/sh\nprintf watched-rg\n", encoding="utf-8")
@@ -82,10 +95,11 @@ class ExternalEventSkillTest(unittest.IsolatedAsyncioTestCase):
         info = self.module.get_job(job_id)
         self.assertEqual(info.status, "completed")
         self.assertEqual(info.exit_code, 0)
-        self.assertIn("watched-rg", host.await_args.args[1]["text"])
+        self.assertIn("watched-rg", payloads[-1]["text"])
 
     async def test_timed_out_bash_still_emits_terminal_result(self) -> None:
-        host = AsyncMock(return_value={"deliveryStatus": "delivered"})
+        payloads: list[dict] = []
+        host = _emit_host(payloads)
         with patch.object(self.module, "host_request", host):
             job_id = self.module.watch_bash(bash("sleep 30", timeout=0.05), "bounded")
             assert self.module._jobs[job_id].task is not None
@@ -93,11 +107,12 @@ class ExternalEventSkillTest(unittest.IsolatedAsyncioTestCase):
         info = self.module.get_job(job_id)
         self.assertEqual(info.status, "timed_out")
         self.assertNotEqual(info.exit_code, 0)
-        self.assertIn("timed_out", host.await_args.args[1]["text"])
-        self.assertIn("TimeoutError", host.await_args.args[1]["text"])
+        self.assertIn("timed_out", payloads[-1]["text"])
+        self.assertIn("TimeoutError", payloads[-1]["text"])
 
     async def test_rejects_duplicate_watch_registration(self) -> None:
-        host = AsyncMock(return_value={"deliveryStatus": "delivered"})
+        payloads: list[dict] = []
+        host = _emit_host(payloads)
         with patch.object(self.module, "host_request", host):
             job = bash("printf done")
             job_id = self.module.watch_bash(job, "first")
@@ -105,10 +120,11 @@ class ExternalEventSkillTest(unittest.IsolatedAsyncioTestCase):
                 self.module.watch_bash(job, "second")
             assert self.module._jobs[job_id].task is not None
             await self.module._jobs[job_id].task
-        host.assert_awaited_once()
+        self.assertEqual(len(payloads), 1)
 
     async def test_watch_bash_reports_ssh_transport(self) -> None:
-        host = AsyncMock(return_value={"deliveryStatus": "delivered"})
+        payloads: list[dict] = []
+        host = _emit_host(payloads)
         with tempfile.TemporaryDirectory() as tmp:
             capture = os.path.join(tmp, "capture")
             fake = _fake_ssh(tmp)
@@ -127,7 +143,7 @@ class ExternalEventSkillTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info.ssh, "host")
         self.assertEqual(info.remote_cwd, tmp)
         self.assertEqual(info.remote_env_keys, ("TARGET",))
-        text = host.await_args.args[1]["text"]
+        text = payloads[-1]["text"]
         self.assertIn("SSH: host", text)
         self.assertIn(f"Remote cwd: {tmp}", text)
         self.assertIn("Remote env keys: TARGET", text)

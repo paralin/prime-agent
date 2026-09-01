@@ -133,7 +133,7 @@ function daemonSupportsActStream(client: DaemonTransportClient): boolean {
 	const hello = client.hello;
 	return (
 		hello !== undefined &&
-		hello.protocol.version >= compatibility.minProtocol &&
+		(hello.protocol?.version ?? 0) >= compatibility.minProtocol &&
 		(hello.schemaRevision ?? 0) >= compatibility.minSchemaRevision &&
 		client.supportsServerCapability(compatibility.capability)
 	);

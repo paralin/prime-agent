@@ -875,7 +875,14 @@ export class DaemonSupervisor {
 			hasOwnerClient: worker.descriptor.ownerClientId !== undefined,
 			isPreparingUpdateRestart:
 				this.updateRestartPhase !== undefined || worker.updateRestartPrepareClient !== undefined,
-			sessions: [...worker.summaries.values()].map((summary) => {
+			sessions: (this.workerRosterEntries(worker)
+				.filter((entry) => !entry.queuedChild)
+				.map(sessionSummaryFromRosterEntry).length > 0
+				? this.workerRosterEntries(worker)
+						.filter((entry) => !entry.queuedChild)
+						.map(sessionSummaryFromRosterEntry)
+				: [...(worker.summaries?.values() ?? [])]
+			).map((summary) => {
 				const activeSessionId = summary.activeSessionId ?? summary.id;
 				return {
 					isSessionActive: isSessionSummaryBusy(summary),

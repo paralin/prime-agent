@@ -421,7 +421,11 @@ pwd
         with tempfile.TemporaryDirectory() as tmp:
             journal = os.path.join(tmp, "journal.jsonl")
             with mock.patch.dict(
-                os.environ, {"PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL": journal}
+                os.environ,
+                {
+                    "PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL": journal,
+                    "PRIME_AGENT_KERNEL_OWNER_PID": str(os.getpid()),
+                },
             ):
                 result = await bash_module._argv_handle(
                     [sys.executable, "-c", "print('journaled')"], None

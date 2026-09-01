@@ -7907,13 +7907,28 @@ export class AgentSession {
 	}
 
 	async compact(customInstructions?: string, options: { skipAbort?: boolean } = {}): Promise<CompactionResult> {
-		if (options.skipAbort && this.isStreaming) {
+		const queuesBehindForegroundAct = this._rootForeground.blocksCurrentContext && this._rootForeground.actActive;
+		if (options.skipAbort && this.isStreaming && !queuesBehindForegroundAct) {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
 		const continueAfterSessionInput = this._postCompactionContinuationSettlement?.continueAfterSessionInput ?? false;
+		if (!options.skipAbort && !queuesBehindForegroundAct) await this.abort();
+		return this._rootForeground.run("compaction", () =>
+			this._compactWithLease(customInstructions, hadPostCompactionContinue, continueAfterSessionInput),
+		);
+	}
+
+	/** Runs the compaction core under the root foreground lease so queued prompts, compaction, and cells execute in foreground order. */
+	private async _compactWithLease(
+		customInstructions: string | undefined,
+		hadPostCompactionContinue: boolean,
+		continueAfterSessionInput: boolean,
+	): Promise<CompactionResult> {
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
+			throw new Error("Cannot compact a disposing or disposed session.");
+		}
 		this._disconnectFromAgent();
-		if (!options.skipAbort) await this.abort();
 		let didCompact = false;
 		this._compactionAbortController = new AbortController();
 		let resolveCompactionOperation: () => void = () => {};
@@ -8505,7 +8520,9 @@ export class AgentSession {
 					waitForSessionInput = true;
 				} else {
 					this._postCompactionContinuationScheduled = false;
-					continuation = this.agent.continue();
+					// The continuation is foreground work: it queues behind any
+					// active Act and runs once the lease admits it.
+					continuation = this._rootForeground.run("root-turn", () => this.agent.continue());
 				}
 			} finally {
 				commitFence.release();

@@ -15,7 +15,7 @@ import {
 	type OAuthProviderId,
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
@@ -173,6 +173,16 @@ export interface AuthStorageBackend {
 export class FileAuthStorageBackend implements AuthStorageBackend {
 	constructor(private authPath: string = join(getAgentDir(), "auth.json")) {}
 
+	/** Cheap change probe so consumers can skip a locked reload when the file is untouched. */
+	statFile(): { mtimeMs: number; size: number } | undefined {
+		try {
+			const stats = statSync(this.authPath);
+			return { mtimeMs: stats.mtimeMs, size: stats.size };
+		} catch {
+			return undefined;
+		}
+	}
+
 	private ensureParentDir(): void {
 		const dir = dirname(this.authPath);
 		if (!existsSync(dir)) {
@@ -317,6 +327,7 @@ export class AuthStorage {
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
+	private lastSync: { mtimeMs: number; size: number } | undefined;
 
 	private constructor(
 		private storage: AuthStorageBackend,
@@ -753,10 +764,33 @@ export class AuthStorage {
 			});
 			this.data = this.parseStorageData(content);
 			this.loadError = null;
+			this.lastSync = this.storage instanceof FileAuthStorageBackend ? this.storage.statFile() : undefined;
 		} catch (error) {
 			this.loadError = error as Error;
 			this.recordError(error);
 		}
+	}
+
+	/**
+	 * Reload credentials only when the storage file changed on disk.
+	 *
+	 * Credentials are written by other processes (an interactive /login while
+	 * this session keeps running), so the request path must observe them; the
+	 * stat probe keeps the per-request cost to one stat call.
+	 */
+	reloadIfChanged(): void {
+		if (!(this.storage instanceof FileAuthStorageBackend)) {
+			return;
+		}
+		const current = this.storage.statFile();
+		if (!current) {
+			return;
+		}
+		const last = this.lastSync;
+		if (last && last.mtimeMs === current.mtimeMs && last.size === current.size) {
+			return;
+		}
+		this.reload();
 	}
 
 	private persistProviderChange(provider: string, credential: AuthCredential | undefined): void {
@@ -850,6 +884,7 @@ export class AuthStorage {
 	 * Return auth status without exposing credential values or refreshing tokens.
 	 */
 	getAuthStatus(provider: string): AuthStatus {
+		this.reloadIfChanged();
 		return this.getAuthStatusFromCandidates(provider);
 	}
 
@@ -957,6 +992,9 @@ export class AuthStorage {
 		providerId: string,
 		options?: { includeFallback?: boolean },
 	): Promise<AuthApiKeyResult> {
+		// Credentials may have been rewritten by another process (e.g. /login
+		// in the UI process) since this instance last loaded them.
+		this.reloadIfChanged();
 		// Runtime overrides take precedence over stored credentials and environment keys.
 		const runtimeCandidate = this.getRuntimeAuthCandidate(providerId);
 		const runtimeKey = this.runtimeOverrides.get(providerId);

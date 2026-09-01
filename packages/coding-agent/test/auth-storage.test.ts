@@ -310,6 +310,39 @@ describe("AuthStorage", () => {
 			await expect(authStorage.getApiKey("anthropic")).resolves.toBeUndefined();
 		});
 
+		test("credential rewritten by another process revives a stale-marked provider without restart", async () => {
+			writeAuthJson({
+				"openai-codex": { type: "api_key", key: "old-access-token" },
+			});
+			authStorage = AuthStorage.create(authJsonPath);
+			await expect(authStorage.getApiKey("openai-codex")).resolves.toBe("old-access-token");
+
+			// A failed request marks the current source stale, as the session does.
+			expect(authStorage.markAuthStale("openai-codex")).toBe(true);
+			await expect(authStorage.getApiKey("openai-codex")).resolves.toBeUndefined();
+
+			// /login in the UI process rewrites auth.json with fresh credentials.
+			writeAuthJson({
+				"openai-codex": { type: "api_key", key: "new-access-token" },
+			});
+
+			// The still-running session must pick the new credential up; the
+			// stale marker belongs to the old value and must not apply.
+			await expect(authStorage.getApiKey("openai-codex")).resolves.toBe("new-access-token");
+			expect(authStorage.getAuthStatus("openai-codex")).toEqual({ configured: true, source: "stored" });
+		});
+
+		test("unchanged auth.json does not trigger a reload on every request", async () => {
+			writeAuthJson({
+				anthropic: { type: "api_key", key: "sk-ant-literal-key" },
+			});
+			authStorage = AuthStorage.create(authJsonPath);
+			const reloadSpy = vi.spyOn(authStorage, "reload");
+			await authStorage.getApiKey("anthropic");
+			await authStorage.getApiKey("anthropic");
+			expect(reloadSpy).toHaveBeenCalledTimes(0);
+		});
+
 		test("changed command-backed stored key no longer matches stale auth marker", async () => {
 			const tokenFile = join(tempDir, "command-token");
 			writeFileSync(tokenFile, "stale-key");

@@ -173,8 +173,10 @@ describe("Merge Gateway provider", () => {
 		expect(payload).not.toHaveProperty("store");
 		expect(payload).not.toHaveProperty("prompt_cache_key");
 		expect(payload).not.toHaveProperty("prompt_cache_retention");
-		expect(payload).not.toHaveProperty("reasoning");
-		expect(payload).not.toHaveProperty("include");
+		// Merge forwards a Responses reasoning field for thinking models; the
+		// gateway strips unsupported shape itself, so we send it.
+		expect(payload).toHaveProperty("reasoning", { effort: "high", summary: "auto" });
+		expect(payload).toHaveProperty("include", ["reasoning.encrypted_content"]);
 		expect(payload).toHaveProperty("tools.0.name", "read");
 		expect(payload.input).toEqual([
 			{ type: "message", role: "system", content: "Use tools when available." },

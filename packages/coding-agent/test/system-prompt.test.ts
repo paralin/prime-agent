@@ -297,7 +297,9 @@ describe("buildRlmPrompt", () => {
 
 		expect(prompt).toContain('await bash("command")');
 		expect(prompt).toContain('pass `ssh="host"`');
-		expect(prompt).toContain("The kernel preloads `asyncio`, `bash`, `rg`, `rsync`, callable `rlm`, and `mcp`");
+		expect(prompt).toContain(
+			"The kernel preloads `asyncio`, `bash`, `rg`, `rsync`, `ssh_forward`, callable `rlm`, and `mcp`",
+		);
 		expect(prompt).toContain("rg(pattern, *paths, options=(), timeout=None)");
 		expect(prompt).toContain('rsync(*paths, options=("-a",), timeout=None)');
 		expect(prompt).toContain("await mcp.list_tools(server)");

@@ -41,7 +41,6 @@ class ExternalEventSkillTest(unittest.IsolatedAsyncioTestCase):
                 "name": "watch",
                 "event_id": "event-1",
                 "text": "done",
-                "delivery_policy": "followUp",
             },
         )
 

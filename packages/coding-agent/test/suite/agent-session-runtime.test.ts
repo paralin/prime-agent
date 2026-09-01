@@ -375,18 +375,29 @@ describe("AgentSessionRuntime characterization", () => {
 		expect((runtime as unknown as RuntimeSubagentMapAccess).subagentRuntimes.has("cancelled-child")).toBe(false);
 	});
 
-	it("releases a failed child run from the inline runtime host", async () => {
+	it("retains a failed child run until the parent explicitly deletes it", async () => {
 		const { runtime } = await createRuntimeForTest(() => {});
 		const deleteRlmSubagentRuntime = vi.spyOn(runtime, "deleteRlmSubagentRuntime");
+		let childRuntime: AgentSessionRuntime | undefined;
 		vi.spyOn(runtime, "createRlmSubagentRuntime").mockImplementationOnce(async (options) => {
-			const childRuntime = await AgentSessionRuntime.prototype.createRlmSubagentRuntime.call(runtime, options);
-			vi.spyOn(childRuntime.session, "promptAndWait").mockRejectedValue(new Error("child run failed"));
-			return childRuntime;
+			const created = (await AgentSessionRuntime.prototype.createRlmSubagentRuntime.call(
+				runtime,
+				options,
+			)) as AgentSessionRuntime;
+			childRuntime = created;
+			vi.spyOn(created.session, "promptAndWait").mockRejectedValue(new Error("child run failed"));
+			return created;
 		});
 
 		await runtime.session.runRlmChild("fail after startup");
 
-		await vi.waitFor(() => expect(deleteRlmSubagentRuntime).toHaveBeenCalledOnce());
+		// A failed model turn is not a child-session lifetime boundary: the
+		// published session and its descendants stay until explicit deletion.
+		await vi.waitFor(() => expect(runtime.listSubagentRuntimes()).toHaveLength(1));
+		expect(deleteRlmSubagentRuntime).not.toHaveBeenCalled();
+		const [childId] = (runtime as unknown as RuntimeSubagentMapAccess).subagentRuntimes.keys();
+		await runtime.deleteRlmSubagentRuntime(childId!, childRuntime!.session);
+		expect(deleteRlmSubagentRuntime).toHaveBeenCalledOnce();
 		expect(runtime.listSubagentRuntimes()).toEqual([]);
 	});
 

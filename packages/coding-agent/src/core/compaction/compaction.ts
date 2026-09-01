@@ -115,6 +115,8 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	/** Absolute context-token threshold that overrides the window-reserve heuristic when set. */
+	triggerContextTokens?: number;
 	native: boolean;
 	strategy?: "default" | "native-or-scratch";
 }
@@ -218,6 +220,9 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
  */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
+	if (typeof settings.triggerContextTokens === "number" && settings.triggerContextTokens > 0) {
+		return contextTokens > settings.triggerContextTokens;
+	}
 	if (contextWindow <= 0) return false;
 	return contextTokens > contextWindow - settings.reserveTokens;
 }

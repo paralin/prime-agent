@@ -2500,7 +2500,11 @@ export class InteractiveMode {
 	}
 
 	private getScopedHeartbeats(): AgentConnectionHeartbeat[] {
-		return scopeHeartbeatsToSession(this.heartbeatCatalog, this.connectionState, this.subagentSnapshots.values());
+		return scopeHeartbeatsToSession(
+			this.heartbeatCatalog ?? [],
+			this.connectionState,
+			this.subagentSnapshots?.values() ?? [],
+		);
 	}
 
 	private applyWatchCatalog(watches: ExternalEventWatch[]): void {

@@ -444,7 +444,11 @@ pwd
             marker = os.path.join(tmp, "ran")
             bad_journal = os.path.join(tmp, "missing", "journal.jsonl")
             with mock.patch.dict(
-                os.environ, {"PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL": bad_journal}
+                os.environ,
+                {
+                    "PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL": bad_journal,
+                    "PRIME_AGENT_KERNEL_OWNER_PID": str(os.getpid()),
+                },
             ):
                 with self.assertRaisesRegex(RuntimeError, "orphan-journal enrollment failed"):
                     bash_module._argv_handle(

@@ -875,19 +875,16 @@ export class DaemonSupervisor {
 			hasOwnerClient: worker.descriptor.ownerClientId !== undefined,
 			isPreparingUpdateRestart:
 				this.updateRestartPhase !== undefined || worker.updateRestartPrepareClient !== undefined,
-			sessions: this.workerRosterEntries(worker)
-				.filter((entry) => !entry.queuedChild)
-				.map(sessionSummaryFromRosterEntry)
-				.map((summary) => {
-					const activeSessionId = summary.activeSessionId ?? summary.id;
-					return {
-						isSessionActive: isSessionSummaryBusy(summary),
-						attachedClients: this.attachedClientCount(summary, activeSessionId),
-						hasRegisteredHeartbeat: summary.hasRegisteredHeartbeat === true,
-						hasRegisteredCronJob: summary.hasRegisteredCronJob === true,
-						lastActivityAt: Date.parse(summary.lastActivityAt ?? ""),
-					};
-				}),
+			sessions: [...worker.summaries.values()].map((summary) => {
+				const activeSessionId = summary.activeSessionId ?? summary.id;
+				return {
+					isSessionActive: isSessionSummaryBusy(summary),
+					attachedClients: this.attachedClientCount(summary, activeSessionId),
+					hasRegisteredHeartbeat: summary.hasRegisteredHeartbeat === true,
+					hasRegisteredCronJob: summary.hasRegisteredCronJob === true,
+					lastActivityAt: Date.parse(summary.lastActivityAt ?? ""),
+				};
+			}),
 		};
 	}
 
@@ -1008,7 +1005,7 @@ export class DaemonSupervisor {
 		isStillEligible: () => boolean,
 		describeEvicted: () => string,
 	): Promise<void> {
-		await this.refreshWorkerSummaries(worker, false, true);
+		await this.refreshWorkerSummaries(worker);
 		if (!isStillEligible()) return;
 		await this.stopWorker(worker, true);
 		this.log(describeEvicted());
@@ -1027,8 +1024,10 @@ export class DaemonSupervisor {
 			return;
 		}
 		try {
-			await this.refreshWorkerSummaries(worker, false, true);
-		} catch {
+			await this.refreshWorkerSummaries(worker);
+			console.log("DBG detach refresh done");
+		} catch (error) {
+			console.log("DBG detach refresh failed", String(error));
 			return;
 		}
 		if (!this.isEmptyDetachEvictionCandidate(worker)) return;
@@ -1056,9 +1055,7 @@ export class DaemonSupervisor {
 		) {
 			return false;
 		}
-		const summaries = this.workerRosterEntries(worker)
-			.filter((entry) => !entry.queuedChild)
-			.map(sessionSummaryFromRosterEntry);
+		const summaries = [...worker.summaries.values()];
 		const hasAttachedClient = summaries.some((summary) => {
 			const summaryActiveSessionId = summary.activeSessionId ?? summary.id;
 			return [...this.clients].some((client) => client.attachedActiveSessionIds.has(summaryActiveSessionId));
@@ -1216,29 +1213,29 @@ export class DaemonSupervisor {
 		this.sessionInputPauseEpochs.set(client, 0);
 		this.detachingInputPauseSessions.set(client, new Set());
 		this.clients.add(client);
-		void this.ready.then(
-			() => {
-				if (!client.socket.destroyed && this.clients.has(client)) {
-					this.write(client, {
-						type: "daemon_hello",
-						socketPath: this.socketPath,
-						protocol: DAEMON_PROTOCOL_INFO,
-						schemaId: DAEMON_SCHEMA_ID,
-						schemaRevision: DAEMON_SCHEMA_REVISION,
-						appVersion: VERSION,
-						runtime: getDaemonRuntimeIdentity(),
-						supervisorGeneration: this.generation,
-						supervisorOwnerToken: this.ownership?.record.token,
-						supervisorPid: process.pid,
-						supervisorProcessStartId: this.ownership?.record.processStartId,
-						supervisorSocketPath: this.ownership?.record.socketPath,
-						clientId: client.id,
-						serverCapabilities: SUPERVISOR_SERVER_CAPABILITIES,
-					});
-				}
-			},
-			() => client.socket.destroy(),
-		);
+		// Greet immediately: clients classify a connected daemon as stale when
+		// the hello misses their short deadline, and startup work (worker
+		// adoption, peer sync) can hold `ready` far past it. Commands still
+		// await `ready`; only the greeting is early.
+		this.write(client, {
+			type: "daemon_hello",
+			socketPath: this.socketPath,
+			protocol: DAEMON_PROTOCOL_INFO,
+			schemaId: DAEMON_SCHEMA_ID,
+			schemaRevision: DAEMON_SCHEMA_REVISION,
+			appVersion: VERSION,
+			runtime: getDaemonRuntimeIdentity(),
+			supervisorGeneration: this.generation,
+			supervisorOwnerToken: this.ownership?.record.token,
+			supervisorPid: process.pid,
+			supervisorProcessStartId: this.ownership?.record.processStartId,
+			supervisorSocketPath: this.ownership?.record.socketPath,
+			clientId: client.id,
+			serverCapabilities: SUPERVISOR_SERVER_CAPABILITIES,
+		});
+		// Admitted connections have nothing to talk to once a failed startup
+		// releases the socket lease, so destroy them with it.
+		void this.ready.catch(() => client.socket.destroy());
 		client.detachInput = attachJsonlLineReader(socket, (line) => void this.handleLine(client, line));
 		let cleaned = false;
 		const cleanup = () => {
@@ -3797,11 +3794,57 @@ export class DaemonSupervisor {
 		);
 	}
 
+	/**
+	 * Coalesce concurrent summary refreshes: one request per worker, and a
+	 * trailing refresh when a caller arrives while a refresh is in flight.
+	 */
 	private async refreshWorkerSummaries(
 		worker: ResidentWorker,
 		recovery = false,
-		fillGaps = recovery,
-		retried = false,
+		includePassive = false,
+	): Promise<void> {
+		if (includePassive) {
+			if (worker.fullSummaryRefresh) return worker.fullSummaryRefresh;
+			const refresh = (async () => {
+				if (worker.summaryRefresh) await worker.summaryRefresh;
+				await this.refreshWorkerSummariesOnce(worker, recovery, true);
+			})();
+			worker.fullSummaryRefresh = refresh;
+			try {
+				await refresh;
+			} finally {
+				if (worker.fullSummaryRefresh === refresh) worker.fullSummaryRefresh = undefined;
+			}
+			return;
+		}
+		if (worker.fullSummaryRefresh) return worker.fullSummaryRefresh;
+		if (worker.summaryRefresh) {
+			worker.summaryRefreshPending = true;
+			worker.summaryRefreshRecovery ||= recovery;
+			return worker.summaryRefresh;
+		}
+		const refresh = (async () => {
+			let requireRecovery = recovery;
+			do {
+				worker.summaryRefreshPending = false;
+				requireRecovery ||= worker.summaryRefreshRecovery === true;
+				worker.summaryRefreshRecovery = false;
+				await this.refreshWorkerSummariesOnce(worker, requireRecovery, false);
+				requireRecovery = false;
+			} while (worker.summaryRefreshPending);
+		})();
+		worker.summaryRefresh = refresh;
+		try {
+			await refresh;
+		} finally {
+			if (worker.summaryRefresh === refresh) worker.summaryRefresh = undefined;
+		}
+	}
+
+	private async refreshWorkerSummariesOnce(
+		worker: ResidentWorker,
+		recovery: boolean,
+		includePassive: boolean,
 	): Promise<void> {
 		if (this.isWorkerStopping(worker)) {
 			throw new Error("Session worker is stopping");
@@ -3809,22 +3852,22 @@ export class DaemonSupervisor {
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
-		const pullSource = worker.client;
-		const epochAtStart = worker.rosterEpoch ?? 0;
-		const response = await pullSource.request({ type: "list" }, 5000);
-		// A frame received mid-pull can remove rows this stale pull would resurrect; re-pull once, then skip the fill.
-		if (fillGaps && (worker.rosterEpoch ?? 0) !== epochAtStart && !retried) {
-			return this.refreshWorkerSummaries(worker, recovery, fillGaps, true);
-		}
+		const useActiveOnly =
+			!includePassive &&
+			(worker.schemaRevision ?? 0) >=
+				DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_list_active_sessions.minSchemaRevision;
+		const response = useActiveOnly
+			? await worker.client.requestWorker({ type: "worker_list_active_sessions" }, 5000)
+			: await worker.client.request({ type: "list" }, 5000);
 		const summaries = sessionSummariesFromResponse(response);
-		worker.summaries = this.mergeWorkerSummaries(worker.summaries, summaries, true);
-		if (recovery && !worker.summaries.has(worker.descriptor.rootActiveSessionId)) {
+		const next = this.mergeWorkerSummaries(worker.summaries, summaries, useActiveOnly);
+		if (recovery && !next.has(worker.descriptor.rootActiveSessionId)) {
+			// Leave the cached summaries untouched so a retry can still succeed.
 			throw new Error(`Session worker omitted its root session during recovery`);
 		}
-		if (fillGaps) {
-			await this.chainWorkerRosterApply(worker, pullSource, () => {
-				if ((worker.rosterEpoch ?? 0) === epochAtStart) this.syncRosterFromWorkerSummaries(worker);
-			});
+		worker.summaries = next;
+		if (worker.rosterEpoch !== undefined) {
+			await this.chainWorkerRosterApply(worker, worker.client!, () => this.syncRosterFromWorkerSummaries(worker));
 		}
 		for (const summary of summaries) {
 			const activeSessionId = summary.activeSessionId ?? summary.id;
@@ -3839,8 +3882,7 @@ export class DaemonSupervisor {
 			if (recovery) {
 				await this.assertRecoveryAllowed();
 			}
-			await this.chainWorkerRosterApply(worker, pullSource, () => {
-				if ((worker.rosterEpoch ?? 0) !== epochAtStart) return;
+			await this.chainWorkerRosterApply(worker, worker.client!, () => {
 				worker.descriptor.rootSessionId = root.sessionId;
 				worker.descriptor.sessionFile = root.sessionFile;
 				worker.descriptor.createCommand = durableDaemonCreateCommand({
@@ -4415,7 +4457,7 @@ export class DaemonSupervisor {
 	}
 
 	private syncAgentPeers(): Promise<void> {
-		const sync = this.agentPeerSyncQueue
+		const sync = (this.agentPeerSyncQueue ?? Promise.resolve())
 			.catch(() => undefined)
 			.then(async () => {
 				const readyWorkers = [...this.workers.values()].filter(
@@ -4645,6 +4687,9 @@ export class DaemonSupervisor {
 	private matchWorkers(selector: string, includeWorker?: (worker: ResidentWorker) => boolean): WorkerMatch[] {
 		const exact: WorkerMatch[] = [];
 		const suffix: WorkerMatch[] = [];
+		// The roster is authoritative for published rows, but a resident worker's
+		// own summary catalog must stay matchable for direct dispatch before a
+		// roster push lands.
 		for (const entry of this.roster().values()) {
 			if (entry.queuedChild) continue;
 			const worker = entry.workerId !== undefined ? this.workers.get(entry.workerId) : undefined;
@@ -4661,6 +4706,27 @@ export class DaemonSupervisor {
 				matchesSessionIdSuffix(summary.sessionId, selector)
 			) {
 				suffix.push(match);
+			}
+		}
+		const matched = new Set(
+			[...exact, ...suffix].map((candidate) => `${candidate.worker.descriptor.workerId}:${candidate.summary.id}`),
+		);
+		for (const worker of this.workers.values()) {
+			if (includeWorker && !includeWorker(worker)) {
+				continue;
+			}
+			for (const summary of worker.summaries.values()) {
+				const activeSessionId = summary.activeSessionId ?? summary.id;
+				if (matched.has(`${worker.descriptor.workerId}:${summary.id}`)) continue;
+				const match = { worker, summary };
+				if (activeSessionId === selector || summary.sessionId === selector || summary.sessionName === selector) {
+					exact.push(match);
+				} else if (
+					matchesSessionIdSuffix(activeSessionId, selector) ||
+					matchesSessionIdSuffix(summary.sessionId, selector)
+				) {
+					suffix.push(match);
+				}
 			}
 		}
 		return exact.length > 0 ? exact : suffix;

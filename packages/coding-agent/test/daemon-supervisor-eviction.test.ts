@@ -769,9 +769,15 @@ describe("daemon supervisor empty-session eviction on detach", () => {
 		const sweep = supervisor.runIdleEvictionSweep(now);
 		await vi.waitFor(() => expect(worker.client!.request).toHaveBeenCalledTimes(1));
 		await supervisor.handleCommand(client, { id: "detach", type: "detach", activeSessionId: "gap-root" });
-		await vi.waitFor(() => expect(worker.client!.request).toHaveBeenCalledTimes(3));
-		releaseSweepList();
 		await settle();
+
+		// The detach-path refresh coalesces behind the pending sweep refresh
+		// instead of racing it with a second in-flight list.
+		expect(worker.client!.request).toHaveBeenCalledTimes(1);
+		releaseSweepList();
+		// The sweep's trailing candidate refresh and the detach hook's decision
+		// refresh run next; the hook's list is gated.
+		await vi.waitFor(() => expect(worker.client!.request).toHaveBeenCalledTimes(3));
 
 		// The hook is still mid-decision, so its fence must still be in the slot.
 		expect(supervisor.idleEvictionFence).toBeDefined();

@@ -291,6 +291,22 @@ describe("shouldCompact", () => {
 
 		expect(shouldCompact(95000, 0, settings)).toBe(false);
 	});
+
+	it("should honor an absolute trigger threshold over the window reserve", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			native: true,
+			reserveTokens: 16384,
+			keepRecentTokens: 20000,
+			triggerContextTokens: 256000,
+		};
+
+		// A 1M-token window with the default reserve would not compact yet.
+		expect(shouldCompact(256001, 1_000_000, settings)).toBe(true);
+		expect(shouldCompact(256000, 1_000_000, settings)).toBe(false);
+		// The absolute threshold applies even when the window is unknown.
+		expect(shouldCompact(256001, 0, settings)).toBe(true);
+	});
 });
 
 describe("findCutPoint", () => {

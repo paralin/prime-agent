@@ -21,6 +21,12 @@ export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
+	/**
+	 * Absolute context-token count that starts auto compaction, overriding the
+	 * contextWindow - reserveTokens heuristic. Useful for large-context models
+	 * (for example 256000 on a 1M-token window).
+	 */
+	triggerContextTokens?: number;
 	agentCallable?: boolean; // default: true - expose the compact skill so the model can request compaction
 	native?: boolean; // default: true - prefer provider-native compaction when the active API supports it
 	/**
@@ -1095,6 +1101,11 @@ export class SettingsManager {
 		return this.settings.compaction?.keepRecentTokens ?? 20000;
 	}
 
+	getCompactionTriggerContextTokens(): number | undefined {
+		const value = this.settings.compaction?.triggerContextTokens;
+		return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+	}
+
 	getCompactionAgentCallable(): boolean {
 		return this.settings.compaction?.agentCallable ?? true;
 	}
@@ -1118,6 +1129,7 @@ export class SettingsManager {
 		enabled: boolean;
 		reserveTokens: number;
 		keepRecentTokens: number;
+		triggerContextTokens: number | undefined;
 		native: boolean;
 		strategy: "default" | "native-or-scratch";
 	} {
@@ -1125,6 +1137,7 @@ export class SettingsManager {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
+			triggerContextTokens: this.getCompactionTriggerContextTokens(),
 			native: this.getCompactionNative(),
 			strategy: this.getCompactionStrategy(),
 		};

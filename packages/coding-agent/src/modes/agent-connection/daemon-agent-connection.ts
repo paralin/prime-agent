@@ -128,7 +128,7 @@ function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function daemonSupportsActStream(client: DaemonClient): boolean {
+function daemonSupportsActStream(client: DaemonTransportClient): boolean {
 	const compatibility = DAEMON_SESSION_EVENT_COMPATIBILITY.act_event;
 	const hello = client.hello;
 	return (
@@ -140,7 +140,7 @@ function daemonSupportsActStream(client: DaemonClient): boolean {
 }
 
 function daemonAttachCapabilities(
-	client: DaemonClient,
+	client: DaemonTransportClient,
 	supportsExtensionUi: boolean,
 	ownedSession: boolean,
 ): DaemonClientCapability[] {
@@ -411,14 +411,11 @@ export class DaemonAgentConnection implements AgentConnection {
 				activeSessionId: this.activeSessionId,
 				supportsExtensionUi,
 				clientId: this.clientId,
-				capabilities: [
-					"attach_snapshot",
-					"event_sequence",
-					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
-					"slim_attach",
-					"chunked_snapshot",
-					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
-				],
+				capabilities: daemonAttachCapabilities(
+					this.client,
+					supportsExtensionUi,
+					this.options.ownedSession === true,
+				),
 				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
 				launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
 				...(this.options.ownedSession &&
@@ -541,6 +538,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.latestSnapshot = {
 			state,
 			messages: messagesData.messages,
+			sessionContext: sessionContextData.context,
 			...(children ? { children } : {}),
 			...(streamingMessage ? { streamingMessage } : {}),
 		};

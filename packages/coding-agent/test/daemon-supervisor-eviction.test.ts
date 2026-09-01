@@ -5,9 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DAEMON_SCHEMA_REVISION, success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor, idleEvictionSweepIntervalMs } from "../src/modes/daemon/daemon-supervisor.js";
-import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
 import { DAEMON_WORKER_COMMAND_COMPATIBILITY } from "../src/modes/daemon/daemon-worker-protocol.js";
 import type { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
+import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
 
 interface WorkerFixture {
 	descriptor: {

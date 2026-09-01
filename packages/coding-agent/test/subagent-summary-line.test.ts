@@ -6,7 +6,6 @@ import type { AgentConnectionRlmChildAgentSnapshot } from "../src/modes/agent-co
 import { isDirectAgentChild } from "../src/modes/agents-view/agents-view-state.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import {
-	countDirectSubagentStatuses,
 	countRosterSubagentStatuses,
 	countSubagentTreeStatuses,
 	SubagentSummaryLine,

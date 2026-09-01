@@ -68,12 +68,12 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 20 lets cancellation target a prompt the session owns but has not started.
 // Revision 21 adds capability-gated, session-scoped ACP MCP server replacement.
 // Revision 22 scopes ACP MCP replacement and cleanup to a connection owner.
-// Revision 23 lets workers query the supervisor agent roster on demand.
+// Revision 23 adds active-only worker summaries and supervisor agent-roster queries.
 // Revision 24 adds the capability-gated agent-roster subscription and push.
-// Revision 25 adds capability-gated direct worker peer transport discovery.
-// Revision 26 adds stable mailbox identity fields to cross-worker agent-message delivery.
+// Revision 25 adds stable mailbox identity fields to cross-worker agent-message delivery.
+// Revision 26 adds capability-gated direct worker peer transport discovery.
 export const DAEMON_SCHEMA_REVISION = 26;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-4f0e763b8226c";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-c23b4ec8493c";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -122,8 +122,8 @@ export type DaemonServerCapability =
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
-	| "direct_peer_transport"
-	| "session_model_selection";
+	| "session_model_selection"
+	| "direct_peer_transport";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -171,7 +171,6 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"rlm_quiescence_barrier",
 	"session_input_pause",
 	"acp_mcp_servers",
-	"direct_peer_transport",
 ];
 
 /** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
@@ -959,6 +958,9 @@ export const DAEMON_COMMAND_PLANE = {
 	mutate_queued_message: "session",
 	clear_queue: "session",
 	abort_and_clear_queue: "session",
+	agent_message_inbox: "session",
+	agent_message_wait: "session",
+	list_watches: "session",
 	acquire_session_input_pause: "session",
 	release_session_input_pause: "session",
 	cron_list: "control",

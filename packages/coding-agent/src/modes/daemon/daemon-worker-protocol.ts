@@ -25,9 +25,26 @@ export const DAEMON_WORKER_COMMAND_COMPATIBILITY = {
 	worker_list_active_sessions: { minSchemaRevision: 23 },
 	// Schema revision at which worker_deliver_message carries stable mailbox identity
 	// fields; older workers drop unknown fields, so senders must gate on this revision.
-	worker_deliver_message: { minSchemaRevision: 26 },
+	worker_deliver_message: { minSchemaRevision: 25 },
 } as const;
+// Worker->supervisor roster frames live outside the client-facing DaemonOutbound schema.
+export type DaemonWorkerRosterOutbound =
+	| {
+			type: "roster_delta";
+			entries: WorkerRosterEntry[];
+			removedAgentIds?: string[];
+			snapshot?: true;
+	  }
+	| { type: "roster_heartbeat" };
 
+/** Advertised by new workers in the worker_auth response; absent on legacy workers. */
+export const DAEMON_WORKER_ROSTER_CAPABILITY = "agent_roster";
+
+/** Advertised in the worker_auth response by workers that accept peer transport grants. */
+export const DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY = "peer_transport";
+
+/** Idle keepalive cadence for worker->supervisor roster frames; the supervisor staleness threshold derives from it. */
+export const ROSTER_HEARTBEAT_INTERVAL_MS = 15_000;
 export type DaemonWorkerFrameHeader =
 	| {
 			kind: "command";
@@ -108,6 +125,9 @@ export type DaemonWorkerCommand =
 			supportsExtensionUi?: boolean;
 	  }
 	| { id?: string; type: "worker_unsubscribe"; activeSessionId: string }
+	| { id?: string; type: "worker_list_active_sessions" }
+	| { id?: string; type: "worker_sync_agent_peers"; peers: AgentSessionMessageAgentSummary[] }
+	| { id?: string; type: "worker_register_peer_transport"; grant: DaemonWorkerPeerGrant }
 	| { id?: string; type: "worker_archive_and_shutdown" }
 	| {
 			id?: string;

@@ -3128,6 +3128,9 @@ export class DaemonSupervisor {
 			try {
 				await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
 				await client.waitForHello(1000);
+				// Record the worker's advertised schema revision so compatibility gates
+				// (e.g. stable mailbox identity on worker_deliver_message) can trust it.
+				worker.schemaRevision = client.hello?.schemaRevision;
 				// Listen before authenticating: the worker flushes its roster snapshot right after auth succeeds.
 				client.onFrame((frame) => this.handleWorkerFrame(worker, frame, client));
 				client.onClose((error) => void this.handleWorkerClose(worker, client, error));

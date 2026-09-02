@@ -178,6 +178,8 @@ export function convertResponsesMessages<TApi extends Api>(
 				for (const block of msg.content) {
 					if (block.type === "text" && block.text) {
 						content.push({ type: "text", text: sanitizeSurrogates(block.text) });
+					} else if (block.type === "thinking" && block.thinking) {
+						content.push({ type: "thinking", thinking: sanitizeSurrogates(block.thinking) });
 					} else if (block.type === "toolCall") {
 						content.push({ type: "tool_use", id: block.id, name: block.name, input: block.arguments });
 					}

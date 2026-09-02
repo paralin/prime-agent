@@ -1419,13 +1419,16 @@ export class ReplKernelManager {
 			this.cleanupResources();
 			return true;
 		}
+		// Interrupt a hung execution and flush the final snapshot before waiting
+		// on grace interrupts: the flush issues the interrupt synchronously, so a
+		// blocked snapshot cannot delay teardown behind an already-gated cell.
+		if (opts.snapshot) {
+			await this.flushSnapshotForDispose();
+		}
 		await Promise.allSettled([...this.pendingGraceInterrupts]);
 		// Captured before any await: teardowns and newer starts bump the counter.
 		const generation = this.startGeneration;
-		if (opts.snapshot) {
-			await this.flushSnapshotForDispose();
-			if (this.startStale(generation)) return false;
-		}
+		if (opts.snapshot && this.startStale(this.startGeneration)) return false;
 		// Protocol shutdown first: the runtime closes MCP servers and kills live bash() process groups a bare hard-kill would leak.
 		const protocolShutdownAvailable = this.state === "running";
 		this.state = "shutdown";

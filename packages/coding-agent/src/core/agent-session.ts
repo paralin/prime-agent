@@ -8520,9 +8520,14 @@ export class AgentSession {
 					waitForSessionInput = true;
 				} else {
 					this._postCompactionContinuationScheduled = false;
-					// The continuation is foreground work: it queues behind any
-					// active Act and runs once the lease admits it.
-					continuation = this._rootForeground.run("root-turn", () => this.agent.continue());
+					// The continuation starts as foreground work: it queues
+					// behind any active Act. The lease releases before the run
+					// itself, so a cancelled stale continue can never block its
+					// replacement.
+					continuation = (async () => {
+						await this._rootForeground.run("root-turn", async () => {});
+						return this.agent.continue();
+					})();
 				}
 			} finally {
 				commitFence.release();

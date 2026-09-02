@@ -307,6 +307,26 @@ describe("shouldCompact", () => {
 		// The absolute threshold applies even when the window is unknown.
 		expect(shouldCompact(256001, 0, settings)).toBe(true);
 	});
+
+	it("should compact at whichever trigger is smaller: the manual threshold or the window reserve", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			native: true,
+			reserveTokens: 16384,
+			keepRecentTokens: 20000,
+			triggerContextTokens: 900_000,
+		};
+
+		// The manual 900k fires before the window reserve (1000000 - 16384).
+		expect(shouldCompact(900_001, 1_000_000, settings)).toBe(true);
+		expect(shouldCompact(900_000, 1_000_000, settings)).toBe(false);
+
+		// A manual threshold above the window reserve never delays compaction:
+		// the reserve boundary still fires.
+		const late: CompactionSettings = { ...settings, triggerContextTokens: 999_000 };
+		expect(shouldCompact(983_617, 1_000_000, late)).toBe(true);
+		expect(shouldCompact(983_616, 1_000_000, late)).toBe(false);
+	});
 });
 
 describe("findCutPoint", () => {

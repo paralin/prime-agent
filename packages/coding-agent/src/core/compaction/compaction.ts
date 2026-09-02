@@ -220,11 +220,17 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
  */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
-	if (typeof settings.triggerContextTokens === "number" && settings.triggerContextTokens > 0) {
-		return contextTokens > settings.triggerContextTokens;
+	const manual =
+		typeof settings.triggerContextTokens === "number" && settings.triggerContextTokens > 0
+			? settings.triggerContextTokens
+			: undefined;
+	const defaultTrigger = contextWindow > 0 ? contextWindow - settings.reserveTokens : undefined;
+	if (manual !== undefined && defaultTrigger !== undefined) {
+		return contextTokens > Math.min(manual, defaultTrigger);
 	}
-	if (contextWindow <= 0) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	if (manual !== undefined) return contextTokens > manual;
+	if (defaultTrigger !== undefined) return contextTokens > defaultTrigger;
+	return false;
 }
 /**
  * Estimate token count for a message using chars/4 heuristic.

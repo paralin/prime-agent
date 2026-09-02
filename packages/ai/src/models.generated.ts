@@ -7029,7 +7029,7 @@ export const MODELS = {
 			baseUrl: "https://api-gateway.merge.dev/v1",
 			compat: {"sendSessionIdHeader":false,"supportsStore":false,"supportsPromptCache":false,"supportsDeveloperRole":false,"requiresStringMessageContent":true,"includeRoutingMetadata":true,"supportsLongCacheRetention":false},
 			reasoning: true,
-			thinkingLevelMap: {"off":"none","minimal":null,"low":"max","medium":"max","high":"max","xhigh":"max","max":"max"},
+			thinkingLevelMap: {"off":"none","minimal":"minimal","low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":"max"},
 			input: ["text", "image"],
 			cost: {
 				input: 0.015,

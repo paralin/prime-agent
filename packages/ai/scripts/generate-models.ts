@@ -932,7 +932,7 @@ function getMergeGatewayModels(): Model<Api>[] {
 				includeRoutingMetadata: true,
 				supportsLongCacheRetention: false,
 			},
-			thinkingLevelMap: { off: "none", minimal: null, low: "max", medium: "max", high: "max", xhigh: "max", max: "max" },
+			thinkingLevelMap: { off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
 			reasoning: true,
 			input: ["text", "image"],
 			cost: { input: 0.015, output: 0.05, cacheRead: 0, cacheWrite: 0 },

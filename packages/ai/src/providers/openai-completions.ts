@@ -255,6 +255,19 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			if (nextParams !== undefined) {
 				params = nextParams as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
 			}
+			if (model.provider === "merge-gateway") {
+				const fields = params as unknown as Record<string, unknown>;
+				const details: Record<string, unknown> = {};
+				// Record only control fields after payload hooks, never prompts, tools, or credentials.
+				for (const key of ["model", "vendor", "reasoning_effort", "max_tokens", "max_completion_tokens"]) {
+					const value = fields[key];
+					if (typeof value === "string" || typeof value === "number") details[key] = value;
+				}
+				const thinking = fields.thinking as Record<string, unknown> | undefined;
+				if (typeof thinking?.type === "string") details.thinking_type = thinking.type;
+				if (typeof thinking?.budget_tokens === "number") details.thinking_budget_tokens = thinking.budget_tokens;
+				appendAssistantMessageDiagnostic(output, { type: "merge_request", timestamp: Date.now(), details });
+			}
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
@@ -400,6 +413,19 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 					output.usage = parseChunkUsage(chunk.usage, model, cacheWriteCost);
 				}
 				appendProviderWarnings(output, (chunk as unknown as Record<string, unknown>).warnings);
+				if (model.provider === "merge-gateway") {
+					const routing = (chunk as unknown as { routing?: { vendor_used?: unknown } }).routing;
+					if (
+						typeof routing?.vendor_used === "string" &&
+						!output.diagnostics?.some((diagnostic) => diagnostic.type === "merge_routing")
+					) {
+						appendAssistantMessageDiagnostic(output, {
+							type: "merge_routing",
+							timestamp: Date.now(),
+							details: { vendor_used: routing.vendor_used },
+						});
+					}
+				}
 
 				const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
 				if (!choice) continue;
@@ -865,7 +891,10 @@ function buildParams(
 ) {
 	const messages = convertMessages(model, context, compat);
 
-	const params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & { session_id?: string } = {
+	const params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & {
+		session_id?: string;
+		include_routing_metadata?: boolean;
+	} = {
 		model: model.id,
 		messages,
 		stream: true,
@@ -877,6 +906,7 @@ function buildParams(
 				: undefined,
 		prompt_cache_retention: cacheRetention === "long" && compat.supportsLongCacheRetention ? "24h" : undefined,
 	};
+	if (model.provider === "merge-gateway") params.include_routing_metadata = true;
 
 	if (compat.supportsUsageInStreaming !== false) {
 		(params as any).stream_options = { include_usage: true };

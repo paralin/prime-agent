@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added sanitized Merge Gateway request-control and serving-vendor diagnostics to session responses.
 - Fixed Merge Gateway replay of legacy native reasoning and reasoning-only responses without turning internal plans into assistant text.
 - Rejected malformed terminal tool arguments and Merge thinking budgets that leave no room for an answer.
 - Fixed Merge Gateway Chat tool loops dropping signed reasoning before follow-up requests.

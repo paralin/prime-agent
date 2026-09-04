@@ -406,6 +406,7 @@ describe("Merge Gateway provider", () => {
 			expect(requests[0]?.clientRequestId).toBeUndefined();
 			expect(requests[0]?.body).toEqual({
 				model: MODEL_ID,
+				include_routing_metadata: true,
 				messages: [
 					{ role: "system", content: "Use tools when available." },
 					{
@@ -516,12 +517,60 @@ describe("Merge Gateway provider", () => {
 
 			expect(result.stopReason).toBe("length");
 			expect(result.diagnostics).toEqual([
+				{ type: "merge_request", timestamp: expect.any(Number), details: { model: MODEL_ID } },
 				{
 					type: "provider_warning",
 					timestamp: expect.any(Number),
 					error: { code: warning.code, message: warning.message },
 					details: { detail: warning.detail },
 				},
+			]);
+		} finally {
+			await closeServer(server);
+		}
+	});
+
+	it("records effective controls after payload hooks and only the serving vendor from routing metadata", async () => {
+		const { server, url, requests } = await startMergeGatewayMock((_request, response) => {
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			response.end(
+				chatSse([
+					{ id: "chat_route", choices: [{ delta: { content: "Done" }, finish_reason: "stop" }] },
+					{
+						id: "chat_route",
+						choices: [],
+						routing: { vendor_used: "particle", private_metadata: "do-not-record" },
+					},
+				]),
+			);
+		});
+		try {
+			const result = await streamSimpleOpenAICompletions(mergeModel(`${url}/v1/ai-sdk`), context, {
+				apiKey: MERGE_GATEWAY_API_KEY,
+				reasoning: "low",
+				thinkingBudgets: { low: 1024 },
+				onPayload: (payload) => ({
+					...(payload as Record<string, unknown>),
+					max_tokens: 4096,
+					vendor: "particle",
+					secret: "do-not-record",
+				}),
+			}).result();
+			expect(requests[0].body.include_routing_metadata).toBe(true);
+			expect(result.diagnostics).toEqual([
+				{
+					type: "merge_request",
+					timestamp: expect.any(Number),
+					details: {
+						model: MODEL_ID,
+						vendor: "particle",
+						reasoning_effort: "low",
+						max_tokens: 4096,
+						thinking_type: "enabled",
+						thinking_budget_tokens: 1024,
+					},
+				},
+				{ type: "merge_routing", timestamp: expect.any(Number), details: { vendor_used: "particle" } },
 			]);
 		} finally {
 			await closeServer(server);

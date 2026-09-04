@@ -160,7 +160,7 @@ import {
 	ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE,
 	ENGLISH_OUTPUT_NUDGE_PREVIEW_LABEL,
 	ENGLISH_OUTPUT_NUDGE_PROMPT,
-	stripChineseOutputBlocks,
+	needsEnglishOutputNudge,
 } from "./english-output-nudge.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
@@ -2610,25 +2610,13 @@ export class AgentSession {
 		});
 	}
 
-	/** _guardEnglishAssistantOutput strips Chinese text blocks from live context. Returns true when the message was dropped and must not be persisted. */
-	private async _guardEnglishAssistantOutput(message: AgentMessage): Promise<boolean> {
-		if (message.role !== "assistant") return false;
-		const stripped = stripChineseOutputBlocks(message);
-		if (!stripped) return false;
-		this._replaceMessageInPlace(message, stripped);
+	private async _guardEnglishAssistantOutput(message: AgentMessage): Promise<void> {
+		if (message.role !== "assistant" || !needsEnglishOutputNudge(message)) return;
 		try {
 			await this._queueEnglishOutputNudge();
 		} catch {
 			// English-output nudge must not interrupt the core agent loop.
 		}
-		if (stripped.content.length === 0) {
-			const messages = this.agent.state.messages;
-			if (messages.at(-1) === message) {
-				this.agent.state.messages = messages.slice(0, -1);
-			}
-			return true;
-		}
-		return false;
 	}
 
 	private async _shouldStopForThresholdCompaction(context: ShouldStopAfterTurnContext): Promise<boolean> {
@@ -4074,17 +4062,13 @@ export class AgentSession {
 
 		this._addLoginGuidanceToAuthError(event);
 
-		let skipPersist = false;
 		if (event.type === "message_end" && event.message.role === "assistant" && !this._scratchCloseoutRunActive) {
-			skipPersist = await this._guardEnglishAssistantOutput(event.message);
+			await this._guardEnglishAssistantOutput(event.message);
 		}
 
 		this._emit(event);
 
 		if (event.type === "message_end") {
-			if (skipPersist) {
-				return;
-			}
 			if (event.message.role === "custom") {
 				this.sessionManager.appendCustomMessageEntry(
 					event.message.customType,

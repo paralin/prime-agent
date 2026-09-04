@@ -542,6 +542,16 @@ async function runLoop(
 			) {
 				const usedBudget = Math.max(message.usage.output, requestConfig.maxTokens ?? 0);
 				const nextBudget = Math.min(usedBudget * 2, config.model.maxTokens);
+				const thinkingBudget =
+					config.reasoning && config.reasoning !== "off" ? config.thinkingBudgets?.[config.reasoning] : undefined;
+				if (thinkingBudget !== undefined && message.usage.output >= thinkingBudget) {
+					message.stopReason = "error";
+					message.errorMessage =
+						"Provider exhausted output on reasoning despite a configured thinking budget; automatic budget growth was stopped. Check the provider's applied reasoning controls before retrying.";
+					await emit({ type: "turn_end", message, toolResults: [] });
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
 				// Grow only the provider's default allowance. An explicit caller cap
 				// remains authoritative, and the incomplete-response limit bounds retries.
 				if (config.maxTokens !== undefined || !(nextBudget > usedBudget)) {

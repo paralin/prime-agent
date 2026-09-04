@@ -4,7 +4,7 @@ import type { CustomMessage } from "./messages.js";
 export const ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE = "english_output_nudge";
 export const ENGLISH_OUTPUT_NUDGE_PREVIEW_LABEL = "English reminder";
 export const ENGLISH_OUTPUT_NUDGE_PROMPT =
-	"Your previous response contained non-English text, which violates the language policy. Rewrite your response entirely in English for all communication, code, and reasoning. Do not mention this notice.";
+	"Continue the user's active task from the latest tool result. Use English for subsequent user-facing explanations. This is a language reminder, not a new task: do not reconstruct the conversation or repeat completed work. No reply to this notice is needed.";
 
 // Han ideographs. Thinking traces are ignored; only assistant text output is checked.
 // Density-based: a couple of stray Han characters (or Han glyphs inside ASCII art)
@@ -17,14 +17,9 @@ export function textHasChinese(text: string): boolean {
 	return han >= 2 && han / chars.length >= 0.05;
 }
 
-/** stripChineseOutputBlocks removes assistant text blocks that contain Chinese, leaving thinking and tool calls. */
-export function stripChineseOutputBlocks(message: AssistantMessage): AssistantMessage | undefined {
-	if (message.role !== "assistant") return undefined;
-	const content = message.content.filter((block) => block.type !== "text" || !textHasChinese(block.text));
-	if (content.length === message.content.length) {
-		return undefined;
-	}
-	return { ...message, content };
+/** needsEnglishOutputNudge checks visible explanations without changing the transcript. */
+export function needsEnglishOutputNudge(message: AssistantMessage): boolean {
+	return message.content.some((block) => block.type === "text" && textHasChinese(block.text));
 }
 
 export function createEnglishOutputNudgeMessage(timestamp = Date.now()): CustomMessage {

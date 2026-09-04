@@ -15,11 +15,29 @@ use pa_tui::client_settings::ClientSettings;
 pub struct CliClientSettings {
     cwd: PathBuf,
     agent_dir: PathBuf,
+    runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy,
 }
 
 impl CliClientSettings {
+    #[cfg(test)]
     pub fn new(cwd: PathBuf, agent_dir: PathBuf) -> Arc<Self> {
-        Arc::new(Self { cwd, agent_dir })
+        Self::with_runtime_policy(
+            cwd,
+            agent_dir,
+            pa_core::session_engine::runtime_policy::RuntimePolicy::default(),
+        )
+    }
+
+    pub fn with_runtime_policy(
+        cwd: PathBuf,
+        agent_dir: PathBuf,
+        runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            cwd,
+            agent_dir,
+            runtime_policy,
+        })
     }
 
     fn manager(&self) -> pa_core::settings::SettingsManager {
@@ -52,6 +70,13 @@ macro_rules! str_setting {
 }
 
 impl ClientSettings for CliClientSettings {
+    fn launch_rlm_max_depth_ceiling(&self) -> Option<u32> {
+        self.runtime_policy.rlm_max_depth_ceiling
+    }
+    fn launch_disable_rlm_act(&self) -> bool {
+        !self.runtime_policy.act_enabled()
+    }
+
     fn theme(&self) -> Option<String> {
         self.manager().get_theme().map(str::to_string)
     }
@@ -242,6 +267,20 @@ mod tests {
         let agent_dir = dir.path().join("agent");
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
         let settings = CliClientSettings::new(dir.path().to_path_buf(), agent_dir.clone());
+
+        let restricted = CliClientSettings::with_runtime_policy(
+            dir.path().to_path_buf(),
+            agent_dir.clone(),
+            pa_core::session_engine::runtime_policy::RuntimePolicy {
+                rlm_max_depth_ceiling: Some(0),
+                disable_rlm_act: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(restricted.launch_rlm_max_depth_ceiling(), Some(0));
+        assert!(restricted.launch_disable_rlm_act());
+        assert_eq!(settings.launch_rlm_max_depth_ceiling(), None);
+        assert!(!settings.launch_disable_rlm_act());
 
         // The TS defaults read first.
         assert!(settings.show_images());

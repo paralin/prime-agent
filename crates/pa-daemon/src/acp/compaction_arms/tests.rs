@@ -85,6 +85,7 @@ async fn acp_test_bed(
             prompt_guidelines: Vec::new(),
             generic_mcp_servers: Vec::new(),
             allow_recursion: None,
+            runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy::default(),
             session_manager: None,
             extra_host_handlers: None,
             conversation_log_path: None,

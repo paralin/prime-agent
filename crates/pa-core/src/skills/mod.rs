@@ -111,8 +111,7 @@ impl Skill {
         self.kind == SkillKind::Python
     }
 
-    /// The kind label the prompt inventory and telemetry share
-    /// (`<type>` in `format_skills_for_prompt`, `skill_kind` in events).
+    /// The kind label used by telemetry (`skill_kind` in events).
     #[must_use]
     pub fn kind_label(&self) -> &'static str {
         if self.is_python() {
@@ -204,56 +203,18 @@ pub(crate) fn validate_description(description: &str) -> Vec<String> {
 pub(crate) use validate_description as validate_skill_description;
 pub(crate) use validate_name as validate_skill_name;
 
-/// Format skills for a system prompt (Agent Skills XML standard).
-/// Skills with disableModelInvocation are excluded.
+/// Point at skills on disk when at least one skill permits model invocation.
 #[must_use]
 pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
-    let visible: Vec<&Skill> = skills
-        .iter()
-        .filter(|skill| !skill.disable_model_invocation)
-        .collect();
-    if visible.is_empty() {
+    if !skills.iter().any(|skill| !skill.disable_model_invocation) {
         return String::new();
     }
-    let mut lines = vec![
-        "\n\nThe following skills provide specialized instructions for specific tasks.".to_string(),
-        "Use ipython to inspect a skill's file when the task matches its description.".to_string(),
-        "Skills with a python_import are prepared in the persistent Python kernel when available and can be called directly by that import name.".to_string(),
-        "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.".to_string(),
-        String::new(),
-        "<available_skills>".to_string(),
-    ];
-    for skill in visible {
-        lines.push("  <skill>".to_string());
-        lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
-        lines.push(format!("    <type>{}</type>", skill.kind_label()));
-        if let Some(python) = &skill.python {
-            lines.push(format!(
-                "    <python_import>{}</python_import>",
-                escape_xml(&python.import_name)
-            ));
-        }
-        lines.push(format!(
-            "    <description>{}</description>",
-            escape_xml(&skill.description)
-        ));
-        lines.push(format!(
-            "    <location>{}</location>",
-            escape_xml(&skill.file_path.display().to_string())
-        ));
-        lines.push("  </skill>".to_string());
-    }
-    lines.push("</available_skills>".to_string());
-    lines.join("\n")
-}
-
-pub(crate) fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    [
+        "", "",
+        "Skills live on disk. Read the one SKILL.md that matches the work. Do not preload the catalog, and do not expect a roster of skill descriptions in this prompt.",
+        "Look under `.agents/skills/`, `~/.agents/skills/`, the session skills directory, and any path AGENTS.md names. When a skill file references a relative path, resolve it against that skill's directory (the parent of SKILL.md).",
+        "When the user invokes a skill inline, read its SKILL.md and follow its applicable requirements unless current facts or a higher-priority instruction conflict. Adapt examples and optional tactics to the immediate request.",
+    ].join("\n")
 }
 
 /// Expand skill commands (`/skill:<name> [args]`) into the `<skill ...>`
@@ -449,8 +410,13 @@ mod tests {
         let hidden = format_skills_for_prompt(&[skill("hidden", true)]);
         assert_eq!(hidden, "");
         let formatted = format_skills_for_prompt(&[skill("web-search", false)]);
-        assert!(formatted.contains("<name>web-search</name>"));
-        assert!(formatted.contains("<type>markdown</type>"));
-        assert!(formatted.contains("<description>Does web-search</description>"));
+        assert!(formatted.contains("Skills live on disk."));
+        assert!(formatted.contains("`.agents/skills/`"));
+        assert!(!formatted.contains("web-search"));
+        assert!(!formatted.contains("<available_skills>"));
+        assert_eq!(
+            formatted,
+            format_skills_for_prompt(&[skill("other", false), skill("hidden", true)])
+        );
     }
 }

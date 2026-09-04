@@ -3,8 +3,8 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
-fn route(input: Value, controls: Value, efforts: Value, disable: bool) -> Value {
-    json!({"availability_status":"available", "context_window":262144,"max_output_tokens":65536,
+fn route(input: &Value, controls: &Value, efforts: &Value, disable: bool) -> Value {
+    json!({"availability_status":"available", "context_window":262_144,"max_output_tokens":65536,
         "capabilities":{"input":input,"output":["text"],"supports_tool_calling":true,"supports_reasoning":true,
             "reasoning":{"controls":controls,"effort_values":efforts,"disable_supported":disable}}})
 }
@@ -30,7 +30,7 @@ fn legacy_catalog_reuses_merge_pricing_and_flash_effort_map() {
     let map = serde_json::to_value(&models[0].thinking_level_map).unwrap();
     assert_eq!(map["low"], "low");
     assert!(map["medium"].is_null());
-    assert_eq!(models[1].context_window, 128000);
+    assert_eq!(models[1].context_window, 128_000);
     assert_eq!(models[1].name, "Model");
     let compat = models[0].compat.as_ref().unwrap();
     assert!(compat.kind().is_ok());
@@ -43,16 +43,16 @@ fn legacy_catalog_reuses_merge_pricing_and_flash_effort_map() {
 #[test]
 fn rich_catalog_intersects_routes_and_filters_unavailable_or_toolless_vendors() {
     let mut text = route(
-        json!(["text"]),
-        json!(["thinking.budget_tokens"]),
-        json!([]),
+        &json!(["text"]),
+        &json!(["thinking.budget_tokens"]),
+        &json!([]),
         false,
     );
-    text["context_window"] = json!(128000);
+    text["context_window"] = json!(128_000);
     let vision = route(
-        json!(["text", "image"]),
-        json!(["thinking", "reasoning_effort"]),
-        json!(["low", "high"]),
+        &json!(["text", "image"]),
+        &json!(["thinking", "reasoning_effort"]),
+        &json!(["low", "high"]),
         true,
     );
     let mut excluded = vision.clone();
@@ -70,7 +70,7 @@ fn rich_catalog_intersects_routes_and_filters_unavailable_or_toolless_vendors() 
         serde_json::to_value(&models[0].input).unwrap(),
         json!(["text"])
     );
-    assert_eq!(models[0].context_window, 128000);
+    assert_eq!(models[0].context_window, 128_000);
     assert!(models[0].reasoning);
     assert_eq!(
         models[0].compat.as_ref().unwrap().raw["supportsReasoningEffort"],
@@ -85,9 +85,9 @@ fn rich_catalog_intersects_routes_and_filters_unavailable_or_toolless_vendors() 
 #[test]
 fn live_flash_thinking_controls_restrict_effort_levels() {
     let vendor = route(
-        json!(["text", "image"]),
-        json!(["thinking", "reasoning_effort"]),
-        json!(["low", "high", "max"]),
+        &json!(["text", "image"]),
+        &json!(["thinking", "reasoning_effort"]),
+        &json!(["low", "high", "max"]),
         false,
     );
     let models = parse_merge_gateway_models(
@@ -163,13 +163,14 @@ async fn pages_catalog_with_auth_and_rejects_repeated_cursor() {
         .unwrap();
     handle.join().unwrap();
     assert_eq!(models.len(), 2);
-    let requests = requests.lock().unwrap();
-    assert!(requests[0].starts_with("GET /models?limit=500 "));
-    assert!(requests[0]
-        .to_ascii_lowercase()
-        .contains("authorization: bearer test-key"));
-    assert!(requests[1].starts_with("GET /models?limit=500&cursor=first%2Fmodel "));
-    drop(requests);
+    {
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].starts_with("GET /models?limit=500 "));
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-key"));
+        assert!(requests[1].starts_with("GET /models?limit=500&cursor=first%2Fmodel "));
+    }
     let page = json!({"data":[],"has_more":true,"next_cursor":"same"});
     let (url, _, handle) = server(vec![(200, page.clone()), (200, page)]);
     assert!(fetch_merge_gateway_models(&url, "test-key", &[])

@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 
 use crate::kernel::shared::{host_handler, HostRequestHandlers};
 
+pub mod mailbox;
+
 pub const AGENT_MESSAGE_CUSTOM_TYPE: &str = "agent_message";
 /// TS `AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL`: the queue-strip preview label
 /// for a delivered agent message (`queuedAgentMessagePreview` renders
@@ -87,6 +89,8 @@ pub struct AgentMessageSendInput {
     pub target: String,
     pub message: String,
     pub receiver_role: Option<AgentFamilyRelationship>,
+    pub message_id: Option<String>,
+    pub reply_to: Option<String>,
 }
 
 /// The receipt returned after sending an agent message.
@@ -105,6 +109,7 @@ pub struct AgentMessageReceipt {
     pub receiver_role: Option<AgentFamilyRelationship>,
     pub delivered_at: Option<String>,
     pub queued_at: Option<String>,
+    pub mailbox_metadata: Option<Value>,
 }
 
 /// One addressable family member (TS `AgentFamilyMember`): a parent,
@@ -142,6 +147,31 @@ impl AgentFamilyMember {
 
 /// The controller the daemon supplies for `agent_message.*` requests.
 pub trait AgentMessageController: Send + Sync {
+    fn inbox(
+        &self,
+        _filter: mailbox::MailboxFilter,
+        _limit: usize,
+        _consume: bool,
+    ) -> impl Future<Output = anyhow::Result<Value>> + Send {
+        std::future::ready(Err(anyhow::anyhow!(
+            "agent mailbox is not available in this session"
+        )))
+    }
+
+    fn wait(
+        &self,
+        _filter: mailbox::MailboxFilter,
+        _timeout_ms: u64,
+    ) -> impl Future<Output = anyhow::Result<Value>> + Send {
+        std::future::ready(Err(anyhow::anyhow!(
+            "agent mailbox is not available in this session"
+        )))
+    }
+    fn roster(&self) -> impl Future<Output = anyhow::Result<Value>> + Send {
+        std::future::ready(Err(anyhow::anyhow!(
+            "agent family roster is not available in this session"
+        )))
+    }
     /// The addressable family (TS `controller.family()`): the parent,
     /// siblings, and children of this session, excluding the session itself.
     fn family(&self) -> impl Future<Output = anyhow::Result<Vec<AgentFamilyMember>>> + Send;
@@ -195,11 +225,9 @@ pub fn normalize_agent_session_message_limited(
     if trimmed.is_empty() {
         anyhow::bail!("Agent session message cannot be empty");
     }
-    if trimmed.chars().count() > max_chars {
-        anyhow::bail!(
-            "Agent session message is too long: {} chars exceeds {max_chars}",
-            trimmed.chars().count()
-        );
+    let length = trimmed.encode_utf16().count();
+    if length > max_chars {
+        anyhow::bail!("Agent session message is too long: {length} chars exceeds {max_chars}");
     }
     Ok(trimmed.to_string())
 }
@@ -384,7 +412,7 @@ fn receipt_target_value(receipt: &AgentMessageReceipt) -> Value {
 }
 
 fn receipt_value(receipt: &AgentMessageReceipt) -> Value {
-    json!({
+    let mut value = json!({
         "id": receipt.id,
         "source": AGENT_MESSAGE_SOURCE,
         "target": receipt_target_value(receipt),
@@ -394,7 +422,15 @@ fn receipt_value(receipt: &AgentMessageReceipt) -> Value {
         "queuedAt": receipt.queued_at,
         "deliveryMode": receipt.delivery_mode,
         "receiverRole": receipt.receiver_role.map(|role| role.as_str()),
-    })
+    });
+    if let Some(metadata) = receipt.mailbox_metadata.as_ref().and_then(Value::as_object) {
+        for key in ["from", "replyTo", "acceptedAt", "targetSequence", "handoff"] {
+            if let Some(field) = metadata.get(key) {
+                value[key] = field.clone();
+            }
+        }
+    }
+    value
 }
 
 /// Register `agent_message.*` handlers onto a handler map. The `send`
@@ -406,14 +442,41 @@ pub fn register_agent_message_host_handlers<C: AgentMessageController + 'static>
     controller: std::sync::Arc<C>,
     handlers: &mut HostRequestHandlers,
 ) {
+    let inbox_controller = controller.clone();
+    handlers.register(
+        "agent_message.inbox",
+        host_handler(move |payload| {
+            let controller = inbox_controller.clone();
+            async move {
+                let filter = mailbox::normalize_filter(&payload.data)?;
+                let limit = mailbox::normalize_limit(payload.data.get("limit"))?;
+                let consume = payload.data["consume"] == true;
+                controller.inbox(filter, limit, consume).await
+            }
+        }),
+    );
+    let wait_controller = controller.clone();
+    handlers.register_duplex(
+        "agent_message.wait",
+        crate::kernel::host_channel::duplex_host_handler(move |payload, channel| {
+            let controller = wait_controller.clone();
+            async move {
+                let filter = mailbox::normalize_filter(&payload.data)?;
+                let timeout = mailbox::normalize_timeout(payload.data.get("timeout_ms"))?;
+                tokio::select! {
+                    biased;
+                    () = channel.signal.cancelled() => Err(pa_agent::abort::aborted_error()),
+                    result = controller.wait(filter, timeout) => result,
+                }
+            }
+        }),
+    );
+    let roster_controller = controller.clone();
     handlers.register(
         "agent_message.list_agents",
-        host_handler(|_payload| {
-            Box::pin(async {
-                Err(anyhow::anyhow!(
-                    "agent_message.list_agents was removed; the family roster now lives in agent_observe.list_agents(). Restart the Python kernel to load the current skills, then call await agent_observe.list_agents()."
-                ))
-            })
+        host_handler(move |_payload| {
+            let controller = roster_controller.clone();
+            async move { controller.roster().await }
         }),
     );
     handlers.register(
@@ -430,6 +493,15 @@ pub fn register_agent_message_host_handlers<C: AgentMessageController + 'static>
                 // TS normalizes inside every send (broadcast included), so
                 // normalizing up front is behaviorally identical.
                 let message = normalize_agent_session_message(message)?;
+                let optional_id = |name: &str| -> anyhow::Result<Option<String>> {
+                    match data.get(name) {
+                        None | Some(Value::Null) => Ok(None),
+                        Some(Value::String(id)) if !id.trim().is_empty() && id.encode_utf16().count() <= 512 => Ok(Some(id.trim().to_string())),
+                        _ => Err(anyhow::anyhow!("agent_message.send {name} must be a nonempty string of at most 512 characters")),
+                    }
+                };
+                let message_id = optional_id("id")?;
+                let reply_to = optional_id("reply_to")?;
                 // Broadcast form (`target: "all"`): one send per family
                 // member, all-settled into a receipts array.
                 if let Some(target) = data.get("target").and_then(Value::as_str) {
@@ -451,6 +523,8 @@ pub fn register_agent_message_host_handlers<C: AgentMessageController + 'static>
                                 target: member.id.clone(),
                                 message: message.clone(),
                                 receiver_role: Some(member.relationship),
+                                message_id: message_id.clone(),
+                                reply_to: reply_to.clone(),
                             })
                             .await;
                         receipts.push(match result {
@@ -538,6 +612,8 @@ pub fn register_agent_message_host_handlers<C: AgentMessageController + 'static>
                         target: member.id.clone(),
                         message: message.clone(),
                         receiver_role: Some(role),
+                        message_id,
+                        reply_to,
                     })
                     .await?;
                 Ok(receipt_value(&receipt))

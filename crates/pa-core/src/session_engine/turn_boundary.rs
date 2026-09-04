@@ -24,6 +24,7 @@ use pa_types::usage::{calculate_context_tokens, estimate_tokens, valid_assistant
 
 use super::compact_session::{prepare_compaction, CompactSkip};
 use super::engine::SessionEngine;
+use super::scratch_handoff::ScratchBoundaryReason;
 
 /// A scheduled compaction (kernel `compact.run`).
 #[derive(Debug, Clone, PartialEq)]
@@ -431,21 +432,16 @@ impl SessionEngine {
         let pending = self.turn_boundary.take_compaction().await?;
         let compact = async {
             self.session
-                .compact(pending.instructions.as_deref(), model, api_key, abort)
+                .compact_for_reason(
+                    pending.instructions.as_deref(),
+                    model,
+                    api_key,
+                    abort,
+                    ScratchBoundaryReason::Requested,
+                )
                 .await
         };
-        Some(match abort {
-            // An in-flight abort drops the summarizer request (TS cancels
-            // the provider stream through the signal); the abort surfaces
-            // as the marker error for the consumer to map to its cancelled
-            // outcome. The refinement is not raced — TS `abortCompaction`
-            // never aborts it.
-            Some(signal) => match pa_agent::abort::race_with_abort(compact, signal).await {
-                Ok(inner) => inner,
-                Err(error) => Err(error),
-            },
-            None => compact.await,
-        })
+        Some(compact.await)
     }
 
     /// Consume a pending model-requested refinement at a turn boundary (TS

@@ -137,6 +137,15 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
 
     let app_mode = mode::AppMode::resolve(&parsed, std::io::stdin().is_terminal());
 
+    if parsed.harness_rpc_only {
+        if app_mode != mode::AppMode::Rpc {
+            return Err("--harness-mode rpc-only requires --mode rpc".into());
+        }
+        if parsed.daemon_socket.is_some() || public_command.attach_agent.is_some() {
+            return Err("--harness-mode rpc-only cannot attach to a daemon session".into());
+        }
+    }
+
     if public_command.attach_agent.is_some() && app_mode != mode::AppMode::Interactive {
         return Err("attach requires an interactive terminal".to_string());
     }

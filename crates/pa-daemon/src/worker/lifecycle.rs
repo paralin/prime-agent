@@ -63,6 +63,7 @@ impl Worker {
     /// The session's telemetry finalizes first (TS dispose callback:
     /// `agent session ended` + one flush), bounded by the sink timeouts.
     pub(crate) async fn handle_shutdown(&self) -> DaemonResponse {
+        self.close_mailbox("Session is shutting down");
         // TS `shutdown` -> `closeSession(state, "shutdown")`: the session is
         // closing, so the continuation mint sites and their settle-hook
         // retries bail (a stopped session never continues) — but unlike a
@@ -181,6 +182,7 @@ impl Worker {
     /// this: TS rebuilds the branch context in place and the kernel
     /// stays warm.
     pub(crate) async fn teardown_for_replacement(&self) -> anyhow::Result<()> {
+        self.close_mailbox("Session was replaced");
         // The retired session is closing: mark it before the children close,
         // exactly like the kill/shutdown closes — each child's settle retry
         // fires while the old runtime is still installed, and the marker
@@ -309,6 +311,7 @@ impl Worker {
     /// TS dispatch handlers that call `rebindCronJobsToState` after the
     /// runtime call.
     pub(crate) fn refresh_replaced_session_state(&self) {
+        self.discard_closed_mailbox();
         let (rlm_depth, summary, child_script) = {
             let mut core = self
                 .core

@@ -405,6 +405,22 @@ pub trait SessionEngine: Send + Sync {
         None
     }
 
+    fn external_event_watches(
+        &self,
+    ) -> Vec<pa_core::session_engine::external_events::ExternalEventWatch> {
+        Vec::new()
+    }
+
+    fn act_context_tree_nodes(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + '_>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    fn runtime_tool_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The session's assembled system prompt, when the engine can produce
     /// it synchronously (the HTML export embeds it like the TS
     /// `state.systemPrompt`). Engines whose session is busy or not yet

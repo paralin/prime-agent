@@ -1,7 +1,7 @@
 //! Kernel client for the REPL runtime: the kernel is a JSON-lines subprocess
 //! (`python -m rlm.repl`) — requests on stdin, events on stdout, stderr kept
 //! as a diagnostics tail. The protocol is documented in
-//! prime-agent-runtime/src/rlm/repl.md (protocol version 3).
+//! prime-agent-runtime/src/rlm/repl.md (protocol version 4).
 //!
 //! Ported from `core/kernel/repl-manager.ts`.
 
@@ -18,6 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{oneshot, Notify};
 
 use crate::kernel::cancellation::{merge_signals, AbortSignal};
+use crate::kernel::host_channel::HostRequestChannel;
 use crate::kernel::live_kernels;
 use crate::kernel::orphan_journal;
 use crate::kernel::protocol::{parse_event, Event, Request, REPL_PROTOCOL_VERSION};
@@ -110,6 +111,8 @@ pub(crate) struct ActiveExecution {
     started: Instant,
     max_chars: usize,
     opts: ExecuteOptions,
+    cooperative_host_request: AtomicBool,
+    cancellation_interrupt_sent: AtomicBool,
     /// The request runs user-namespace code (an execute — the bootstrap
     /// class included, internal or not): its settle can rebind or mutate
     /// names, which ends the capture-freshness memo's description.
@@ -346,6 +349,7 @@ struct Guarded {
     pending_done_waiters: HashMap<String, oneshot::Sender<()>>,
     bash_activity_waiters: HashMap<String, oneshot::Sender<Value>>,
     host_inflight: Vec<tokio::task::JoinHandle<()>>,
+    host_channels: HashMap<String, (Arc<HostRequestChannel>, tokio::sync::mpsc::Sender<Value>)>,
     active_execution: Option<Arc<ActiveExecution>>,
     /// Source of the most recently started cell, retained after it finishes so
     /// rlm.run spawns from detached asyncio tasks (cell already idle) can
@@ -361,7 +365,7 @@ struct ChildHandle {
 }
 
 /// The RLM kernel manager: owns one `python -m rlm.repl` subprocess and the
-/// JSON-lines protocol v3 conversation with it.
+/// JSON-lines protocol v4 conversation with it.
 #[derive(Clone)]
 pub struct ReplKernelManager {
     pub(crate) inner: Arc<Inner>,
@@ -489,6 +493,7 @@ impl ReplKernelManager {
                 pending_done_waiters: HashMap::new(),
                 bash_activity_waiters: HashMap::new(),
                 host_inflight: Vec::new(),
+                host_channels: HashMap::new(),
                 active_execution: None,
                 last_cell_code: None,
                 ready_tx: None,

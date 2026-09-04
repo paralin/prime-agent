@@ -83,6 +83,7 @@ impl AgentSessionEngine {
             custom_instructions,
         );
         emit(EngineEvent::Compaction {
+            continuation: None,
             entry: Value::Null,
             event,
         })

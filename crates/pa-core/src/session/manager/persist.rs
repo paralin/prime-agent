@@ -115,11 +115,15 @@ impl SessionManager {
         Ok(())
     }
     pub(super) fn persist_entry(&mut self, index: usize) -> std::io::Result<()> {
+        self.persist_entries(index, index + 1)
+    }
+
+    pub(super) fn persist_entries(&mut self, start: usize, end: usize) -> std::io::Result<()> {
         if !self.persist || self.session_file.is_none() {
             return Ok(());
         }
         let is_session_state_or_info = matches!(
-            self.file_entries[index],
+            self.file_entries[start],
             FileEntry::SessionState { .. } | FileEntry::SessionInfo { .. }
         );
         if !self.has_assistant_entry && !is_session_state_or_info {
@@ -133,11 +137,13 @@ impl SessionManager {
             self.try_rewrite_file()?;
             self.flushed = true;
         } else {
-            let entry = serialize_entry(&self.file_entries[index]);
             if let Some(session_file) = &self.session_file {
-                let mut line = entry.into_bytes();
-                line.push(b'\n');
-                super::window::append_cached(session_file, &line, self.append_ownership)?;
+                let mut bytes = Vec::new();
+                for entry in &self.file_entries[start..end] {
+                    bytes.extend_from_slice(serialize_entry(entry).as_bytes());
+                    bytes.push(b'\n');
+                }
+                super::window::append_cached(session_file, &bytes, self.append_ownership)?;
             }
             self.notify_persist_listeners();
         }

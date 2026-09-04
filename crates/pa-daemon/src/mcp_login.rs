@@ -47,6 +47,8 @@ impl McpLoginUi for WorkerMcpLoginUi {
     fn on_auth(&self, url: &str, instructions: &str) {
         // The browser is the interface (the TS dialog tries the same
         // fire-and-forget launch and keeps showing the URL on failure).
+        // Unit tests exercise login events without launching the desktop browser.
+        #[cfg(not(test))]
         pa_core::platform::browser::open_in_browser(url);
         eprintln!("pa-daemon: MCP login: {url} — {instructions}");
         if let Some(path) = &self.auth_url_file {

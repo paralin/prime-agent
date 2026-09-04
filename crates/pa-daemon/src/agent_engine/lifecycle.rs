@@ -12,6 +12,12 @@ use super::{
     SupervisorChildSessions, Value,
 };
 
+#[cfg(test)]
+mod act_records_tests;
+
+#[cfg(test)]
+mod mailbox_tests;
+
 /// The harness-owned instruction the engine floor appends to a bare
 /// skill invocation (no task text): the model receives the skill's
 /// protocol, but as an instruction to ask what the user wants first —
@@ -160,6 +166,7 @@ impl AgentSessionEngine {
         // create writes the settings modes — steering "all" by default).
         let queue_modes = std::sync::Mutex::new((None, None));
         Ok(Self {
+            claude_query: std::sync::Mutex::new(None),
             runtime,
             config,
             mcp,
@@ -187,6 +194,7 @@ impl AgentSessionEngine {
             initial_selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
             service_tier: std::sync::RwLock::new(None),
+            role_candidate_state: std::sync::Mutex::default(),
             session: tokio::sync::Mutex::new(None),
             session_build: tokio::sync::Mutex::new(()),
             pending_branch: std::sync::Mutex::new(None),
@@ -219,6 +227,14 @@ impl AgentSessionEngine {
             overflow_recovery: std::sync::Mutex::new(OverflowRecovery::default()),
             auto_compaction_abort: std::sync::Mutex::new(None),
             compaction_summary_sink: std::sync::Mutex::new(None),
+            act_record_sink: std::sync::Mutex::new(None),
+            act_event_sink: std::sync::Mutex::new(None),
+            act_runtime: std::sync::Mutex::new(None),
+            mailbox_provider: std::sync::Mutex::new(None),
+            external_events: std::sync::Mutex::new(Arc::default()),
+            external_watch_sink: std::sync::Mutex::new(None),
+            nudge_admission: std::sync::Mutex::new(None),
+            external_event_emit: std::sync::Mutex::new(None),
             model_refusal_telemetry,
         })
     }
@@ -383,6 +399,52 @@ impl AgentSessionEngine {
     }
 
     async fn adopt_built_session(&self, built: &CoreSessionEngine) -> anyhow::Result<()> {
+        let act_cwd = self.cwd();
+        let act_agent_dir = self.config.agent_dir.clone();
+        let act_engine = self.self_weak.lock().expect("engine weak lock").clone();
+        built.act_runtime.set_model_gate(Arc::new(move |selector| {
+            let result = crate::model_allowlist::assert_allowed(
+                &crate::model_allowlist::load(&act_cwd, &act_agent_dir),
+                selector,
+            );
+            if let Err(error) = &result {
+                if let Some(refusal) =
+                    error.downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+                {
+                    if let Some(engine) = act_engine.as_ref().and_then(std::sync::Weak::upgrade) {
+                        engine.note_model_refused("act", &refusal.selector);
+                    }
+                }
+            }
+            result
+        }));
+        if let Some(sink) = self
+            .nudge_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            built.tool_error_nudge.set_admission_sink(sink.clone());
+            built.english_output_nudge.set_admission_sink(sink);
+        }
+        let act_sink = self
+            .act_record_sink
+            .lock()
+            .expect("Act record sink lock")
+            .clone();
+        if let Some(sink) = act_sink {
+            built.act_runtime.set_record_sink(sink);
+        }
+        if let Some(sink) = self
+            .act_event_sink
+            .lock()
+            .expect("Act event sink lock")
+            .clone()
+        {
+            built.act_runtime.set_event_sink(sink);
+        }
+        *self.act_runtime.lock().expect("Act runtime lock") =
+            Some(Arc::downgrade(&built.act_runtime));
         self.mirror_goal_runtime(built).await;
         // The live compaction summary-delta sink (the worker's
         // `compaction_summary_delta` broadcast): adopted onto the built
@@ -630,6 +692,10 @@ impl AgentSessionEngine {
             // The context adoption replaced the manager contents: the
             // stale-row guard's deferred terminal row lands now.
             self.flush_pending_stale_goal_terminal().await;
+            built
+                .act_runtime
+                .bind_session(&built.session.shared_persistence())
+                .await?;
             return Ok(());
         }
         // Restore the retained context and certified metadata without loading
@@ -667,6 +733,10 @@ impl AgentSessionEngine {
         // passed is left to the durable job — a later failure re-parks
         // from a fresh count, like the TS.
         self.restore_quota_park(built).await;
+        built
+            .act_runtime
+            .bind_session(&built.session.shared_persistence())
+            .await?;
         // The window walk and the retained-context replay allocated
         // transient entry trees several times the retained size; both are
         // consumed here, so release their freed heap to the OS.
@@ -757,7 +827,17 @@ impl AgentSessionEngine {
     /// is taken, so the fresh build it enables starts from nothing.
     pub(crate) async fn retire_session_runtime(&self) {
         let _build = self.session_build.lock().await;
+        self.dispose_claude_query().await;
+        {
+            let mut events = self
+                .external_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            events.registry.dispose();
+            *events = Arc::default();
+        }
         let built = self.session.lock().await.take();
+        *self.act_runtime.lock().expect("Act runtime lock") = None;
         // The retired session's quota park ends with it (the wake's owner
         // is gone); the replacement build restores whatever the new
         // branch's own entries say.
@@ -815,6 +895,7 @@ impl AgentSessionEngine {
     /// worker invokes at every session end — kill, shutdown, the orphan
     /// exit — so the kernel process never outlives the session that owns it.
     pub async fn dispose_kernel(&self) {
+        self.dispose_claude_query().await;
         let guard = self.session.lock().await;
         if let Some(engine) = guard.as_deref() {
             engine.dispose_kernel().await;
@@ -838,6 +919,12 @@ impl AgentSessionEngine {
     /// autonomous boundary lock, after a holder panicked while holding
     /// it).
     pub fn mark_session_closed(&self) {
+        self.abort_claude_query("Session closed");
+        self.external_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .registry
+            .dispose();
         self.session_closed
             .store(true, std::sync::atomic::Ordering::SeqCst);
         *self.goal_runtime.lock().expect("goal runtime lock") = None;
@@ -959,7 +1046,37 @@ impl AgentSessionEngine {
         let mut handlers = HostRequestHandlers::default();
         register_agent_message_host_handlers(sender, &mut handlers);
         register_agent_observe_host_handlers(observer, &mut handlers);
+        if let Some(provider) = self
+            .mailbox_provider
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            pa_core::session_engine::agent_messaging::mailbox::runtime::register_mailbox_provider_host_handlers(provider, &mut handlers);
+        }
         self.register_bash_notice_host_handlers(&mut handlers);
+        if let Some(sink) = self
+            .external_watch_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            self.external_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_watch_sink(sink);
+        }
+        if let Some(emit) = self
+            .external_event_emit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            self.external_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .register(&mut handlers, emit);
+        }
         Some(handlers)
     }
 
@@ -1130,6 +1247,7 @@ impl AgentSessionEngine {
             prompt_guidelines: create_resources.append_system_prompt,
             generic_mcp_servers: vec![],
             allow_recursion: None,
+            runtime_policy: create_resources.runtime_policy,
             session_manager: Some(session_manager),
             extra_host_handlers: self.extra_host_handlers(),
             conversation_log_path: session_file,

@@ -34,6 +34,7 @@ use pa_core::session_engine::compact_session::CompactOutcome;
 use pa_core::session_engine::compaction_exec::CompactionResult;
 use pa_core::session_engine::engine::SessionEngine;
 use pa_core::session_engine::messages::{CompactionOutcomeKind, CompactionOutcomeReason};
+use pa_core::session_engine::scratch_handoff::ScratchBoundaryReason;
 use pa_types::ai::{AssistantMessage, Model};
 
 use crate::overflow_compaction::{OverflowRecovery, OVERFLOW_RECOVERY_FAILED_MESSAGE};
@@ -328,7 +329,15 @@ impl AcpSession {
             }
             _ => None,
         };
-        let outcome = run_compaction(self, engine, model, api_key, None).await;
+        let outcome = run_compaction(
+            self,
+            engine,
+            model,
+            api_key,
+            None,
+            ScratchBoundaryReason::Threshold,
+        )
+        .await;
         let cancelled = outcome
             .as_ref()
             .err()
@@ -362,7 +371,15 @@ impl AcpSession {
             .take_compaction()
             .await
             .and_then(|pending| pending.instructions);
-        let outcome = run_compaction(self, engine, model, api_key, instructions.as_deref()).await;
+        let outcome = run_compaction(
+            self,
+            engine,
+            model,
+            api_key,
+            instructions.as_deref(),
+            ScratchBoundaryReason::Requested,
+        )
+        .await;
         self.finish_compaction(engine, CompactionOutcomeReason::Requested, outcome)
             .await;
         RequestedArmRun::Consumed
@@ -524,7 +541,15 @@ impl AcpSession {
             .take_compaction()
             .await
             .and_then(|pending| pending.instructions);
-        let outcome = run_compaction(self, engine, model, api_key, instructions.as_deref()).await;
+        let outcome = run_compaction(
+            self,
+            engine,
+            model,
+            api_key,
+            instructions.as_deref(),
+            ScratchBoundaryReason::Overflow,
+        )
+        .await;
         match outcome {
             Ok(CompactOutcome::Ran(run)) => {
                 if let Some(telemetry) = &engine.telemetry {
@@ -609,21 +634,19 @@ async fn run_compaction(
     model: &Model,
     api_key: Option<String>,
     instructions: Option<&str>,
+    reason: ScratchBoundaryReason,
 ) -> anyhow::Result<CompactOutcome> {
     let controller = session.arms.install_abort_controller();
     let signal = controller.signal();
     let compact = async {
         engine
             .session
-            .compact(instructions, model, api_key, Some(&signal))
+            .compact_for_reason(instructions, model, api_key, Some(&signal), reason)
             .await
     };
-    let outcome = pa_agent::abort::race_with_abort(compact, &signal).await;
+    let outcome = compact.await;
     session.arms.clear_abort_controller(&controller);
-    // The race's outer `Err` is the abort marker (the summarizer was
-    // dropped); the inner `Err` is the compaction's own failure — both
-    // surface as the caller's `Err` for `is_abort_error` to classify.
-    outcome?
+    outcome
 }
 
 /// Publish the ACP `compaction_end` mapping for one arm outcome: a ran

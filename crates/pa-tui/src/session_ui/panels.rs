@@ -139,6 +139,12 @@ impl SessionUi {
             heartbeats: self.heartbeat_catalog.len(),
             heartbeats_paused: paused_heartbeat_count(&self.heartbeat_catalog),
             bash_running,
+            watches: self.external_watches.len(),
+            watches_running: self
+                .external_watches
+                .iter()
+                .filter(|watch| watch.running())
+                .count(),
             goal_label,
             selected: self.activity_group,
             focused: self.subagents_focused,
@@ -278,6 +284,7 @@ impl SessionUi {
                 self.emit_activity_opened("bash");
                 self.open_bash_view(view);
             }
+            crate::chrome::ActivityGroup::Watches => self.open_watches_panel(view),
             crate::chrome::ActivityGroup::Goal => {
                 self.emit_activity_opened("goal");
                 self.open_goal_panel(view);
@@ -315,6 +322,7 @@ impl SessionUi {
         title: Option<String>,
         content: InfoContent,
     ) {
+        self.watches_panel_open = false;
         view.info_panel = Some(crate::info_panel::InfoPanel::new(title, content));
         self.dirty = true;
     }
@@ -373,6 +381,7 @@ impl SessionUi {
             panel.handle_key(&id, view.editor.keybindings()) == InfoPanelAction::Close
         }) {
             view.info_panel = None;
+            self.watches_panel_open = false;
         }
         self.dirty = true;
         Ok(())

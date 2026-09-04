@@ -105,7 +105,7 @@ fn make_session_active(socket: &Path, session_path: &Path, cwd: &Path) -> String
     let command = json!({
         "type": "command",
         "id": "guard-create",
-        "protocol": { "name": "prime-agent.daemon", "version": 7 },
+        "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
         "command": {
             "type": "create",
             "sessionPath": session_path.to_string_lossy(),

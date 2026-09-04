@@ -18,6 +18,9 @@ use pa_types::ai::Model;
 
 use super::LineWriter;
 
+mod act;
+use act::ActRelay;
+
 /// One assembled engine plus the live provider target its stream reads
 /// (`set_model` swaps the target without rebuilding the session), and
 /// the runtime session lease the factory acquired for the opened file
@@ -73,6 +76,7 @@ pub struct RpcSession {
     writer: LineWriter,
     factory: Option<RpcEngineFactory>,
     subscription: tokio::sync::Mutex<Option<Subscription>>,
+    act_relay: tokio::sync::Mutex<Option<Arc<ActRelay>>>,
     /// Connection outputs buffered while a prompt response is pending
     /// (TS `bufferedConnectionOutputs`): `Some` arms buffering, the flush
     /// emits the buffered frames in order.
@@ -113,6 +117,7 @@ impl RpcSession {
             writer,
             factory,
             subscription: tokio::sync::Mutex::new(None),
+            act_relay: tokio::sync::Mutex::new(None),
             pending_outputs: Arc::new(tokio::sync::Mutex::new(None)),
             replacement: tokio::sync::Mutex::new(()),
             pump_epoch: Arc::new(AtomicU64::new(0)),
@@ -152,6 +157,9 @@ impl RpcSession {
     /// the older buffered frames. Events arriving after this write
     /// directly again.
     pub async fn flush_connection_events(&self) {
+        if let Some(relay) = self.act_relay.lock().await.as_ref() {
+            relay.flush().await;
+        }
         let mut pending_outputs = self.pending_outputs.lock().await;
         let buffered = pending_outputs.take().unwrap_or_default();
         for event in buffered {
@@ -213,9 +221,13 @@ impl RpcSession {
     /// subscription.
     async fn resubscribe(&self) {
         let engine = self.handle.read().await.engine.clone();
+        let relay = ActRelay::new(self.pending_outputs.clone(), self.writer.clone());
+        engine.act_runtime.set_event_sink(relay.sink());
         let subscription =
-            Self::engine_subscription(&engine, &self.pending_outputs, &self.writer).await;
+            Self::engine_subscription(&engine, &self.pending_outputs, &self.writer, relay.clone())
+                .await;
         *self.subscription.lock().await = Some(subscription);
+        *self.act_relay.lock().await = Some(relay);
     }
 
     /// Create the loop-event subscription for one engine (the frames
@@ -224,6 +236,7 @@ impl RpcSession {
         engine: &Arc<SessionEngine>,
         pending_outputs: &Arc<tokio::sync::Mutex<Option<Vec<serde_json::Value>>>>,
         writer: &LineWriter,
+        relay: Arc<ActRelay>,
     ) -> Subscription {
         let pending_outputs = Arc::clone(pending_outputs);
         let writer = writer.clone();
@@ -231,9 +244,11 @@ impl RpcSession {
             .session
             .agent()
             .subscribe(move |event, _signal| {
+                let relay = relay.clone();
                 let pending_outputs = Arc::clone(&pending_outputs);
                 let writer = writer.clone();
                 Box::pin(async move {
+                    relay.flush().await;
                     if let Some(event) = agent_event_json(&event) {
                         let mut pending_outputs = pending_outputs.lock().await;
                         if let Some(buffer) = pending_outputs.as_mut() {
@@ -420,9 +435,15 @@ impl RpcSession {
         // Subscribe the replacement BEFORE publishing the handle: a
         // prompt dispatched the instant the handle lands finds the
         // subscription attached, so the turn's first events never drop.
-        let subscription =
-            Self::engine_subscription(&replacement.engine, &self.pending_outputs, &self.writer)
-                .await;
+        let relay = ActRelay::new(self.pending_outputs.clone(), self.writer.clone());
+        replacement.engine.act_runtime.set_event_sink(relay.sink());
+        let subscription = Self::engine_subscription(
+            &replacement.engine,
+            &self.pending_outputs,
+            &self.writer,
+            relay.clone(),
+        )
+        .await;
         if let Some(subscription) = self.subscription.lock().await.take() {
             subscription.unsubscribe().await;
         }
@@ -446,8 +467,10 @@ impl RpcSession {
         if adopted_lease.is_some() {
             replacement.session_lease = adopted_lease;
         }
+        handle.engine.act_runtime.clear_event_sink();
         *handle = replacement;
         *self.subscription.lock().await = Some(subscription);
+        *self.act_relay.lock().await = Some(relay);
         Ok(())
     }
 
@@ -481,6 +504,10 @@ impl RpcSession {
         if let Some(subscription) = self.subscription.lock().await.take() {
             subscription.unsubscribe().await;
         }
+        if let Some(relay) = self.act_relay.lock().await.take() {
+            relay.flush().await;
+        }
+        engine.act_runtime.clear_event_sink();
         engine.dispose_kernel().await;
     }
 }

@@ -8,6 +8,15 @@
 use anyhow::Result;
 
 pub trait ClientSettings: Send + Sync {
+    /// Immutable recursion ceiling selected for this client invocation.
+    fn launch_rlm_max_depth_ceiling(&self) -> Option<u32> {
+        None
+    }
+    /// Immutable Act restriction selected for this client invocation.
+    fn launch_disable_rlm_act(&self) -> bool {
+        false
+    }
+
     /// `theme` (TS `getTheme`/`setTheme`).
     fn theme(&self) -> Option<String>;
     /// Persists `theme` to the global scope.

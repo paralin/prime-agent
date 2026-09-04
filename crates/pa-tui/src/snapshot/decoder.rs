@@ -11,13 +11,18 @@ use super::{
 /// `session_event` frames, matching the worker's event vocabulary).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnUpdate {
+    ActProjection(Value),
     /// `agent_start` / `turn_start`.
     TurnStarted,
     /// `session_info_changed`: the session display name (cleared when the
     /// event carries none).
-    SessionInfoChanged { name: Option<String> },
+    SessionInfoChanged {
+        name: Option<String>,
+    },
     /// `service_tier_changed`: the session's effective service tier.
-    ServiceTierChanged { tier: String },
+    ServiceTierChanged {
+        tier: String,
+    },
     /// `message_start` with a user message.
     UserMessage(String),
     /// `message_start`/`message_update`/`message_end` with an assistant
@@ -46,7 +51,9 @@ pub enum TurnUpdate {
         is_error: bool,
     },
     /// `turn_end`, with the turn error string when the turn failed.
-    TurnEnded { error: Option<String> },
+    TurnEnded {
+        error: Option<String>,
+    },
     /// A `custom`-role message the transcript renders (session-command
     /// echo/result rows, or the malformed-notice fallback).
     CustomRow(ChatEntry),
@@ -134,7 +141,9 @@ pub enum TurnUpdate {
         run_id: Option<String>,
     },
     /// `bash_output` (the user-bash slot): one streamed output chunk.
-    BashOutput { chunk: String },
+    BashOutput {
+        chunk: String,
+    },
     /// `bash_end` (the user-bash slot): the settled run.
     BashEnd {
         exit_code: Option<i64>,
@@ -162,6 +171,7 @@ pub enum RetryStartReason {
 /// Decode the `event` payload of a `session_event` frame.
 pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
     match event.get("type").and_then(Value::as_str)? {
+        "act_event" => Some(TurnUpdate::ActProjection(event.clone())),
         "compaction_start" => Some(TurnUpdate::CompactionStart {
             reason: event
                 .get("reason")

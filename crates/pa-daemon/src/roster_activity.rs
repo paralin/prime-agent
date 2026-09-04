@@ -41,6 +41,7 @@ pub(crate) const ROSTER_SESSION_EVENT_TRIGGERS: &[&str] = &[
     "session_action_update",
     "session_info_changed",
     "thinking_level_changed",
+    "external_event_watches_changed",
 ];
 
 /// Whether one broadcast frame triggers a roster flush (TS

@@ -76,7 +76,15 @@ impl SupervisorChildSessionsInner {
             "sessionDir": session_dir.to_string_lossy(),
             "rlmDepth": depth,
             "rlmMaxDepth": identity.rlm_max_depth,
+            "serviceTier": runtime_metadata.as_ref().and_then(|metadata| metadata.get("serviceTier")).cloned()
+                .unwrap_or_else(|| json!(identity.service_tier)),
         });
+        if let Some(ceiling) = identity.runtime_policy.rlm_max_depth_ceiling {
+            config["rlmMaxDepthCeiling"] = json!(ceiling);
+        }
+        if identity.runtime_policy.disable_rlm_act {
+            config["disableRlmAct"] = json!(true);
+        }
         if let Some((provider, id)) = model.split_once('/') {
             config["provider"] = json!(provider);
             config["model"] = json!(id);
@@ -85,6 +93,13 @@ impl SupervisorChildSessionsInner {
         }
         if let Some(thinking) = thinking {
             config["thinking"] = json!(thinking);
+        }
+        if let Some(candidates) = runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("rlmModelCandidates"))
+            .filter(|candidates| candidates.as_array().is_some_and(|items| !items.is_empty()))
+        {
+            config["rlmModelCandidates"] = candidates.clone();
         }
         if let Some(parent_file) = &identity.session_file {
             config["parentSessionPath"] = json!(parent_file);
@@ -134,10 +149,32 @@ impl SupervisorChildSessionsInner {
             launch_env: None,
             rest: Map::default(),
         };
-        let summary = self
-            .command(&create, CREATE_TIMEOUT_MS)
+        let response = if model.starts_with("claude-code/") {
+            async {
+                let response = self
+                    .link
+                    .request_with_capability(
+                        serde_json::to_value(&create)?,
+                        Duration::from_millis(CREATE_TIMEOUT_MS),
+                        "claude_code_children",
+                    )
+                    .await?
+                    .context("Daemon does not support Claude Code children")?;
+                anyhow::ensure!(
+                    response.success,
+                    "{}",
+                    response
+                        .error
+                        .as_deref()
+                        .unwrap_or("Claude Code child creation failed")
+                );
+                Ok(response.data.unwrap_or(Value::Null))
+            }
             .await
-            .with_context(|| format!("spawn RLM child session {child_id}"))?;
+        } else {
+            self.command(&create, CREATE_TIMEOUT_MS).await
+        };
+        let summary = response.with_context(|| format!("spawn RLM child session {child_id}"))?;
         let created = CreatedChild::from_summary(&summary, session_dir)?;
         Ok(created)
     }

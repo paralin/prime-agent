@@ -71,6 +71,7 @@ async fn engine_runs_tool_loop_and_persists() {
         prompt_guidelines: vec![],
         generic_mcp_servers: vec![],
         allow_recursion: None,
+        runtime_policy: super::super::runtime_policy::RuntimePolicy::default(),
         session_manager: None,
         extra_host_handlers: None,
         conversation_log_path: None,
@@ -170,6 +171,7 @@ async fn spawned_child_prompt_stamps_its_depth() {
         prompt_guidelines: vec![],
         generic_mcp_servers: vec![],
         allow_recursion: None,
+        runtime_policy: super::super::runtime_policy::RuntimePolicy::default(),
         session_manager: None,
         extra_host_handlers: None,
         conversation_log_path: None,
@@ -236,6 +238,7 @@ async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
             prompt_guidelines: vec![],
             generic_mcp_servers: vec![],
             allow_recursion: None,
+            runtime_policy: super::super::runtime_policy::RuntimePolicy::default(),
             session_manager: None,
             extra_host_handlers: None,
             conversation_log_path: None,
@@ -371,5 +374,72 @@ async fn create_session_registers_goal_and_heartbeat_handlers() {
     assert!(
         names.iter().any(|name| name == "ipython"),
         "tools: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn rpc_harness_does_not_restore_or_enable_persisted_goals() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = SessionManager::in_memory(dir.path());
+    let mut goal = super::super::goal_driver::GoalDriver::new();
+    goal.start(&mut manager, "persisted work", None).unwrap();
+    let model = pa_agent::types::Model::unknown();
+    let provider = Arc::new(ScriptedProvider::new(model.clone()));
+    let engine = create_session(SessionEngineConfig {
+        cwd: dir.path().into(),
+        agent_dir: dir.path().into(),
+        model: Some(model.clone()),
+        stream_fn: Some(provider.stream_fn()),
+        session_manager: Some(manager),
+        runtime_policy: super::super::runtime_policy::RuntimePolicy {
+            rpc_only: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        engine.goal_state().await.status,
+        crate::goals::GoalStatus::Idle
+    );
+    assert!(engine
+        .seed_initial_goal("new work", None)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("disabled in rpc-only"));
+    assert!(engine.mint_goal_continuation().await.is_none());
+    let mut model_value = serde_json::to_value(&model).unwrap();
+    model_value["input"] = serde_json::json!(["text"]);
+    model_value["baseUrl"] = serde_json::json!("http://localhost");
+    let full_model: pa_types::ai::Model = serde_json::from_value(model_value).unwrap();
+    let mut autonomous = crate::autonomous::create_autonomous_runtime_state(None, None);
+    for name in ["goal", "autonomous", "refine"] {
+        let command = super::super::slash_commands::SessionSlashCommand {
+            name,
+            args: "new work".into(),
+            text: format!("/{name} new work"),
+        };
+        let outcome = super::super::session_commands::execute_session_command(
+            &engine,
+            &mut super::super::session_commands::SessionCommandParams {
+                model: &full_model,
+                api_key: None,
+                global_harness_dir: dir.path().into(),
+                autonomous: &mut autonomous,
+            },
+            &command,
+        )
+        .await;
+        assert!(outcome
+            .error
+            .unwrap()
+            .contains("disabled in rpc-only harness mode"));
+        assert!(outcome.continuation_message.is_none());
+    }
+    assert_eq!(
+        engine.goal_state().await.status,
+        crate::goals::GoalStatus::Idle
     );
 }

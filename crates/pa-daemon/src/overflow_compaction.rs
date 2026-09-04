@@ -18,6 +18,8 @@
 //! (TS resets `_overflowRecovery` at agent-run message starts and at
 //! non-error assistant message ends).
 
+use pa_core::session_engine::scratch_handoff::ScratchBoundaryReason;
+
 use serde_json::Value;
 
 use crate::agent_engine::AgentSessionEngine;
@@ -324,17 +326,18 @@ impl AgentSessionEngine {
             let compact = async {
                 engine
                     .session
-                    .compact(
+                    .compact_for_reason(
                         custom_instructions.as_deref(),
                         &model,
                         api_key,
                         Some(&signal),
+                        ScratchBoundaryReason::Overflow,
                     )
                     .await
             };
             let outcome = self
                 .runtime
-                .block_on(pa_agent::abort::race_with_abort(compact, &signal));
+                .block_on(async { Ok::<_, anyhow::Error>(compact.await) });
             self.clear_auto_compaction_abort(&controller);
             outcome
         };
@@ -378,7 +381,15 @@ impl AgentSessionEngine {
                     true,
                     custom_instructions.as_deref(),
                 );
-                if !emit(EngineEvent::Compaction { entry, event }) {
+                let continuation = run
+                    .continuation
+                    .as_ref()
+                    .and_then(|message| serde_json::to_value(message).ok());
+                if !emit(EngineEvent::Compaction {
+                    entry,
+                    event,
+                    continuation,
+                }) {
                     return OverflowAttempt::Cancelled;
                 }
                 pa_core::session_engine::compaction_trace::trace(

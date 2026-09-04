@@ -2,6 +2,7 @@
 //! per-tick update coalescing and the settle-frame flush, with the
 //! `BurstStreamEngine` + `texts_at` fixtures.
 use super::*;
+use std::fmt::Write as _;
 
 /// One scripted turn that streams `deltas` partial-message updates
 /// (one full-snapshot `message_update` frame per provider delta, the
@@ -227,7 +228,10 @@ async fn the_last_parked_update_carries_the_final_content() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::TempDir::new().unwrap();
-    let text = "pin word ".repeat(512);
+    let text: String = (0..512).fold(String::new(), |mut output, index| {
+        write!(output, "pin {index:04} ").unwrap();
+        output
+    });
     let script = json!({ "engine": "faux", "responses": [{ "content": [{ "type": "text", "text": text }] }] });
     let engine = AgentSessionEngine::new(AgentEngineConfig {
         cwd: dir.path().to_path_buf(),

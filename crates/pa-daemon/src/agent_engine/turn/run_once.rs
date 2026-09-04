@@ -82,6 +82,20 @@ impl AgentSessionEngine {
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> anyhow::Result<TurnOnce> {
+        let _continuation_suppression = match prompt {
+            TurnPrompt::Injected(message)
+                if message.custom_type == "agent_message"
+                    && message.details.as_ref().is_some_and(|details| {
+                        details["from"]["sessionName"] == "system"
+                            && details["id"]
+                                .as_str()
+                                .is_some_and(|id| id.starts_with("agentmsg_external_"))
+                    }) =>
+            {
+                Some(agent.suppress_continuations())
+            }
+            _ => None,
+        };
         // Stream assistant events while the turn runs.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
         // Goal usage accounting (TS `_accountGoalUsageForAssistantMessage`

@@ -103,7 +103,7 @@ impl Client {
         let value = serde_json::json!({
             "type": "command",
             "id": id,
-            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
             "command": command,
         });
         let mut line = serde_json::to_string(&value).expect("serialize command");

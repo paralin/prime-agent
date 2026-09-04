@@ -591,6 +591,7 @@ mod tests {
 
     fn compaction_summary(timestamp: u64) -> AgentMessage {
         AgentMessage::CompactionSummary(pa_types::session::CompactionSummaryMessage {
+            provider_payload: None,
             summary: "the story so far".to_string(),
             tokens_before: 100,
             retained_message_count: None,

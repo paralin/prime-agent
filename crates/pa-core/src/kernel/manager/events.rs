@@ -61,6 +61,14 @@ impl Inner {
                 }
             }
             Event::HostRequest { id, data } => self.start_host_request(&id, data),
+            Event::HostMessage { id, data } => {
+                let channel = lock(&self.guarded).host_channels.get(&id).cloned();
+                if let Some((channel, sender)) = channel {
+                    if !data.is_object() || sender.try_send(data).is_err() {
+                        channel.close();
+                    }
+                }
+            }
             Event::Stdout { id, text } => {
                 self.route_stream(id.as_deref(), StreamName::Stdout, &text);
             }

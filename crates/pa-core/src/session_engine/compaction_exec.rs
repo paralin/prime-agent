@@ -390,6 +390,7 @@ pub fn compaction_entry_for(
     harness_state_fingerprint: Option<String>,
 ) -> CompactionEntry {
     CompactionEntry {
+        provider_native_compaction: None,
         summary: result.summary.clone(),
         first_kept_entry_id: result.first_kept_entry_id.clone(),
         tokens_before: result.tokens_before,
@@ -504,6 +505,7 @@ mod tests {
         assert_eq!(
             compaction_entry_for(&result, &details, Some("focus"), None, None),
             CompactionEntry {
+                provider_native_compaction: None,
                 summary: "the overflow summary".to_string(),
                 first_kept_entry_id: "e4".to_string(),
                 tokens_before: 214,

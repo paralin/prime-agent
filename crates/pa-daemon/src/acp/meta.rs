@@ -62,6 +62,8 @@ pub enum PrimeAgentOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct PrimeAgentSessionMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub act: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_turn_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_sequence: Option<u64>,

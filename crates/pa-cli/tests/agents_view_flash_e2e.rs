@@ -68,7 +68,7 @@ fn graceful_shutdown(socket: &Path) {
     let command = serde_json::json!({
         "type": "command",
         "id": "test-shutdown",
-        "protocol": { "name": "prime-agent.daemon", "version": 7 },
+        "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
         "command": { "type": "shutdown" },
     });
     let Ok(mut line) = serde_json::to_string(&command) else {
@@ -234,7 +234,7 @@ impl Client {
         let envelope = json!({
             "type": "command",
             "id": id,
-            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
             "command": command,
         });
         let mut line = serde_json::to_string(&envelope).expect("serialize");
@@ -352,7 +352,12 @@ const DEAD_CHILDREN: usize = 300;
 
 #[tokio::test]
 async fn the_first_agents_view_render_is_clean_behind_hundreds_of_dead_subagents() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
+    // The ledger persists real paths; keep the fixture's root rows in the
+    // same namespace on macOS, where /var aliases /private/var.
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical temp root");
+    let dir = tempfile::TempDir::new_in(temp_root).expect("temp dir");
     let agent_dir = dir.path().join("agent");
     let sessions_dir = agent_dir.join("sessions");
     std::fs::create_dir_all(&sessions_dir).expect("session dir");
@@ -518,7 +523,11 @@ async fn the_first_agents_view_render_is_clean_behind_hundreds_of_dead_subagents
     );
     let saved = client.request("s1");
     assert_eq!(saved["success"], true, "list_saved_sessions: {saved}");
-    let parent_path = parent_file.to_string_lossy().to_string();
+    let parent_path = parent_file
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     let children = saved["data"]["sessions"]
         .as_array()
         .map(|rows| {
@@ -580,7 +589,12 @@ async fn the_first_agents_view_render_is_clean_behind_hundreds_of_dead_subagents
 /// vanishing.
 #[tokio::test]
 async fn a_stopped_session_stays_visible_in_the_view() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
+    // The ledger persists real paths; keep the fixture's root rows in the
+    // same namespace on macOS, where /var aliases /private/var.
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical temp root");
+    let dir = tempfile::TempDir::new_in(temp_root).expect("temp dir");
     let agent_dir = dir.path().join("agent");
     let sessions_dir = agent_dir.join("sessions");
     std::fs::create_dir_all(&sessions_dir).expect("session dir");

@@ -323,6 +323,10 @@ pub const APP_KEYBINDINGS: &[(&str, KeybindingDefinition)] = &[
     ),
     ("app.subagents.focus", def!(&["alt+a"], "Focus activity")),
     (
+        "app.watches.open",
+        def!(&["alt+w"], "Open external event watches"),
+    ),
+    (
         "app.heartbeats.openSelected",
         def!(&["right"], "Open selected heartbeat"),
     ),

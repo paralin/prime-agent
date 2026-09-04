@@ -95,6 +95,9 @@ pub(crate) struct CreateSessionResources {
     pub(crate) skills: Vec<String>,
     pub(crate) prompt_templates: Vec<String>,
     pub(crate) autonomous: Option<pa_core::autonomous::AgentAutonomousConfig>,
+    pub(crate) rlm_model_candidates: Vec<String>,
+    #[serde(flatten)]
+    pub(crate) runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy,
 }
 
 /// The create command's `--models` scope inputs (TS main.ts:548-568 +

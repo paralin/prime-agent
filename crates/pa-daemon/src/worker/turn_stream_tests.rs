@@ -16,6 +16,7 @@ mod burst;
 mod feed;
 mod park;
 mod queue;
+mod scratch;
 
 /// A minimal turn runner over a fresh session core: exactly what
 /// `run_turn` touches (the store stays `None`, the roster push is a

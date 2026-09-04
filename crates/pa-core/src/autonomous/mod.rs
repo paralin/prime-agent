@@ -456,6 +456,7 @@ pub fn autonomous_continuation_loop_row(
                 },
             )]),
             timestamp: timestamp as i64,
+            rest: serde_json::Map::default(),
         },
     ))
 }

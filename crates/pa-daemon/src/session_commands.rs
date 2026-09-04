@@ -175,7 +175,16 @@ fn emit_compact_end(
             ),
         )
     };
-    emit(EngineEvent::Compaction { entry, event })
+    let continuation = execution
+        .compaction
+        .as_ref()
+        .and_then(|run| run.continuation.as_ref())
+        .and_then(|message| serde_json::to_value(message).ok());
+    emit(EngineEvent::Compaction {
+        entry,
+        event,
+        continuation,
+    })
 }
 
 /// Parse a session command out of a prompt, if it is one.

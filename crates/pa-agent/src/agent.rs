@@ -13,14 +13,21 @@ use tokio::sync::watch;
 use crate::abort::{AbortController, AbortSignal};
 use crate::agent_loop::{
     AfterToolCallFn, AgentEventSink, AgentLoopConfig, BeforeToolCallFn, ConvertToLlmFn,
-    GetContinuationMessagesFn, PollMessagesFn, ShouldStopAfterTurnFn, ShouldStopBeforeTurnFn,
-    TransformContextFn,
+    FilterAssistantMessageFn, GetContinuationMessagesFn, PollMessagesFn, ShouldStopAfterTurnFn,
+    ShouldStopBeforeTurnFn, TransformContextFn,
 };
 use crate::stream::StreamFn;
 use crate::types::{
     AgentEvent, AgentMessage, AgentTool, ImageContent, Model, ThinkingLevel, ToolExecutionMode,
     Usage,
 };
+
+/// Host-owned scope around the complete run, including detached accepted prompts.
+pub type AgentRunScopeFn = Arc<
+    dyn Fn(crate::BoxFut<'static, anyhow::Result<()>>) -> crate::BoxFut<'static, anyhow::Result<()>>
+        + Send
+        + Sync,
+>;
 
 /// Queue drain mode (TS `QueueMode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -106,6 +113,7 @@ pub struct AgentOptions {
     pub initial_state: AgentInitialState,
     pub convert_to_llm: Option<ConvertToLlmFn>,
     pub transform_context: Option<TransformContextFn>,
+    pub filter_assistant_message: Option<FilterAssistantMessageFn>,
     pub stream_fn: Option<StreamFn>,
     pub get_api_key: Option<crate::agent_loop::GetApiKeyFn>,
     pub before_tool_call: Option<BeforeToolCallFn>,
@@ -328,6 +336,38 @@ struct ActiveRun {
     model: Model,
 }
 
+struct RunLifecycleGuard {
+    inner: Arc<AgentInner>,
+    controller: AbortController,
+    idle: watch::Sender<bool>,
+    finished: bool,
+}
+
+impl Drop for RunLifecycleGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.controller.abort();
+        let inner = self.inner.clone();
+        let idle = self.idle.clone();
+        tokio::spawn(async move {
+            let mut shared = inner.shared.lock().await;
+            let mut run = inner.run.lock().unwrap();
+            if run
+                .as_ref()
+                .is_some_and(|active| active.idle_tx.same_channel(&idle))
+            {
+                shared.state.is_streaming = false;
+                shared.state.streaming_message = None;
+                shared.state.pending_tool_calls.clear();
+                run.take();
+                let _ = idle.send(true);
+            }
+        });
+    }
+}
+
 struct AgentInner {
     /// One lock serializes state reduction and listener awaits, mirroring the
     /// single-threaded TS event loop: emitted events are processed strictly in
@@ -339,8 +379,11 @@ struct AgentInner {
     run: Mutex<Option<ActiveRun>>,
     convert_to_llm: ConvertToLlmFn,
     transform_context: Option<TransformContextFn>,
+    filter_assistant_message: Option<FilterAssistantMessageFn>,
     stream_fn: Option<StreamFn>,
     get_api_key: Option<crate::agent_loop::GetApiKeyFn>,
+    run_scope: Mutex<Option<AgentRunScopeFn>>,
+    continuation_suppression: std::sync::atomic::AtomicUsize,
     before_tool_call: Option<BeforeToolCallFn>,
     after_tool_call: Option<AfterToolCallFn>,
     should_stop_after_turn: Option<ShouldStopAfterTurnFn>,
@@ -554,7 +597,15 @@ impl AgentInner {
                     as crate::BoxFut<'static, anyhow::Result<Vec<AgentMessage>>>
             }) as PollMessagesFn
         };
-        let continuation = self.get_continuation_messages.lock().unwrap().clone();
+        let continuation = if self
+            .continuation_suppression
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            self.get_continuation_messages.lock().unwrap().clone()
+        } else {
+            None
+        };
         let should_stop_after_turn = self.should_stop_after_turn.clone();
 
         // A routed run serves every LLM request on the override model with
@@ -574,6 +625,9 @@ impl AgentInner {
         config.reasoning = reasoning;
         config.session_id.clone_from(&self.session_id);
         config.transform_context.clone_from(&self.transform_context);
+        config
+            .filter_assistant_message
+            .clone_from(&self.filter_assistant_message);
         config.get_api_key.clone_from(&self.get_api_key);
         config.should_stop_after_turn = should_stop_after_turn;
         config
@@ -591,11 +645,26 @@ impl AgentInner {
     /// Port of `runWithLifecycle`.
     async fn run_with_lifecycle<F, Fut>(self: &Arc<Self>, executor: F) -> anyhow::Result<()>
     where
-        F: FnOnce(AbortSignal, Option<AgentModelOverride>) -> Fut,
-        Fut: std::future::Future<Output = anyhow::Result<()>>,
+        F: FnOnce(AbortSignal, Option<AgentModelOverride>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let scope = self.run_scope.lock().unwrap().clone();
+        let inner = self.clone();
+        let work = Box::pin(async move { inner.run_with_lifecycle_inner(executor).await });
+        match scope {
+            Some(scope) => scope(work).await,
+            None => work.await,
+        }
+    }
+
+    async fn run_with_lifecycle_inner<F, Fut>(self: &Arc<Self>, executor: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(AbortSignal, Option<AgentModelOverride>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let controller = AbortController::new();
         let (idle_tx, _idle_rx) = watch::channel(false);
+        let lifecycle_idle = idle_tx.clone();
         // The run's model-override snapshot, read ONCE (TS `ActiveRun.model`
         // + `createLoopConfig`'s `modelOverride` read the same value in the
         // same synchronous block): every LLM request of the run, and its
@@ -622,6 +691,12 @@ impl AgentInner {
                 model: run_model,
             });
         }
+        let mut lifecycle = RunLifecycleGuard {
+            inner: self.clone(),
+            controller: controller.clone(),
+            idle: lifecycle_idle,
+            finished: false,
+        };
         let run_signal = controller.signal();
 
         {
@@ -652,6 +727,7 @@ impl AgentInner {
                 let _ = active.idle_tx.send(true);
             }
         }
+        lifecycle.finished = true;
         result
     }
 
@@ -674,7 +750,7 @@ impl AgentInner {
         started: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> anyhow::Result<()> {
         let inner = Arc::clone(self);
-        self.run_with_lifecycle(|signal, model_override| async move {
+        self.run_with_lifecycle(move |signal, model_override| async move {
             if let Some(started) = started {
                 let _ = started.send(());
             }
@@ -708,7 +784,7 @@ impl AgentInner {
 
     async fn run_continuation(self: &Arc<Self>) -> anyhow::Result<()> {
         let inner = Arc::clone(self);
-        self.run_with_lifecycle(|signal, model_override| async move {
+        self.run_with_lifecycle(move |signal, model_override| async move {
             let (context, config) = {
                 let shared = inner.shared.lock().await;
                 (
@@ -769,6 +845,7 @@ impl AgentInner {
                     crate::types::UserMessage {
                         content: crate::types::UserContent::Parts(content),
                         timestamp: crate::now_ms(),
+                        rest: serde_json::Map::default(),
                     },
                 ))]
             }
@@ -781,7 +858,34 @@ pub struct Agent {
     inner: Arc<AgentInner>,
 }
 
+pub struct AgentContinuationSuppression(Arc<AgentInner>);
+
+impl Drop for AgentContinuationSuppression {
+    fn drop(&mut self) {
+        self.0
+            .continuation_suppression
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 impl Agent {
+    /// Suppress autonomous continuation for internal episodes; dropping restores it.
+    #[must_use]
+    pub fn suppress_continuations(&self) -> AgentContinuationSuppression {
+        self.inner
+            .continuation_suppression
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        AgentContinuationSuppression(self.inner.clone())
+    }
+
+    /// Install the host's run serialization scope before admitting work.
+    ///
+    /// # Panics
+    /// Panics if the run-scope mutex is poisoned.
+    pub fn set_run_scope(&self, scope: Option<AgentRunScopeFn>) {
+        *self.inner.run_scope.lock().unwrap() = scope;
+    }
+
     pub fn new(options: AgentOptions) -> Self {
         let initial = options.initial_state;
         let state = MutableAgentState {
@@ -809,8 +913,11 @@ impl Agent {
                 .convert_to_llm
                 .unwrap_or_else(AgentLoopConfig::default_convert_to_llm),
             transform_context: options.transform_context,
+            filter_assistant_message: options.filter_assistant_message,
             stream_fn: options.stream_fn,
             get_api_key: options.get_api_key,
+            run_scope: Mutex::new(None),
+            continuation_suppression: std::sync::atomic::AtomicUsize::new(0),
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
             should_stop_after_turn: options.should_stop_after_turn,

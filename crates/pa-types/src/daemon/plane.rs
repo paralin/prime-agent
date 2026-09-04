@@ -36,6 +36,8 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "restore_actions"
         | "append_custom_message"
         | "resume_queue"
+        | "agent_message_inbox"
+        | "agent_message_wait"
         | "abort"
         | "abort_and_send_queued"
         | "start_side_question"

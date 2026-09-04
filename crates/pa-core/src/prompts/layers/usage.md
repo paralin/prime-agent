@@ -1,7 +1,7 @@
 The following are mandatory rules, only to be overridden by clear user intent.
 
 - Memories must be kept lean and up-to-date.
-- `goal.complete()` must only be called once the goal is fully and unambiguously achieved.
+- `goal.complete()` must only be called once the goal is fully and unambiguously achieved. If progress depends only on external input, call `await goal.pause(reason)` and end the turn; resume when the dependency clears.
 - Goals must only be created at a user's request.
 - Agents run shell commands with `bash()`, not `subprocess`/`os.system`: subprocess calls block the kernel, show the user nothing while they run, and spawn processes the harness cannot see or stop.
 - `bash("""...""")` should be used over `bash("...")` because it makes using quotation marks inside bash easy.

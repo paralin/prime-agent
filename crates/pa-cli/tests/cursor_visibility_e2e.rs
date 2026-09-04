@@ -549,7 +549,7 @@ impl MockSupervisor {
             &mut writer,
             &json!({
                 "type": "daemon_hello",
-                "protocol": { "name": "prime-agent.daemon", "version": 7 },
+                "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
                 "serverCapabilities": [],
                 "clientId": "mock",
             }),
@@ -631,7 +631,7 @@ fn attach_data(id: &str) -> Value {
         "command": "attach",
         "success": true,
         "data": {
-            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
             "activeSessionId": "s1",
             "snapshot": {
                 "activeSessionId": "s1",

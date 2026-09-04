@@ -605,6 +605,7 @@ impl SessionEngine for ScriptedEngine {
         })() else {
             return CompactionOutcome::Compacted {
                 run: Box::new(CompactionRun {
+                    continuation: None,
                     result: json!({
                         "summary": "scripted compaction summary",
                         "firstKeptEntryId": "",
@@ -649,6 +650,7 @@ impl SessionEngine for ScriptedEngine {
         });
         CompactionOutcome::Compacted {
             run: Box::new(CompactionRun {
+                continuation: None,
                 result,
                 usage: entry.get("usage").cloned().filter(|usage| !usage.is_null()),
                 entry: Value::Null,

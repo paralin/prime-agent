@@ -100,7 +100,7 @@ impl CompactionManager {
             custom_instructions: custom_instructions.clone(),
         };
         let run_signal = signal.clone();
-        let outcome = {
+        let mut outcome = {
             let engine = Arc::clone(&engine);
             tokio::task::spawn_blocking(move || engine.run_compaction(request, &run_signal))
                 .await
@@ -109,13 +109,16 @@ impl CompactionManager {
                 })
         };
 
-        if let CompactionOutcome::Compacted { run } = &outcome {
+        let mut persistence_error = None;
+        if let CompactionOutcome::Compacted { run } = &mut outcome {
             pa_core::session_engine::compaction_trace::trace(
                 "manual.compact_returned",
                 &serde_json::Value::Null,
             );
             let persist_started = std::time::Instant::now();
-            self.persist_compaction(run, custom_instructions.as_deref());
+            persistence_error = self
+                .persist_compaction(run, custom_instructions.as_deref())
+                .err();
             pa_core::session_engine::compaction_trace::trace(
                 "manual.compaction_persisted",
                 &serde_json::json!({
@@ -127,9 +130,18 @@ impl CompactionManager {
             // `_performCompaction`, so its `message_start`/`message_end`
             // pair precedes `compaction_end` on the wire): persist the
             // durable row and broadcast the pair.
-            if let Some(message) = &run.ipython_state {
+            if let Some(message) = run
+                .ipython_state
+                .as_ref()
+                .filter(|_| persistence_error.is_none())
+            {
                 self.persist_and_emit_ipython_state(message);
             }
+        }
+        if let Some(error) = persistence_error {
+            outcome = CompactionOutcome::Failed {
+                error: format!("Could not persist compaction: {error:#}"),
+            };
         }
         let end = compaction_end_event(&outcome, custom_instructions.as_deref());
         let _ = self.emit_session_event(end);
@@ -230,14 +242,14 @@ impl CompactionManager {
     /// the transcript.
     fn persist_compaction(
         &self,
-        run: &crate::engine::CompactionRun,
+        run: &mut crate::engine::CompactionRun,
         custom_instructions: Option<&str>,
-    ) {
+    ) -> anyhow::Result<()> {
         let result = &run.result;
         let mut core = self.core.lock().unwrap();
         let cwd = core.cwd.clone();
         let Some(store) = core.store.as_mut() else {
-            return;
+            return Ok(());
         };
         let mut fields = if run.entry.is_object() {
             run.entry.clone()
@@ -261,6 +273,17 @@ impl CompactionManager {
             }
             fields
         };
+        if let Some(continuation) = &run.continuation {
+            let id = store.persist_message_compaction(continuation, fields)?;
+            run.entry["firstKeptEntryId"] = json!(id);
+            run.result["firstKeptEntryId"] = json!(id);
+            let message = continuation.clone();
+            drop(core);
+            for event_type in ["message_start", "message_end"] {
+                let _ = self.emit_session_event(json!({"type":event_type,"message":message}));
+            }
+            return Ok(());
+        }
         // The engine's id references its in-memory entry list, a separate
         // id space from the session file: re-pin the boundary to the
         // durable cut so the file read retains the kept tail (TS: one
@@ -291,7 +314,8 @@ impl CompactionManager {
                 .unwrap_or(first_kept_entry_id)
         };
         fields["firstKeptEntryId"] = json!(first_kept_entry_id);
-        let _ = store.persist_entry("compaction", fields);
+        store.persist_entry("compaction", fields)?;
+        Ok(())
     }
 
     /// Persist the post-compaction `ipython_state` row to the session store
@@ -389,6 +413,9 @@ pub(crate) fn compaction_result_value(
     });
     if let Some(details) = &entry.details {
         value["details"] = details.clone();
+    }
+    if let Some(payload) = &entry.provider_native_compaction {
+        value["providerNativeCompaction"] = payload.clone();
     }
     value
 }
@@ -538,6 +565,7 @@ mod tests {
             usage: Some(pa_types::ai::Usage::default()),
         };
         let entry = pa_types::session::CompactionEntry {
+            provider_native_compaction: None,
             summary: result.summary.clone(),
             first_kept_entry_id: result.first_kept_entry_id.clone(),
             tokens_before: result.tokens_before,
@@ -583,11 +611,22 @@ mod tests {
                 "tokensBefore": 1234,
             })
         );
+        let native = pa_types::session::CompactionEntry {
+            provider_native_compaction: Some(
+                json!({"items": [{"type": "compaction", "encrypted_content": "opaque"}]}),
+            ),
+            ..bare
+        };
+        assert_eq!(
+            compaction_result_value(&result, &native)["providerNativeCompaction"],
+            native.provider_native_compaction.unwrap()
+        );
     }
 
     #[test]
     fn event_shapes_match_ts() {
         let run = crate::engine::CompactionRun {
+            continuation: None,
             result: json!({
                 "summary": "the story so far",
                 "firstKeptEntryId": "abcd1234",

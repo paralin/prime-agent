@@ -457,8 +457,10 @@ mod tests {
             .clone();
         model.compat =
             Some(serde_json::from_value(json!({"supportsReasoningBudgetTokens":true})).unwrap());
-        let mut options = OpenAICompletionsOptions::default();
-        options.reasoning_budget_tokens = Some(8192);
+        let options = OpenAICompletionsOptions {
+            reasoning_budget_tokens: Some(8192),
+            ..OpenAICompletionsOptions::default()
+        };
         let params = build_params(
             &model,
             &Context::default(),

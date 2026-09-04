@@ -132,6 +132,10 @@ pub enum Event {
         id: String,
         data: Value,
     },
+    HostMessage {
+        id: String,
+        data: Value,
+    },
     Error {
         id: Option<String>,
         ename: String,
@@ -154,6 +158,7 @@ impl Event {
             Event::Result { .. } => "result",
             Event::Display { .. } => "display",
             Event::HostRequest { .. } => "host_request",
+            Event::HostMessage { .. } => "host_message",
             Event::Error { .. } => "error",
             Event::Done { .. } => "done",
         }
@@ -182,7 +187,7 @@ pub fn parse_event(line: &str) -> Result<Event, String> {
         Some(map)
             if matches!(
                 map.get("event").and_then(Value::as_str),
-                Some("display" | "host_request")
+                Some("display" | "host_request" | "host_message")
             ) =>
         {
             map.remove("data").unwrap_or(Value::Null)
@@ -198,7 +203,15 @@ pub fn parse_event(line: &str) -> Result<Event, String> {
         .ok_or_else(|| format!("unknown protocol event: {}", clip(line)))?;
     let known = matches!(
         kind,
-        "ready" | "stdout" | "stderr" | "result" | "display" | "host_request" | "error" | "done"
+        "ready"
+            | "stdout"
+            | "stderr"
+            | "result"
+            | "display"
+            | "host_request"
+            | "host_message"
+            | "error"
+            | "done"
     );
     if !known {
         return Err(format!("unknown protocol event: {}", clip(line)));
@@ -236,6 +249,12 @@ pub fn parse_event(line: &str) -> Result<Event, String> {
             let rid =
                 id("id").ok_or_else(|| format!("host_request frame without id: {}", clip(line)))?;
             Ok(Event::HostRequest { id: rid, data })
+        }
+        "host_message" => {
+            let id = id("id")
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| format!("host_message frame without id: {}", clip(line)))?;
+            Ok(Event::HostMessage { id, data })
         }
         "error" => Ok(Event::Error {
             id: id("id"),

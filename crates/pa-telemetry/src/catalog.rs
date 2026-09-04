@@ -480,7 +480,7 @@ pub const AUTH_CATEGORIES: &[&str] = &[
 /// The #2117 feature names.
 pub const FEATURE_NAMES: &[&str] = &[
     "model", "login", "logout", "effort", "goal", "new", "resume", "fork", "clone", "tree",
-    "feedback",
+    "feedback", "rlm.act",
 ];
 
 /// The #2117 feature outcomes.

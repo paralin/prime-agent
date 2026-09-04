@@ -12,6 +12,40 @@ use super::{
 };
 
 impl SessionEngine for AgentSessionEngine {
+    fn act_context_tree_nodes(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + '_>> {
+        let runtime = self
+            .act_runtime
+            .lock()
+            .expect("Act runtime lock")
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        Box::pin(async move {
+            match runtime {
+                Some(runtime) => runtime.context_tree_nodes().await,
+                None => Vec::new(),
+            }
+        })
+    }
+
+    fn runtime_tool_names(&self) -> Vec<String> {
+        self.claude_query
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|query| query.runtime.snapshot().running_tool)
+            .into_iter()
+            .collect()
+    }
+    fn external_event_watches(
+        &self,
+    ) -> Vec<pa_core::session_engine::external_events::ExternalEventWatch> {
+        self.external_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .watches()
+    }
     /// TS `_clearQueuedGoalContexts`: the worker-installed purge withdraws
     /// the queued minted goal-context turns (pause/clear/start must not
     /// leave a stale continuation to run after the state change).
@@ -375,6 +409,9 @@ impl SessionEngine for AgentSessionEngine {
 
     fn configure_service_tier(&self, tier: Option<pa_types::ai::ServiceTier>) {
         *self.service_tier.write().expect("service tier lock") = tier;
+        if let Some(children) = &self.children {
+            children.set_service_tier(tier);
+        }
         if let Some(target) = self
             .provider_target
             .write()
@@ -696,7 +733,7 @@ impl SessionEngine for AgentSessionEngine {
         };
         let result = self
             .runtime
-            .block_on(pa_agent::abort::race_with_abort(run, signal));
+            .block_on(async { Ok::<_, anyhow::Error>(run.await) });
         let compaction = match result {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(error)) => {
@@ -737,6 +774,10 @@ impl SessionEngine for AgentSessionEngine {
                 self.mark_compact_auto_refine_pending();
                 CompactionOutcome::Compacted {
                     run: Box::new(CompactionRun {
+                        continuation: run
+                            .continuation
+                            .as_ref()
+                            .and_then(|message| serde_json::to_value(message).ok()),
                         // The wire result is the TS `CompactionResult` shape
                         // (`_performCompaction`'s return): summary,
                         // firstKeptEntryId, tokensBefore, and the file-op
@@ -988,16 +1029,24 @@ impl SessionEngine for AgentSessionEngine {
                     .map(|depth| (depth, "env"))
             })
             .unwrap_or((u64::from(DEFAULT_RLM_MAX_DEPTH), "default"));
+        let policy = self
+            .create_resources
+            .read()
+            .expect("create resources lock")
+            .runtime_policy;
+        let max_depth = policy.max_depth(max_depth.min(u64::from(u32::MAX)) as u32);
         *self.rlm_max_depth_source.lock().expect("depth source lock") = source;
         if let Some(children) = &self.children {
             let parent = ParentIdentity {
                 rlm_depth: identity.rlm_depth,
-                rlm_max_depth: max_depth.min(u64::from(u32::MAX)) as u32,
+                rlm_max_depth: max_depth,
+                runtime_policy: policy,
                 model: None,
                 cwd: identity.cwd.clone(),
                 session_id: identity.session_id.clone(),
                 session_file: identity.session_file.clone(),
                 thinking: identity.thinking.clone(),
+                service_tier: *self.service_tier.read().expect("service tier lock"),
                 child_script: identity.child_script,
             };
             children.set_identity(parent);
@@ -1316,7 +1365,12 @@ impl SessionEngine for AgentSessionEngine {
             // The live bound the registry enforces (the chat override and
             // the inherited/seeded bound both land there).
             Some(children) => children.rlm_max_depth(),
-            None => DEFAULT_RLM_MAX_DEPTH,
+            None => self
+                .create_resources
+                .read()
+                .expect("create resources lock")
+                .runtime_policy
+                .max_depth(DEFAULT_RLM_MAX_DEPTH),
         };
         json!({ "maxDepth": max_depth, "source": source })
     }
@@ -1352,7 +1406,12 @@ impl SessionEngine for AgentSessionEngine {
         // and rebuilds the system prompt; the bound itself lives in the
         // registry here).
         if let Some(children) = &self.children {
-            children.set_rlm_max_depth(max_depth.min(u64::from(u32::MAX)) as u32);
+            let policy = self
+                .create_resources
+                .read()
+                .expect("create resources lock")
+                .runtime_policy;
+            children.set_rlm_max_depth(policy.max_depth(max_depth.min(u64::from(u32::MAX)) as u32));
         }
         *self.rlm_max_depth_source.lock().expect("depth source lock") = "chat";
         // The durable `rlm_max_depth_state` custom entry (TS
@@ -1364,7 +1423,7 @@ impl SessionEngine for AgentSessionEngine {
         // + flush + drain): errors join the TS `globalError` field, they
         // do not fail the command.
         let mut result = json!({
-            "maxDepth": max_depth,
+            "maxDepth": self.create_resources.read().expect("create resources lock").runtime_policy.max_depth(max_depth.min(u64::from(u32::MAX)) as u32),
             "source": "chat",
             "globalSaved": false,
         });
@@ -1385,6 +1444,10 @@ impl SessionEngine for AgentSessionEngine {
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
+        if self.is_claude_code_selection() {
+            self.run_claude_code_prompt(request, aborted, emit);
+            return;
+        }
         // Goal-state changes surface as `goal_update` at the moment they
         // happen (kernel host requests and session-command mutations), so
         // every emit of this prompt runs through the tracking wrapper.
@@ -1566,6 +1629,7 @@ impl SessionEngine for AgentSessionEngine {
     }
 
     fn abort_in_flight_turn(&self) {
+        self.abort_claude_query("RLM child cancelled");
         // TS `requestAbort` ends with `this.agent.abort()`: the agent's
         // active-run controller aborts, every loop await rejects, and the
         // in-flight provider fetch cancels. No run in flight (or a

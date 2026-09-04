@@ -68,8 +68,8 @@ impl AgentCronJobStore {
         Ok(job)
     }
 
-    /// Bind jobs stored for a session file to a live session id on restore, or
-    /// move a live session's jobs to a new file when it switches.
+    /// Rebind restored jobs; internal heartbeats stay with their creating session.
+    /// Other jobs follow a live session when it switches files.
     pub fn rebind_session_jobs(&self, input: &SessionBinding) -> Vec<AgentCronJob> {
         let target_session_file = resolve_path(&input.session_file);
         let mut rebound_jobs = Vec::new();
@@ -77,6 +77,23 @@ impl AgentCronJobStore {
             .read_jobs()
             .into_iter()
             .map(|job| {
+                if job.source.as_deref() == Some("rlm_heartbeat") {
+                    if job.session_id != input.session_id
+                        || resolve_path(&job.session_file) != target_session_file
+                    {
+                        return job;
+                    }
+                    if job.active_session_id == input.active_session_id && job.cwd == input.cwd {
+                        return job;
+                    }
+                    let restored = AgentCronJob {
+                        active_session_id: input.active_session_id.clone(),
+                        cwd: input.cwd.clone(),
+                        ..job
+                    };
+                    rebound_jobs.push(restored.clone());
+                    return restored;
+                }
                 if job.active_session_id != input.active_session_id
                     && resolve_path(&job.session_file) != target_session_file
                 {
@@ -454,6 +471,43 @@ mod tests {
         assert_eq!(store.list()[0].status, JobStatus::Cancelled);
         // Empty prompt rejected.
         assert!(store.create(&input("  ", "every 10m", now)).is_err());
+    }
+
+    #[test]
+    fn internal_heartbeats_follow_only_their_durable_creating_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentCronJobStore::new(dir.path().join("jobs.json"));
+        let mut heartbeat = input("observe", "every 10m", 1_700_000_000_000);
+        heartbeat.source = Some("rlm_heartbeat".into());
+        heartbeat.active_session_id = "reused-live".into();
+        heartbeat.session_id = "original".into();
+        heartbeat.session_file = "/work/original.jsonl".into();
+        let original = store.create(&heartbeat).unwrap();
+        let other = SessionBinding {
+            active_session_id: "reused-live".into(),
+            session_id: "replacement".into(),
+            session_file: "/work/replacement.jsonl".into(),
+            cwd: "/other".into(),
+        };
+        assert!(store.rebind_session_jobs(&other).is_empty());
+        assert_eq!(store.list()[0].session_file, original.session_file);
+        let wrong_identity = SessionBinding {
+            session_file: original.session_file.clone(),
+            ..other
+        };
+        assert!(store.rebind_session_jobs(&wrong_identity).is_empty());
+        let restored = SessionBinding {
+            active_session_id: "fresh-live".into(),
+            session_id: original.session_id.clone(),
+            session_file: "/work/./original.jsonl".into(),
+            cwd: "/restored".into(),
+        };
+        let rebound = store.rebind_session_jobs(&restored);
+        assert_eq!(rebound.len(), 1);
+        assert_eq!(rebound[0].active_session_id, "fresh-live");
+        assert_eq!(rebound[0].cwd, "/restored");
+        assert_eq!(rebound[0].session_file, original.session_file);
+        assert!(store.rebind_session_jobs(&restored).is_empty());
     }
 
     #[test]

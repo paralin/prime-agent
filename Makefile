@@ -2,7 +2,8 @@
 check:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
-	cargo test --workspace
+	# Background catalogs, update checks and telemetry stay offline in tests.
+	PI_OFFLINE=1 DO_NOT_TRACK=1 cargo test --workspace
 	cargo build --release --workspace
 
 

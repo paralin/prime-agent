@@ -3,7 +3,9 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::{register_faux_provider, FauxModelDefinition, RegisterFauxProviderOptions};
-use crate::types::{Context, ProviderNativeCompactionOptions, ProviderNativeCompactionResult};
+use crate::types::{
+    Context, ProviderNativeCompactionOptions, ProviderNativeCompactionResult, StreamOptions,
+};
 
 #[tokio::test]
 async fn registered_compactor_receives_context_and_instructions() {
@@ -27,6 +29,9 @@ async fn registered_compactor_receives_context_and_instructions() {
         ..Default::default()
     });
     let model = registration.get_model();
+    assert!(crate::registry::get_api_provider(&model.api)
+        .unwrap()
+        .supports_native_compaction());
     assert!(model.thinking_level_map.is_some());
     let result = crate::compact(
         &model,
@@ -37,7 +42,7 @@ async fn registered_compactor_receives_context_and_instructions() {
         },
         &ProviderNativeCompactionOptions {
             instructions: "compact".into(),
-            base: Default::default(),
+            base: StreamOptions::default(),
         },
     )
     .await
@@ -49,6 +54,9 @@ async fn registered_compactor_receives_context_and_instructions() {
 #[tokio::test]
 async fn absent_compactor_reports_unsupported() {
     let registration = register_faux_provider(RegisterFauxProviderOptions::default());
+    assert!(!crate::registry::get_api_provider(&registration.api)
+        .unwrap()
+        .supports_native_compaction());
     let error = crate::compact(
         &registration.get_model(),
         &Context {
@@ -58,7 +66,7 @@ async fn absent_compactor_reports_unsupported() {
         },
         &ProviderNativeCompactionOptions {
             instructions: String::new(),
-            base: Default::default(),
+            base: StreamOptions::default(),
         },
     )
     .await

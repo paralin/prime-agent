@@ -23,9 +23,12 @@ use super::meta::{
 use super::producer::UpdateProducer;
 use super::types::{parse_prompt_blocks, AcpSessionUpdate, ImageBlock, PromptBlockError};
 
+mod act;
+
 /// One hosted ACP session: the producer, the engine event subscription, the
 /// autonomous run state, and the prompt-lifecycle bookkeeping.
 pub struct AcpSession {
+    act_relay: Arc<act::ActRelay>,
     pub id: String,
     producer: Arc<UpdateProducer>,
     subscription: Mutex<Option<Subscription>>,
@@ -63,6 +66,8 @@ impl AcpSession {
         autonomous_driver: Arc<dyn pa_core::autonomous::AutonomousDriver>,
     ) -> AcpSession {
         let mapping = Arc::new(Mutex::new(MappingState::default()));
+        let act_relay = Arc::new(act::ActRelay::new(producer.clone()));
+        engine.act_runtime.set_event_sink(act_relay.sink());
         let last_published_goal =
             Arc::new(Mutex::new(engine.goal_driver.lock().await.state().clone()));
         // The compaction arm state is shared with the event subscription:
@@ -79,9 +84,11 @@ impl AcpSession {
             last_published_goal.clone(),
             arms.clone(),
             goal_budget_crossed.clone(),
+            act_relay.clone(),
         )
         .await;
         AcpSession {
+            act_relay,
             id,
             producer,
             subscription: Mutex::new(Some(subscription)),
@@ -98,6 +105,7 @@ impl AcpSession {
 
     /// Release the engine event subscription; no further updates flow.
     pub async fn unsubscribe(&self) {
+        self.act_relay.flush().await;
         let subscription = self.subscription.lock().await.take();
         if let Some(subscription) = subscription {
             subscription.unsubscribe().await;
@@ -202,6 +210,7 @@ async fn subscribe_engine_events(
     last_published_goal: Arc<Mutex<pa_core::goals::GoalState>>,
     arms: Arc<CompactionArms>,
     goal_budget_crossed: Arc<AtomicBool>,
+    act_relay: Arc<act::ActRelay>,
 ) -> Subscription {
     let agent = engine.session.agent().clone();
     let goal_driver = engine.goal_driver.clone();
@@ -217,7 +226,11 @@ async fn subscribe_engine_events(
             let last_published_goal = last_published_goal.clone();
             let arms = arms.clone();
             let goal_budget_crossed = goal_budget_crossed.clone();
+            let act_relay = act_relay.clone();
             Box::pin(async move {
+                if matches!(event, AgentEvent::ToolExecutionEnd { .. } | AgentEvent::AgentEnd { .. }) {
+                    act_relay.flush().await;
+                }
                 // A user row that starts an agent run resets the overflow
                 // recovery machine (TS `startsAgentRun` at
                 // `message_start`): the stale attempt state from the
@@ -504,6 +517,7 @@ pub async fn publish_response_boundary(
     expected: bool,
     outcome: PrimeAgentOutcome,
 ) -> anyhow::Result<()> {
+    session.act_relay.flush().await;
     let boundary = AcpSessionUpdate::SessionInfoUpdate {
         meta: super::meta::prime_agent_meta(&PrimeAgentSessionMeta {
             terminal_quiescence_expected: Some(expected),

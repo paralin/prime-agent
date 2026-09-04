@@ -114,6 +114,7 @@ const FOLLOWUP_START_POLL_MS: u64 = 2_000;
 pub struct ParentIdentity {
     pub rlm_depth: u32,
     pub rlm_max_depth: u32,
+    pub runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy,
     /// Parent model selector (`provider/id`); children inherit it.
     pub model: Option<String>,
     /// Parent working directory; children inherit it.
@@ -124,6 +125,7 @@ pub struct ParentIdentity {
     pub session_file: Option<String>,
     /// Default thinking level children inherit.
     pub thinking: Option<String>,
+    pub service_tier: Option<pa_types::ai::ServiceTier>,
     /// Verification seam: create children with a scripted engine file.
     pub child_script: Option<String>,
 }
@@ -684,6 +686,14 @@ impl SupervisorChildSessions {
     /// while holding the lock).
     pub fn set_model(&self, model: String) {
         self.inner.identity.lock().expect("identity lock").model = Some(model);
+    }
+
+    pub(crate) fn set_service_tier(&self, tier: Option<pa_types::ai::ServiceTier>) {
+        self.inner
+            .identity
+            .lock()
+            .expect("identity lock")
+            .service_tier = tier;
     }
 
     /// Set the session's RLM depth bound (TS `setRlmMaxDepth`): the

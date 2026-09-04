@@ -295,6 +295,8 @@ fn entry_type(entry: &FileEntry) -> &'static str {
         FileEntry::SessionState { .. } => "session_state",
         FileEntry::GitState { .. } => "git_state",
         FileEntry::Unknown { .. } => "unknown",
+        FileEntry::ActStart { .. } => "act_start",
+        FileEntry::ActTerminal { .. } => "act_terminal",
     }
 }
 

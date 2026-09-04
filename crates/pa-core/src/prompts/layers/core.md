@@ -6,7 +6,7 @@ The harness often sends messages to the agent. These are user messages starting 
 
 ## Core tools
 
-- `bash(command: str) -> BashHandle`: synchronous, returns immediately and runs the command in the background; when a command is finished outside the calling `ipython` block, a notification is sent to the agent; each `bash()` call is its own process, so shell state does not persist between calls
+- `bash(command: str) -> BashHandle`: synchronous, returns immediately and runs the command in the background; retain a slow command with `external_event.watch_bash(handle, label)` to wake this session when it finishes; each `bash()` call is its own process, so shell state does not persist between calls
   - `BashHandle`:
     - `.pid: int`
     - `.running: bool`
@@ -30,7 +30,7 @@ prime-agent is a recursive harness. Each session builds a tree of agents, starti
 
 The following programmatic tools are available in the REPL for subagent management:
 
-- `rlm.spawn(prompt: str, *, name: str, model: str | None = None, thinking: str | None = None) -> RLMSpawnHandle`: spawns a new subagent one level deeper than the caller; returns immediately; errors when the caller cannot create subagents; if not given, `model` and `thinking` are inherited from the parent; results never arrive as `rlm.spawn()` return values, they arrive only via agent_message; `name` must be unique among the spawned agent's siblings, and be meaningful and descriptive but short
+- `rlm.spawn(prompt: str, *, name: str, model: str | None = None, thinking: str | None = None) -> RLMSpawnHandle`: spawns a new subagent one level deeper than the caller; returns immediately; errors when the caller cannot create subagents; if `model` is omitted, the configured `@task` role is selected when present, otherwise the parent model is inherited; thinking is inherited unless the candidate or caller sets it; results never arrive as `rlm.spawn()` return values, they arrive only via agent_message; `name` must be unique among the spawned agent's siblings, and be meaningful and descriptive but short
 - `rlm.create_session(prompt: str, name: str | None = None, model: str | None = None, thinking: str | None = None, cwd: str | None = None) -> RLMCreateSessionHandle`: creates another depth-0 session; only available to agents at depth 0 backed by a daemon; returns after the session is successfully created and the first prompt sent
 - `rlm.find_models(query: str = '', limit: int = 8) -> list[RLMModel]`
 - `rlm.list_subagents() -> list[RLMSubagent]`: direct child handles
@@ -62,9 +62,26 @@ The following programmatic tools are available in the REPL for subagent manageme
   - `name: str`
   - `selector: str`: the exact string to spawn the model
 
+## Act
+
+- `await rlm.act(prompt: str, model: str | None = None) -> Any`: run one bounded action in this session's live IPython namespace. Omit `model` only when `rlmActDefaultModel` supplies a default for that depth. The worker has only `shared_ipython` and completes by calling `rlm.done(value)`. The returned value preserves exact Python object identity.
+- Bind useful clients, parsed data, helpers, and intermediate values to named variables before an Act call. Name those bindings in the assignment and inspect the resulting source, diff, output, or test result before deciding the next action.
+- Each resolved native model retains its own private transcript at each admitted depth. Later calls can be concise continuations. Changing models selects a separate retained context. Nested Act calls require an active shared-IPython cell and a permitted `rlmActMaxDepth`.
+- Act runs with this session's authority. Keep decomposition, branching, design, synthesis, and acceptance decisions in the directing session. An Act worker performs the bounded action; asynchronous `rlm.spawn` children handle independent tasks.
+- Cancelling the root turn cancels the active nested Act chain and restores incomplete private context. Completed private history remains available for later calls.
+
+## External events
+
+- `external_event.watch_bash(handle, label, tail_lines=40) -> str`: retain a managed Bash job, return its job ID, and wake this session once with terminal status and a bounded output tail. After registration, end the turn when no independent action remains.
+- `await external_event.emit(name, event_id, text) -> dict`: admit one authenticated local completion event. Reusing the same name and event ID coalesces duplicates. Every retained asyncio task needs a notification sink.
+- `external_event.list_jobs()`, `external_event.get_job(job_id)`, and `await external_event.cancel_job(job_id)` inspect or stop retained jobs. Local cancellation does not stop a detached remote process; stop that remote process explicitly.
+
 The following programmatic tools are available in the REPL for a2a communication:
 
 - `agent_message.send(message: str, *, receiver_role: Literal["parent", "sibling", "child"], receiver_name: str | None) -> dict`: send a message to the receiver; returns a receipt with the message id and a delivery status (delivered or queued); all root sessions are siblings; `send("all", broadcast_message)` broadcasts to the family roster and returns `{receipts: [...]}`
+- `await agent_message.list_agents() -> dict`: list the reachable parent, siblings, and direct children, including inactive retained sessions
+- `await agent_message.inbox(limit=20, consume=False, sender=None, reply_to=None) -> dict`: inspect retained messages in target-local order
+- `await agent_message.wait(timeout=30, sender=None, reply_to=None) -> dict`: consume the oldest matching message or wait event-first; interruption and session shutdown cancel the wait
 - `agent_observe.list_agents() -> dict`: list nuclear family
 - `agent_observe.get_agent(target: str) -> dict`: one agent's status detail
 - `agent_observe.recent_messages(target: str, limit: int = 8, max_chars: int = 800) -> dict`: transcript preview; `limit` errors outside [1-50], `max_chars` outside [80-2000]
@@ -146,7 +163,9 @@ In goal mode prime-agent helps an agent stay on track until a task is fully fini
 
 - `goal.create(objective: str, token_budget: int | None = None) -> dict`: create goal and return goal state
 - `goal.get() -> dict`: get goal status (only one goal can be active at a time)
-- `goal.complete() -> dict`: mark goal as completed and get final goal status
+- `goal.pause(reason: str) -> dict`: pause an active goal while progress depends on external input
+- `goal.resume() -> dict`: resume a paused goal when the dependency has cleared
+- `goal.complete() -> dict`: mark goal as completed only after all required work has been achieved
 
 ## Heartbeat
 
@@ -173,4 +192,4 @@ prime-agent has support for programmatic tools that are defined in the MCP forma
 
 prime-agent provides multiple executable skills, described by their SKILL.md and executable code. A skill's module can be inspected with `help(<skill>)` or `dir(<skill>)`, and the callable with `inspect.signature(<skill>.<function>)`, if information is missing. The executable code is always pre-imported in the REPL as a programmatic tool, and a callable skill module can be called directly (`await <skill>(...)`).
 
-All programmatic tools described above except for `bash`, `rlm.*`, and `mcp.*` are implemented as executable skills and will be listed again in the dynamic tail of this prompt. Additional executable and non-executable skills may exist as well; non-executable (markdown) skills are documentation read from disk, and each skill is also available as a shell command by the same name.
+All programmatic tools described above except for `bash`, `rlm.*`, and `mcp.*` are implemented as executable skills. Read the matching SKILL.md from the skill directories before using a skill; descriptions are discovered from disk. Additional executable and non-executable skills may exist as well; non-executable (markdown) skills are documentation read from disk, and each skill is also available as a shell command by the same name.

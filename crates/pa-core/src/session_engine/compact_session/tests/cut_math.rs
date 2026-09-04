@@ -19,6 +19,7 @@ fn cut_and_tokens_computed_from_entries() {
 fn message_extraction_skips_compaction_and_tool_results() {
     let mut compaction = FileEntry::Compaction {
         payload: pa_types::session::CompactionEntry {
+            provider_native_compaction: None,
             summary: "s".to_string(),
             first_kept_entry_id: "x".to_string(),
             tokens_before: 1,

@@ -237,6 +237,9 @@ impl Supervisor {
         for key in [
             "rlmDepth",
             "rlmMaxDepth",
+            "rlmMaxDepthCeiling",
+            "rlmModelCandidates",
+            "disableRlmAct",
             "parentSessionPath",
             "models",
             // The scripted-parent verification seam: a dropped key leaves

@@ -311,11 +311,13 @@ impl KernelExecutor for KernelManagerExecutor {
         let manager = self.manager.clone();
         let code = code.to_string();
         let signal = options.signal;
+        let outer_tool_call_id = crate::tools::ipython::current_tool_call_id();
         Box::pin(async move {
             let result = manager
                 .execute(
                     &code,
                     crate::kernel::shared::ExecuteOptions {
+                        outer_tool_call_id,
                         signal: signal.map(crate::kernel::cancellation::AbortSignal::from_token),
                         ..Default::default()
                     },

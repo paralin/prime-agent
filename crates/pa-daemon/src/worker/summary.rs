@@ -28,6 +28,7 @@ impl Worker {
             self.user_bash.is_running(),
             self.engine.is_quota_parked(),
         );
+        apply_external_work_activity(&mut summary, &*self.engine);
         // The worker's roster-delta counter at snapshot time, and the
         // process instance that read it — the pair is one snapshot:
         // the supervisor's pull gate orders the summary against the
@@ -114,8 +115,9 @@ impl Worker {
             compaction_count: store.map_or(0, |store| store.compaction_count() as u32),
             goal: self.engine.goal_state_value(),
             scoped_models: core.scoped_models.clone(),
-            active_tool_names: Vec::new(),
+            active_tool_names: self.engine.runtime_tool_names(),
             context_usage: None,
+            external_event_watches: self.engine.external_event_watches(),
         }
     }
 
@@ -309,7 +311,7 @@ pub(crate) fn push_roster_delta(context: &RosterPushContext) {
     let _order = context.roster_push_order.lock().unwrap();
     let mut summary = {
         let core = context.core.lock().unwrap();
-        session_summary(
+        let mut summary = session_summary(
             &core,
             &context
                 .engine
@@ -319,7 +321,9 @@ pub(crate) fn push_roster_delta(context: &RosterPushContext) {
             context.engine.model_fallback_message(),
             context.user_bash.is_running(),
             context.engine.is_quota_parked(),
-        )
+        );
+        apply_external_work_activity(&mut summary, &*context.engine);
+        summary
     };
     // The embedded counter is the pre-stamp value read under the order
     // lock: every sequence this worker stamped before the snapshot is at
@@ -351,6 +355,16 @@ pub(crate) fn push_roster_delta(context: &RosterPushContext) {
             .request(command, std::time::Duration::from_secs(10))
             .await;
     });
+}
+
+fn apply_external_work_activity(summary: &mut SessionSummary, engine: &dyn SessionEngine) {
+    summary.is_running_tools |= summary.is_streaming && !engine.runtime_tool_names().is_empty();
+    if engine.external_event_watches().iter().any(|watch| {
+        watch.status == pa_core::session_engine::external_events::ExternalEventWatchStatus::Running
+    }) {
+        summary.is_session_active = true;
+        summary.activity = "working".into();
+    }
 }
 
 pub(crate) fn session_summary(

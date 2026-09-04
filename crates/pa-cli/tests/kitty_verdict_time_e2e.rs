@@ -736,7 +736,11 @@ fn spawn_child(socket: &Path, slave: &OwnedFd) -> Child {
     // and claim the pty slave as the controlling terminal.
     fn claim_controlling_tty(fd: i32) -> std::io::Result<()> {
         nix::unistd::setsid()?;
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSCTTY as libc::c_ulong, 0) };
+        #[cfg(target_os = "macos")]
+        let request = libc::c_ulong::from(libc::TIOCSCTTY);
+        #[cfg(not(target_os = "macos"))]
+        let request = libc::TIOCSCTTY as libc::c_ulong;
+        let rc = unsafe { libc::ioctl(fd, request, 0) };
         if rc < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -834,7 +838,7 @@ impl MockSupervisor {
             &mut writer,
             &json!({
                 "type": "daemon_hello",
-                "protocol": { "name": "prime-agent.daemon", "version": 7 },
+                "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
                 "serverCapabilities": [],
                 "clientId": "mock",
             }),
@@ -916,7 +920,7 @@ fn attach_data(id: &str) -> Value {
         "command": "attach",
         "success": true,
         "data": {
-            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
             "activeSessionId": "s1",
             "snapshot": {
                 "activeSessionId": "s1",

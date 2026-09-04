@@ -1,5 +1,6 @@
 //! The compaction tests (threshold/requested/manual compaction, telemetry, the durable outcome rows, the /compact command).
 use super::*;
+use std::fmt::Write as _;
 
 /// The faux model's per-request output budget (maxTokens `16_384` under the
 /// `32_000` request cap): threshold fixtures subtract it from the window
@@ -109,7 +110,7 @@ fn threshold_crossing_auto_compacts_with_the_event_pair() {
         .iter()
         .position(|event| matches!(event, EngineEvent::Compaction { .. }))
         .expect("compaction_end emitted");
-    let EngineEvent::Compaction { entry, event } = &events[compaction_index] else {
+    let EngineEvent::Compaction { entry, event, .. } = &events[compaction_index] else {
         unreachable!();
     };
     assert!(compaction_index > start_index);
@@ -1147,7 +1148,10 @@ fn compact_session_command_emits_the_result_on_success() {
     // assistant crossing) is a split-turn compaction that makes TWO
     // summarizer wire calls (TS parity), which this single-summary script
     // does not serve.
-    let filler = "history ".repeat(6_000); // ~48k chars = ~12k tokens each
+    let filler: String = (0..6_000).fold(String::new(), |mut output, index| {
+        write!(output, "{index:05} x ").unwrap();
+        output
+    }); // ~48k chars = ~12k tokens each
     let big_second = format!("second {}", "padded ".repeat(6_000)); // ~10.5k tokens
     let (_engine, events) = run_prompts(
         &serde_json::json!({
@@ -1174,7 +1178,9 @@ fn compact_session_command_emits_the_result_on_success() {
     assert_eq!(end["reason"], "manual");
     assert_eq!(end["aborted"], false);
     assert_eq!(end["customInstructions"], "focus on the goal");
-    let result = end["result"].as_object().expect("the result payload");
+    let result = end["result"]
+        .as_object()
+        .unwrap_or_else(|| panic!("the result payload: {end}"));
     assert_eq!(result["summary"], "## Summary\nthe session story");
     assert!(result["tokensBefore"].as_u64().unwrap_or_default() > 0);
     // The TS dataKeys on the wire result (the live golden,

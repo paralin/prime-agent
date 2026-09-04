@@ -696,6 +696,17 @@ impl DaemonClient {
         id: &str,
         timeout_ms: u64,
     ) -> Result<DaemonResponse> {
+        if let DaemonCommand::Create {
+            config: Some(config),
+            ..
+        } = &command
+        {
+            if pa_types::daemon::compatibility::requires_runtime_launch_policy(config)
+                && !self.supports_server_capability("runtime_launch_policy")
+            {
+                anyhow::bail!("Daemon does not support runtime launch restrictions");
+            }
+        }
         if *self.reader_dead_rx.borrow() {
             return Err(self.dead_reader_error());
         }

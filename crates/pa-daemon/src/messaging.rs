@@ -42,6 +42,7 @@ impl Supervisor {
             message,
             from_active_session_id,
             delivery_mode,
+            rest,
             ..
         } = command
         else {
@@ -123,13 +124,19 @@ impl Supervisor {
             // the client id (`createAgentSessionMessageSender`).
             None => json!({ "clientId": client_id }),
         };
+        let mut metadata = Map::default();
+        for key in ["messageId", "replyTo"] {
+            if let Some(value) = rest.get(key).filter(|value| !value.is_null()) {
+                metadata.insert(key.to_string(), value.clone());
+            }
+        }
         let delivery = DaemonWorkerCommand::WorkerDeliverMessage {
             id: None,
             target_active_session_id: target.worker_id.clone(),
             message: message.clone(),
             sender,
             delivery_mode: delivery_mode.clone(),
-            rest: Map::default(),
+            rest: metadata,
         };
         let payload = match serde_json::to_value(&delivery) {
             Ok(payload) => payload,

@@ -133,6 +133,8 @@ impl SessionUi {
             command_refresh_epoch: 0,
             skill_commands_cache: Vec::new(),
             bash_activities: serde_json::json!({"activities": []}),
+            external_watches: Vec::new(),
+            watches_panel_open: false,
             bash_list_epoch: 0,
             bash_updates: activity_updates.bash,
             subagents_focused: false,
@@ -395,6 +397,14 @@ impl SessionUi {
         // `activeBashComponent` tracked) — the rebuild's kind decides
         // its fate.
         let state = attach.snapshot.get("state");
+        self.external_watches = if self
+            .client
+            .supports_server_capability("external_event_watches")
+        {
+            super::watches::parse(state.and_then(|state| state.get("externalEventWatches")))
+        } else {
+            Vec::new()
+        };
         let resync_bash = ResyncBash {
             was_running: self.user_bash_running,
             snap_running: state
@@ -616,6 +626,7 @@ impl SessionUi {
             // previous session's fetched document, and a stale panel
             // would keep consuming keys over the new session.
             view.info_panel = None;
+            self.watches_panel_open = false;
             self.speed_stats = None;
             view.chrome.speed_text = None;
         }

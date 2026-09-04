@@ -471,6 +471,14 @@ impl InteractiveOptions {
         if self.telemetry_disabled == Some(true) {
             config["telemetryDisabled"] = json!(true);
         }
+        if let Some(settings) = &self.client_settings {
+            if let Some(ceiling) = settings.launch_rlm_max_depth_ceiling() {
+                config["rlmMaxDepthCeiling"] = json!(ceiling);
+            }
+            if settings.launch_disable_rlm_act() {
+                config["disableRlmAct"] = json!(true);
+            }
+        }
         config
     }
 }

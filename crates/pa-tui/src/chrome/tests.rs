@@ -334,6 +334,8 @@ fn activity_dock_selection_is_the_hover_colored_band() {
         goal_label: Some("Pursuing goal (0s)".to_string()),
         selected: ActivityGroup::Heartbeats,
         focused: true,
+        watches: 0,
+        watches_running: 0,
     };
     let frame = render_activity_dock(&dock, &theme, 120);
     let row = &frame[1];

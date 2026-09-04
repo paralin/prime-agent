@@ -12,6 +12,11 @@ use crate::types::{Context, Model, SimpleStreamOptions, StreamOptions};
 
 /// A provider implementation for one API (the TS `ApiProvider`).
 pub trait Provider: Send + Sync {
+    /// Whether this provider supplies an optional native compactor.
+    fn supports_native_compaction(&self) -> bool {
+        false
+    }
+
     fn compact<'a>(
         &'a self,
         model: &'a Model,

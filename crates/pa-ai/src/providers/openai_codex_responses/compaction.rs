@@ -376,7 +376,7 @@ mod tests {
             messages: vec![Message::User(UserMessage {
                 content: UserMessageContent::Text("active task".into()),
                 timestamp: 1,
-                rest: Default::default(),
+                rest: serde_json::Map::default(),
             })],
             tools: None,
         }

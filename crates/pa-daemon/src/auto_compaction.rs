@@ -15,6 +15,8 @@
 //! the outcome shapes: the client-facing result on success, the TS skip /
 //! failure messages with their severities otherwise.
 
+use pa_core::session_engine::scratch_handoff::ScratchBoundaryReason;
+
 use pa_agent::abort::AbortController;
 use serde_json::Value;
 
@@ -112,18 +114,22 @@ impl AgentSessionEngine {
                 self.clear_auto_compaction_abort(&controller);
                 return AutoCompactionRun::NotDue;
             };
-            // The abort race drops the summarizer request in flight (TS
-            // cancels the provider stream through the signal); the signal
-            // also lands the pre-commit check inside the compaction.
+            // The session cancels providers and joins scratch closeout cleanup.
             let compact = async {
                 engine
                     .session
-                    .compact(None, &model, api_key, Some(&signal))
+                    .compact_for_reason(
+                        None,
+                        &model,
+                        api_key,
+                        Some(&signal),
+                        ScratchBoundaryReason::Threshold,
+                    )
                     .await
             };
             let outcome = self
                 .runtime
-                .block_on(pa_agent::abort::race_with_abort(compact, &signal));
+                .block_on(async { Ok::<_, anyhow::Error>(compact.await) });
             self.clear_auto_compaction_abort(&controller);
             outcome
         };
@@ -187,7 +193,15 @@ impl AgentSessionEngine {
                 let entry = serde_json::to_value(&run.entry).unwrap_or(Value::Null);
                 let event =
                     crate::compaction::compaction_end_success("threshold", &result, false, None);
-                if !emit(EngineEvent::Compaction { entry, event }) {
+                let continuation = run
+                    .continuation
+                    .as_ref()
+                    .and_then(|message| serde_json::to_value(message).ok());
+                if !emit(EngineEvent::Compaction {
+                    entry,
+                    event,
+                    continuation,
+                }) {
                     return AutoCompactionRun::Cancelled;
                 }
                 pa_core::session_engine::compaction_trace::trace(

@@ -14,17 +14,24 @@ This skill is read-only: it can list family sessions, inspect one session, and f
 bounded recent message previews. It cannot prompt, steer, clear, kill, rename, or
 otherwise mutate another session.
 
-Call directly from the kernel:
+This read-only skill lists reachable sessions, inspects one session, and fetches
+bounded recent-message previews. Parent-side lifecycle and messaging operations
+perform every session mutation.
+
+Call directly from the IPython kernel:
 
 ```python
 children = await rlm.list_subagents()
-child = next((item for item in children if item.active_session_id), None)
+child = next(iter(children), None)
 if child is not None:
-    worker = await agent_observe.get_agent(child.session_name)
+    observed = await agent_observe.get_agent(child.session_name)
     recent = await agent_observe.recent_messages(child.session_name, limit=6)
-    # Deletion is a parent-owned RLM operation, not an observe mutation:
-    await rlm.delete_subagent(child)
 ```
+
+`rlm.list_subagents()` returns direct-child registry entries. Use
+`child.session_name` to address one of those entries. Child deletion remains a
+separate parent-side `rlm.delete_subagent(target)` operation. The current
+`target` contract accepts a string selector or an `RLMSubagent` registry entry.
 
 ## API
 
@@ -45,11 +52,12 @@ if child is not None:
   returns up to `limit` recent bounded message previews for the target session.
   `limit` must be 1-50, and `max_chars` must be 80-2000.
 
-## Safety
+## Boundaries
 
-- This skill is read-only and exposes no mutation commands.
-- Targets outside the nuclear family are rejected; transcript reads follow the
-  same family rule as messaging.
-- Message access is bounded by count and per-message character limit.
-- Prefer status and recent previews for orchestration. Ask the user before
-  using observed context to steer or message another session.
+- Targets outside the current agent, parent, siblings, and direct children are
+  rejected. Transcript reads follow the same reach boundary as messaging.
+- Message access is bounded by count and by the character limit for each
+  preview.
+- Observation grants no additional authority. Use observed information only for
+  the current task and under the same mutation, communication, privacy, and
+  publication rules that already govern the observing agent.

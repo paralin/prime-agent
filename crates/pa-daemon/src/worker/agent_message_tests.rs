@@ -41,6 +41,197 @@ fn queue_texts(core: &Mutex<SessionCore>, lane: Lane) -> Vec<String> {
     .collect()
 }
 
+#[tokio::test]
+async fn stable_delivery_retry_preserves_the_original_envelope_and_queue() {
+    let worker = created_worker().await;
+    let input = json!({"messageId":"stable-message", "message":"original", "replyTo":"task",
+        "sender":{"sessionId":"sender", "sessionName":"first"}});
+    let first = worker.dispatch("worker_deliver_message", &input).await;
+    assert!(first.success, "{first:?}");
+    let mut retry = input;
+    retry["message"] = json!("replacement");
+    retry["sender"]["sessionName"] = json!("different");
+    let second = worker.dispatch("worker_deliver_message", &retry).await;
+    assert!(second.success, "{second:?}");
+    let receipt = second.data.unwrap();
+    assert_eq!(receipt["id"], "stable-message");
+    assert_eq!(receipt["message"], "original");
+    assert_eq!(receipt["replyTo"], "task");
+    assert_eq!(receipt["from"]["sessionName"], "first");
+    assert_eq!(receipt["handoff"], "retry");
+    assert_eq!(
+        queue_texts(&worker.core, Lane::Steering),
+        vec!["[agent-message from first]\n\noriginal"]
+    );
+    let core = worker.core.lock().unwrap();
+    let store = core.store.as_ref().unwrap();
+    assert_eq!(
+        store
+            .entries()
+            .iter()
+            .filter(|entry| entry.fields["customType"] == "agent_message.accepted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        store
+            .entries()
+            .iter()
+            .filter(|entry| entry.fields["customType"] == "agent_message.handoff")
+            .count(),
+        1
+    );
+    assert_eq!(
+        core.steering
+            .front()
+            .unwrap()
+            .custom_message
+            .as_ref()
+            .unwrap()["details"]["replyTo"],
+        "task"
+    );
+}
+
+#[tokio::test]
+async fn worker_delivery_to_a_waiter_does_not_start_a_turn() {
+    use pa_agent::abort::AbortSignal;
+    use pa_core::session_engine::agent_messaging::mailbox::MailboxFilter;
+
+    let worker = created_worker().await;
+    let mailbox = worker.session_mailbox().unwrap();
+    let waiter = tokio::spawn(async move {
+        mailbox
+            .wait(&MailboxFilter::default(), 1000, &AbortSignal::never())
+            .await
+    });
+    tokio::task::yield_now().await;
+    let response = worker
+        .dispatch(
+            "worker_deliver_message",
+            &json!({"message":"answer", "messageId":"waiter-message"}),
+        )
+        .await;
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data.unwrap()["handoff"], "waiter");
+    assert_eq!(waiter.await.unwrap().unwrap().unwrap().id, "waiter-message");
+    assert!(queue_texts(&worker.core, Lane::Steering).is_empty());
+    assert!(worker
+        .session_mailbox()
+        .unwrap()
+        .inbox(&MailboxFilter::default(), 20, false)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn mailbox_closure_settles_waiters_and_replacement_builds_a_fresh_mailbox() {
+    use pa_agent::abort::AbortSignal;
+    use pa_core::session_engine::agent_messaging::mailbox::MailboxFilter;
+
+    let worker = created_worker().await;
+    let mailbox = worker.session_mailbox().unwrap();
+    let waiter = tokio::spawn({
+        let mailbox = mailbox.clone();
+        async move {
+            mailbox
+                .wait(&MailboxFilter::default(), 1000, &AbortSignal::never())
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    worker.teardown_for_replacement().await.unwrap();
+    assert_eq!(
+        waiter.await.unwrap().unwrap_err().to_string(),
+        "Session was replaced"
+    );
+    assert!(worker.session_mailbox().is_err());
+    worker.discard_closed_mailbox();
+    let fresh = worker.session_mailbox().unwrap();
+    assert!(!Arc::ptr_eq(&mailbox, &fresh));
+    let waiter = tokio::spawn(async move {
+        fresh
+            .wait(&MailboxFilter::default(), 1000, &AbortSignal::never())
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(worker.handle_shutdown().await.success);
+    assert_eq!(
+        waiter.await.unwrap().unwrap_err().to_string(),
+        "Session is shutting down"
+    );
+    assert!(worker.session_mailbox().is_err());
+    let fresh_worker = created_worker().await;
+    fresh_worker.close_mailbox("closed before first access");
+    assert!(fresh_worker.session_mailbox().is_err());
+}
+
+#[tokio::test]
+async fn mailbox_commands_filter_peek_consume_and_wait_for_delivery() {
+    let worker = created_worker().await;
+    let first = worker.dispatch("worker_deliver_message", &json!({"message":"first", "messageId":"first", "replyTo":"question", "sender":{"sessionId":"parent"}})).await;
+    assert!(first.success, "{first:?}");
+    let inbox = json!({"sender":" parent ","replyTo":"question", "limit":1});
+    let response = worker.dispatch("agent_message_inbox", &inbox).await;
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data.unwrap()["messages"][0]["id"], "first");
+    let mut consume = inbox.clone();
+    consume["consume"] = json!(true);
+    assert_eq!(
+        worker
+            .dispatch("agent_message_inbox", &consume)
+            .await
+            .data
+            .unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(worker
+        .dispatch("agent_message_inbox", &inbox)
+        .await
+        .data
+        .unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let wait = tokio::spawn({
+        let worker = worker.clone();
+        async move {
+            worker
+                .dispatch(
+                    "agent_message_wait",
+                    &json!({"timeoutMs":1000, "sender":"parent", "replyTo":"next"}),
+                )
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    let delivery = worker.dispatch("worker_deliver_message", &json!({"message":"second", "messageId":"second", "replyTo":"next", "sender":{"sessionId":"parent"}})).await;
+    assert!(delivery.success, "{delivery:?}");
+    assert_eq!(delivery.data.unwrap()["handoff"], "waiter");
+    let waited = wait.await.unwrap();
+    assert!(waited.success, "{waited:?}");
+    assert_eq!(waited.data.unwrap()["message"]["id"], "second");
+    let timeout = worker
+        .dispatch("agent_message_wait", &json!({"timeoutMs":1}))
+        .await;
+    assert!(timeout.success, "{timeout:?}");
+    assert_eq!(timeout.data.unwrap(), json!({}));
+    assert!(
+        !worker
+            .dispatch("agent_message_inbox", &json!({"limit":101}))
+            .await
+            .success
+    );
+    assert!(
+        !worker
+            .dispatch("agent_message_wait", &json!({"timeoutMs":300_001}))
+            .await
+            .success
+    );
+}
+
 /// Receipt shape (`createAgentSessionMessageReceipt`): id, source,
 /// target endpoint, sender echo, delivered status and timestamp while
 /// the session is idle, and the rendered prompt on the steering lane.

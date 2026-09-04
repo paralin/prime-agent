@@ -552,6 +552,9 @@ impl TurnRunner {
             // ruling 2026-09-23: one outcome row replaces the per-attempt
             // error rows TS keeps).
             let mut last_retry_error: Option<String> = None;
+            let mut compaction_in_progress = false;
+            let mut pending_kernel_notice: Option<Value> = None;
+            let mut compaction_persistence_error: Option<String> = None;
             let mut emit = |mut event: EngineEvent| -> bool {
                 // Sequence + persist under the core lock, then broadcast.
                 // The abort flag lives on the session core (`abort`
@@ -649,9 +652,33 @@ impl TurnRunner {
                 if let EngineEvent::Compaction {
                     ref mut entry,
                     event: ref mut payload,
+                    ref continuation,
                 } = event
                 {
-                    if !entry.is_null() {
+                    if let Some(message) = continuation {
+                        if let Some(store) = core.store.as_mut() {
+                            match store.persist_message_compaction(message, entry.clone()) {
+                                Ok(id) => {
+                                    entry["firstKeptEntryId"] = json!(id);
+                                    if let Some(result) =
+                                        payload.get_mut("result").and_then(Value::as_object_mut)
+                                    {
+                                        result.insert("firstKeptEntryId".into(), json!(id));
+                                    }
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "pa-daemon: scratch handoff persistence failed: {error:#}"
+                                    );
+                                    compaction_persistence_error = Some(format!(
+                                        "Scratch handoff persistence failed: {error:#}"
+                                    ));
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    if !entry.is_null() && continuation.is_none() {
                         let repin_started = std::time::Instant::now();
                         let durable_entries = core
                             .store
@@ -707,7 +734,12 @@ impl TurnRunner {
                     // `appendCustomMessageEntry`: customType/content/display/
                     // details fields on a `custom_message` entry).
                     EngineEvent::CustomMessage(message) => {
-                        if let Some(store) = core.store.as_mut() {
+                        if compaction_in_progress
+                            && message.get("customType").and_then(Value::as_str)
+                                == Some("ipython_state")
+                        {
+                            pending_kernel_notice = Some(message.clone());
+                        } else if let Some(store) = core.store.as_mut() {
                             let _ = store.persist_entry(
                                 "custom_message",
                                 json!({
@@ -719,10 +751,18 @@ impl TurnRunner {
                             );
                         }
                     }
-                    EngineEvent::Compaction { entry, .. } => {
+                    EngineEvent::Compaction {
+                        entry,
+                        continuation,
+                        ..
+                    } => {
                         // A skipped compaction carries a null entry (the
                         // skip shape): publish the event, never persist it.
-                        if let Some(store) = core.store.as_mut().filter(|_| !entry.is_null()) {
+                        if let Some(store) = core
+                            .store
+                            .as_mut()
+                            .filter(|_| !entry.is_null() && continuation.is_none())
+                        {
                             let persist_started = std::time::Instant::now();
                             let _ = store.persist_entry("compaction", entry.clone());
                             pa_core::session_engine::compaction_trace::trace(
@@ -732,7 +772,22 @@ impl TurnRunner {
                                 }),
                             );
                         }
+                        if let Some(message) = pending_kernel_notice.take() {
+                            if let Some(store) = core.store.as_mut() {
+                                if let Err(error) = store.persist_entry("custom_message", json!({
+                                    "customType": message.get("customType").cloned().unwrap_or(Value::Null),
+                                    "content": message.get("content").cloned().unwrap_or(Value::Null),
+                                    "display": message.get("display").cloned().unwrap_or(Value::Bool(true)),
+                                    "details": message.get("details").cloned().unwrap_or(Value::Null),
+                                })) {
+                                    compaction_persistence_error = Some(format!("Compaction kernel notice persistence failed: {error:#}"));
+                                    return false;
+                                }
+                            }
+                        }
+                        compaction_in_progress = false;
                     }
+                    EngineEvent::CompactionStart { .. } => compaction_in_progress = true,
                     // The durable mirror of a goal-state change (TS
                     // `_setGoalState` -> `_persistGoalState`: the
                     // `thread_goal_state` custom entry + flush, one store
@@ -935,8 +990,20 @@ impl TurnRunner {
                         json!({ "type": "message_start", "message": message }),
                         json!({ "type": "message_end", "message": message }),
                     ],
-                    EngineEvent::CompactionStart { event }
-                    | EngineEvent::Compaction { event, .. } => vec![event],
+                    EngineEvent::CompactionStart { event } => vec![event],
+                    EngineEvent::Compaction {
+                        event,
+                        continuation,
+                        ..
+                    } => {
+                        let mut frames = Vec::new();
+                        if let Some(message) = continuation {
+                            frames.push(json!({"type":"message_start","message":message}));
+                            frames.push(json!({"type":"message_end","message":message}));
+                        }
+                        frames.push(event);
+                        frames
+                    }
                     EngineEvent::GoalUpdate { goal } => vec![json!({
                         "type": "goal_update",
                         "goal": goal,
@@ -1154,6 +1221,10 @@ impl TurnRunner {
             }
             emitting_prefix_rows.set(false);
             engine.run_prompt(prompt_index, request, &aborted_probe, &mut emit);
+            if let Some(error) = compaction_persistence_error {
+                engine.on_turn_done();
+                *turn_outcome_slot.lock().unwrap() = Some(TurnSettle::Failed(error));
+            }
         });
         let _ = turn.await;
         // The turn's emit path is joined: nothing parks from here on, a

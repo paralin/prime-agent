@@ -21,6 +21,14 @@ use crate::tools::tool_definition::{
 /// Mime types the model context accepts as images.
 pub const IMAGE_MIME_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 
+tokio::task_local! {
+    static TOOL_CALL_ID: String;
+}
+
+pub(crate) fn current_tool_call_id() -> Option<String> {
+    TOOL_CALL_ID.try_with(Clone::clone).ok()
+}
+
 // ---------------------------------------------------------------------------
 // Kernel execution types
 // ---------------------------------------------------------------------------
@@ -490,15 +498,21 @@ pub fn create_ipython_tool_definition(_cwd: &str, options: IpythonToolOptions) -
     let options = Arc::new(options);
     let execute: crate::tools::tool_definition::ExecuteFn = {
         let options = options;
-        Arc::new(move |_tool_call_id, params, signal, on_update| {
+        Arc::new(move |tool_call_id, params, signal, on_update| {
             let options = options.clone();
+            let tool_call_id = tool_call_id.to_owned();
             Box::pin(async move {
                 let code = params
                     .get("code")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("ipython tool requires a code string"))?
                     .to_string();
-                execute_ipython(&options, &code, signal, on_update).await
+                TOOL_CALL_ID
+                    .scope(
+                        tool_call_id,
+                        execute_ipython(&options, &code, signal, on_update),
+                    )
+                    .await
             })
         })
     };

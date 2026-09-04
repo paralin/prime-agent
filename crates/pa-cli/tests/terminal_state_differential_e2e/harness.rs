@@ -319,7 +319,7 @@ pub(crate) struct Termios {
     oflag: libc::tcflag_t,
     cflag: libc::tcflag_t,
     lflag: libc::tcflag_t,
-    line: libc::cc_t,
+    line: Option<libc::cc_t>,
     cc: [libc::cc_t; libc::NCCS],
 }
 
@@ -334,7 +334,10 @@ impl Termios {
             oflag: raw.c_oflag,
             cflag: raw.c_cflag,
             lflag: raw.c_lflag,
-            line: raw.c_line,
+            #[cfg(target_os = "linux")]
+            line: Some(raw.c_line),
+            #[cfg(not(target_os = "linux"))]
+            line: None,
             cc: raw.c_cc,
         }
     }
@@ -412,7 +415,7 @@ impl MockSupervisor {
             &mut writer,
             &json!({
                 "type": "daemon_hello",
-                "protocol": { "name": "prime-agent.daemon", "version": 7 },
+                "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
                 "serverCapabilities": [],
                 "clientId": "mock",
             }),
@@ -507,7 +510,7 @@ pub(crate) fn attach_data(id: &str) -> Value {
         "command": "attach",
         "success": true,
         "data": {
-            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
             "activeSessionId": "s1",
             "snapshot": {
                 "activeSessionId": "s1",
@@ -575,7 +578,11 @@ pub(crate) fn spawn_child(spec: &ChildSpec, socket: &Path, slave: &OwnedFd) -> C
     // and claim the pty slave as the controlling terminal.
     pub(crate) fn claim_controlling_tty(fd: i32) -> std::io::Result<()> {
         nix::unistd::setsid()?;
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSCTTY as libc::c_ulong, 0) };
+        #[cfg(target_os = "macos")]
+        let request = libc::c_ulong::from(libc::TIOCSCTTY);
+        #[cfg(not(target_os = "macos"))]
+        let request = libc::TIOCSCTTY as libc::c_ulong;
+        let rc = unsafe { libc::ioctl(fd, request, 0) };
         if rc < 0 {
             return Err(std::io::Error::last_os_error());
         }

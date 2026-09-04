@@ -3,6 +3,8 @@
 //! (Case 1) with its three state enums, and the requested/threshold
 //! compaction arms — the child cut of the `print_boundary` facade.
 
+use pa_core::session_engine::scratch_handoff::ScratchBoundaryReason;
+
 use super::{
     compaction_end_success_event, compaction_start_event, is_context_overflow_failure,
     json_round_trip, CompactOutcome, CompactionOutcomeKind, CompactionOutcomeReason, Model,
@@ -142,7 +144,17 @@ impl TurnBoundary {
                         CompactionOutcomeReason::Threshold.wire(),
                         None,
                     ));
-                    match engine.session.compact(None, model, api_key, None).await {
+                    match engine
+                        .session
+                        .compact_for_reason(
+                            None,
+                            model,
+                            api_key,
+                            None,
+                            ScratchBoundaryReason::Threshold,
+                        )
+                        .await
+                    {
                         Ok(CompactOutcome::Ran(run)) => {
                             // Adoption telemetry (TS `compaction_end`
                             // handling counts every completed compaction
@@ -288,7 +300,13 @@ impl TurnBoundary {
         // have no abort trigger), so no abort race wraps the run.
         let outcome = engine
             .session
-            .compact(custom_instructions.as_deref(), model, api_key, None)
+            .compact_for_reason(
+                custom_instructions.as_deref(),
+                model,
+                api_key,
+                None,
+                ScratchBoundaryReason::Overflow,
+            )
             .await;
         match outcome {
             Ok(CompactOutcome::Ran(run)) => {

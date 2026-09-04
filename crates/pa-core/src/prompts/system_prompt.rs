@@ -147,7 +147,7 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
         + 2 * segments.len().saturating_sub(1);
 
     // The dynamic tail, in fixed order: packages -> project context ->
-    // skills inventory -> MCP servers -> environment -> session role ->
+    // skill discovery guidance -> MCP servers -> environment -> session role ->
     // additional guidance -> appended prompt.
     let tools: Vec<&str> = options
         .selected_tools
@@ -464,7 +464,8 @@ mod tests {
         let tail = &prompt[breakdown.cached_prefix_len..];
         assert!(tail.contains("Working directory: /w"));
         assert!(tail.contains("Conversation log: /log.jsonl"));
-        assert!(tail.contains("<available_skills>"));
+        assert!(tail.contains("Skills live on disk."));
+        assert!(!tail.contains("<available_skills>"));
         assert!(tail.contains("Recursive agent depth: 0 (root)"));
         assert!(tail.contains("Pre-installed Python packages: requests, httpx,"));
     }

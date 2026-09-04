@@ -199,6 +199,7 @@ async fn run_timed_request(
                 Ok(vec![Message::User(UserMessage {
                     content: UserContent::Text("hello".to_string()),
                     timestamp: 0,
+                    rest: serde_json::Map::default(),
                 })])
             })
         }),
@@ -463,6 +464,7 @@ async fn a_cloned_stream_seam_never_steals_the_parent_correlation() {
                 Ok(vec![Message::User(UserMessage {
                     content: UserContent::Text("hello".to_string()),
                     timestamp: 0,
+                    rest: serde_json::Map::default(),
                 })])
             })
         }),
@@ -476,6 +478,7 @@ async fn a_cloned_stream_seam_never_steals_the_parent_correlation() {
         messages: vec![Message::User(UserMessage {
             content: UserContent::Text("meanwhile".to_string()),
             timestamp: 0,
+            rest: serde_json::Map::default(),
         })],
         tools: Vec::new(),
     };

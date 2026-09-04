@@ -152,7 +152,7 @@ impl Client {
         let envelope = json!({
             "type": "command",
             "id": id,
-            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
             "command": command,
         });
         let mut line = serde_json::to_string(&envelope).expect("serialize command");
@@ -251,6 +251,8 @@ fn children(socket: &Path, agent_dir: &Path, script: &Path) -> SupervisorChildSe
     sessions.set_identity(ParentIdentity {
         rlm_depth: 0,
         rlm_max_depth: 2,
+        runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy::default(),
+        service_tier: None,
         // Off-catalog on purpose: scripted children do not resolve models.
         model: Some("scripted/faux-1".to_string()),
         cwd: Some(agent_dir.to_string_lossy().to_string()),

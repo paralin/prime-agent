@@ -7,6 +7,7 @@ use super::{
     InternalExecuteResult, KernelStartOptions, KernelState, Mutex, ReplKernelManager, Request,
     DEFAULT_MAX_OUTPUT_CHARS, KERNEL_ABORT_GRACE_MS,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
 // Request plumbing
@@ -197,6 +198,8 @@ impl ReplKernelManager {
             buffers: Mutex::new(buffers),
             result_tx: Mutex::new(Some(result_tx)),
             opts,
+            cooperative_host_request: AtomicBool::new(false),
+            cancellation_interrupt_sent: AtomicBool::new(false),
         });
         {
             let mut g = lock(&self.inner.guarded);
@@ -219,7 +222,10 @@ impl ReplKernelManager {
                 let Some(inner) = inner.upgrade() else {
                     return;
                 };
-                let _ = inner.interrupt(Some(&execution.request_id)).await;
+                if execution.cooperative_host_request.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                inner.interrupt_execution_once(&execution).await;
                 tokio::time::sleep(Duration::from_millis(KERNEL_ABORT_GRACE_MS)).await;
                 // The execution stays active until its done event arrives;
                 // clearing it early would let a new cell race the interrupted

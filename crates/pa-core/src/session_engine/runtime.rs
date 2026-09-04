@@ -100,11 +100,7 @@ impl SessionRuntime {
                     let mut driver = driver.lock().await;
                     let mut session = session.lock().await;
                     let response = handle_goal_host_request(
-                        payload
-                            .data
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("goal.get"),
+                        "goal.get",
                         &payload.data,
                         &mut driver,
                         &mut session,
@@ -133,6 +129,37 @@ impl SessionRuntime {
                 })
             }),
         );
+        for request_type in ["goal.pause", "goal.resume"] {
+            let driver = self.goal_driver.clone();
+            let session = session.clone();
+            let purge = self.goal_complete_purge.clone();
+            handlers.register(
+                request_type,
+                host_handler(move |payload| {
+                    let driver = driver.clone();
+                    let session = session.clone();
+                    let purge = purge.clone();
+                    async move {
+                        let response = {
+                            let mut driver = driver.lock().await;
+                            let mut session = session.lock().await;
+                            handle_goal_host_request(
+                                request_type,
+                                &payload.data,
+                                &mut driver,
+                                &mut session,
+                            )?
+                        };
+                        if request_type == "goal.pause" {
+                            if let Some(purge) = purge {
+                                purge();
+                            }
+                        }
+                        host_ok(&response)
+                    }
+                }),
+            );
+        }
         let driver = self.goal_driver.clone();
         let goal_session = session;
         // TS `_completeGoalFromHost` clears the queued goal contexts: a
@@ -194,11 +221,7 @@ impl SessionRuntime {
                     let mutation_hook = mutation_hook.clone();
                     Box::pin(async move {
                         let outcome = handle_rlm_heartbeat_host_request(
-                            payload
-                                .data
-                                .get("type")
-                                .and_then(Value::as_str)
-                                .unwrap_or("rlm_heartbeat.list"),
+                            request_type,
                             &payload.data,
                             &store,
                             &active_session_id,
@@ -293,6 +316,19 @@ mod tests {
             .unwrap();
         assert_eq!(response["goal"]["objective"], "finish the port");
         assert_eq!(response["remaining_tokens"], 1000);
+        let response = get(payload(serde_json::json!({ "type": "goal.complete" })))
+            .await
+            .unwrap();
+        assert_eq!(response["goal"]["status"], "active");
+
+        let pause = handlers.get("goal.pause").unwrap();
+        let response = pause(payload(serde_json::json!({"reason":"waiting for review"})))
+            .await
+            .unwrap();
+        assert_eq!(response["goal"]["status"], "paused");
+        let resume = handlers.get("goal.resume").unwrap();
+        let response = resume(payload(serde_json::json!({}))).await.unwrap();
+        assert_eq!(response["goal"]["status"], "active");
 
         // goal.complete carries the budget report.
         let complete = handlers.get("goal.complete").unwrap().clone();
@@ -345,6 +381,20 @@ mod tests {
         // The heartbeat file holds the job.
         let jobs = runtime.cron_store().list_rlm_heartbeats("live-1", true);
         assert_eq!(jobs.len(), 1);
+        let list = handlers.get("rlm_heartbeat.list").unwrap();
+        let response = list(payload(serde_json::json!({
+            "type":"rlm_heartbeat.delete", "id":id
+        })))
+        .await
+        .unwrap();
+        assert_eq!(response["heartbeats"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            runtime
+                .cron_store()
+                .list_rlm_heartbeats("live-1", true)
+                .len(),
+            1
+        );
     }
 
     /// The kernel `rlm_heartbeat.*` handlers invoke the mutation hook with

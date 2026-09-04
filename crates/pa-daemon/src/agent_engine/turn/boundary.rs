@@ -159,7 +159,15 @@ impl AgentSessionEngine {
                 let result = crate::compaction::compaction_result_value(&run.result, &run.entry);
                 let event =
                     crate::compaction::compaction_end_success("requested", &result, false, None);
-                if !emit(EngineEvent::Compaction { entry, event }) {
+                let continuation = run
+                    .continuation
+                    .as_ref()
+                    .and_then(|message| serde_json::to_value(message).ok());
+                if !emit(EngineEvent::Compaction {
+                    entry,
+                    event,
+                    continuation,
+                }) {
                     return BoundaryRun::Cancelled;
                 }
                 stopped_for_compaction = true;

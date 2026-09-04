@@ -96,6 +96,33 @@ pub fn handle_goal_host_request(
             let goal = create_goal_from_host(driver, session, objective, token_budget)?;
             Ok(goal_host_response(&goal, false))
         }
+        "goal.pause" => {
+            let reason = record
+                .get("reason")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("goal.pause reason must be a string"))?;
+            anyhow::ensure!(
+                driver.state().status == GoalStatus::Active,
+                "cannot pause goal because this thread has no active goal"
+            );
+            let reason = crate::goals::validate_goal_pause_reason(reason)?;
+            driver.pause(session, &reason)?;
+            Ok(goal_host_response(
+                &driver.state_with_creation_elapsed(),
+                false,
+            ))
+        }
+        "goal.resume" => {
+            anyhow::ensure!(
+                driver.state().status == GoalStatus::Paused,
+                "cannot resume goal because this thread has no paused goal"
+            );
+            driver.resume(session)?;
+            Ok(goal_host_response(
+                &driver.state_with_creation_elapsed(),
+                false,
+            ))
+        }
         "goal.complete" => {
             let goal = complete_goal_from_host(driver, session)?;
             Ok(goal_host_response(&goal, true))
@@ -446,6 +473,50 @@ mod tests {
         let error = handle_goal_host_request("goal.nope", &json!({}), &mut driver, &mut session)
             .unwrap_err();
         assert!(error.to_string().contains("unknown goal request type"));
+    }
+
+    #[test]
+    fn goal_pause_resume_validate_and_persist_the_waiting_dependency() {
+        let mut session = SessionManager::in_memory(std::path::Path::new("/tmp"));
+        let mut driver = GoalDriver::new();
+        assert!(handle_goal_host_request(
+            "goal.pause",
+            &json!({"reason":"waiting"}),
+            &mut driver,
+            &mut session
+        )
+        .is_err());
+        driver.start(&mut session, "finish", None).unwrap();
+        for reason in [json!(null), json!(""), json!("x".repeat(1001))] {
+            assert!(handle_goal_host_request(
+                "goal.pause",
+                &json!({"reason":reason}),
+                &mut driver,
+                &mut session
+            )
+            .is_err());
+            assert_eq!(driver.state().status, GoalStatus::Active);
+        }
+        let paused = handle_goal_host_request(
+            "goal.pause",
+            &json!({"reason":" waiting for review "}),
+            &mut driver,
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(paused.goal.unwrap().status, GoalStatus::Paused);
+        assert_eq!(
+            driver.state().last_reason.as_deref(),
+            Some("waiting for review")
+        );
+        driver = GoalDriver::load_persisted(&session);
+        let resumed =
+            handle_goal_host_request("goal.resume", &json!({}), &mut driver, &mut session).unwrap();
+        assert_eq!(resumed.goal.unwrap().status, GoalStatus::Active);
+        assert!(driver.state().last_reason.is_none());
+        assert!(
+            handle_goal_host_request("goal.resume", &json!({}), &mut driver, &mut session).is_err()
+        );
     }
 
     #[test]

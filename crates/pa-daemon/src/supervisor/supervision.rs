@@ -847,6 +847,20 @@ impl Supervisor {
                 response.error.unwrap_or_default()
             ));
         }
+        let capabilities = response
+            .data
+            .as_ref()
+            .and_then(|data| data["capabilities"].as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        resident.set_capabilities(connection_epoch, capabilities);
+
         // The handshake answered: install the channel for routing (TS
         // `worker.client = client`, after `authenticateWorker`). A
         // superseded connect (a replacement already owns a newer

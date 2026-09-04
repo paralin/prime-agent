@@ -254,6 +254,8 @@ pub struct AgentConnectionState {
     pub active_tool_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_event_watches: Vec<pa_core::session_engine::external_events::ExternalEventWatch>,
 }
 
 #[cfg(test)]
@@ -291,5 +293,38 @@ mod tests {
         assert_eq!(summary.message_count, 3);
         let out = serde_json::to_value(&summary).unwrap();
         assert_eq!(out["messageCount"], 3);
+    }
+
+    #[test]
+    fn external_watch_metadata_is_optional_for_both_client_generations() {
+        #[derive(Deserialize)]
+        struct LegacyClientState {
+            cwd: String,
+            #[serde(rename = "isStreaming")]
+            is_streaming: bool,
+        }
+        let legacy = json!({
+            "cwd":"/tmp", "thinkingLevel":"high", "serviceTier":"auto",
+            "availableThinkingLevels":["high"], "isStreaming":false,
+            "isCompacting":false, "isBashRunning":false, "retryAttempt":0,
+            "steeringMode":"all", "followUpMode":"all", "sessionId":"session",
+            "autoCompactionEnabled":true, "messageCount":0,
+            "sessionActions":{"queuedCount":0,"steering":[],"followUps":[]},
+            "compactionCount":0, "goal":null
+        });
+        let old_daemon: AgentConnectionState = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(old_daemon.external_event_watches.is_empty());
+        assert!(serde_json::to_value(old_daemon)
+            .unwrap()
+            .get("externalEventWatches")
+            .is_none());
+        let mut current = legacy;
+        current["externalEventWatches"] =
+            json!([{"id":"job", "label":"capture", "status":"running"}]);
+        let old_client: LegacyClientState = serde_json::from_value(current.clone()).unwrap();
+        assert_eq!(old_client.cwd, "/tmp");
+        assert!(!old_client.is_streaming);
+        let new_client: AgentConnectionState = serde_json::from_value(current).unwrap();
+        assert_eq!(new_client.external_event_watches[0].id, "job");
     }
 }

@@ -150,6 +150,14 @@ impl AgentSessionEngine {
         let Some((provider, model_id)) = saved.model else {
             return;
         };
+        if provider == "claude-code" {
+            self.configure_model(EngineModelSelection {
+                provider: Some(provider),
+                model: Some(model_id),
+                ..Default::default()
+            });
+            return;
+        }
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
         let mut registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
@@ -246,7 +254,27 @@ impl AgentSessionEngine {
     /// startup chain never lands a session on a model the daemon may not
     /// resolve to), and the refusal emits `model refused`.
     pub(super) fn resolve_registry_model(&self) -> anyhow::Result<Model> {
-        let model = self.resolve_registry_model_unchecked()?;
+        let mut model = self.resolve_registry_model_unchecked()?;
+        if model.reasoning {
+            let candidates = self.create_resources.read().expect("create resources lock");
+            if let Some(level) = candidates
+                .rlm_model_candidates
+                .iter()
+                .filter_map(|selector| pa_core::models::parse_rlm_runtime_candidate(selector).ok())
+                .find(|candidate| {
+                    candidate
+                        .selector
+                        .eq_ignore_ascii_case(&format!("{}/{}", model.provider, model.id))
+                })
+                .and_then(|candidate| candidate.thinking_level)
+                .filter(|level| self.current_selection().thinking == Some(*level))
+            {
+                model
+                    .thinking_level_map
+                    .get_or_insert_with(std::collections::BTreeMap::new)
+                    .insert(level, Some(level.wire_name().into()));
+            }
+        }
         let selector = format!("{}/{}", model.provider, model.id);
         let allowlist = crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir);
         if let Err(refusal) = crate::model_allowlist::assert_allowed(&allowlist, &selector) {
@@ -263,6 +291,9 @@ impl AgentSessionEngine {
     /// arm (TS `resolveCliModel`) or the TS `createAgentSession` startup
     /// chain.
     fn resolve_registry_model_unchecked(&self) -> anyhow::Result<Model> {
+        if self.is_claude_code_selection() {
+            return self.claude_code_model();
+        }
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
         let mut registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));

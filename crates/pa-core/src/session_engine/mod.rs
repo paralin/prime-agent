@@ -7,25 +7,32 @@
 //! pa-agent Agent owns the loop and its steer/follow-up queues; this layer
 //! decides admission and persists what the loop produces.
 
+pub mod act_lane;
+pub mod act_runtime;
 pub mod agent_messaging;
 pub mod auto_refine_trigger;
 pub mod auto_retry;
 pub mod auxiliary_model;
 pub mod branch_summarization;
+pub mod claude_code;
 pub mod compact_session;
 pub mod compaction;
 pub mod compaction_exec;
 pub mod compaction_trace;
 pub mod compaction_utils;
 pub mod engine;
+pub mod english_output_nudge;
 pub mod error_classify;
+pub mod external_events;
 pub mod goal_boundary;
 pub mod goal_driver;
 pub mod harness_digest;
 pub mod headless;
+pub mod history_snapshot;
 pub mod host_requests;
 pub mod image_model_routing;
 pub mod ipython_state;
+pub mod local_external_events;
 pub mod messages;
 pub mod provider_adapter;
 pub mod provider_failover;
@@ -36,8 +43,13 @@ pub mod request_timing;
 pub mod rlm_host;
 pub mod rlm_notices;
 pub mod rlm_usage;
+mod role_fallback;
+pub use role_fallback::can_advance_role_candidate;
+pub mod root_foreground_lease;
 pub mod runtime;
+pub mod runtime_policy;
 pub mod runtime_wiring;
+pub mod scratch_handoff;
 pub mod session_commands;
 pub mod session_events;
 pub mod side_question;
@@ -46,6 +58,7 @@ pub mod slash_commands;
 pub mod state_restore_notice;
 pub mod telemetry;
 pub mod tool_bridge;
+pub mod tool_error_nudge;
 pub mod turn_boundary;
 
 // The concern children split out of this composition root:
@@ -204,6 +217,9 @@ pub struct AgentSession {
     /// summarizer completion — no deltas, no broadcast, no behavior
     /// change.
     compaction_summary_sink: std::sync::Mutex<Option<compaction_exec::SummaryDeltaSink>>,
+    native_compaction: std::sync::atomic::AtomicBool,
+    foreground: Arc<root_foreground_lease::RootForegroundLease>,
+    scratch_handoff: std::sync::RwLock<Option<scratch_handoff::ScratchHandoffRuntimeSettings>>,
 }
 
 impl AgentSession {
@@ -241,6 +257,8 @@ impl AgentSession {
         prompt_templates: Vec<PromptTemplate>,
         harness_digest: Option<harness_digest::HarnessDigestContext>,
     ) -> anyhow::Result<Self> {
+        let foreground = Arc::new(root_foreground_lease::RootForegroundLease::default());
+        agent.set_run_scope(Some(foreground.run_scope()));
         let persistence = session.clone();
         agent
             .subscribe(move |event, _signal| {
@@ -269,9 +287,25 @@ impl AgentSession {
             skill_telemetry: None,
             image_model_router: None,
             compaction_summary_sink: std::sync::Mutex::new(None),
+            native_compaction: std::sync::atomic::AtomicBool::new(true),
+            foreground,
+            scratch_handoff: std::sync::RwLock::new(None),
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)
+    }
+
+    pub fn set_foreground_lease(
+        &mut self,
+        foreground: Arc<root_foreground_lease::RootForegroundLease>,
+    ) {
+        self.agent.set_run_scope(Some(foreground.run_scope()));
+        self.foreground = foreground;
+    }
+
+    /// The shared serialization lease for root turns, cells, and mutations.
+    pub fn foreground_lease(&self) -> Arc<root_foreground_lease::RootForegroundLease> {
+        self.foreground.clone()
     }
 
     /// The underlying agent loop (steering, state, subscriptions).
@@ -474,6 +508,7 @@ fn user_prompt_message(text: &str, images: &[pa_agent::types::ImageContent]) -> 
         pa_agent::types::UserMessage {
             content: pa_agent::types::UserContent::Parts(parts),
             timestamp: now_millis() as i64,
+            rest: serde_json::Map::default(),
         },
     ))
 }

@@ -30,6 +30,7 @@
 #![cfg(unix)]
 
 use std::fmt::Write as _;
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -204,7 +205,7 @@ fn assert_daemon_stops_clean(socket: &Path) {
     let command = serde_json::json!({
         "type": "command",
         "id": "stop-assert",
-        "protocol": { "name": "prime-agent.daemon", "version": 7 },
+        "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
         "command": { "type": "shutdown" },
     });
     let mut line = serde_json::to_string(&command).expect("serialize");
@@ -264,7 +265,7 @@ fn graceful_shutdown(socket: &Path) -> Option<u32> {
     let command = serde_json::json!({
         "type": "command",
         "id": "test-shutdown",
-        "protocol": { "name": "prime-agent.daemon", "version": 7 },
+        "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
         "command": { "type": "shutdown" },
     });
     let Ok(mut line) = serde_json::to_string(&command) else {
@@ -459,6 +460,8 @@ fn spawn_supervisor(dir: &Path) -> Supervisor {
     // guard's protocol teardown below stays the normal exit path; this is
     // the backstop. The per-test guards drop before the owning harness
     // thread can exit, so the early-fire window is empty.
+    // Parent-death signals are Linux-only; other Unix hosts use the guard teardown.
+    #[cfg(target_os = "linux")]
     unsafe {
         command.pre_exec(move || {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);

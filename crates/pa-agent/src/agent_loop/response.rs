@@ -27,7 +27,7 @@ pub(crate) async fn stream_assistant_response(
     emit: &AgentEventSink,
     stream_fn: Option<&StreamFn>,
     progress: &mut TurnProgress,
-) -> anyhow::Result<AssistantMessage> {
+) -> anyhow::Result<(AssistantMessage, bool)> {
     for attempt in 0..3 {
         let mut partial_event = None;
         let mut added_partial = false;
@@ -92,20 +92,7 @@ pub(crate) async fn stream_assistant_response(
                             Some(format!("{error}; gave up after {} attempts", attempt + 1));
                     }
                 }
-                if added_partial {
-                    *context.messages.last_mut().unwrap() = message.clone().into();
-                } else {
-                    context.messages.push(message.clone().into());
-                    emit(AgentEvent::MessageStart {
-                        message: message.clone().into(),
-                    })
-                    .await?;
-                }
-                emit(AgentEvent::MessageEnd {
-                    message: message.clone().into(),
-                })
-                .await?;
-                return Ok(message);
+                return publish_response(context, config, emit, message, added_partial).await;
             }
         }
     }
@@ -174,7 +161,7 @@ async fn stream_assistant_response_inner(
     added_partial: &mut bool,
     request_signal: &AbortSignal,
     progress: &mut TurnProgress,
-) -> anyhow::Result<AssistantMessage> {
+) -> anyhow::Result<(AssistantMessage, bool)> {
     crate::abort::throw_if_aborted_signal(signal)?;
 
     let mut messages: Vec<AgentMessage> = context.messages.clone();
@@ -306,25 +293,8 @@ async fn stream_assistant_response_inner(
                     }
                 }
                 final_message = progress.finalize(final_message);
-                if *added_partial {
-                    *context.messages.last_mut().unwrap() =
-                        AgentMessage::from(final_message.clone());
-                } else {
-                    context
-                        .messages
-                        .push(AgentMessage::from(final_message.clone()));
-                }
-                if !*added_partial {
-                    emit(AgentEvent::MessageStart {
-                        message: AgentMessage::from(final_message.clone()),
-                    })
-                    .await?;
-                }
-                emit(AgentEvent::MessageEnd {
-                    message: AgentMessage::from(final_message.clone()),
-                })
-                .await?;
-                return Ok(final_message);
+                return publish_response(context, config, emit, final_message, *added_partial)
+                    .await;
             }
             _ => {}
         }
@@ -334,22 +304,41 @@ async fn stream_assistant_response_inner(
     // awaits `response.result()` here too; a stream that ends cleanly always
     // pushed done/error first).
     let final_message = progress.finalize(with_timeout(response.result(), config, signal).await?);
-    if *added_partial {
-        *context.messages.last_mut().unwrap() = AgentMessage::from(final_message.clone());
+    publish_response(context, config, emit, final_message, *added_partial).await
+}
+
+async fn publish_response(
+    context: &mut AgentContext,
+    config: &AgentLoopConfig,
+    emit: &AgentEventSink,
+    mut message: AssistantMessage,
+    added_partial: bool,
+) -> anyhow::Result<(AssistantMessage, bool)> {
+    if let Some(filter) = &config.filter_assistant_message {
+        if let Some(filtered) = filter(message.clone())? {
+            message = filtered;
+        } else {
+            if added_partial {
+                context.messages.pop();
+            }
+            message.content.clear();
+            return Ok((message, false));
+        }
+    }
+    if added_partial {
+        *context.messages.last_mut().unwrap() = message.clone().into();
     } else {
-        context
-            .messages
-            .push(AgentMessage::from(final_message.clone()));
+        context.messages.push(message.clone().into());
         emit(AgentEvent::MessageStart {
-            message: AgentMessage::from(final_message.clone()),
+            message: message.clone().into(),
         })
         .await?;
     }
     emit(AgentEvent::MessageEnd {
-        message: AgentMessage::from(final_message.clone()),
+        message: message.clone().into(),
     })
     .await?;
-    Ok(final_message)
+    Ok((message, true))
 }
 
 fn event_partial(event: &crate::stream::AssistantMessageEvent) -> Option<&AssistantMessage> {

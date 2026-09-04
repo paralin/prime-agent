@@ -65,6 +65,7 @@ pub(crate) fn wire_continuation_hook(
             ) else {
                 return Ok(Vec::new());
             };
+            let external_event = context.new_messages.iter().any(|message| matches!(message, AgentMessage::Custom(custom) if custom.payload["customType"] == "agent_message" && custom.payload["details"]["id"].as_str().is_some_and(|id| id.starts_with("agentmsg_external_"))));
             match goal.natural_continuation(&engine, &model).await {
                 NaturalContinuation::QueuedInput | NaturalContinuation::RequestedCompaction => {
                     Ok(Vec::new())
@@ -73,12 +74,15 @@ pub(crate) fn wire_continuation_hook(
                     // The autonomous continuation the threshold arm owes:
                     // minted (budget bumped) and held, the run ends, the
                     // boundary compacts, the driver admits the held turn.
-                    if let Some(text) = autonomous.follow_up_text(&context.message).await {
-                        autonomous.hold_threshold_continuation(text).await;
+                    if !external_event {
+                        if let Some(text) = autonomous.follow_up_text(&context.message).await {
+                            autonomous.hold_threshold_continuation(text).await;
+                        }
                     }
                     Ok(Vec::new())
                 }
                 NaturalContinuation::GoalRow(row) => Ok(vec![*row]),
+                NaturalContinuation::FallThrough if external_event => Ok(Vec::new()),
                 NaturalContinuation::FallThrough => {
                     // The natural autonomous mint: the continuation user row
                     // runs as the next turn of the same run (TS

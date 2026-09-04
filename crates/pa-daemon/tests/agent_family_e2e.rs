@@ -160,7 +160,7 @@ impl Client {
         let envelope = json!({
             "type": "command",
             "id": id,
-            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
             "command": command,
         });
         let mut line = serde_json::to_string(&envelope).expect("serialize command");
@@ -456,6 +456,8 @@ async fn parent_child_agent_message_round_trip_end_to_end() {
     children.set_identity(ParentIdentity {
         rlm_depth: 0,
         rlm_max_depth: 2,
+        runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy::default(),
+        service_tier: None,
         model: Some("faux/faux-1".to_string()),
         cwd: Some(dir.path().to_string_lossy().to_string()),
         session_id: Some(parent_session_id.to_string()),
@@ -842,6 +844,8 @@ async fn family_edges_never_cross_families_end_to_end() {
         children.set_identity(ParentIdentity {
             rlm_depth: 0,
             rlm_max_depth: 2,
+            runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy::default(),
+            service_tier: None,
             model: Some("faux/faux-1".to_string()),
             cwd: Some(dir.path().to_string_lossy().to_string()),
             session_id: Some(session.clone()),
@@ -999,6 +1003,8 @@ async fn family_edges_never_cross_families_end_to_end() {
     kid_children.set_identity(ParentIdentity {
         rlm_depth: 1,
         rlm_max_depth: 2,
+        runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy::default(),
+        service_tier: None,
         model: Some("faux/faux-1".to_string()),
         cwd: Some(dir.path().to_string_lossy().to_string()),
         session_id: Some(kid_a_session.clone()),

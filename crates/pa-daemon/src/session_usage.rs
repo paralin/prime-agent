@@ -285,6 +285,8 @@ pub struct UsageScan {
     attributed_child_usage: Usage,
     #[serde(with = "usage_bits")]
     summarization_usage: Usage,
+    #[serde(with = "usage_bits")]
+    act_usage: Usage,
 }
 
 impl UsageScan {
@@ -335,6 +337,12 @@ impl UsageScan {
         }
     }
 
+    pub(crate) fn fold_act(&mut self, usage: Option<Usage>) {
+        if let Some(usage) = usage {
+            add_assistant_usage(&mut self.act_usage, &usage);
+        }
+    }
+
     /// The totals behind [`summary`](Self::summary): `own` subtracts the
     /// attributed child spend, `total` keeps it (the deletion capture reads
     /// both from the child's frozen file).
@@ -347,6 +355,7 @@ impl UsageScan {
         add_assistant_usage(&mut total, &self.summarization_usage);
         let mut own = total;
         subtract_assistant_usage(&mut own, &self.attributed_child_usage);
+        add_assistant_usage(&mut total, &self.act_usage);
         SessionUsageTotals { own, total }
     }
 
@@ -408,6 +417,7 @@ impl ScanEntry {
             "compaction" | "branch_summary" => {
                 scan.fold_summarization(self.usage.map(Usage::from));
             }
+            "act_terminal" => scan.fold_act(self.usage.map(Usage::from)),
             _ => {}
         }
     }
@@ -628,6 +638,25 @@ mod tests {
                 cost: 1.0 + (0.3 + 0.1)
             })
         );
+    }
+
+    #[test]
+    fn act_spend_is_in_recursive_totals_and_excluded_from_root_own_spend() {
+        let mut scan = UsageScan::default();
+        scan.fold_message("root", Some("assistant"), Some(usage(10, 2, 0.25)));
+        let terminal: ScanEntry =
+            serde_json::from_value(json!({"type":"act_terminal","usage":usage(7, 3, 0.5)}))
+                .unwrap();
+        terminal.fold_into(&mut scan);
+        let totals = scan.totals();
+        assert_eq!(totals.own.input, 10);
+        assert_eq!(totals.own.cost.total, pa_types::JsNumber(0.25));
+        assert_eq!(totals.total.input, 17);
+        assert_eq!(totals.total.output, 5);
+        assert_eq!(totals.total.cost.total, pa_types::JsNumber(0.75));
+        let restored: UsageScan =
+            serde_json::from_str(&serde_json::to_string(&scan).unwrap()).unwrap();
+        assert_eq!(restored.totals(), totals);
     }
 
     /// A session with no billable work publishes no usage field at all

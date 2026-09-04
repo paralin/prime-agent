@@ -104,7 +104,7 @@ impl Worker {
         });
         // Folded before the background build spawn at the create's tail,
         // so the first build sees them.
-        let resources = match CreateSessionResources::deserialize(payload) {
+        let mut resources = match CreateSessionResources::deserialize(payload) {
             Ok(resources) => resources,
             Err(error) => {
                 return response_failure(
@@ -115,15 +115,27 @@ impl Worker {
                 );
             }
         };
+        if resources.runtime_policy.rpc_only {
+            return response_failure(
+                None,
+                "create",
+                "rpc-only harness mode requires a local RPC session",
+                None,
+            );
+        }
         if let Some(agent_engine) = &self.agent_engine {
             if let Some(autonomous) = &resources.autonomous {
                 *agent_engine.autonomous.lock().await =
                     pa_core::autonomous::create_autonomous_runtime_state(Some(autonomous), None);
             }
-            *agent_engine
+            let mut current_resources = agent_engine
                 .create_resources
                 .write()
-                .expect("create resources lock") = resources;
+                .expect("create resources lock");
+            resources.runtime_policy = current_resources
+                .runtime_policy
+                .merge(resources.runtime_policy);
+            *current_resources = resources;
         }
         let cwd = payload
             .get("cwd")
@@ -655,8 +667,39 @@ impl Worker {
         // build failure still surfaces on the first demand seam exactly
         // as before. Scripted harness engines have no session to build.
         if let Some(agent_engine) = &self.agent_engine {
+            let event_core = Arc::downgrade(&self.core);
+            let event_pump = Arc::clone(&self.events);
+            *agent_engine
+                .act_event_sink
+                .lock()
+                .expect("Act event sink lock") = Some(Arc::new(move |event| {
+                if let Some(core) = event_core.upgrade() {
+                    super::emit_worker_event_with(&core, &event_pump, event);
+                }
+            }));
+            let core = Arc::downgrade(&self.core);
+            *agent_engine
+                .act_record_sink
+                .lock()
+                .expect("Act record sink lock") = Some(Arc::new(move |kind, fields| {
+                let core = core
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("Act session worker was disposed"))?;
+                let mut core = core
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Act session worker lock poisoned"))?;
+                let store = core
+                    .store
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Act session store is unavailable"))?;
+                store.persist_entry(kind, fields)?;
+                Ok(())
+            }));
             let engine = std::sync::Arc::clone(agent_engine);
             tokio::spawn(async move {
+                if engine.is_claude_code_selection() {
+                    return;
+                }
                 let Ok(model) = engine.resolve_model() else {
                     return;
                 };

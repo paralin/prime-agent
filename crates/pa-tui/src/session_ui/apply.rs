@@ -7,6 +7,8 @@ use super::{
     UI_REQUEST_TIMEOUT_MS,
 };
 
+mod act_projection;
+
 /// One backgrounded compaction-abort outcome (the abort supervision's UI
 /// recovery): a failed abort request surfaces as the transcript note and
 /// clears the stuck compaction loader locally — when even the abort could
@@ -293,6 +295,20 @@ impl SessionUi {
                 if meta_sequence > self.last_event_sequence {
                     self.last_event_sequence = meta_sequence;
                 }
+                if event["type"] == "act_event"
+                    && !self.client.supports_server_capability("act_projection")
+                {
+                    return;
+                }
+                if event["type"] == "external_event_watches_changed" {
+                    if self
+                        .client
+                        .supports_server_capability("external_event_watches")
+                    {
+                        self.apply_external_watches(event.get("watches"), view);
+                    }
+                    return;
+                }
                 if let Some(update) = event_to_update(&event) {
                     self.apply_update(update, view);
                 }
@@ -421,6 +437,7 @@ impl SessionUi {
 
     fn apply_update(&mut self, update: TurnUpdate, view: &mut AgentView) {
         match update {
+            TurnUpdate::ActProjection(event) => self.apply_act_projection(&event, view),
             TurnUpdate::TurnStarted => {
                 self.turn_active = true;
                 self.turn_error_shown = false;

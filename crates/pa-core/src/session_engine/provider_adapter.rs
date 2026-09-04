@@ -397,6 +397,15 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn opaque_compaction_history_survives_the_agent_message_boundary() {
+        let payload = serde_json::json!({"type":"openaiResponsesHistory", "provider":"openai-codex", "items":[{"type":"compaction", "encrypted_content":"opaque"}]});
+        let original: pa_types::ai::Message = serde_json::from_value(serde_json::json!({"role":"user", "content":"summary", "timestamp":1, "providerPayload":payload})).unwrap();
+        let loop_message: pa_agent::types::Message = json_round_trip(&original).unwrap();
+        let restored: pa_types::ai::Message = json_round_trip(&loop_message).unwrap();
+        assert_eq!(restored, original);
+    }
+
     #[tokio::test]
     async fn live_target_service_tier_reaches_provider_and_reset() {
         let registration =
@@ -458,6 +467,7 @@ mod tests {
                     }),
                 ]),
                 timestamp: 1,
+                rest: serde_json::Map::default(),
             },
         ));
         let converted: Option<pa_types::ai::Message> = json_round_trip(&message);

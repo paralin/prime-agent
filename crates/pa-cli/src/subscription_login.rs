@@ -58,6 +58,8 @@ impl PanelSubscriptionLoginUi {
 impl OAuthLoginUi for PanelSubscriptionLoginUi {
     fn on_auth(&self, url: &str, instructions: Option<&str>) {
         self.panel.auth_url(url, instructions);
+        // Login-panel unit tests render authorization URLs without opening a browser.
+        #[cfg(not(test))]
         pa_core::platform::browser::open_in_browser(url);
         if self.provider_id == GITHUB_COPILOT_PROVIDER_ID {
             // TS `showWaiting` (the dialog's own method, no onboarding

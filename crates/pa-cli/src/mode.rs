@@ -97,6 +97,7 @@ pub struct RuntimeConfig {
     pub execution_mode: Option<AppMode>,
     pub telemetry_disabled: bool,
     pub serialized_refine: bool,
+    pub runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy,
     pub initial_goal: Option<InitialGoal>,
 }
 
@@ -276,15 +277,33 @@ pub fn runtime_config_from_args(
         themes,
         no_themes: parsed.no_themes,
         no_context_files: parsed.no_context_files,
-        autonomous: AutonomousConfig::from_args(parsed),
+        autonomous: if parsed.harness_rpc_only {
+            None
+        } else {
+            AutonomousConfig::from_args(parsed)
+        },
         execution_mode: (app_mode != AppMode::Daemon).then_some(app_mode),
         telemetry_disabled,
         // Serialized refine is only used by print/json/rpc clients.
-        serialized_refine: !matches!(app_mode, AppMode::Interactive | AppMode::Daemon),
-        initial_goal: parsed.goal.as_ref().map(|objective| InitialGoal {
-            objective: objective.clone(),
-            token_budget: parsed.goal_token_budget,
-        }),
+        serialized_refine: !parsed.harness_rpc_only
+            && !matches!(app_mode, AppMode::Interactive | AppMode::Daemon),
+        runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy {
+            rlm_max_depth_ceiling: if parsed.harness_rpc_only {
+                Some(0)
+            } else {
+                parsed.rlm_max_depth_ceiling
+            },
+            disable_rlm_act: parsed.harness_rpc_only || parsed.disable_rlm_act,
+            rpc_only: parsed.harness_rpc_only,
+        },
+        initial_goal: parsed
+            .goal
+            .as_ref()
+            .filter(|_| !parsed.harness_rpc_only)
+            .map(|objective| InitialGoal {
+                objective: objective.clone(),
+                token_budget: parsed.goal_token_budget,
+            }),
     }
 }
 
@@ -292,10 +311,37 @@ pub fn runtime_config_from_args(
 mod tests {
     use super::*;
 
+    #[test]
+    fn rpc_harness_disables_automatic_work_and_preserves_launch_restrictions() {
+        let args = crate::args::parse_args(&[
+            "--harness-mode".into(),
+            "rpc-only".into(),
+            "--mode".into(),
+            "rpc".into(),
+            "--goal".into(),
+            "finish work".into(),
+        ]);
+        let config = runtime_config_from_args(
+            &args,
+            PathBuf::from("/workspace"),
+            PathBuf::from("/agent"),
+            None,
+            AppMode::Rpc,
+            true,
+        );
+        assert!(config.runtime_policy.rpc_only);
+        assert_eq!(config.runtime_policy.max_depth(5), 0);
+        assert!(!config.runtime_policy.act_enabled());
+        assert!(config.initial_goal.is_none());
+        assert!(config.autonomous.is_none());
+        assert!(!config.serialized_refine);
+    }
+
     /// Run the body with the three telemetry env overrides held at a known
     /// state and restored after (an assertion panic must never leave the
     /// process env mutated, and a host-exported opt-out must not bleed in).
     fn with_clean_telemetry_env(body: impl FnOnce() + std::panic::UnwindSafe) {
+        let _env = crate::config::env_lock();
         let vars = ["PRIME_AGENT_TELEMETRY", "DO_NOT_TRACK", "PI_OFFLINE"];
         let saved: Vec<(String, Option<String>)> = vars
             .iter()

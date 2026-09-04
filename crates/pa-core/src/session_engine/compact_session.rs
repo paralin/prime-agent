@@ -40,6 +40,9 @@ mod recent_state_anchor;
 mod prepare;
 pub use prepare::{compute_cut, prepare_compaction, CompactSkip, CompactionPreparation};
 
+mod native;
+pub use native::execute_native_compaction;
+
 // The test mass (the in-file unit battery) moved to the child module at
 // the same tree position (compact_session::tests) and splits by test
 // family under compact_session::tests; the moved blocks keep their
@@ -143,6 +146,8 @@ fn context_tokens(entries: &[FileEntry], leaf_id: Option<&str>) -> u64 {
 /// One completed compaction run: the result plus the entry to persist.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactRun {
+    /// A scratch checkpoint's retained message, committed with the boundary.
+    pub continuation: Option<AgentMessage>,
     pub result: CompactionResult,
     pub entry: pa_types::session::CompactionEntry,
     /// The whole compaction's wall duration (the `agent timing` compaction
@@ -477,6 +482,7 @@ pub async fn execute_compaction(
         }),
     );
     Ok(CompactOutcome::Ran(Box::new(CompactRun {
+        continuation: None,
         result,
         entry,
         duration_ms: started_at.elapsed().as_millis() as u64,

@@ -6,6 +6,21 @@ use super::{
 };
 
 impl AgentSession {
+    pub fn set_native_compaction_enabled(&self, enabled: bool) {
+        self.native_compaction
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn set_scratch_handoff_settings(
+        &self,
+        settings: super::scratch_handoff::ScratchHandoffRuntimeSettings,
+    ) {
+        *self
+            .scratch_handoff
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(settings);
+    }
+
     /// The latest compaction boundary in the live loop context, if any
     /// (the TS `getLatestCompactionEntry` guard source): the timestamp of
     /// the newest compaction summary in the agent state.
@@ -197,6 +212,52 @@ impl AgentSession {
         api_key: Option<String>,
         abort: Option<&pa_agent::abort::AbortSignal>,
     ) -> anyhow::Result<CompactOutcome> {
+        self.compact_for_reason(
+            custom_instructions,
+            model,
+            api_key,
+            abort,
+            super::scratch_handoff::ScratchBoundaryReason::Manual,
+        )
+        .await
+    }
+
+    /// # Errors
+    /// Returns cancellation, provider, checkpoint, or persistence errors.
+    pub async fn compact_for_reason(
+        &self,
+        custom_instructions: Option<&str>,
+        model: &pa_types::ai::Model,
+        api_key: Option<String>,
+        abort: Option<&pa_agent::abort::AbortSignal>,
+        reason: super::scratch_handoff::ScratchBoundaryReason,
+    ) -> anyhow::Result<CompactOutcome> {
+        let admission = self.foreground.acquire(
+            super::root_foreground_lease::RootForegroundActor::Compaction,
+            None,
+        );
+        let lease = if let Some(abort) = abort {
+            tokio::select! {
+                biased;
+                () = abort.aborted() => return Err(pa_agent::abort::aborted_error()),
+                result = admission => result?,
+            }
+        } else {
+            admission.await?
+        };
+        lease
+            .run(self.compact_with_foreground(custom_instructions, model, api_key, abort, reason))
+            .await
+    }
+
+    async fn compact_with_foreground(
+        &self,
+        custom_instructions: Option<&str>,
+        model: &pa_types::ai::Model,
+        api_key: Option<String>,
+        abort: Option<&pa_agent::abort::AbortSignal>,
+        reason: super::scratch_handoff::ScratchBoundaryReason,
+    ) -> anyhow::Result<CompactOutcome> {
         // TS `_performCompaction` captures `this._harnessDigest()` at the
         // commit: relevance terms from the live (pre-compaction) context,
         // harness state read fresh from disk when the snapshot renders.
@@ -206,6 +267,70 @@ impl AgentSession {
                 "customInstructions": custom_instructions.is_some(),
             }),
         );
+        pa_agent::abort::throw_if_aborted_signal(abort)?;
+        pa_ai::registry::ensure_builtins();
+        let supports_native = pa_ai::registry::get_api_provider(&model.api)
+            .is_some_and(|provider| provider.supports_native_compaction());
+        let mut native_enabled = self
+            .native_compaction
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut scratch_settings = self
+            .scratch_handoff
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(context) = &self.auxiliary_model {
+            let settings =
+                crate::settings::SettingsManager::create(&context.cwd, &context.agent_dir);
+            native_enabled = settings.get_compaction_native();
+            let (enabled, root_dir) = settings.get_scratch_handoff_settings();
+            scratch_settings = Some(super::scratch_handoff::ScratchHandoffRuntimeSettings {
+                strategy: settings.get_compaction_strategy(),
+                enabled,
+                root_dir,
+                cwd: context.cwd.clone(),
+            });
+        }
+        let scratch_route = scratch_settings.as_ref().map(|settings| {
+            super::scratch_handoff::resolve_scratch_handoff_boundary(
+                settings.strategy,
+                settings.enabled,
+                native_enabled && supports_native,
+                model.input.contains(&pa_types::ai::ModelInput::Image),
+                reason,
+            )
+        });
+        if scratch_route
+            .as_ref()
+            .is_some_and(|route| route.requires_closeout)
+        {
+            let settings = scratch_settings
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Scratch handoff settings unavailable"))?;
+            let mut outcome =
+                super::scratch_handoff::execute_scratch_handoff(self, settings, abort).await?;
+            self.sync_compaction_context(&mut outcome).await?;
+            return Ok(outcome);
+        }
+        if let Some(warning) = scratch_route.and_then(|route| route.warning) {
+            let row = pa_types::session::CustomMessage {
+                custom_type: super::scratch_handoff::SCRATCH_HANDOFF_WARNING_CUSTOM_TYPE.into(),
+                content: pa_types::ai::UserContent::Text(warning.into()),
+                display: true,
+                details: Some(serde_json::json!({"reason":format!("{reason:?}").to_lowercase()})),
+                timestamp: super::now_millis(),
+                rest: serde_json::Map::default(),
+            };
+            self.session.lock().await.append_custom_message(
+                &row.custom_type,
+                row.content.clone(),
+                row.display,
+                row.details.clone(),
+            )?;
+            if let Some(message) = session_message_to_loop(&SessionAgentMessage::Custom(row)) {
+                self.agent.append_messages(vec![message]).await;
+            }
+        }
         let digest_inputs = self.harness_digest_inputs().await;
         compaction_trace::trace("compact.digest_captured", &serde_json::Value::Null);
         let mut outcome = {
@@ -215,29 +340,85 @@ impl AgentSession {
                 .lock()
                 .expect("compaction summary sink lock")
                 .clone();
-            crate::session_engine::compact_session::execute_compaction(
-                &mut session,
-                crate::session_engine::compact_session::CompactOptions {
-                    model: model.clone(),
-                    api_key,
-                    custom_instructions,
-                    settings: self.compaction_settings(),
-                    abort,
-                    harness_digest: digest_inputs,
-                    auxiliary: self.auxiliary_model.as_ref(),
-                    summary_delta,
-                },
-            )
-            .await?
+            let options = crate::session_engine::compact_session::CompactOptions {
+                model: model.clone(),
+                api_key,
+                custom_instructions,
+                settings: self.compaction_settings(),
+                abort,
+                harness_digest: digest_inputs,
+                auxiliary: self.auxiliary_model.as_ref(),
+                summary_delta,
+            };
+            pa_ai::registry::ensure_builtins();
+            let use_native = native_enabled && custom_instructions.is_none() && supports_native;
+            let mut native_failure = None;
+            let native_outcome = if use_native {
+                let headers = self.auxiliary_model.as_ref().and_then(|context| {
+                    super::auxiliary_model::session_fallback_with_headers(
+                        context,
+                        model,
+                        options.api_key.clone(),
+                    )
+                    .headers
+                });
+                match super::compact_session::execute_native_compaction(
+                    &mut session,
+                    &options,
+                    headers,
+                )
+                .await
+                {
+                    Ok(outcome) => Some(outcome),
+                    Err(error)
+                        if pa_agent::abort::is_abort_error(&error)
+                            || abort.is_some_and(pa_agent::abort::AbortSignal::is_aborted) =>
+                    {
+                        return Err(error)
+                    }
+                    Err(error) => {
+                        native_failure = Some(error);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(outcome) = native_outcome {
+                outcome
+            } else {
+                let local = super::compact_session::execute_compaction(&mut session, options);
+                let result = match abort {
+                    Some(signal) => pa_agent::abort::race_with_abort(local, signal).await?,
+                    None => local.await,
+                };
+                result.map_err(|error| match native_failure {
+                    Some(native) => anyhow::anyhow!(
+                        "Native compaction failed: {native:#}; local fallback failed: {error:#}"
+                    ),
+                    None => error,
+                })?
+            }
         };
         if matches!(outcome, CompactOutcome::Skipped(_)) {
             compaction_trace::trace("compact.skipped", &serde_json::Value::Null);
             return Ok(outcome);
         }
-        // Rebuild the loop context from the post-compaction session.
+        self.sync_compaction_context(&mut outcome).await?;
+        Ok(outcome)
+    }
+
+    async fn sync_compaction_context(&self, outcome: &mut CompactOutcome) -> anyhow::Result<()> {
+        // Replay opaque compaction history only on the provider serving the session.
+        let provider = self.agent.state().await.model.provider;
         let rebuilt = {
             let session = self.session.lock().await;
-            crate::session_engine::compact_session::rebuilt_context_after_compaction(&session)
+            crate::session::build_session_context_for_provider(
+                session.get_all_entries(),
+                session.get_leaf_id(),
+                &provider,
+            )
+            .messages
         };
         let loop_messages: Vec<AgentMessage> = rebuilt_loop_messages(rebuilt);
         let rebuilt_message_count = loop_messages.len();
@@ -262,7 +443,7 @@ impl AgentSession {
             None => None,
         };
         let notice_landed = kernel_state.is_some();
-        if let CompactOutcome::Ran(run) = &mut outcome {
+        if let CompactOutcome::Ran(run) = outcome {
             run.ipython_state = kernel_state;
         }
         compaction_trace::trace(
@@ -271,7 +452,7 @@ impl AgentSession {
                 "notice": notice_landed,
             }),
         );
-        Ok(outcome)
+        Ok(())
     }
 
     /// Record an unsuccessful compaction outcome (TS
@@ -339,10 +520,23 @@ impl AgentSession {
         &self,
         branch_entries: Vec<FileEntry>,
     ) -> anyhow::Result<()> {
+        let _foreground = self
+            .foreground
+            .acquire(
+                super::root_foreground_lease::RootForegroundActor::RootTurn,
+                None,
+            )
+            .await?;
+        let provider = self.agent.state().await.model.provider;
         let rebuilt = {
             let mut session = self.session.lock().await;
             session.adopt_entries(branch_entries);
-            crate::session_engine::compact_session::rebuilt_context_after_compaction(&session)
+            crate::session::build_session_context_for_provider(
+                session.get_all_entries(),
+                session.get_leaf_id(),
+                &provider,
+            )
+            .messages
         };
         self.agent
             .set_messages(rebuilt_loop_messages(rebuilt))
@@ -386,6 +580,13 @@ impl AgentSession {
         refine_call: crate::refinement::executor::RefinerFn,
         global_harness_dir: std::path::PathBuf,
     ) -> anyhow::Result<crate::refinement::RefinementResult> {
+        let _foreground = self
+            .foreground
+            .acquire(
+                super::root_foreground_lease::RootForegroundActor::Refinement,
+                None,
+            )
+            .await?;
         // The transcript's consumed artifacts (the message rows plus the
         // in-session refinement history) are extracted under this first
         // lock straight from the retained rows: no owned copy of the full

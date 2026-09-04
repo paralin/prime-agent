@@ -168,6 +168,8 @@ fn input() -> AgentMessageSendInput {
         target: "bbb222".to_string(),
         message: "hello there".to_string(),
         receiver_role: Some(AgentFamilyRelationship::Sibling),
+        message_id: None,
+        reply_to: None,
     }
 }
 
@@ -358,6 +360,8 @@ async fn self_target_is_refused() {
             target: "aaa111".to_string(),
             message: "note to self".to_string(),
             receiver_role: None,
+            message_id: None,
+            reply_to: None,
         })
         .await
         .unwrap_err();

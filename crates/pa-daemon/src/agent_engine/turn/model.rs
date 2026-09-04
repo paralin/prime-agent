@@ -7,6 +7,8 @@ use super::{
     TurnAdmission, TurnOnce, TurnPrompt, TurnResult,
 };
 
+mod role_fallback;
+
 impl AgentSessionEngine {
     /// Drive one admitted prompt through the retry-driver model loop and
     /// emit the turn outcome (provider-failure retries + final-row
@@ -117,7 +119,16 @@ impl AgentSessionEngine {
         // agent state itself never swaps - TS the override is per-run).
         self.apply_armed_image_route(&agent);
         let policy = self.retry_policy();
-        let failover_policy = self.failover_policy();
+        let mut failover_policy = self.failover_policy();
+        if !self
+            .create_resources
+            .read()
+            .expect("create resources lock")
+            .rlm_model_candidates
+            .is_empty()
+        {
+            failover_policy.enabled = false;
+        }
         // A routed image-model episode serves (and may fail over within)
         // the ROUTED model: the candidate chain and its overflow window
         // derive from the serving model, never from the text-only session
@@ -213,7 +224,7 @@ impl AgentSessionEngine {
                         }
                         self.refresh_codex_home_target()?;
                         match self
-                            .run_turn_once(
+                            .run_turn_with_role_fallback(
                                 &agent,
                                 &prompt,
                                 first,

@@ -361,6 +361,15 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
                 // passes block content through (the request's cacheable
                 // shape is the array either way).
                 let content = match custom.content.clone() {
+                    UserContent::Text(text)
+                        if custom.custom_type
+                            == super::tool_error_nudge::TOOL_ERROR_NUDGE_CUSTOM_TYPE
+                            || custom.custom_type == super::english_output_nudge::ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE =>
+                    {
+                        UserContent::Blocks(vec![text_block(format!(
+                            "<system-notice>\n{text}\n</system-notice>"
+                        ))])
+                    }
                     UserContent::Text(text) => UserContent::Blocks(vec![text_block(text)]),
                     blocks @ UserContent::Blocks(_) => blocks,
                 };
@@ -386,13 +395,25 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
                         format!("{HARNESS_DIGEST_PREFIX}{digest}{HARNESS_DIGEST_SUFFIX}\n\n")
                     })
                     .unwrap_or_default();
-                AgentMessage::User(UserMessage {
-                    content: UserContent::Blocks(vec![text_block(format!(
+                let summary_text = if summary.summary.is_empty() {
+                    if digest_block.is_empty() && summary.provider_payload.is_none() {
+                        continue;
+                    }
+                    digest_block
+                } else {
+                    format!(
                         "{digest_block}{COMPACTION_SUMMARY_PREFIX}{}{COMPACTION_SUMMARY_SUFFIX}",
                         summary.summary
-                    ))]),
+                    )
+                };
+                AgentMessage::User(UserMessage {
+                    content: UserContent::Blocks(vec![text_block(summary_text)]),
                     timestamp: summary.timestamp,
-                    rest: serde_json::Map::default(),
+                    rest: summary
+                        .provider_payload
+                        .clone()
+                        .map(|payload| [("providerPayload".into(), payload)].into_iter().collect())
+                        .unwrap_or_default(),
                 })
             }
             AgentMessage::User(_) | AgentMessage::Assistant(_) | AgentMessage::ToolResult(_) => {
@@ -555,6 +576,7 @@ mod tests {
                 timestamp: 0,
             }),
             AgentMessage::CompactionSummary(pa_types::session::CompactionSummaryMessage {
+                provider_payload: None,
                 summary: "the story".to_string(),
                 tokens_before: 1,
                 retained_message_count: None,

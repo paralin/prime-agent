@@ -1,6 +1,10 @@
 //! Host request handling: execute-side requests answered by the host
 //! (harness/goal/etc.) and their settle/exit waits.
 
+use crate::kernel::cancellation::AbortSignal;
+use crate::kernel::host_channel::{ChannelInterrupt, ChannelSend, HostRequestChannel};
+use std::sync::atomic::Ordering;
+
 use super::{
     anyhow, json, lock, Arc, Duration, HostRequestPayload, Inner, Value,
     MAX_HANDLED_HOST_REQUEST_IDS,
@@ -50,10 +54,88 @@ impl Inner {
                 }
             }
         }
+        let (execution, generation) = {
+            let guarded = lock(&self.guarded);
+            (guarded.active_execution.clone(), guarded.start_generation)
+        };
+        let duplex = data
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| self.options.host_handlers.get_duplex(kind).is_some());
+        if duplex {
+            if let Some(execution) = &execution {
+                execution
+                    .cooperative_host_request
+                    .store(true, Ordering::Release);
+            }
+        }
+        let signal = AbortSignal::new();
+        let interrupt_signal = execution
+            .as_ref()
+            .and_then(|execution| execution.opts.signal.clone());
+        let outer_tool_call_id = execution
+            .as_ref()
+            .and_then(|execution| execution.opts.outer_tool_call_id.clone());
+        let weak = Arc::downgrade(self);
+        let outbound_id = request_id.to_string();
+        let send: ChannelSend = Arc::new(move |mut data| {
+            let weak = weak.clone();
+            let id = outbound_id.clone();
+            Box::pin(async move {
+                let inner = weak.upgrade().ok_or_else(|| anyhow!("kernel has closed"))?;
+                anyhow::ensure!(!inner.start_stale(generation), "kernel has closed");
+                data["status"] = json!("event");
+                inner
+                    .write_line(&json!({"type":"host_message","id":id,"data":data}))
+                    .await
+            })
+        });
+        let weak = Arc::downgrade(self);
+        let interrupt: ChannelInterrupt = Arc::new(move |grace_ms| {
+            let weak = weak.clone();
+            let execution = execution.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(grace_ms)).await;
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let Some(execution) = execution else {
+                    return;
+                };
+                inner.interrupt_execution_once(&execution).await;
+            });
+        });
+        let (channel, sender) = HostRequestChannel::new(
+            signal,
+            interrupt_signal.clone(),
+            outer_tool_call_id,
+            send,
+            interrupt,
+        );
+        lock(&self.guarded)
+            .host_channels
+            .insert(request_id.to_string(), (channel.clone(), sender));
+        if let Some(parent) = interrupt_signal {
+            let channel = channel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = parent.cancelled() => channel.close(),
+                    () = channel.signal.cancelled() => {},
+                }
+            });
+        }
         let inner = Arc::clone(self);
         let request_id = request_id.to_string();
         let task = tokio::spawn(async move {
-            let result = inner.handle_host_request(&data).await;
+            let result = if duplex {
+                inner.handle_host_request(&data, channel.clone()).await
+            } else {
+                tokio::select! {
+                    biased;
+                    () = channel.signal.cancelled() => Err(anyhow!("host request cancelled")),
+                    result = inner.handle_host_request(&data, channel.clone()) => result,
+                }
+            };
             let reply = match result {
                 Ok(result) => json!({ "status": "ok", "result": result }),
                 Err(error) => {
@@ -64,11 +146,17 @@ impl Inner {
                 }
             };
             let frame = json!({ "type": "host_reply", "id": request_id, "data": reply });
+            if inner.start_stale(generation) {
+                channel.close();
+                return;
+            }
             if let Err(error) = inner.write_line(&frame).await {
                 inner.append_diagnostic(&format!(
                     "failed to send host request reply for {request_id}: {error:#}"
                 ));
             }
+            channel.close();
+            lock(&inner.guarded).host_channels.remove(&request_id);
         });
         let mut g = lock(&self.guarded);
         // Completed task handles are dropped so the inflight set stays bounded.
@@ -76,7 +164,11 @@ impl Inner {
         g.host_inflight.push(task);
     }
 
-    async fn handle_host_request(&self, data: &Value) -> anyhow::Result<Value> {
+    async fn handle_host_request(
+        &self,
+        data: &Value,
+        channel: Arc<HostRequestChannel>,
+    ) -> anyhow::Result<Value> {
         let Some(obj) = data.as_object() else {
             return Err(anyhow!("host request payload must be an object"));
         };
@@ -85,14 +177,6 @@ impl Inner {
             .and_then(Value::as_str)
             .filter(|t| !t.is_empty())
             .ok_or_else(|| anyhow!("host request payload must have a string type"))?;
-        let handler = self
-            .options
-            .host_handlers
-            .get(request_type)
-            .ok_or_else(|| {
-                anyhow!("host request type \"{request_type}\" is not available in this session")
-            })?
-            .clone();
         // Tag the request with the cell that triggered it. A blocking call is
         // still the in-flight execution; detached spawns fire after the
         // scheduling cell goes idle, so fall back to that last cell's source.
@@ -104,14 +188,24 @@ impl Inner {
                 .or_else(|| g.last_cell_code.as_deref().map(cap_cell_source))
         };
         let mut payload = obj.clone();
-        if let Some(code) = cell_source_code {
-            payload.insert("cellSourceCode".to_string(), Value::String(code));
+        if let Some(code) = &cell_source_code {
+            payload.insert("cellSourceCode".to_string(), Value::String(code.clone()));
         }
-        handler(HostRequestPayload {
+        let payload = HostRequestPayload {
             data: Value::Object(payload),
-            cell_source_code: None,
-        })
-        .await
+            cell_source_code,
+        };
+        if let Some(handler) = self.options.host_handlers.get_duplex(request_type) {
+            return handler(payload, channel).await;
+        }
+        let handler = self
+            .options
+            .host_handlers
+            .get(request_type)
+            .ok_or_else(|| {
+                anyhow!("host request type \"{request_type}\" is not available in this session")
+            })?;
+        handler(payload).await
     }
 
     /// Wait (bounded) for the in-flight host request tasks to settle.

@@ -232,6 +232,8 @@ fn entry_base_mut(entry: &mut FileEntry) -> Option<&mut EntryBase> {
         | FileEntry::BranchSummary { base, .. }
         | FileEntry::Custom { base, .. }
         | FileEntry::ChildUsageAttributed { base, .. }
+        | FileEntry::ActStart { base, .. }
+        | FileEntry::ActTerminal { base, .. }
         | FileEntry::Label { base, .. }
         | FileEntry::SessionInfo { base, .. }
         | FileEntry::SessionState { base, .. }
@@ -297,7 +299,24 @@ pub struct SessionContext {
 
 /// Walk the parent chain from the leaf, reconstructing the model context
 /// (summary-first when a compaction is on the path).
+#[must_use]
 pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> SessionContext {
+    build_session_context_inner(entries, leaf_id, /*active_provider*/ None)
+}
+
+pub(crate) fn build_session_context_for_provider(
+    entries: &[FileEntry],
+    leaf_id: Option<&str>,
+    provider: &str,
+) -> SessionContext {
+    build_session_context_inner(entries, leaf_id, Some(provider))
+}
+
+fn build_session_context_inner(
+    entries: &[FileEntry],
+    leaf_id: Option<&str>,
+    active_provider: Option<&str>,
+) -> SessionContext {
     let by_id: HashMap<String, usize> = entries
         .iter()
         .enumerate()
@@ -452,15 +471,40 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
         } else {
             payload.harness_state_fingerprint
         };
-        messages.push(AgentMessage::CompactionSummary(CompactionSummaryMessage {
-            summary: payload.summary,
-            tokens_before: payload.tokens_before,
-            retained_message_count: Some(retained.len() as u64),
-            custom_instructions: payload.custom_instructions,
-            harness_digest: summary_harness_digest,
-            harness_state_fingerprint: summary_harness_state_fingerprint,
-            timestamp: timestamp_to_millis(entries[compaction_index].timestamp()),
-        }));
+        // Keep the boundary across provider switches so the compacted prefix
+        // cannot grow back beyond the window. Only the originating provider
+        // receives its opaque replacement history; other providers get text.
+        let replay_provider =
+            active_provider.or_else(|| model.as_ref().map(|(provider, _)| provider.as_str()));
+        let provider_payload = if let FileEntry::Compaction { base, payload } =
+            &entries[compaction_index]
+        {
+            payload.provider_native_compaction.as_ref()
+                .or_else(|| base.rest.get("providerNativeCompaction"))
+                .filter(|native| {
+                    native["provider"].is_string()
+                        && native["provider"].as_str() == replay_provider
+                        && native["replacementHistory"].is_array()
+                })
+                .map(|native| serde_json::json!({"type":"openaiResponsesHistory", "provider":native["provider"], "items":native["replacementHistory"]}))
+        } else {
+            None
+        };
+        if !payload.summary.is_empty()
+            || provider_payload.is_some()
+            || summary_harness_digest.is_some()
+        {
+            messages.push(AgentMessage::CompactionSummary(CompactionSummaryMessage {
+                provider_payload,
+                summary: payload.summary,
+                tokens_before: payload.tokens_before,
+                retained_message_count: Some(retained.len() as u64),
+                custom_instructions: payload.custom_instructions,
+                harness_digest: summary_harness_digest,
+                harness_state_fingerprint: summary_harness_state_fingerprint,
+                timestamp: timestamp_to_millis(entries[compaction_index].timestamp()),
+            }));
+        }
         messages.extend(retained);
         for &index in &path[path.partition_point(|&i| i <= compaction_index)..] {
             append_message(&entries[index], &mut messages, keep_digest_entry_id);
@@ -533,6 +577,26 @@ mod context_tests {
             }
         })
         .to_string()
+    }
+
+    /// Captured by executing buildSessionContext exported by the preserved TS bundle.
+    #[test]
+    fn native_compaction_replay_matches_the_ts_bundle_corpus() {
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/native-compaction-replay.v1.json"
+        ))
+        .unwrap();
+        for case in corpus["cases"].as_array().unwrap() {
+            let entries: Vec<pa_types::session::FileEntry> =
+                serde_json::from_value(case["entries"].clone()).unwrap();
+            let context = build_session_context(&entries, /*leaf_id*/ None);
+            assert_eq!(
+                serde_json::to_value(context.messages).unwrap(),
+                case["expectedMessages"],
+                "TS parity case {}",
+                case["name"]
+            );
+        }
     }
 
     #[test]

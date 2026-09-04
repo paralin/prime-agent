@@ -77,6 +77,19 @@ impl Supervisor {
         timeout_ms: u64,
         admission: RouteAdmission,
     ) -> Result<WorkerReply> {
+        let mailbox_command = matches!(command_type, "agent_message_inbox" | "agent_message_wait")
+            || (command_type == "worker_deliver_message"
+                && ["messageId", "replyTo"]
+                    .iter()
+                    .any(|key| payload.get(*key).is_some_and(|value| !value.is_null())));
+        if mailbox_command && !resident.supports_capability("agent_message_mailbox") {
+            return Ok(WorkerReply::Typed(response_failure(
+                None,
+                command_type,
+                "Agent mailbox is not supported by this session worker",
+                None,
+            )));
+        }
         // Bounded admission (the Codex request/await split): a client's
         // request-shaped command answers the explicit overload refusal
         // the moment the worker's in-flight bound is full — nothing is
@@ -650,6 +663,7 @@ impl Supervisor {
                 | DaemonCommand::WaitForIdle { .. }
                 // Headless completion settles a whole autonomous run.
                 | DaemonCommand::WaitForHeadlessCompletion { .. }
+                | DaemonCommand::AgentMessageWait { .. }
                 // Compaction runs a summarizer model call, like a turn.
                 | DaemonCommand::Compact { .. }
                 // A tree navigation may run a branch-summary model call.

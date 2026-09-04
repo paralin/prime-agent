@@ -11,7 +11,7 @@
 )]
 
 //! Verifier integration tests: spawn a real `python -m rlm.repl` kernel
-//! (the same JSON-lines protocol v3 runtime the TS product ships) through
+//! (the shared JSON-lines protocol v4 runtime) through
 //! `ReplKernelManager`, and check the persistence/revival semantics against
 //! the TS product's behavior contract:
 //!
@@ -519,4 +519,236 @@ async fn graceful_shutdown_flushes_the_final_snapshot() {
         .shutdown(KernelShutdownOptions::default())
         .await
         .expect("shutdown");
+}
+
+#[tokio::test]
+async fn act_duplex_cells_share_live_namespace_and_return_exact_python_identity() {
+    use pa_agent::scripted::ScriptedProvider;
+    use pa_core::kernel::host_channel::duplex_host_handler;
+    use pa_core::session_engine::act_lane::{ActLane, ActLaneResult, ActLaneTarget};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let Some(mut options) = test_options(None) else {
+        return;
+    };
+    let provider = Arc::new(ScriptedProvider::new(pa_agent::types::Model::unknown()));
+    provider.push_tool_call_turn(
+        None,
+        vec![(
+            "inspect-cell",
+            "shared_ipython",
+            json!({"code":"state['visits'] += 1\nprint(state['visits'])"}),
+        )],
+    );
+    provider.push_tool_call_turn(
+        None,
+        vec![(
+            "done-cell",
+            "shared_ipython",
+            json!({"code":"rlm.done(state)"}),
+        )],
+    );
+    let lane = Arc::new(ActLane::default());
+    let worker = lane.clone();
+    let provider_for_handler = provider.clone();
+    options.host_handlers.register_duplex(
+        "rlm.act",
+        duplex_host_handler(move |payload, channel| {
+            let lane = worker.clone();
+            let provider = provider_for_handler.clone();
+            async move {
+                assert!(payload
+                    .cell_source_code
+                    .as_deref()
+                    .unwrap()
+                    .contains("rlm.act"));
+                let outcome = lane
+                    .run(
+                        payload.data["prompt"].as_str().unwrap().into(),
+                        channel,
+                        ActLaneTarget {
+                            session_key: "test/shared".into(),
+                            model: pa_agent::types::Model::unknown(),
+                            thinking_level: pa_agent::types::ThinkingLevel::High,
+                            stream_fn: provider.stream_fn(),
+                            depth: 1,
+                            max_depth: 1,
+                        },
+                        Vec::new(),
+                    )
+                    .await?;
+                assert_eq!(outcome, ActLaneResult::Done);
+                Ok(json!({"outcome":"done"}))
+            }
+        }),
+    );
+    let manager = started_manager(options).await;
+    let result = tokio::time::timeout(Duration::from_secs(15), execute(
+        &manager,
+        "state = {'visits': 0}\nreturned = await rlm.act('Update state and return it', model='test/shared')\n(returned is state, state['visits'])",
+    )).await.expect("duplex Act must settle");
+    assert_eq!(result.status, ExecuteStatus::Ok, "{:?}", result.error);
+    assert_eq!(result.result.as_deref(), Some("(True, 1)"));
+    assert!(!lane.running());
+    assert_eq!(provider.calls().len(), 2);
+    manager
+        .shutdown(KernelShutdownOptions::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn configured_act_roles_and_nested_depths_execute_through_the_native_runtime() {
+    use pa_ai::faux::{
+        faux_assistant_message, faux_tool_call, FauxAssistantMessageOptions, FauxResponseStep,
+        RegisterFauxProviderOptions,
+    };
+    use pa_core::session_engine::act_runtime::ActRuntime;
+    use serde_json::json;
+
+    let Some(mut options) = test_options(None) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let api = "act-runtime-nested-test";
+    let registration = pa_ai::faux::register_faux_provider(RegisterFauxProviderOptions {
+        api: Some(api.into()),
+        ..Default::default()
+    });
+    let model = registration.get_model();
+    std::fs::write(dir.path().join("models.json"), json!({"providers": {
+        model.provider.clone(): {"api":api, "baseUrl":"http://localhost:0", "apiKey":"test-key", "models":[
+            {"id":model.id.clone(), "name":"Faux Act", "input":["text"], "reasoning":false, "contextWindow":200_000, "maxTokens":4096}
+        ]}
+    }}).to_string()).unwrap();
+    std::fs::write(
+        dir.path().join("settings.json"),
+        json!({
+            "rlmActMaxDepth":2, "rlmActDefaultModel":["@task", "@task"],
+            "modelRoles":{"task":["missing/model", format!("{}/{}", model.provider, model.id)]}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let responses = [
+        "nested = await rlm.act('nested task')\nrlm.done(nested)",
+        "state['nested'] = True\nrlm.done(state)",
+    ]
+    .into_iter()
+    .map(|code| {
+        FauxResponseStep::Message(faux_assistant_message(
+            vec![faux_tool_call(
+                "shared_ipython",
+                &json!({"code":code}),
+                None,
+            )],
+            FauxAssistantMessageOptions {
+                stop_reason: Some(pa_types::ai::StopReason::ToolUse),
+                ..Default::default()
+            },
+        ))
+    })
+    .collect();
+    registration.set_responses(responses);
+    let runtime = ActRuntime::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+    let parent = std::sync::Arc::new(pa_agent::agent::Agent::new(
+        pa_agent::agent::AgentOptions::default(),
+    ));
+    let prior_call: pa_agent::types::AgentMessage = serde_json::from_value(json!({
+        "role":"assistant", "content":[{"type":"toolCall", "id":"root-call", "name":"ipython", "arguments":{}}],
+        "api":"faux", "provider":"faux", "model":"faux", "usage":pa_types::ai::Usage::default(), "stopReason":"toolUse", "timestamp":0,
+    })).unwrap();
+    parent.set_messages(vec![prior_call.clone()]).await;
+    runtime.bind_parent(&parent);
+    runtime.register(&mut options.host_handlers);
+    let manager = started_manager(options).await;
+    let result = tokio::time::timeout(Duration::from_secs(15), manager.execute(
+        "state = {}\nreturned = await rlm.act('outer task')\n(returned is state, state['nested'])",
+        ExecuteOptions { outer_tool_call_id:Some("root-call".into()), ..Default::default() },
+    )).await.expect("nested Act must settle").unwrap();
+    assert_eq!(result.status, ExecuteStatus::Ok, "{:?}", result.error);
+    assert_eq!(result.result.as_deref(), Some("(True, True)"));
+    assert!(!runtime.running());
+    let between: pa_agent::types::AgentMessage = serde_json::from_value(json!({
+        "role":"user", "content":"between outer calls", "timestamp":0,
+    }))
+    .unwrap();
+    parent.set_messages(vec![prior_call, between]).await;
+    let history_error = manager
+        .execute(
+            "await rlm.act('second outer task')",
+            ExecuteOptions {
+                outer_tool_call_id: Some("root-call-2".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_error.status, ExecuteStatus::Error);
+    assert!(history_error
+        .error
+        .unwrap()
+        .evalue
+        .contains("requires an image-capable model"));
+    assert!(!runtime.running());
+    runtime.dispose().await;
+    manager
+        .shutdown(KernelShutdownOptions::default())
+        .await
+        .unwrap();
+    registration.unregister();
+}
+
+#[tokio::test]
+async fn cancellation_allows_cooperative_host_cleanup_before_interrupting_the_cell() {
+    use pa_core::kernel::cancellation::AbortSignal;
+    use pa_core::kernel::host_channel::duplex_host_handler;
+    use std::sync::Arc;
+
+    let Some(mut options) = test_options(None) else {
+        return;
+    };
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let handler_entered = entered.clone();
+    options.host_handlers.register_duplex(
+        "test.cooperative",
+        duplex_host_handler(move |_, channel| {
+            let entered = handler_entered.clone();
+            async move {
+                entered.notify_one();
+                channel.signal.cancelled().await;
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok(serde_json::json!({"cleaned":true}))
+            }
+        }),
+    );
+    let manager = Arc::new(started_manager(options).await);
+    let signal = AbortSignal::new();
+    let execution = {
+        let manager = manager.clone();
+        let signal = signal.clone();
+        tokio::spawn(async move {
+            manager.execute(
+                "import rlm\nawait rlm.host_request('test.cooperative', {})\nnative_replied = True",
+                ExecuteOptions { signal:Some(signal), ..Default::default() },
+            ).await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .unwrap();
+    signal.abort();
+    let result = tokio::time::timeout(Duration::from_secs(5), execution)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status, ExecuteStatus::Aborted);
+    let retained = execute(&manager, "native_replied").await;
+    assert_eq!(retained.result.as_deref(), Some("True"));
+    manager
+        .shutdown(KernelShutdownOptions::default())
+        .await
+        .unwrap();
 }

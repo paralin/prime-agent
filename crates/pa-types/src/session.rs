@@ -14,6 +14,9 @@ use crate::ai::{
 };
 use crate::JsonMap;
 
+mod act;
+pub use act::{ActModel, ActStartEntry, ActTerminalEntry, ActTerminalStatus};
+
 // ---------------------------------------------------------------------------
 // Git context
 // ---------------------------------------------------------------------------
@@ -115,6 +118,9 @@ pub struct BranchSummaryMessage {
 #[serde(rename_all = "camelCase")]
 pub struct CompactionSummaryMessage {
     pub summary: String,
+    /// Opaque history used only by the matching provider's transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<Value>,
     pub tokens_before: u64,
     /// Retained messages that precede this summary in transcript presentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,6 +197,9 @@ pub struct ModelChangeEntry {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionEntry {
+    /// Opaque provider-owned compacted history; optional for portable summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_native_compaction: Option<Value>,
     pub summary: String,
     pub first_kept_entry_id: String,
     pub tokens_before: u64,
@@ -386,6 +395,18 @@ pub enum FileEntry {
         #[serde(flatten)]
         base: EntryBase,
     },
+    ActStart {
+        #[serde(flatten)]
+        payload: ActStartEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    ActTerminal {
+        #[serde(flatten)]
+        payload: ActTerminalEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
     ChildUsageAttributed {
         #[serde(flatten)]
         payload: ChildUsageAttributionEntry,
@@ -486,6 +507,18 @@ enum KnownFileEntry {
         #[serde(flatten)]
         base: EntryBase,
     },
+    ActStart {
+        #[serde(flatten)]
+        payload: ActStartEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    ActTerminal {
+        #[serde(flatten)]
+        payload: ActTerminalEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
     ChildUsageAttributed {
         #[serde(flatten)]
         payload: ChildUsageAttributionEntry,
@@ -541,6 +574,8 @@ impl From<KnownFileEntry> for FileEntry {
                 Self::BranchSummary { payload, base }
             }
             KnownFileEntry::Custom { payload, base } => Self::Custom { payload, base },
+            KnownFileEntry::ActStart { payload, base } => Self::ActStart { payload, base },
+            KnownFileEntry::ActTerminal { payload, base } => Self::ActTerminal { payload, base },
             KnownFileEntry::ChildUsageAttributed { payload, base } => {
                 Self::ChildUsageAttributed { payload, base }
             }
@@ -587,6 +622,8 @@ impl FileEntry {
             | FileEntry::Compaction { base, .. }
             | FileEntry::BranchSummary { base, .. }
             | FileEntry::Custom { base, .. }
+            | FileEntry::ActStart { base, .. }
+            | FileEntry::ActTerminal { base, .. }
             | FileEntry::ChildUsageAttributed { base, .. }
             | FileEntry::Label { base, .. }
             | FileEntry::SessionInfo { base, .. }
@@ -612,6 +649,8 @@ impl FileEntry {
             | FileEntry::Compaction { base, .. }
             | FileEntry::BranchSummary { base, .. }
             | FileEntry::Custom { base, .. }
+            | FileEntry::ActStart { base, .. }
+            | FileEntry::ActTerminal { base, .. }
             | FileEntry::ChildUsageAttributed { base, .. }
             | FileEntry::Label { base, .. }
             | FileEntry::SessionInfo { base, .. }
@@ -640,6 +679,8 @@ impl FileEntry {
             | FileEntry::Compaction { base, .. }
             | FileEntry::BranchSummary { base, .. }
             | FileEntry::Custom { base, .. }
+            | FileEntry::ActStart { base, .. }
+            | FileEntry::ActTerminal { base, .. }
             | FileEntry::ChildUsageAttributed { base, .. }
             | FileEntry::Label { base, .. }
             | FileEntry::SessionInfo { base, .. }

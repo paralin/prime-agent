@@ -154,6 +154,71 @@ impl SessionFile {
         self.persist_entry_at(entry_type, fields, &crate::util::now_iso())
     }
 
+    /// Commit the scratch continuation and boundary with one durable append.
+    ///
+    /// # Errors
+    /// Returns serialization or persistence errors before adopting either row.
+    pub fn persist_message_compaction(
+        &mut self,
+        message: &Value,
+        mut fields: Value,
+    ) -> Result<String> {
+        anyhow::ensure!(
+            self.window.is_none() || self.path.exists(),
+            "window-backed session file is missing"
+        );
+        let timestamp = crate::util::now_iso();
+        let mut message_entry = SessionEntry::new(
+            "message",
+            self.leaf_id.clone(),
+            &self.by_id,
+            json!({"message":message}),
+            &timestamp,
+        );
+        if self.window.is_some() {
+            message_entry.id = uuid::Uuid::new_v4().to_string();
+        }
+        let message_id = message_entry.id.clone();
+        fields["firstKeptEntryId"] = json!(message_id);
+        let mut boundary = SessionEntry::new(
+            "compaction",
+            Some(message_id.clone()),
+            &self.by_id,
+            fields,
+            &timestamp,
+        );
+        boundary.id = uuid::Uuid::new_v4().to_string();
+        let boundary_id = boundary.id.clone();
+        if !self.path.as_os_str().is_empty() && self.path.exists() {
+            let mut bytes = Vec::new();
+            write_line(&mut bytes, &message_entry)?;
+            write_line(&mut bytes, &boundary)?;
+            match &self.lease {
+                Some(lease) => lease.append(&self.path, &bytes)?,
+                None => pa_core::session::window::append_cached(
+                    &self.path,
+                    &bytes,
+                    pa_core::session::window::AppendOwnership::Unleased,
+                )?,
+            }
+            self.push_index(message_entry);
+            self.push_index(boundary);
+        } else {
+            let previous_leaf = self.leaf_id.clone();
+            let start = self.entries.len();
+            self.push_index_inner(message_entry, false);
+            self.push_index_inner(boundary, false);
+            if let Err(error) = self.rewrite() {
+                self.entries.truncate(start);
+                self.by_id.remove(&message_id);
+                self.by_id.remove(&boundary_id);
+                self.leaf_id = previous_leaf;
+                return Err(error);
+            }
+        }
+        Ok(message_id)
+    }
+
     /// Durably mark that this session has drawn the Anthropic subscription
     /// ban-risk warning (the once-per-session-lifecycle gate, operator
     /// directive 2026-09-29): append the

@@ -116,6 +116,8 @@ impl Worker {
             "get_rlm_max_depth_status" => self.handle_get_rlm_max_depth_status(),
             "get_available_models" => self.handle_get_available_models(),
             "worker_deliver_message" => self.handle_worker_deliver_message(payload),
+            "agent_message_inbox" => self.handle_mailbox_inbox(payload),
+            "agent_message_wait" => self.handle_mailbox_wait(payload).await,
             "update_snapshot" => self.handle_update_snapshot(),
             "kill" => self.handle_kill(payload).await,
             "shutdown" => self.handle_shutdown().await,
@@ -620,6 +622,7 @@ impl Worker {
     }
 
     async fn handle_kill(&self, payload: &Value) -> DaemonResponse {
+        self.close_mailbox("Session is closed");
         let reason = KillCloseReason::from_payload(payload);
         // The session is closing: the continuation mint sites and their
         // settle-hook retries bail from here on (TS `_disposed ||

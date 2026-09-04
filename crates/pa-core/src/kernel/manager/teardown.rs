@@ -152,6 +152,10 @@ impl Inner {
             if let Some(timer) = lock(&self.snapshot_timer).take() {
                 timer.abort();
             }
+            for (channel, _) in g.host_channels.values() {
+                channel.close();
+            }
+            g.host_channels.clear();
             g.late_handlers.clear();
             g.pending_done_waiters.clear();
             g.bash_activity_waiters.clear();

@@ -287,7 +287,7 @@ impl AgentSessionEngine {
         children.any_running().await
     }
 
-    /// Whether a live background `bash()` handle holds the boundary (TS
+    /// Whether a live background `bash()` handle or external watch holds the boundary (TS
     /// `_hasLiveBackgroundBashHandles`): the session's kernel still runs
     /// one. The kernel's bash-activity tracking (the same state that
     /// powers the bash-done completion follow-ups) is the liveness
@@ -297,6 +297,14 @@ impl AgentSessionEngine {
     /// consult can run inside a compaction turn, which holds it); an
     /// unwired probe (engine without a built session) answers `false`.
     pub(crate) fn has_live_background_bash_handles(&self) -> bool {
+        if self
+            .external_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .has_running_watches()
+        {
+            return true;
+        }
         self.background_bash_probe
             .lock()
             .expect("background bash probe lock")

@@ -184,7 +184,9 @@ impl SessionManager {
                 .any(|entry| matches!(entry, FileEntry::ServiceTierChange { .. }))
     }
 
-    fn active_branch_entries(&self) -> Vec<&FileEntry> {
+    /// Loaded ancestor path, stopping at the retained window boundary.
+    #[must_use]
+    pub fn active_branch_entries(&self) -> Vec<&FileEntry> {
         let mut branch = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut id = self.leaf_id.as_deref();
@@ -199,6 +201,41 @@ impl SessionManager {
         }
         branch.reverse();
         branch
+    }
+
+    /// Latest retained Act identities and their outcomes across compaction.
+    #[must_use]
+    pub fn act_records(&self) -> Vec<FileEntry> {
+        let mut records: Vec<FileEntry> = self.window.as_ref().map_or_else(Vec::new, |window| {
+            window
+                .metadata_entries()
+                .iter()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        FileEntry::ActStart { .. } | FileEntry::ActTerminal { .. }
+                    )
+                })
+                .collect()
+        });
+        let mut seen: std::collections::HashSet<String> = records
+            .iter()
+            .filter_map(|entry| entry.id().map(str::to_owned))
+            .collect();
+        records.extend(
+            self.active_branch_entries()
+                .into_iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        FileEntry::ActStart { .. } | FileEntry::ActTerminal { .. }
+                    )
+                })
+                .filter(|entry| entry.id().is_some_and(|id| seen.insert(id.to_owned())))
+                .cloned(),
+        );
+        records
     }
 
     #[must_use]

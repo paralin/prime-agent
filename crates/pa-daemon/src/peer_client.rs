@@ -46,6 +46,8 @@ pub(crate) async fn deliver_message_over_peer_transport(
     message: &str,
     sender: &Value,
     delivery_mode: Option<&str>,
+    message_id: Option<&str>,
+    reply_to: Option<&str>,
 ) -> PeerDeliveryOutcome {
     let future = deliver_once(
         ticket,
@@ -53,6 +55,8 @@ pub(crate) async fn deliver_message_over_peer_transport(
         message,
         sender,
         delivery_mode,
+        message_id,
+        reply_to,
     );
     match tokio::time::timeout(
         std::time::Duration::from_millis(DELIVERY_TIMEOUT_MS),
@@ -71,6 +75,8 @@ async fn deliver_once(
     message: &str,
     sender: &Value,
     delivery_mode: Option<&str>,
+    message_id: Option<&str>,
+    reply_to: Option<&str>,
 ) -> PeerDeliveryOutcome {
     // Link establishment: connect, hello, and the grant burn. Any failure
     // here means nothing was delivered.
@@ -80,8 +86,22 @@ async fn deliver_once(
     let (reader, mut writer) = stream.split();
     let mut reader = PrivateFrameReader::new(reader, DEFAULT_PRIVATE_FRAME_LIMITS);
     // Consume the daemon hello (every connection gets one immediately).
-    if read_frame(&mut reader).await.is_err() {
+    let Ok(hello) = read_frame(&mut reader).await else {
         return PeerDeliveryOutcome::NotEstablished;
+    };
+    if message_id.is_some() || reply_to.is_some() {
+        let capable = serde_json::from_slice::<Value>(&hello.payload).is_ok_and(|hello| {
+            hello["capabilities"]
+                .as_array()
+                .is_some_and(|capabilities| {
+                    capabilities
+                        .iter()
+                        .any(|capability| capability == "agent_message_mailbox")
+                })
+        });
+        if !capable {
+            return PeerDeliveryOutcome::NotEstablished;
+        }
     }
     // Burn the grant: peer_auth with the `worker` purpose.
     let Ok(auth) = request(
@@ -112,6 +132,12 @@ async fn deliver_once(
     });
     if let Some(mode) = delivery_mode {
         payload["deliveryMode"] = json!(mode);
+    }
+    if let Some(id) = message_id {
+        payload["messageId"] = json!(id);
+    }
+    if let Some(reply_to) = reply_to {
+        payload["replyTo"] = json!(reply_to);
     }
     match request(&mut writer, &mut reader, "worker_deliver_message", &payload).await {
         Ok(response) => PeerDeliveryOutcome::Answered(Box::new(response)),

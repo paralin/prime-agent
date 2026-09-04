@@ -10,6 +10,7 @@ use crate::types::{
     ThinkingBudgets,
 };
 use serde_json::{json, Value};
+use std::fmt::Write;
 
 fn model() -> Model {
     get_model("merge-gateway", "zai/glm-5.3-flash")
@@ -17,11 +18,12 @@ fn model() -> Model {
         .clone()
 }
 fn sse(frames: Vec<Value>) -> String {
-    frames
-        .into_iter()
-        .map(|frame| format!("data: {frame}\n\n"))
-        .collect::<String>()
-        + "data: [DONE]\n\n"
+    let mut output = frames.into_iter().fold(String::new(), |mut output, frame| {
+        write!(output, "data: {frame}\n\n").unwrap();
+        output
+    });
+    output.push_str("data: [DONE]\n\n");
+    output
 }
 #[test]
 fn gateway_catalog_and_credentials_match_the_provider_contract() {
@@ -48,8 +50,8 @@ fn gateway_catalog_and_credentials_match_the_provider_contract() {
             ModelThinkingLevel::Max
         ]
     );
-    assert_eq!(model.cost.input.0, 0.015);
-    assert_eq!(model.cost.output.0, 0.05);
+    assert_eq!(model.cost.input, crate::types::JsNumber(0.015));
+    assert_eq!(model.cost.output, crate::types::JsNumber(0.05));
 }
 
 #[tokio::test]

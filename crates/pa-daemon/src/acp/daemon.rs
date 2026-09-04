@@ -58,6 +58,8 @@ pub(crate) struct DaemonLink {
     pending: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<DaemonResponse>>>>,
     frames: Mutex<mpsc::UnboundedReceiver<LinkFrame>>,
     protocol_version: u64,
+    act_projection_enabled: bool,
+    runtime_launch_policy_enabled: bool,
     next_request_id: std::sync::atomic::AtomicU64,
 }
 
@@ -148,6 +150,20 @@ impl DaemonLink {
             pending,
             frames: Mutex::new(frame_rx),
             protocol_version: version,
+            act_projection_enabled: hello["serverCapabilities"].as_array().is_some_and(
+                |capabilities| {
+                    capabilities
+                        .iter()
+                        .any(|capability| capability == "act_projection")
+                },
+            ),
+            runtime_launch_policy_enabled: hello["serverCapabilities"].as_array().is_some_and(
+                |capabilities| {
+                    capabilities
+                        .iter()
+                        .any(|capability| capability == "runtime_launch_policy")
+                },
+            ),
             next_request_id: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -159,6 +175,17 @@ impl DaemonLink {
         timeout_ms: u64,
     ) -> anyhow::Result<DaemonResponse> {
         use std::sync::atomic::Ordering;
+        if let DaemonCommand::Create {
+            config: Some(config),
+            ..
+        } = &command
+        {
+            anyhow::ensure!(
+                !pa_types::daemon::compatibility::requires_runtime_launch_policy(config)
+                    || self.runtime_launch_policy_enabled,
+                "Daemon does not support runtime launch restrictions"
+            );
+        }
         let id = format!(
             "acp-{}",
             self.next_request_id.fetch_add(1, Ordering::SeqCst) + 1
@@ -285,7 +312,8 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
         let link = Arc::clone(&link);
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            let mut mapping = WireMappingState::default();
+            let mut mapping = WireMappingState::with_act_projection(link.act_projection_enabled);
+            let mut mapping_session: Option<String> = None;
             let mut frames = link.frames.lock().await;
             while let Some(frame) = frames.recv().await {
                 match frame {
@@ -303,6 +331,18 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                             let Some(current) = guard.session.as_mut() else {
                                 continue;
                             };
+                            if frame["activeSessionId"]
+                                .as_str()
+                                .is_some_and(|id| id != current.daemon_active_session_id)
+                            {
+                                continue;
+                            }
+                            if mapping_session.as_deref() != Some(&current.acp_session_id) {
+                                mapping = WireMappingState::with_act_projection(
+                                    link.act_projection_enabled,
+                                );
+                                mapping_session = Some(current.acp_session_id.clone());
+                            }
                             if let Some(stop) = wire_events::assistant_stop(&event) {
                                 current.assistant_stop_reason = stop.stop_reason;
                             }

@@ -848,3 +848,40 @@ fn a_fork_launch_never_opens_the_agents_view() {
         "a --continue with a saved candidate still opens the view"
     );
 }
+
+#[test]
+fn bare_launch_opens_agents_view_but_prompts_and_explicit_sessions_open_chat() {
+    let mut options = run_options_for_continue(std::path::Path::new("/workspace"));
+    assert!(should_open_agents_view(&options, false, false));
+    assert!(!should_open_agents_view(&options, true, false));
+    options.initial_message = Some("fix the failing test".into());
+    assert!(!should_open_agents_view(&options, false, false));
+    options.initial_message = None;
+    options.session.no_session = true;
+    assert!(!should_open_agents_view(&options, false, false));
+    options.session.no_session = false;
+    options.session.resume = Some("saved-session".into());
+    options.agents_view_requested = true;
+    assert!(!should_open_agents_view(&options, false, false));
+    options.session.resume = None;
+    options.attach_agent = Some("live-session".into());
+    assert!(!should_open_agents_view(&options, false, false));
+}
+
+#[test]
+fn launch_restrictions_reach_interactive_create_without_changing_saved_settings() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut options = run_options_for_continue(dir.path());
+    options.config.runtime_policy.rlm_max_depth_ceiling = Some(0);
+    options.config.runtime_policy.disable_rlm_act = true;
+    let (tui, _) = build_tui_options(
+        &options,
+        dir.path().join("daemon.sock"),
+        std::sync::Arc::default(),
+    )
+    .unwrap();
+    let config = tui.create_config();
+    assert_eq!(config["rlmMaxDepthCeiling"], 0);
+    assert_eq!(config["disableRlmAct"], true);
+    assert!(!options.config.agent_dir.join("settings.json").exists());
+}

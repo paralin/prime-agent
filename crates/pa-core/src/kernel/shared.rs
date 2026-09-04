@@ -10,6 +10,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::kernel::bootstrap::KernelPythonSkill;
+use crate::kernel::host_channel::HostDuplexHandlerFn;
 
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 65_536;
 pub const HOST_REQUEST_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
@@ -180,6 +181,8 @@ pub struct ExecuteResult {
 /// Options for one `execute` call.
 #[derive(Default)]
 pub struct ExecuteOptions {
+    /// Model tool call whose live cell owns duplex host requests.
+    pub outer_tool_call_id: Option<String>,
     /// Aborting interrupts the kernel out-of-band.
     pub signal: Option<crate::kernel::cancellation::AbortSignal>,
     /// Streaming callback for stdout/stderr chunks.
@@ -240,6 +243,7 @@ where
 #[derive(Clone, Default)]
 pub struct HostRequestHandlers {
     handlers: Arc<HashMap<String, HostHandlerFn>>,
+    duplex_handlers: Arc<HashMap<String, HostDuplexHandlerFn>>,
 }
 
 impl HostRequestHandlers {
@@ -255,9 +259,25 @@ impl HostRequestHandlers {
         self.handlers = Arc::new(map);
     }
 
+    pub fn register_duplex(
+        &mut self,
+        request_type: impl Into<String>,
+        handler: HostDuplexHandlerFn,
+    ) {
+        Arc::make_mut(&mut self.duplex_handlers).insert(request_type.into(), handler);
+    }
+
+    #[must_use]
+    pub fn get_duplex(&self, request_type: &str) -> Option<&HostDuplexHandlerFn> {
+        self.duplex_handlers.get(request_type)
+    }
+
     /// Merge another registry into this one; the other registry's entries
     /// win on key collisions (later registrations override).
     pub fn merge(&mut self, other: Self) {
+        let duplex =
+            Arc::try_unwrap(other.duplex_handlers).unwrap_or_else(|shared| (*shared).clone());
+        Arc::make_mut(&mut self.duplex_handlers).extend(duplex);
         let other_map = Arc::try_unwrap(other.handlers).unwrap_or_else(|shared| (*shared).clone());
         let mut map = Arc::try_unwrap(std::mem::take(&mut self.handlers))
             .unwrap_or_else(|shared| (*shared).clone());
@@ -267,6 +287,12 @@ impl HostRequestHandlers {
         self.handlers = Arc::new(map);
     }
 
+    /// Filter both ordinary and duplex registrations by request type.
+    pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        Arc::make_mut(&mut self.handlers).retain(|name, _| keep(name));
+        Arc::make_mut(&mut self.duplex_handlers).retain(|name, _| keep(name));
+    }
+
     #[must_use]
     pub fn get(&self, request_type: &str) -> Option<&HostHandlerFn> {
         self.handlers.get(request_type)
@@ -274,12 +300,12 @@ impl HostRequestHandlers {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.handlers.is_empty()
+        self.handlers.is_empty() && self.duplex_handlers.is_empty()
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.handlers.len()
+        self.handlers.len() + self.duplex_handlers.len()
     }
 }
 

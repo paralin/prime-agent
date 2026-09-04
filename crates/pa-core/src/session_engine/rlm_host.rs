@@ -163,6 +163,18 @@ pub type RlmHostFuture<T> = std::pin::Pin<Box<dyn Future<Output = anyhow::Result
 pub trait RlmSubagentHost: Send + Sync {
     /// Spawn a recursive child session and return once its task is admitted.
     fn spawn(&self, request: RlmSpawnRequest) -> RlmHostFuture<RlmSpawnHandle>;
+    fn spawn_with_service_tier(
+        &self,
+        request: RlmSpawnRequest,
+        tier: Option<pa_types::ai::ServiceTier>,
+    ) -> RlmHostFuture<RlmSpawnHandle> {
+        if tier.is_some() {
+            return Box::pin(async {
+                anyhow::bail!("This child runtime does not support service_tier overrides")
+            });
+        }
+        self.spawn(request)
+    }
     /// Create and prompt a resident depth-0 daemon session.
     fn create_session(
         &self,
@@ -294,6 +306,7 @@ pub struct RlmHostBridge {
     registry: Arc<ModelRegistry>,
     pub notes: Arc<RlmProgressNotes>,
     host: Arc<dyn RlmSubagentHost>,
+    launch: std::sync::Mutex<(super::runtime_policy::RuntimePolicy, u32)>,
     /// The child-usage attribution producer `rlm.spawn` registers into
     /// and the daemon's child observation drives.
     pub usage: Arc<super::rlm_usage::RlmChildUsageAttributions>,
@@ -310,8 +323,15 @@ impl RlmHostBridge {
             registry,
             notes: Arc::new(RlmProgressNotes::default()),
             host: host.unwrap_or_else(|| Arc::new(NoRlmChildren)),
+            launch: std::sync::Mutex::new((super::runtime_policy::RuntimePolicy::default(), 0)),
             usage,
         }
+    }
+    pub fn set_runtime_policy(&self, policy: super::runtime_policy::RuntimePolicy, depth: u32) {
+        *self
+            .launch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (policy, depth);
     }
 }
 
@@ -405,12 +425,12 @@ fn register_progress_note(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHo
 }
 
 fn register_run(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>) {
-    let host = Arc::clone(&bridge.host);
+    let bridge = bridge.clone();
     let usage = Arc::clone(&bridge.usage);
     handlers.register(
         "rlm.run",
         host_handler(move |payload| {
-            let host = Arc::clone(&host);
+            let bridge = bridge.clone();
             let usage = Arc::clone(&usage);
             Box::pin(async move {
                 let data = &payload.data;
@@ -419,7 +439,19 @@ fn register_run(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>)
                 };
                 let mut request = spawn_request_from_payload(prompt, data)?;
                 request.cell_source_code = payload.cell_source_code.clone();
-                let handle = host.spawn(request).await?;
+                let (policy, depth) = *bridge
+                    .launch
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                anyhow::ensure!(
+                    depth < policy.max_depth(u32::MAX),
+                    "RLM recursion is disabled at the launch depth ceiling"
+                );
+                let service_tier = requested_service_tier(data)?;
+                let handle = bridge
+                    .host
+                    .spawn_with_service_tier(request, service_tier)
+                    .await?;
                 // TS `_findLastAssistantMessage` at spawn: the spawning
                 // assistant row (persisted at `message_end` before tool
                 // execution) is the target every child-usage attribution
@@ -437,7 +469,11 @@ fn register_run(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>)
 fn spawn_request_from_payload(prompt: &str, data: &Value) -> anyhow::Result<RlmSpawnRequest> {
     const OPERATION: &str = "rlm.spawn";
     let kwargs = kwargs_from_payload(data);
-    reject_unsupported_kwargs(&kwargs, OPERATION, &["name", "model", "thinking"])?;
+    reject_unsupported_kwargs(
+        &kwargs,
+        OPERATION,
+        &["name", "model", "thinking", "service_tier"],
+    )?;
     let name = optional_string_kwarg(&kwargs, "name", OPERATION)?;
     let name = normalize_requested_rlm_subagent_session_name(name, OPERATION)?;
     if let Some(name) = &name {
@@ -455,6 +491,16 @@ fn spawn_request_from_payload(prompt: &str, data: &Value) -> anyhow::Result<RlmS
         thinking,
         cell_source_code: None,
     })
+}
+
+fn requested_service_tier(data: &Value) -> anyhow::Result<Option<pa_types::ai::ServiceTier>> {
+    let kwargs = kwargs_from_payload(data);
+    match kwargs.get("service_tier") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone()).map(Some).map_err(|_| {
+            anyhow::anyhow!("rlm.spawn service_tier must be one of: auto, default, flex, scale, priority, or null")
+        }),
+    }
 }
 
 fn register_create_session(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>) {
@@ -633,6 +679,30 @@ mod tests {
     use crate::kernel::shared::HostRequestPayload;
     use crate::session::manager::SessionManager;
     use std::sync::Arc;
+
+    #[test]
+    fn child_service_tiers_are_validated_before_admission() {
+        assert_eq!(requested_service_tier(&json!({})).unwrap(), None);
+        assert_eq!(
+            requested_service_tier(&json!({"kwargs":{"service_tier":null}})).unwrap(),
+            None
+        );
+        for (name, tier) in [
+            ("auto", pa_types::ai::ServiceTier::Auto),
+            ("default", pa_types::ai::ServiceTier::Default),
+            ("flex", pa_types::ai::ServiceTier::Flex),
+            ("scale", pa_types::ai::ServiceTier::Scale),
+            ("priority", pa_types::ai::ServiceTier::Priority),
+        ] {
+            assert_eq!(
+                requested_service_tier(&json!({"kwargs":{"service_tier":name}})).unwrap(),
+                Some(tier)
+            );
+        }
+        for invalid in [json!("unknown"), json!(5), json!(true)] {
+            assert!(requested_service_tier(&json!({"kwargs":{"service_tier":invalid}})).is_err());
+        }
+    }
 
     /// A host recording every call, answering with fixed handles.
     /// One recorded collect call: its targets and timeout.
@@ -974,6 +1044,26 @@ mod tests {
             error.to_string(),
             "rlm.progress.note message must be at most 512 characters"
         );
+    }
+
+    #[tokio::test]
+    async fn launch_ceiling_rejects_spawn_before_host_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = RecordingHost::new();
+        let requests = host.spawn_requests.clone();
+        let wiring = wired(dir.path(), Some(host));
+        wiring.rlm.set_runtime_policy(
+            super::super::runtime_policy::RuntimePolicy {
+                rlm_max_depth_ceiling: Some(1),
+                ..Default::default()
+            },
+            1,
+        );
+        let error = call(&wiring, "rlm.run", json!({"prompt":"work"}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("launch depth ceiling"));
+        assert!(requests.lock().await.is_empty());
     }
 
     #[tokio::test]

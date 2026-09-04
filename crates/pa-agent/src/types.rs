@@ -211,6 +211,8 @@ pub struct UserMessage {
     pub content: UserContent,
     #[serde(default)]
     pub timestamp: i64,
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -370,6 +372,7 @@ impl AgentMessage {
         AgentMessage::Standard(Message::User(UserMessage {
             content: UserContent::Text(content.into()),
             timestamp: crate::now_ms(),
+            rest: serde_json::Map::default(),
         }))
     }
 

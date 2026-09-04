@@ -110,6 +110,7 @@ pub enum ActivityGroup {
     Subagents,
     Heartbeats,
     Bash,
+    Watches,
     /// The active goal: its group is mounted while a goal is being
     /// pursued and opens the read-only goal panel (the objective and
     /// its facts); a goal that ended unmounts the row with it.
@@ -147,6 +148,8 @@ pub struct ActivityDock {
     /// kernel registry only): finished runs never inflate the indicator
     /// — they stay as rows inside the bash view.
     pub bash_running: usize,
+    pub watches: usize,
+    pub watches_running: usize,
     /// The active goal's dock label — `Pursuing goal (12m 05s)`-style,
     /// the elapsed-time form (the operator's 2026-09-24 directive: the
     /// row reads the time, the token budget lives inside the goal
@@ -170,6 +173,9 @@ impl ActivityDock {
             ActivityGroup::Heartbeats,
             ActivityGroup::Bash,
         ];
+        if self.watches > 0 {
+            groups.push(ActivityGroup::Watches);
+        }
         if self.goal_label.is_some() {
             groups.push(ActivityGroup::Goal);
         }
@@ -795,6 +801,13 @@ pub fn render_activity_dock_segments(
                     "▸ {} shell{}",
                     dock.bash_running,
                     if dock.bash_running == 1 { "" } else { "s" }
+                ),
+            )],
+            ActivityGroup::Watches => vec![theme.fg_span(
+                running_color(dock.watches_running),
+                format!(
+                    "{} watches ({} running)",
+                    dock.watches, dock.watches_running
                 ),
             )],
             // The goal row carries the dock's activity convention: an

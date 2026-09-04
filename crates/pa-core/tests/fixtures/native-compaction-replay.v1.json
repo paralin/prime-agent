@@ -1,0 +1,447 @@
+{
+  "version": 1,
+  "source": {
+    "originalCommit": "0c01865c8d0c8c11d11698001e41dac28a0ee905",
+    "bundleSha256": "ba8bf1cc528ed30921bdb3dc7b07647c027cd0672ec26aa30fa54aa04ec5220a"
+  },
+  "cases": [
+    {
+      "name": "originating-provider",
+      "entries": [
+        {
+          "type": "model_change",
+          "id": "m0",
+          "parentId": null,
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "provider": "openai-codex",
+          "modelId": "primary"
+        },
+        {
+          "type": "message",
+          "id": "u1",
+          "parentId": "m0",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "before boundary",
+            "timestamp": 0
+          }
+        },
+        {
+          "type": "message",
+          "id": "u2",
+          "parentId": "u1",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "retained",
+            "timestamp": 0
+          }
+        },
+        {
+          "type": "compaction",
+          "id": "c1",
+          "parentId": "u2",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "summary": "compacted context",
+          "firstKeptEntryId": "u2",
+          "tokensBefore": 100,
+          "providerNativeCompaction": {
+            "provider": "openai-codex",
+            "replacementHistory": [
+              {
+                "type": "compaction",
+                "encrypted_content": "opaque"
+              }
+            ]
+          }
+        }
+      ],
+      "expectedMessages": [
+        {
+          "role": "compactionSummary",
+          "summary": "compacted context",
+          "tokensBefore": 100,
+          "retainedMessageCount": 1,
+          "providerPayload": {
+            "type": "openaiResponsesHistory",
+            "provider": "openai-codex",
+            "items": [
+              {
+                "type": "compaction",
+                "encrypted_content": "opaque"
+              }
+            ]
+          },
+          "timestamp": 1704067200000
+        },
+        {
+          "role": "user",
+          "content": "retained",
+          "timestamp": 0
+        }
+      ]
+    },
+    {
+      "name": "foreign-provider-retains-boundary",
+      "entries": [
+        {
+          "type": "model_change",
+          "id": "m0",
+          "parentId": null,
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "provider": "openai-codex",
+          "modelId": "primary"
+        },
+        {
+          "type": "message",
+          "id": "u1",
+          "parentId": "m0",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "before boundary",
+            "timestamp": 0
+          }
+        },
+        {
+          "type": "message",
+          "id": "u2",
+          "parentId": "u1",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "retained",
+            "timestamp": 0
+          }
+        },
+        {
+          "type": "compaction",
+          "id": "c1",
+          "parentId": "u2",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "summary": "compacted context",
+          "firstKeptEntryId": "u2",
+          "tokensBefore": 100,
+          "providerNativeCompaction": {
+            "provider": "openai-codex",
+            "replacementHistory": [
+              {
+                "type": "compaction",
+                "encrypted_content": "opaque"
+              }
+            ]
+          }
+        },
+        {
+          "type": "model_change",
+          "id": "m1",
+          "parentId": "c1",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "provider": "anthropic",
+          "modelId": "backup"
+        }
+      ],
+      "expectedMessages": [
+        {
+          "role": "compactionSummary",
+          "summary": "compacted context",
+          "tokensBefore": 100,
+          "retainedMessageCount": 1,
+          "timestamp": 1704067200000
+        },
+        {
+          "role": "user",
+          "content": "retained",
+          "timestamp": 0
+        }
+      ]
+    },
+    {
+      "name": "return-to-originating-provider",
+      "entries": [
+        {
+          "type": "model_change",
+          "id": "m0",
+          "parentId": null,
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "provider": "openai-codex",
+          "modelId": "primary"
+        },
+        {
+          "type": "message",
+          "id": "u1",
+          "parentId": "m0",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "before boundary",
+            "timestamp": 0
+          }
+        },
+        {
+          "type": "message",
+          "id": "u2",
+          "parentId": "u1",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "retained",
+            "timestamp": 0
+          }
+        },
+        {
+          "type": "compaction",
+          "id": "c1",
+          "parentId": "u2",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "summary": "compacted context",
+          "firstKeptEntryId": "u2",
+          "tokensBefore": 100,
+          "providerNativeCompaction": {
+            "provider": "openai-codex",
+            "replacementHistory": [
+              {
+                "type": "compaction",
+                "encrypted_content": "opaque"
+              }
+            ]
+          }
+        },
+        {
+          "type": "model_change",
+          "id": "m1",
+          "parentId": "c1",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "provider": "anthropic",
+          "modelId": "backup"
+        },
+        {
+          "type": "model_change",
+          "id": "m2",
+          "parentId": "m1",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "provider": "openai-codex",
+          "modelId": "primary"
+        }
+      ],
+      "expectedMessages": [
+        {
+          "role": "compactionSummary",
+          "summary": "compacted context",
+          "tokensBefore": 100,
+          "retainedMessageCount": 1,
+          "providerPayload": {
+            "type": "openaiResponsesHistory",
+            "provider": "openai-codex",
+            "items": [
+              {
+                "type": "compaction",
+                "encrypted_content": "opaque"
+              }
+            ]
+          },
+          "timestamp": 1704067200000
+        },
+        {
+          "role": "user",
+          "content": "retained",
+          "timestamp": 0
+        }
+      ]
+    },
+    {
+      "name": "portable-boundary",
+      "entries": [
+        {
+          "type": "model_change",
+          "id": "m0",
+          "parentId": null,
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "provider": "openai-codex",
+          "modelId": "primary"
+        },
+        {
+          "type": "message",
+          "id": "u1",
+          "parentId": "m0",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "before boundary",
+            "timestamp": 0
+          }
+        },
+        {
+          "type": "message",
+          "id": "u2",
+          "parentId": "u1",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "retained",
+            "timestamp": 0
+          }
+        },
+        {
+          "type": "compaction",
+          "id": "c1",
+          "parentId": "u2",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "summary": "compacted context",
+          "firstKeptEntryId": "u2",
+          "tokensBefore": 100
+        },
+        {
+          "type": "model_change",
+          "id": "m1",
+          "parentId": "c1",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "provider": "anthropic",
+          "modelId": "backup"
+        }
+      ],
+      "expectedMessages": [
+        {
+          "role": "compactionSummary",
+          "summary": "compacted context",
+          "tokensBefore": 100,
+          "retainedMessageCount": 1,
+          "timestamp": 1704067200000
+        },
+        {
+          "role": "user",
+          "content": "retained",
+          "timestamp": 0
+        }
+      ]
+    },
+    {
+      "name": "foreign-empty-summary",
+      "entries": [
+        {
+          "type": "model_change",
+          "id": "m0",
+          "parentId": null,
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "provider": "openai-codex",
+          "modelId": "primary"
+        },
+        {
+          "type": "message",
+          "id": "u1",
+          "parentId": "m0",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "before boundary",
+            "timestamp": 0
+          }
+        },
+        {
+          "type": "message",
+          "id": "u2",
+          "parentId": "u1",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "retained",
+            "timestamp": 0
+          }
+        },
+        {
+          "type": "compaction",
+          "id": "c1",
+          "parentId": "u2",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "summary": "",
+          "firstKeptEntryId": "u2",
+          "tokensBefore": 100,
+          "providerNativeCompaction": {
+            "provider": "openai-codex",
+            "replacementHistory": [
+              {
+                "type": "compaction",
+                "encrypted_content": "opaque"
+              }
+            ]
+          }
+        },
+        {
+          "type": "model_change",
+          "id": "m1",
+          "parentId": "c1",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "provider": "anthropic",
+          "modelId": "backup"
+        }
+      ],
+      "expectedMessages": [
+        {
+          "role": "user",
+          "content": "retained",
+          "timestamp": 0
+        }
+      ]
+    },
+    {
+      "name": "unknown-provider-drops-opaque-payload",
+      "entries": [
+        {
+          "type": "message",
+          "id": "u1",
+          "parentId": null,
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "before boundary",
+            "timestamp": 0
+          }
+        },
+        {
+          "type": "message",
+          "id": "u2",
+          "parentId": "u1",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "retained",
+            "timestamp": 0
+          }
+        },
+        {
+          "type": "compaction",
+          "id": "c1",
+          "parentId": "u2",
+          "timestamp": "2024-01-01T00:00:00.000Z",
+          "summary": "compacted context",
+          "firstKeptEntryId": "u2",
+          "tokensBefore": 100,
+          "providerNativeCompaction": {
+            "provider": "openai-codex",
+            "replacementHistory": [
+              {
+                "type": "compaction",
+                "encrypted_content": "opaque"
+              }
+            ]
+          }
+        }
+      ],
+      "expectedMessages": [
+        {
+          "role": "compactionSummary",
+          "summary": "compacted context",
+          "tokensBefore": 100,
+          "retainedMessageCount": 1,
+          "timestamp": 1704067200000
+        },
+        {
+          "role": "user",
+          "content": "retained",
+          "timestamp": 0
+        }
+      ]
+    }
+  ]
+}

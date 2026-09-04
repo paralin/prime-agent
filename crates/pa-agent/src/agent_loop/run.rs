@@ -77,7 +77,7 @@ pub(crate) async fn run_loop(
                 }
             }
 
-            let message = stream_assistant_response(
+            let (message, retained) = stream_assistant_response(
                 current_context,
                 config,
                 signal,
@@ -86,7 +86,9 @@ pub(crate) async fn run_loop(
                 &mut progress,
             )
             .await?;
-            new_messages.push(AgentMessage::from(message.clone()));
+            if retained {
+                new_messages.push(AgentMessage::from(message.clone()));
+            }
 
             if message.stop_reason == StopReason::Error
                 || message.stop_reason == StopReason::Aborted

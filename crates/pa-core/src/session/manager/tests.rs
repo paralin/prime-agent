@@ -30,6 +30,7 @@ fn append_compaction_serializes_the_full_ts_record() {
     let mut manager = SessionManager::in_memory(tmp.path());
     manager
         .append_compaction(pa_types::session::CompactionEntry {
+            provider_native_compaction: None,
             summary: "the overflow summary".to_string(),
             first_kept_entry_id: "e4".to_string(),
             tokens_before: 214,
@@ -62,6 +63,66 @@ fn append_compaction_serializes_the_full_ts_record() {
     assert!(line.contains("\"fromHook\":false"));
     assert!(line.contains("\"tokensBefore\":214"));
     assert!(line.contains("\"usage\":"));
+}
+
+#[test]
+fn message_compaction_pair_persists_and_reloads_the_retained_context() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("sessions");
+    let mut manager = SessionManager::persisted(tmp.path(), &dir);
+    manager.has_assistant_entry = true;
+    let message = AgentMessage::User(pa_types::ai::UserMessage {
+        content: pa_types::ai::UserContent::Text("Org checkpoint".into()),
+        timestamp: 1,
+        rest: serde_json::Map::default(),
+    });
+    for round in 0..2 {
+        let (kept, boundary) = manager
+            .append_message_compaction(
+                message.clone(),
+                pa_types::session::CompactionEntry {
+                    tokens_before: 100 + round,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(manager.get_leaf_id(), Some(boundary.as_str()));
+        let file = manager.get_session_file().unwrap();
+        let reloaded = SessionManager::open(tmp.path(), &dir, file);
+        let entries = reloaded.get_entries();
+        let last = entries.last().unwrap();
+        assert_eq!(last.parent_id(), Some(kept.as_str()));
+        let FileEntry::Compaction { payload, .. } = last else {
+            panic!("compaction boundary")
+        };
+        assert_eq!(payload.first_kept_entry_id, kept);
+        assert_eq!(reloaded.active_context().messages.last(), Some(&message));
+    }
+}
+
+#[test]
+fn failed_message_compaction_pair_restores_the_live_indexes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut manager = SessionManager::persisted(tmp.path(), &tmp.path().join("sessions"));
+    manager.has_assistant_entry = true;
+    manager.append_custom_entry("kept", None).unwrap();
+    let file = manager.get_session_file().unwrap().to_owned();
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    let before = manager.get_all_entries().to_vec();
+    let leaf = manager.leaf_id.clone();
+    let index = manager.by_id.clone();
+    let message = AgentMessage::User(pa_types::ai::UserMessage {
+        content: pa_types::ai::UserContent::Text("checkpoint".into()),
+        timestamp: 1,
+        rest: serde_json::Map::default(),
+    });
+    assert!(manager
+        .append_message_compaction(message, pa_types::session::CompactionEntry::default())
+        .is_err());
+    assert_eq!(manager.get_all_entries(), before);
+    assert_eq!(manager.leaf_id, leaf);
+    assert_eq!(manager.by_id, index);
 }
 
 #[test]

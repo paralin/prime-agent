@@ -121,7 +121,7 @@ impl Client {
         self.send(&serde_json::json!({
             "type": "command",
             "id": id,
-            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
             "command": command,
         }));
     }
@@ -437,6 +437,8 @@ async fn rlm_children_key_the_roster_by_parent_path_and_child_id() {
     children.set_identity(ParentIdentity {
         rlm_depth: 0,
         rlm_max_depth: 2,
+        runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy::default(),
+        service_tier: None,
         model: Some("scripted/faux-1".to_string()),
         cwd: Some(agent_dir.to_string_lossy().to_string()),
         session_id: Some("parent-session-uuid".to_string()),

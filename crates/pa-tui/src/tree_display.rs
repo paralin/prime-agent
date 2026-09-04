@@ -277,6 +277,18 @@ pub fn entry_display_text<S: std::hash::BuildHasher + Default>(
                 format!("[child usage: {input} input, {output} output]"),
             )]
         }
+        FileEntry::ActStart { payload, .. } => vec![color(
+            ThemeColor::Dim,
+            format!("[Act depth {}: started]", payload.depth),
+        )],
+        FileEntry::ActTerminal { payload, .. } => vec![color(
+            ThemeColor::Dim,
+            format!(
+                "[Act depth {}: {}]",
+                payload.depth,
+                act_status_name(payload.status)
+            ),
+        )],
         FileEntry::Label { payload, .. } => vec![color(
             ThemeColor::Dim,
             format!(
@@ -310,6 +322,15 @@ fn tier_name(tier: pa_types::ai::ServiceTier) -> &'static str {
         pa_types::ai::ServiceTier::Flex => "flex",
         pa_types::ai::ServiceTier::Scale => "scale",
         pa_types::ai::ServiceTier::Priority => "priority",
+    }
+}
+
+fn act_status_name(status: pa_types::session::ActTerminalStatus) -> &'static str {
+    match status {
+        pa_types::session::ActTerminalStatus::Done => "done",
+        pa_types::session::ActTerminalStatus::Cancelled => "cancelled",
+        pa_types::session::ActTerminalStatus::Error => "error",
+        pa_types::session::ActTerminalStatus::Interrupted => "interrupted",
     }
 }
 
@@ -379,6 +400,23 @@ pub fn searchable_text(node: &TreeNodeData) -> String {
             parts.push("child usage".to_string());
             parts.push(payload.target_id.clone());
         }
+        FileEntry::ActStart { payload, .. } => {
+            parts.push(format!(
+                "Act depth {} started {}",
+                payload.depth, payload.act_id
+            ));
+            parts.extend(payload.session_key.clone());
+        }
+        FileEntry::ActTerminal { payload, .. } => {
+            parts.push(format!(
+                "Act depth {} {} {}",
+                payload.depth,
+                act_status_name(payload.status),
+                payload.act_id
+            ));
+            parts.extend(payload.session_key.clone());
+            parts.extend(payload.error.clone());
+        }
         FileEntry::Label { payload, .. } => {
             parts.push("label".to_string());
             parts.push(payload.label.clone().unwrap_or_default());
@@ -386,4 +424,43 @@ pub fn searchable_text(node: &TreeNodeData) -> String {
         _ => {}
     }
     parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn persisted_act_rows_render_and_keep_identity_and_errors_searchable() {
+        let theme = Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+        for status in ["started", "done", "cancelled", "error", "interrupted"] {
+            let mut row = json!({"type":"act_terminal", "id":"row", "parentId":null,
+                "timestamp":"2026-09-04T00:00:00.000Z", "actId":"assignment-42",
+                "depth":2, "sessionKey":"faux/model", "status":status,
+                "usage":pa_types::ai::Usage::default(), "error":"distinct failure"});
+            if status == "started" {
+                row["type"] = json!("act_start");
+                row["usageBaseline"] = json!(pa_types::ai::Usage::default());
+            }
+            let node = TreeNodeData {
+                entry: serde_json::from_value(row).unwrap(),
+                label: Some("research".into()),
+                label_timestamp: None,
+            };
+            let rendered: String =
+                entry_display_text(&theme, &node, &HashMap::<String, ToolCallInfo>::new())
+                    .into_iter()
+                    .map(|span| span.content)
+                    .collect();
+            assert_eq!(rendered, format!("[Act depth 2: {status}]"));
+            let search = searchable_text(&node);
+            for term in ["research", "depth 2", status, "assignment-42", "faux/model"] {
+                assert!(search.contains(term), "missing {term} in {search}");
+            }
+            if status != "started" {
+                assert!(search.contains("distinct failure"));
+            }
+        }
+    }
 }

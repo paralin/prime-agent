@@ -19,6 +19,7 @@ mod sessions_fork;
 mod settings;
 mod share;
 mod stream;
+mod watches;
 
 pub(crate) use apply::CompactionAbortNote;
 use auth::{McpAuthIntent, PendingModelSignIn, SetModelOutcome};
@@ -408,6 +409,8 @@ pub(crate) struct SessionUi {
     skill_commands_cache: Vec<crate::autocomplete::SlashCommandEntry>,
     /// The current Python `bash()` registry snapshot from the owning kernel.
     bash_activities: Value,
+    external_watches: Vec<watches::Watch>,
+    watches_panel_open: bool,
     /// Monotonic id of the latest issued kernel-bash list request; a late
     /// response from an older request must not repaint a newer snapshot.
     bash_list_epoch: u64,

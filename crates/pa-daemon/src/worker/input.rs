@@ -7,6 +7,8 @@ use super::{
     DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION, QUEUED_INPUT_SUSPENDED,
 };
 
+use pa_core::session_engine::agent_messaging::mailbox::runtime::MailboxDelivery;
+use pa_core::session_engine::agent_messaging::mailbox::MailboxEnvelope;
 use serde_json::Value;
 
 use crate::protocol::{response_failure, DaemonResponse};
@@ -292,13 +294,6 @@ impl Worker {
         {
             self.engine.mark_child_reply(child);
         }
-        // Sender label precedence (TS `createAgentSessionMessagePrompt`):
-        // session name, session id, active session id, client id.
-        let sender_name = ["sessionName", "sessionId", "activeSessionId", "clientId"]
-            .iter()
-            .find_map(|key| sender.get(*key).and_then(Value::as_str))
-            .unwrap_or("unknown")
-            .to_string();
         // The delivery's relationship label derives from the sender's
         // durable parent edge, never from the sender's runtime kind alone:
         // a subagent spawned by a DIFFERENT parent is not this session's
@@ -311,67 +306,156 @@ impl Worker {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             sender_is_child_of(&sender, &core).then_some(AgentFamilyRelationship::Child)
         };
-        let prompt = pa_core::session_engine::agent_messaging::create_agent_session_message_prompt(
-            &AgentMessagePromptPayload {
-                message: message.to_string(),
-                sender_name,
-                from_relationship,
-            },
-        );
         let lane = if payload.get("deliveryMode").and_then(Value::as_str) == Some("follow_up") {
             Lane::FollowUp
         } else {
             Lane::Steering
         };
-        let (id, queued, snapshot, target) = {
-            let mut core = self.core.lock().unwrap();
-            let pending = core.steering.len() + core.follow_up.len();
-            if let Err(error) =
-                pa_core::session_engine::agent_messaging::assert_agent_message_queue_capacity(
-                    pending,
-                    DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
-                )
-            {
-                drop(core);
-                return response_failure(None, "worker_deliver_message", &error.to_string(), None);
+        let id = match payload.get("messageId") {
+            None | Some(Value::Null) => {
+                pa_core::session_engine::agent_messaging::create_agent_session_message_id()
             }
-            let id = pa_core::session_engine::agent_messaging::create_agent_session_message_id();
-            let queued = core.busy;
+            Some(Value::String(id))
+                if !id.trim().is_empty() && id.encode_utf16().count() <= 512 =>
+            {
+                id.clone()
+            }
+            _ => {
+                return response_failure(
+                    None,
+                    "worker_deliver_message",
+                    "messageId must be a nonempty string of at most 512 characters",
+                    None,
+                )
+            }
+        };
+        let reply_to = match payload.get("replyTo") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id))
+                if !id.trim().is_empty() && id.encode_utf16().count() <= 512 =>
+            {
+                Some(id.clone())
+            }
+            _ => {
+                return response_failure(
+                    None,
+                    "worker_deliver_message",
+                    "replyTo must be a nonempty string of at most 512 characters",
+                    None,
+                )
+            }
+        };
+        let target = {
+            let core = self.core.lock().unwrap();
             let summary = self.summary_locked(&core);
-            // The receiving session's endpoint (TS
-            // `createAgentSessionMessageEndpoint`): the receipt's `target`
-            // and the delivered row's `details.target` share the one shape.
             let mut target = json!({
                 "activeSessionId": summary.active_session_id.clone().unwrap_or_default(),
                 "sessionId": summary.session_id,
-                "runtimeKind": summary
-                    .runtime_kind
-                    .clone()
-                    .unwrap_or_else(|| "top-level".to_string()),
+                "runtimeKind": summary.runtime_kind.clone().unwrap_or_else(|| "top-level".to_string()),
             });
             if let Some(name) = summary.session_name.filter(|name| !name.is_empty()) {
                 target["sessionName"] = json!(name);
             }
-            // The receiving side's custom row (TS
-            // `acceptAgentSessionMessage` -> `createAgentSessionMessage`,
-            // riding `acceptAgentMessagePrompt`'s `customMessage`): the
-            // queued turn carries the `agent_message` row so the
-            // transcript renders the collapsed card instead of a plain
-            // user row, while the row's `content` IS the rendered prompt -
-            // the model context stays byte-identical to the
-            // plain-prompt delivery.
-            let custom_message =
+            target
+        };
+        let mailbox = match self.session_mailbox() {
+            Ok(mailbox) => mailbox,
+            Err(error) => {
+                return response_failure(None, "worker_deliver_message", &error.to_string(), None)
+            }
+        };
+        let envelope = MailboxEnvelope {
+            id,
+            source: AGENT_MESSAGE_SOURCE.to_string(),
+            message: message.to_string(),
+            reply_to,
+            from: (!sender.is_null()).then(|| sender.clone()),
+            from_relationship: from_relationship
+                .map(|relationship| relationship.as_str().to_string()),
+            target,
+            accepted_at: crate::util::now_iso(),
+            sequence: 0,
+        };
+        let mut snapshot = None;
+        let operation = match lane {
+            Lane::Steering => "steer_queued",
+            Lane::FollowUp => "follow_up_queued",
+        };
+        let receipt = mailbox.receive(envelope, |envelope| {
+            let message = envelope.message.as_str();
+            let sender = envelope.from.clone().unwrap_or(Value::Null);
+            let from_relationship = envelope
+                .from_relationship
+                .as_deref()
+                .and_then(AgentFamilyRelationship::parse);
+            let sender_name = ["sessionName", "sessionId", "activeSessionId", "clientId"]
+                .iter()
+                .find_map(|key| sender.get(*key).and_then(Value::as_str))
+                .unwrap_or("unknown")
+                .to_string();
+            let prompt =
+                pa_core::session_engine::agent_messaging::create_agent_session_message_prompt(
+                    &AgentMessagePromptPayload {
+                        message: message.to_string(),
+                        sender_name,
+                        from_relationship,
+                    },
+                );
+            let mut core = self.core.lock().unwrap();
+            anyhow::ensure!(
+                core.created && !core.shutdown_requested,
+                "Session is closed"
+            );
+            anyhow::ensure!(
+                core.store
+                    .as_ref()
+                    .is_some_and(|store| store.session_id() == envelope.target_session_id()),
+                "Session was replaced"
+            );
+            anyhow::ensure!(
+                !core.queued_input_suspended || core.busy || core.compacting,
+                "{QUEUED_INPUT_SUSPENDED}"
+            );
+            if core.steering.iter().chain(&core.follow_up).any(|item| {
+                item.custom_message.as_ref().is_some_and(|row| {
+                    row["customType"] == "agent_message"
+                        && row["details"]["id"].as_str() == Some(&envelope.id)
+                })
+            }) {
+                drop(core);
+                self.checkpoint_mailbox_delivery(envelope.target_session_id(), operation)?;
+                return Ok(MailboxDelivery::Queued);
+            }
+            if core.store.as_ref().is_some_and(|store| {
+                store.entries().iter().any(|entry| {
+                    entry.type_ == "custom_message"
+                        && entry.fields["customType"] == "agent_message"
+                        && entry.fields["details"]["id"].as_str() == Some(&envelope.id)
+                })
+            }) {
+                return Ok(MailboxDelivery::Woken);
+            }
+            let pending = core.steering.len() + core.follow_up.len();
+            pa_core::session_engine::agent_messaging::assert_agent_message_queue_capacity(
+                pending,
+                DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+            )?;
+            let queued = core.busy;
+            let mut custom_message =
                 pa_core::session_engine::agent_messaging::create_agent_session_message_row(
                     &pa_core::session_engine::agent_messaging::AgentSessionMessageRowPayload {
-                        id: &id,
+                        id: &envelope.id,
                         prompt: &prompt,
                         message,
                         from: &sender,
                         from_relationship,
-                        target: &target,
+                        target: &envelope.target,
                         timestamp: crate::util::now_ms(),
                     },
                 );
+            if let Some(reply_to) = &envelope.reply_to {
+                custom_message["details"]["replyTo"] = json!(reply_to);
+            }
             let item = QueuedItem {
                 priority: QueuePriority::Background,
                 // The labeled queue-strip row (TS `queuedAgentMessagePreview`:
@@ -398,41 +482,28 @@ impl Worker {
                 Lane::Steering => enqueue_priority(&mut core.steering, item),
                 Lane::FollowUp => enqueue_priority(&mut core.follow_up, item),
             }
-            let snapshot = Self::snapshot_locked(&core);
-            (id, queued, snapshot, target)
+            snapshot = Some(Self::snapshot_locked(&core));
+            drop(core);
+            self.checkpoint_mailbox_delivery(envelope.target_session_id(), operation)?;
+            Ok(if queued {
+                MailboxDelivery::Queued
+            } else {
+                MailboxDelivery::Woken
+            })
+        });
+        let receipt = match receipt {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return response_failure(None, "worker_deliver_message", &error.to_string(), None)
+            }
         };
-        // The delivery checkpoint (busy=true): the queued agent message is
-        // admitted live work — a restart must revive the worker to
-        // deliver it (agent-to-agent messages have no client that
-        // reopens the session). The operation names are TS's steer/follow-up
-        // queue strings, matching the receipt's deliveryMode.
-        self.checkpoint_queue(QueueCheckpoint::Admitted {
-            operation: match lane {
-                Lane::Steering => "steer_queued",
-                Lane::FollowUp => "follow_up_queued",
-            },
-        });
-        let _ = self.emit_action_update(&snapshot);
-        self.work_notify.notify_one();
-        let timestamp = crate::util::now_iso();
-        let mut receipt = json!({
-            "id": id,
-            "source": AGENT_MESSAGE_SOURCE,
-            "target": target,
-            "message": message,
-            // TS receipts always report `steer`; the follow-up lane is the
-            // Rust extension for queue-behind-current-work delivery.
-            "deliveryMode": if lane == Lane::FollowUp { "follow_up" } else { "steer" },
-        });
-        if queued {
-            receipt["deliveryStatus"] = json!("queued");
-            receipt["queuedAt"] = json!(timestamp);
-        } else {
-            receipt["deliveryStatus"] = json!("delivered");
-            receipt["deliveredAt"] = json!(timestamp);
+        if let Some(snapshot) = snapshot {
+            let _ = self.emit_action_update(&snapshot);
+            self.work_notify.notify_one();
         }
-        if !sender.is_null() {
-            receipt["from"] = json!(sender);
+        let mut receipt = receipt.to_value();
+        if lane == Lane::FollowUp {
+            receipt["deliveryMode"] = json!("follow_up");
         }
         response_success(None, "worker_deliver_message", Some(receipt))
     }

@@ -553,10 +553,13 @@ fn build_tui_options(
         theme: settings.get_theme().map(str::to_string).unwrap_or_default(),
         // The client-settings seam the interactive commands persist
         // through (`/settings`).
-        client_settings: Some(crate::client_settings::CliClientSettings::new(
-            config.cwd.clone(),
-            config.agent_dir.clone(),
-        )),
+        client_settings: Some(
+            crate::client_settings::CliClientSettings::with_runtime_policy(
+                config.cwd.clone(),
+                config.agent_dir.clone(),
+                config.runtime_policy,
+            ),
+        ),
         version: crate::config::version().to_string(),
         // TS `shouldRunOnboarding`: the settings flag alone mounts the
         // task; the carried startup-model state decides the branch and
@@ -673,21 +676,31 @@ fn fork_startup_selection(
     Ok(SessionSelection::Resume(fork_file))
 }
 
-/// TS `shouldOpenAgentsViewForDaemonInteractive`: a selector, continuation,
-/// or fork opens its target session directly instead of the agents view.
-/// The selector (`--resume <id>`) and `--continue` launches never reach the
-/// view with `--fork` anyway (the shared flag validation refuses the
-/// combination at startup), so only the explicit `agents` request needs the
-/// guard; bare `--resume` still opens the view, as does a `--continue` with
-/// a saved candidate.
+/// Open the agents view for a bare launch, a bare resume, or an explicit
+/// agents request after onboarding. Selectors and prompts open their session.
 fn should_open_agents_view(
     options: &RunOptions,
     onboarding_pending: bool,
     continue_view: bool,
 ) -> bool {
-    options.session.resume_bare
-        || (options.agents_view_requested && !onboarding_pending && options.session.fork.is_none())
-        || continue_view
+    let bare_launch = !onboarding_pending
+        && options.session.resume.is_none()
+        && !options.session.continue_recent
+        && options.session.fork.is_none()
+        && !options.session.no_session
+        && options.attach_agent.is_none()
+        && options.initial_message.is_none()
+        && options.initial_images.is_empty()
+        && options.messages.is_empty()
+        && options.file_args.is_empty();
+    continue_view
+        || (options.session.resume.is_none()
+            && !options.session.continue_recent
+            && options.session.fork.is_none()
+            && options.attach_agent.is_none()
+            && (bare_launch
+                || options.session.resume_bare
+                || (options.agents_view_requested && !onboarding_pending)))
 }
 
 /// The `--continue` launch's agents-view target: the newest saved session

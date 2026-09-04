@@ -145,6 +145,7 @@ pub(crate) struct ResidentWorker {
     /// The worker advertised `direct_peer_transport` in its `worker_auth`
     /// response (TS `workerAuthAdvertisesPeerTransport`).
     pub(crate) peer_transport_capable: AtomicBool,
+    capabilities: std::sync::Mutex<(u64, Vec<String>)>,
     /// The last-good selector-less heartbeats catalog the worker answered
     /// with (TS `worker.heartbeatSnapshot`), tagged with the catalog
     /// generation it was read at: served when the worker is too busy to
@@ -237,6 +238,7 @@ impl ResidentWorker {
             consecutive_failures: AtomicU32::new(0),
             spawned_at_ms: AtomicU64::new(0),
             peer_transport_capable: AtomicBool::new(false),
+            capabilities: std::sync::Mutex::new((0, Vec::new())),
             heartbeat_snapshot: Mutex::new(None),
             cron_snapshot: Mutex::new(None),
             heartbeat_snapshot_generation: AtomicU64::new(0),
@@ -292,6 +294,26 @@ impl ResidentWorker {
             == self
                 .connection_epoch
                 .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_capabilities(&self, epoch: u64, capabilities: Vec<String>) {
+        let mut current = self
+            .capabilities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.connection_is_current(epoch) {
+            *current = (epoch, capabilities);
+        }
+    }
+
+    pub(crate) fn supports_capability(&self, capability: &str) -> bool {
+        let current = self
+            .capabilities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.route_state().connected
+            && self.connection_is_current(current.0)
+            && current.1.iter().any(|value| value == capability)
     }
 
     /// Install the connection's channel for routing (TS
@@ -738,6 +760,25 @@ mod tests {
             worker_instance_id: Some("inst".to_string()),
             pid: 7,
         }
+    }
+
+    #[test]
+    fn capabilities_follow_the_current_connection_and_reject_stale_handshakes() {
+        let worker = resident("capabilities");
+        let first = worker.note_connection_live();
+        assert!(!worker.supports_capability("agent_message_mailbox"));
+        worker.set_capabilities(first, vec!["agent_message_mailbox".into()]);
+        assert!(worker.supports_capability("agent_message_mailbox"));
+        let replacement = worker.note_connection_live();
+        assert!(!worker.supports_capability("agent_message_mailbox"));
+        worker.set_capabilities(replacement, vec![]);
+        worker.set_capabilities(first, vec!["agent_message_mailbox".into()]);
+        assert!(!worker.supports_capability("agent_message_mailbox"));
+        worker.set_capabilities(replacement, vec!["agent_message_mailbox".into()]);
+        worker.note_connection_lost(first);
+        assert!(worker.supports_capability("agent_message_mailbox"));
+        worker.note_connection_lost(replacement);
+        assert!(!worker.supports_capability("agent_message_mailbox"));
     }
 
     #[tokio::test]

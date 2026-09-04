@@ -1249,7 +1249,7 @@ fn daemon_request(socket: &std::path::Path, id: &str, command: &Value) -> Value 
 #[test]
 fn acp_daemon_attached_forwards_cli_session_options() {
     // --append-system-prompt and --skill land in the daemon worker's system
-    // prompt, and --autonomous-max-turns 1 stops the run.
+    // prompt/command inventory, and --autonomous-max-turns 1 stops the run.
     // Outside the agent dir: only --skill loads it.
     let skill_home = tempfile::TempDir::new().unwrap();
     let skill_dir = skill_home.path().join("argv-skill");
@@ -1290,9 +1290,18 @@ fn acp_daemon_attached_forwards_cli_session_options() {
         system_prompt.contains("ACP_ARGV_MARKER"),
         "--append-system-prompt reaches the worker"
     );
+    let commands = daemon_request(
+        &socket,
+        "argv-commands",
+        &json!({ "type": "get_commands", "activeSessionId": active_session_id }),
+    );
     assert!(
-        system_prompt.contains("<name>acp-argv-probe</name>"),
-        "--skill reaches the worker"
+        commands["data"]["commands"]
+            .as_array()
+            .expect("worker slash commands")
+            .iter()
+            .any(|command| command["name"] == "skill:acp-argv-probe"),
+        "--skill reaches the worker's slash commands: {commands}"
     );
     let turn = client.request(
         "session/prompt",

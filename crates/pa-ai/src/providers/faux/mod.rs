@@ -743,6 +743,10 @@ pub fn register_faux_provider(options: RegisterFauxProviderOptions) -> FauxProvi
     }
 
     impl Provider for FauxStream {
+        fn supports_native_compaction(&self) -> bool {
+            self.compact.is_some()
+        }
+
         fn compact<'a>(
             &'a self,
             model: &'a Model,

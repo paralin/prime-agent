@@ -16,10 +16,10 @@ use crate::JsonMap;
 
 pub const DAEMON_PROTOCOL_NAME: &str = "prime-agent.daemon";
 pub const DAEMON_PROTOCOL_VERSION: u64 = 8;
-/// Revision 31 adds the `unknown` assistant stop reason. The closed stop-reason
-/// enums used by older clients require protocol 8 for message-bearing frames.
-pub const DAEMON_SCHEMA_REVISION: u64 = 31;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-8-schema-31-unknown-stop-reason";
+/// Revision 34 adds capability-gated recursive runtimes and external watches.
+/// Protocol 8 remains required for the `unknown` assistant stop reason.
+pub const DAEMON_SCHEMA_REVISION: u64 = 34;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-8-schema-34-recursive-runtimes";
 
 pub type DaemonClientId = String;
 pub type DaemonCommandId = String;
@@ -184,8 +184,8 @@ mod tests {
     fn protocol_constants_match_ts() {
         assert_eq!(DAEMON_PROTOCOL_NAME, "prime-agent.daemon");
         assert_eq!(DAEMON_PROTOCOL_VERSION, 8);
-        assert_eq!(DAEMON_SCHEMA_REVISION, 31);
-        assert_eq!(DAEMON_SCHEMA_ID, "protocol-8-schema-31-unknown-stop-reason");
+        assert_eq!(DAEMON_SCHEMA_REVISION, 34);
+        assert_eq!(DAEMON_SCHEMA_ID, "protocol-8-schema-34-recursive-runtimes");
         assert_eq!(DAEMON_UPDATE_RESTART_FORMAT_VERSION, 1);
     }
 }

@@ -267,6 +267,8 @@ impl TracesLoginUi for PanelTracesLoginUi {
 
     fn on_auth(&self, url: &str, instructions: &str) {
         self.panel.auth_url(url, Some(instructions));
+        // Unit tests exercise the panel without launching the desktop browser.
+        #[cfg(not(test))]
         pa_core::platform::browser::open_in_browser(url);
     }
 

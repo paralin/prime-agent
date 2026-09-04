@@ -15,20 +15,19 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     let _daemon = spawn_daemon(&socket, &agent_dir);
     let (mut client, hello) = Client::connect(&socket);
     assert_eq!(hello["type"], "daemon_hello");
-    // Differential goldens captured from the TS supervisor
-    // (`prime-agent --mode daemon`, protocol 7, schema 29 — the deployed
-    // TS-main bundle reports the same schema id at the hello).
+    // The Rust protocol revision tracks its closed wire enums; the
+    // capability snapshot includes the recursive runtime additions.
     assert_eq!(
         hello["protocol"],
         serde_json::json!({
-            "name": "prime-agent.daemon", "version": 7
+            "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION
         })
     );
     assert_eq!(
         hello["schemaId"]
             .as_str()
             .map(std::string::ToString::to_string),
-        Some("protocol-7-schema-30-8e4b17c2a9f5".to_string())
+        Some(pa_types::daemon::DAEMON_SCHEMA_ID.to_string())
     );
     assert!(hello["supervisorOwnerToken"].is_string());
     assert!(hello["supervisorProcessStartId"]
@@ -63,6 +62,11 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
             "abort_and_send_queued",
             "agent_roster",
             "direct_peer_transport",
+            "agent_message_mailbox",
+            "claude_code_children",
+            "act_projection",
+            "external_event_watches",
+            "runtime_launch_policy",
         ])
     );
 
@@ -74,7 +78,10 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     assert_eq!(rejected["success"], false);
     assert_eq!(
         rejected["error"],
-        "Daemon commands require protocol 7 or newer"
+        format!(
+            "Daemon commands require protocol {} or newer",
+            pa_types::daemon::DAEMON_PROTOCOL_VERSION
+        )
     );
 
     // Empty list: no live sessions.

@@ -92,7 +92,7 @@ impl Client {
         let envelope = json!({
             "type": "command",
             "id": id,
-            "protocol": {"name": "prime-agent.daemon", "version": 7},
+            "protocol": {"name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION},
             "command": command,
         });
         let mut line = serde_json::to_string(&envelope).expect("serialize");
@@ -264,6 +264,8 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_prompt() {
     children.set_identity(ParentIdentity {
         rlm_depth: 0,
         rlm_max_depth: 2,
+        runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy::default(),
+        service_tier: None,
         model: Some("faux/faux-1".to_string()),
         cwd: Some(dir.path().to_string_lossy().to_string()),
         session_id: Some(parent_session_id.to_string()),

@@ -147,6 +147,7 @@ pub async fn run_side_question(
                     text_signature: None,
                 })]),
                 timestamp: pa_agent::now_ms(),
+                rest: serde_json::Map::default(),
             },
         )));
         messages.push(pa_agent::types::AgentMessage::Standard(Message::Assistant(

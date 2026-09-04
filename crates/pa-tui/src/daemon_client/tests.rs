@@ -510,6 +510,9 @@ async fn direct_upgrade_routes_attach_and_streams_events() {
             if reader.read_line(&mut line).await.unwrap() == 0 {
                 break;
             }
+            if line.trim().is_empty() {
+                continue;
+            }
             let envelope: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
             let id = envelope["id"].as_str().unwrap().to_string();
             let command_type = envelope["command"]["type"].as_str().unwrap();
@@ -547,7 +550,7 @@ async fn direct_upgrade_routes_attach_and_streams_events() {
         }
     });
 
-    let (client, mut events) = DaemonClient::connect(&socket).await.unwrap();
+    let (mut client, mut events) = DaemonClient::connect(&socket).await.unwrap();
     assert!(
         crate::direct_transport::supervisor_supports_direct(client.hello()),
         "capability advertised"
@@ -595,8 +598,11 @@ async fn direct_upgrade_routes_attach_and_streams_events() {
         ),
         "unexpected event: {event:?}"
     );
-    client.close();
-    let _ = supervisor.await;
+    client.hard_close();
+    tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -665,4 +671,73 @@ async fn without_capability_upgrade_is_a_no_op() {
     assert!(!client.upgrade_direct("s1").await.unwrap());
     assert_eq!(client.direct_session_id(), None);
     client.close();
+}
+
+#[tokio::test]
+async fn runtime_launch_restrictions_are_negotiated_before_create() {
+    for supports in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("launch.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let capabilities = if supports {
+                vec!["runtime_launch_policy"]
+            } else {
+                vec![]
+            };
+            let hello = json!({"type":"daemon_hello", "serverCapabilities":capabilities});
+            writer
+                .write_all(format!("{hello}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(line.trim()).unwrap();
+            if supports {
+                assert_eq!(request["command"]["config"]["rlmMaxDepthCeiling"], 0);
+            } else {
+                assert!(request["command"]["config"].is_null());
+            }
+            let response =
+                json!({"type":"response", "id":request["id"], "command":"create", "success":true});
+            writer
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let (client, _events) = DaemonClient::connect(&socket).await.unwrap();
+        let create = |config| DaemonCommand::Create {
+            id: None,
+            session_path: None,
+            continue_recent: None,
+            no_session: None,
+            name: None,
+            config,
+            telemetry_disabled: None,
+            runtime_metadata: None,
+            lifecycle: None,
+            env: None,
+            launch_env: None,
+            rest: Map::default(),
+        };
+        let outcome = client
+            .request(create(Some(
+                json!({"rlmMaxDepthCeiling":0,"disableRlmAct":true}),
+            )))
+            .await;
+        if supports {
+            assert!(outcome.unwrap().success);
+        } else {
+            assert!(outcome
+                .unwrap_err()
+                .to_string()
+                .contains("runtime launch restrictions"));
+            assert!(client.request(create(None)).await.unwrap().success);
+        }
+        client.close();
+        server.await.unwrap();
+    }
 }

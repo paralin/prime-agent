@@ -40,6 +40,7 @@ pub struct SessionEngineConfig {
     pub generic_mcp_servers: Vec<String>,
     /// Suppress the rlm recursion guidance.
     pub allow_recursion: Option<bool>,
+    pub runtime_policy: super::runtime_policy::RuntimePolicy,
     /// Session persistence (in-memory when None).
     pub session_manager: Option<SessionManager>,
     /// Extra kernel host-request handlers (e.g. the daemon's message/observe
@@ -123,6 +124,13 @@ pub struct SessionEngineConfig {
 
 /// An assembled, running session.
 pub struct SessionEngine {
+    pub external_events: Arc<super::external_events::ExternalEventRuntime>,
+    pub local_external_event_admission:
+        Arc<super::local_external_events::LocalExternalEventAdmission>,
+    pub runtime_policy: super::runtime_policy::RuntimePolicy,
+    pub tool_error_nudge: Arc<super::tool_error_nudge::ToolErrorNudgeRuntime>,
+    pub english_output_nudge: Arc<super::english_output_nudge::EnglishOutputNudgeRuntime>,
+    pub act_runtime: Arc<super::act_runtime::ActRuntime>,
     pub session: AgentSession,
     pub skills: Vec<crate::skills::Skill>,
     /// Skill-loading diagnostics (TS `getSkills().diagnostics`; the
@@ -248,8 +256,15 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         config.cron_store.clone(),
     );
 
+    wiring
+        .rlm
+        .set_runtime_policy(config.runtime_policy, config.rlm_depth.unwrap_or(0));
+    if config.runtime_policy.rpc_only {
+        *wiring.runtime.goal_driver().lock().await = super::goal_driver::GoalDriver::new();
+    }
     let settings = crate::settings::SettingsManager::create(&cwd, &config.agent_dir);
     let service_tier_preference = settings.get_default_service_tier();
+    let act_max_depth = settings.get_rlm_act_max_depth()?;
     // Captured before `settings` moves into the resource loader: the
     // compaction scheduling budget (`compact.run` prepare check) and the
     // auto-refine gates (TS `getAutoRefineSettings`).
@@ -318,6 +333,37 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let python_skills = super::runtime_wiring::kernel_python_skills(&resources.skills);
     let session_id = wiring.session.lock().await.get_session_id().to_string();
     let mut handlers = wiring.handlers.clone();
+    let external_events = Arc::new(super::external_events::ExternalEventRuntime::default());
+    let local_external_event_admission =
+        Arc::new(super::local_external_events::LocalExternalEventAdmission::default());
+    external_events.register(
+        &mut handlers,
+        local_external_event_admission.emitter(wiring.session.clone()),
+    );
+    let act_artifact_dir = wiring
+        .session
+        .lock()
+        .await
+        .get_session_artifact_dir()
+        .or_else(|| {
+            config
+                .conversation_log_path
+                .as_deref()
+                .and_then(super::harness_digest::session_artifact_dir_for_log)
+        });
+    let foreground = Arc::new(super::root_foreground_lease::RootForegroundLease::default());
+    let act_runtime = super::act_runtime::ActRuntime::with_persistence(
+        cwd.clone(),
+        config.agent_dir.clone(),
+        act_artifact_dir,
+    );
+    act_runtime.bind_foreground(&foreground);
+    if config.rlm_depth.unwrap_or(0) == 0
+        && config.runtime_policy.act_enabled()
+        && act_max_depth > 0
+    {
+        act_runtime.register(&mut handlers);
+    }
     if let Some(extra) = config.extra_host_handlers.clone() {
         handlers.merge(extra);
     }
@@ -379,7 +425,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // with a local harness state dir — the sessions whose `refine.*` host
     // requests register, and the only sessions the compact-trigger
     // auto-refine may run for.
-    let auto_refine_allowed = config.rlm_depth.unwrap_or(0) == 0 && local_harness_dir.is_some();
+    let auto_refine_allowed = !config.runtime_policy.rpc_only
+        && config.rlm_depth.unwrap_or(0) == 0
+        && local_harness_dir.is_some();
     if auto_refine_allowed {
         turn_boundary.register_refine_handlers(&mut handlers);
     }
@@ -458,6 +506,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         )
             as crate::kernel::provisioner::UnavailableSkillsCallback)
     };
+    config.runtime_policy.restrict_handlers(&mut handlers);
     let provisioner = super::runtime_wiring::kernel_provisioner(
         session_id,
         handlers,
@@ -472,10 +521,29 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     );
     let mut tools = config.tools.clone();
     if !tools.iter().any(|tool| tool.name() == "ipython") {
-        let definition = crate::tools::ipython::create_ipython_tool_definition(
+        let mut definition = crate::tools::ipython::create_ipython_tool_definition(
             &cwd.to_string_lossy(),
             super::runtime_wiring::ipython_tool_options(provisioner.clone()),
         );
+        let execute = definition.execute.clone();
+        let cell_foreground = foreground.clone();
+        definition.execute = Arc::new(move |id, params, signal, update| {
+            let execute = execute.clone();
+            let foreground = cell_foreground.clone();
+            let id = id.to_owned();
+            Box::pin(async move {
+                let abort = signal
+                    .clone()
+                    .map(crate::kernel::cancellation::AbortSignal::from_token);
+                foreground
+                    .run(
+                        super::root_foreground_lease::RootForegroundActor::RootCell,
+                        async move { execute(&id, params, signal, update).await },
+                        abort.as_ref(),
+                    )
+                    .await
+            })
+        });
         tools.push(Arc::new(
             crate::session_engine::tool_bridge::ToolDefinitionBridge::new(definition),
         ));
@@ -503,7 +571,16 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         provisioner.prewarm();
     }
 
-    let prompt_guidelines = config.prompt_guidelines.clone();
+    let mut prompt_guidelines = config.prompt_guidelines.clone();
+    if config.runtime_policy.rpc_only {
+        prompt_guidelines.push("This session uses rpc-only harness mode. Goals, autonomous continuation, refinement, heartbeats, messaging, external-event wake-ups, child spawning, and Act are disabled. Read-only observation, model inspection, and compaction remain available.".into());
+    } else if !config.runtime_policy.act_enabled()
+        || act_max_depth == 0
+        || config.rlm_depth.unwrap_or(0) > 0
+    {
+        prompt_guidelines
+            .push("Act is unavailable in this session; rlm.act cannot be called here.".into());
+    }
 
     // The per-model prompt layer keys on the resolved `provider/id`
     // selector; vision capability gates the image-input line. Both are
@@ -529,7 +606,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
                     .map(String::as_str)
                     .collect::<Vec<_>>(),
             ),
-            allow_recursion: config.allow_recursion,
+            allow_recursion: if config.runtime_policy.max_depth(u32::MAX) == 0 {
+                Some(false)
+            } else {
+                config.allow_recursion
+            },
             // The session's recursion depth rides the dynamic tail's
             // session-role section: a spawned child's prompt must read
             // "depth: N (not root)" with the child-agent reply doctrine,
@@ -616,7 +697,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             &config.agent_dir,
         )),
     );
+    let tool_error_nudge = Arc::new(super::tool_error_nudge::ToolErrorNudgeRuntime::default());
+    let english_output_nudge =
+        Arc::new(super::english_output_nudge::EnglishOutputNudgeRuntime::default());
     let agent = Agent::new(AgentOptions {
+        filter_assistant_message: Some(english_output_nudge.filter_hook()),
         initial_state: AgentInitialState {
             system_prompt: Some(system_prompt.clone()),
             model: Some(model),
@@ -649,14 +734,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // TS `_steeringStopPending`: both the after-turn and the
         // before-turn hooks consult the same probe (a queued steer stops
         // the run at the boundary; the pump delivers it next).
-        should_stop_after_turn: config.queued_steering_probe.take().map(|probe| {
-            let probe: pa_agent::agent_loop::ShouldStopAfterTurnFn =
-                std::sync::Arc::new(move |_context| {
-                    let probe = std::sync::Arc::clone(&probe);
-                    Box::pin(async move { Ok(probe()) })
-                });
-            probe
-        }),
+        should_stop_after_turn: Some(
+            tool_error_nudge.after_turn_hook(config.queued_steering_probe.clone()),
+        ),
         should_stop_before_turn: config.queued_steering_probe.clone(),
         // TS `sdk.ts`: the Agent's steering/follow-up queues drain per
         // the session's configured modes (default "one-at-a-time").
@@ -666,6 +746,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     });
 
     let agent = Arc::new(agent);
+    tool_error_nudge.bind(&agent);
+    english_output_nudge.bind(&agent);
+    act_runtime.bind_parent(&agent);
+    act_runtime.bind_session(&wiring.session).await?;
     let telemetry_agent = std::sync::Arc::clone(&agent);
     let mut session = AgentSession::from_session_arc(
         agent.clone(),
@@ -674,10 +758,13 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         Some(digest_context),
     )
     .await?;
+    session.set_foreground_lease(foreground);
+    local_external_event_admission.bind(&agent).await;
     session.set_auto_refine(auto_refine_allowed, auto_refine_gates);
     // Every compaction path reads the session's resolved compaction
     // settings (TS `getCompactionSettings`): `/compact` matches the
     // `compact.*` turn-boundary tool's `keepRecentTokens`/`reserveTokens`.
+    session.set_native_compaction_enabled(compaction_settings.native.unwrap_or(true));
     session.set_compaction_settings(crate::session_engine::compaction::CompactionSettings {
         enabled: compaction_settings.enabled.unwrap_or(true),
         reserve_tokens: compaction_settings
@@ -794,12 +881,22 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // whether this session reports at all).
     if let Some(telemetry) = telemetry.as_ref() {
         session.set_skill_telemetry(telemetry.clone());
+        *act_runtime
+            .telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(telemetry.clone());
         // Same lifetime for the `rlm child usage attributed` adoption
         // event: the producer's flush reports through this handle.
         wiring.rlm_usage.set_telemetry(telemetry.clone());
     }
     let goal_driver = wiring.runtime.goal_driver().clone();
     Ok(SessionEngine {
+        external_events,
+        local_external_event_admission,
+        runtime_policy: config.runtime_policy,
+        tool_error_nudge,
+        english_output_nudge,
+        act_runtime,
         session,
         skills: resources.skills,
         skill_diagnostics: resources.skill_diagnostics,
@@ -881,6 +978,22 @@ impl SessionEngine {
         self.session.prompt(text, options).await
     }
 
+    /// Wait for watched jobs and their admitted completion turns to settle.
+    pub async fn wait_for_external_events(&self) {
+        loop {
+            self.external_events.wait_for_watches().await;
+            self.local_external_event_admission
+                .wait_for_delivery()
+                .await;
+            self.session.agent().wait_for_idle().await;
+            if !self.external_events.has_running_watches()
+                && !self.local_external_event_admission.has_pending()
+            {
+                return;
+            }
+        }
+    }
+
     /// Tear the session's kernel down now (a final namespace snapshot,
     /// like the TS session dispose). Dropping the engine tears the kernel
     /// down too — this is the explicit seam for a host that ends a
@@ -888,6 +1001,12 @@ impl SessionEngine {
     /// session disposal), so the kernel process never outlives the
     /// session that owns it.
     pub async fn dispose_kernel(&self) {
+        self.external_events.dispose();
+        self.local_external_event_admission.dispose();
+        self.session
+            .foreground_lease()
+            .dispose("Session disposed before foreground admission");
+        self.act_runtime.dispose().await;
         self.provisioner.dispose(None).await;
     }
 

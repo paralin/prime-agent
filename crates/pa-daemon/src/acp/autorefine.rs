@@ -229,6 +229,7 @@ mod tests {
                 prompt_guidelines: Vec::new(),
                 generic_mcp_servers: Vec::new(),
                 allow_recursion: None,
+                runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy::default(),
                 session_manager: Some(session_manager),
                 extra_host_handlers: None,
                 conversation_log_path: None,

@@ -9,8 +9,22 @@ use super::{
     KERNEL_BUSY_REUSE_WAIT_MS, MAX_BACKGROUND_OUTPUT_CHARS, MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS,
 };
 use std::fmt::Write as _;
+use std::sync::atomic::Ordering;
 
 impl Inner {
+    pub(crate) async fn interrupt_execution_once(&self, execution: &Arc<ActiveExecution>) {
+        let active = lock(&self.guarded).active_execution.clone();
+        if active
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, execution))
+            && !execution
+                .cancellation_interrupt_sent
+                .swap(true, Ordering::AcqRel)
+        {
+            let _ = self.interrupt(Some(&execution.request_id)).await;
+        }
+    }
+
     /// Write one JSON-lines request frame; completes when the OS accepted the bytes.
     pub(crate) async fn write_line(&self, frame: &Value) -> anyhow::Result<()> {
         let stdin = {

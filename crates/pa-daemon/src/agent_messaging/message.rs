@@ -8,6 +8,9 @@ use super::{
     AgentMessageReceipt, AgentMessageSendInput, Arc, FamilyIdentity, SupervisorLink, Value,
 };
 
+#[cfg(test)]
+mod mailbox_tests;
+
 /// `agent_message.send` controller for daemon workers. The family roster
 /// and message delivery both go through the supervisor; a send first tries
 /// the direct worker-to-worker peer transport (thin-supervisor stage 3) and
@@ -72,6 +75,52 @@ async fn roster_summaries(
 }
 
 impl AgentMessageController for LinkAgentMessageController {
+    async fn inbox(
+        &self,
+        filter: pa_core::session_engine::agent_messaging::mailbox::MailboxFilter,
+        limit: usize,
+        consume: bool,
+    ) -> anyhow::Result<Value> {
+        self.mailbox_request(
+            json!({"type":"agent_message_inbox", "activeSessionId":self.active_session_id,
+            "limit":limit,"consume":consume,"sender":filter.sender,"replyTo":filter.reply_to}),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+    }
+
+    async fn wait(
+        &self,
+        filter: pa_core::session_engine::agent_messaging::mailbox::MailboxFilter,
+        timeout_ms: u64,
+    ) -> anyhow::Result<Value> {
+        self.mailbox_request(
+            json!({"type":"agent_message_wait", "activeSessionId":self.active_session_id,
+            "timeoutMs":timeout_ms,"sender":filter.sender,"replyTo":filter.reply_to}),
+            std::time::Duration::from_millis(timeout_ms.saturating_add(5000)),
+        )
+        .await
+    }
+
+    async fn roster(&self) -> anyhow::Result<Value> {
+        let current = self
+            .own_summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!("agent family roster is not available in this session")
+            })?;
+        let family = self.family().await?;
+        let rows = roster_summaries(&self.link, &self.worker_token).await?;
+        Ok(family_roster_value(
+            &current,
+            &self.active_session_id,
+            &family,
+            &rows,
+        ))
+    }
+
     async fn family(&self) -> anyhow::Result<Vec<AgentFamilyMember>> {
         let sessions = roster_summaries(&self.link, &self.worker_token).await?;
         // The calling session's durable family identity (its own ids and
@@ -240,7 +289,7 @@ impl AgentMessageController for LinkAgentMessageController {
             children.observe_child_usage(&input.target).await;
         }
         let receipt = match self.deliver_direct(&input).await {
-            DirectDelivery::Delivered(receipt) => receipt,
+            DirectDelivery::Delivered(receipt) => *receipt,
             DirectDelivery::Unavailable => self.deliver_via_supervisor(input.clone()).await?,
             DirectDelivery::Failed(error) => return Err(anyhow::anyhow!(error)),
         };
@@ -248,10 +297,46 @@ impl AgentMessageController for LinkAgentMessageController {
     }
 }
 
+fn family_roster_value(
+    current: &Value,
+    active_id: &str,
+    family: &[AgentFamilyMember],
+    rows: &[Value],
+) -> Value {
+    let current_id = current["sessionId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .unwrap_or(active_id);
+    let depth = current["rlmDepth"].as_u64().unwrap_or(0);
+    let entries: Vec<_> = family.iter().map(|member| {
+        let row = rows.iter().find(|row| {
+            ["activeSessionId", "id", "sessionId", "rlmChildId"].iter().any(|field| {
+                row[*field].as_str().is_some_and(|id| id == member.id || member.aliases.iter().any(|alias| alias == id))
+            })
+        });
+        let default_depth = match member.relationship {
+            AgentFamilyRelationship::Parent => depth.saturating_sub(1),
+            AgentFamilyRelationship::Sibling => depth,
+            AgentFamilyRelationship::Child => depth.saturating_add(1),
+        };
+        let status = match row {
+            Some(row) if row["activeSessionId"].is_string() => {
+                if row["isSessionActive"] == true || row["activity"] == "working" { "running" } else { "idle" }
+            }
+            _ => "inactive",
+        };
+        json!({"relationship":member.relationship.as_str(), "name":member.member_name(),
+            "id":row.and_then(|row| row["sessionId"].as_str()).filter(|id| !id.is_empty()).unwrap_or(&member.id),
+            "depth":row.and_then(|row| row["rlmDepth"].as_u64()).unwrap_or(default_depth), "status":status})
+    }).collect();
+    json!({"current":{"name":current["sessionName"].as_str().filter(|name| !name.is_empty()).unwrap_or(current_id),
+        "id":current_id, "depth":depth}, "entries":entries})
+}
+
 /// The outcome of the direct-delivery attempt.
 enum DirectDelivery {
     /// The target answered with a receipt.
-    Delivered(AgentMessageReceipt),
+    Delivered(Box<AgentMessageReceipt>),
     /// No direct link could be established; the supervisor route may take
     /// over.
     Unavailable,
@@ -261,6 +346,27 @@ enum DirectDelivery {
 }
 
 impl LinkAgentMessageController {
+    async fn mailbox_request(
+        &self,
+        command: Value,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Value> {
+        let response = self
+            .link
+            .request_with_capability(command, timeout, "agent_message_mailbox")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("agent mailbox is not supported by this daemon"))?;
+        anyhow::ensure!(
+            response.success,
+            "{}",
+            response
+                .error
+                .as_deref()
+                .unwrap_or("agent mailbox request failed")
+        );
+        Ok(response.data.unwrap_or(Value::Null))
+    }
+
     /// Try the direct worker-to-worker path. `Unavailable` only when the
     /// delivery command never reached the target (no ticket, connect
     /// failure, or failed grant burn - the message was not delivered);
@@ -294,6 +400,8 @@ impl LinkAgentMessageController {
             &input.message,
             &self.sender_block(),
             None,
+            input.message_id.as_deref(),
+            input.reply_to.as_deref(),
         )
         .await
         {
@@ -313,9 +421,9 @@ impl LinkAgentMessageController {
                 match response
                     .data
                     .as_ref()
-                    .and_then(|data| receipt_from_wire(data, input.clone()))
+                    .and_then(|data| receipt_from_wire(data, input))
                 {
-                    Some(receipt) => DirectDelivery::Delivered(receipt),
+                    Some(receipt) => DirectDelivery::Delivered(Box::new(receipt)),
                     None => DirectDelivery::Failed(
                         "Target session returned an invalid agent-message receipt".to_string(),
                     ),
@@ -329,20 +437,28 @@ impl LinkAgentMessageController {
         &self,
         input: AgentMessageSendInput,
     ) -> anyhow::Result<AgentMessageReceipt> {
-        let data = self
-            .link
-            .request_success(
-                json!({
-                    "type": "send_message",
-                    "targetActiveSessionId": input.target,
-                    "message": input.message,
-                    "fromActiveSessionId": self.active_session_id,
-                    "agentOrigin": true,
-                }),
-                std::time::Duration::from_secs(30),
-            )
-            .await?;
-        receipt_from_wire(&data, input)
+        let mut command = json!({
+            "type": "send_message",
+            "targetActiveSessionId": input.target,
+            "message": input.message,
+            "fromActiveSessionId": self.active_session_id,
+            "agentOrigin": true,
+        });
+        if let Some(id) = &input.message_id {
+            command["messageId"] = json!(id);
+        }
+        if let Some(reply_to) = &input.reply_to {
+            command["replyTo"] = json!(reply_to);
+        }
+        let data = if input.message_id.is_some() || input.reply_to.is_some() {
+            self.mailbox_request(command, std::time::Duration::from_secs(30))
+                .await?
+        } else {
+            self.link
+                .request_success(command, std::time::Duration::from_secs(30))
+                .await?
+        };
+        receipt_from_wire(&data, &input)
             .ok_or_else(|| anyhow::anyhow!("Supervisor returned an invalid agent-message receipt"))
     }
 
@@ -440,9 +556,20 @@ fn child_member(
 /// Map a delivery receipt payload (the `worker_deliver_message` response
 /// data, both delivery paths) onto the kernel receipt shape. `None` marks
 /// a payload that does not carry the TS receipt fields.
-fn receipt_from_wire(data: &Value, input: AgentMessageSendInput) -> Option<AgentMessageReceipt> {
+fn receipt_from_wire(data: &Value, input: &AgentMessageSendInput) -> Option<AgentMessageReceipt> {
     let target = data.get("target")?;
     let id = data.get("id")?.as_str()?.to_string();
+    if input
+        .message_id
+        .as_ref()
+        .is_some_and(|expected| expected != &id)
+        || input
+            .reply_to
+            .as_ref()
+            .is_some_and(|expected| data["replyTo"].as_str() != Some(expected))
+    {
+        return None;
+    }
     let delivery_status = if data.get("deliveryStatus").and_then(Value::as_str) == Some("delivered")
     {
         AgentMessageDeliveryStatus::Delivered
@@ -473,7 +600,11 @@ fn receipt_from_wire(data: &Value, input: AgentMessageSendInput) -> Option<Agent
             .get("runtimeKind")
             .and_then(Value::as_str)
             .map(str::to_string),
-        message: input.message,
+        message: data
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(&input.message)
+            .to_string(),
         delivery_status,
         delivery_mode: Some(delivery_mode),
         receiver_role: input.receiver_role,
@@ -485,5 +616,36 @@ fn receipt_from_wire(data: &Value, input: AgentMessageSendInput) -> Option<Agent
             .get("queuedAt")
             .and_then(Value::as_str)
             .map(str::to_string),
+        mailbox_metadata: Some(data.clone()),
     })
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::*;
+
+    #[test]
+    fn roster_uses_durable_ids_and_keeps_retained_children_without_exposing_unrelated_rows() {
+        let family = vec![AgentFamilyMember {
+            relationship: AgentFamilyRelationship::Child,
+            id: "child-live".into(),
+            name: Some("worker".into()),
+            aliases: vec!["child-durable".into()],
+        }];
+        let rows = vec![
+            json!({"id":"child-durable", "sessionId":"child-durable", "rlmDepth":2}),
+            json!({"activeSessionId":"unrelated", "sessionId":"unrelated-durable"}),
+        ];
+        let roster = family_roster_value(
+            &json!({"sessionId":"self-durable", "sessionName":"self", "rlmDepth":1}),
+            "self-live",
+            &family,
+            &rows,
+        );
+        assert_eq!(roster["current"]["id"], "self-durable");
+        assert_eq!(roster["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(roster["entries"][0]["id"], "child-durable");
+        assert_eq!(roster["entries"][0]["depth"], 2);
+        assert_eq!(roster["entries"][0]["status"], "inactive");
+    }
 }

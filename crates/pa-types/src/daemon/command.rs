@@ -428,6 +428,34 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    AgentMessageInbox {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consume: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AgentMessageWait {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     AgentMessagesStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -1269,6 +1297,16 @@ mod tests {
     fn worker_register_roundtrip() {
         rt::<DaemonCommand>(
             r#"{"type":"worker_register","activeSessionId":"abc123def456","sessionId":"s-uuid","socketPath":"/tmp/w.sock","workerInstanceId":"inst-1","token":"tok","pid":4242}"#,
+        );
+    }
+
+    #[test]
+    fn mailbox_roundtrip() {
+        rt::<DaemonCommand>(
+            r#"{"type":"agent_message_inbox","activeSessionId":"s","limit":10,"consume":true,"sender":"parent","replyTo":"task"}"#,
+        );
+        rt::<DaemonCommand>(
+            r#"{"type":"agent_message_wait","activeSessionId":"s","timeoutMs":1000,"sender":"parent","replyTo":"task"}"#,
         );
     }
 

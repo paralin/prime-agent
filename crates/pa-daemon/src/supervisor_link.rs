@@ -31,6 +31,7 @@ struct LinkClient {
     reader: BufReader<Box<dyn AsyncReadHalf>>,
     writer: Box<dyn AsyncWriteHalf>,
     next_id: u64,
+    capabilities: Vec<String>,
 }
 
 impl LinkClient {
@@ -40,6 +41,17 @@ impl LinkClient {
     /// tagged [`LinkWriteFailed`] (the command was not sent); everything
     /// after the write is uncertain and surfaces as a plain error.
     async fn request(&mut self, command: Value, timeout: Duration) -> Result<DaemonResponse> {
+        if command.get("type").and_then(Value::as_str) == Some("create")
+            && command
+                .get("config")
+                .is_some_and(pa_types::daemon::compatibility::requires_runtime_launch_policy)
+            && !self
+                .capabilities
+                .iter()
+                .any(|capability| capability == "runtime_launch_policy")
+        {
+            anyhow::bail!("Daemon does not support runtime launch restrictions");
+        }
         let id = format!("link-{}", self.next_id);
         self.next_id += 1;
         let envelope = json!({
@@ -110,16 +122,52 @@ impl SupervisorLink {
     /// or response read fails (a failed write reconnects once, then
     /// errors).
     pub async fn request(&self, command: Value, timeout: Duration) -> Result<DaemonResponse> {
+        self.request_gated(command, timeout, None)
+            .await?
+            .ok_or_else(|| anyhow!("supervisor link command was unexpectedly gated"))
+    }
+
+    /// Send an optional command only when the greeting advertises its capability.
+    /// `None` lets callers degrade locally without writing an unsupported command.
+    ///
+    /// # Errors
+    /// Returns an error when the connection, write, response, or deadline fails.
+    pub async fn request_with_capability(
+        &self,
+        command: Value,
+        timeout: Duration,
+        capability: &str,
+    ) -> Result<Option<DaemonResponse>> {
+        self.request_gated(command, timeout, Some(capability)).await
+    }
+
+    async fn request_gated(
+        &self,
+        command: Value,
+        timeout: Duration,
+        capability: Option<&str>,
+    ) -> Result<Option<DaemonResponse>> {
         // Include connect and the supervisor hello in the caller's deadline:
         // a socket that accepts but never greets must not stall this request.
         let deadline = tokio::time::Instant::now() + timeout;
         tokio::time::timeout_at(deadline, async {
             let mut client = self.connect().await?;
+            if capability
+                .is_some_and(|required| !client.capabilities.iter().any(|cap| cap == required))
+            {
+                return Ok(None);
+            }
             match client.request(command.clone(), timeout).await {
                 Err(error) if error.downcast_ref::<LinkWriteFailed>().is_some() => {
-                    self.connect().await?.request(command, timeout).await
+                    let mut client = self.connect().await?;
+                    if capability.is_some_and(|required| {
+                        !client.capabilities.iter().any(|cap| cap == required)
+                    }) {
+                        return Ok(None);
+                    }
+                    client.request(command, timeout).await.map(Some)
                 }
-                outcome => outcome,
+                outcome => outcome.map(Some),
             }
         })
         .await
@@ -136,6 +184,7 @@ impl SupervisorLink {
             reader: BufReader::new(reader),
             writer,
             next_id: 0,
+            capabilities: Vec::new(),
         };
         let mut line = String::new();
         client
@@ -148,6 +197,18 @@ impl SupervisorLink {
         if hello.get("type").and_then(Value::as_str) != Some("daemon_hello") {
             return Err(anyhow!("supervisor link handshake failed"));
         }
+        client.capabilities = hello
+            .get("serverCapabilities")
+            .or_else(|| hello.get("capabilities"))
+            .and_then(Value::as_array)
+            .map(|capabilities| {
+                capabilities
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(client)
     }
 
@@ -176,6 +237,94 @@ impl SupervisorLink {
 mod tests {
     use super::*;
     use crate::protocol::{response_line, response_success};
+
+    #[tokio::test]
+    async fn optional_command_degrades_against_old_daemon_without_writing_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("sup.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                writer
+                    .write_all(b"{\"type\":\"daemon_hello\"}\n")
+                    .await
+                    .unwrap();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
+            }
+        });
+        let link = SupervisorLink::new(socket);
+        assert!(link
+            .request_with_capability(
+                json!({"type":"optional_feature"}),
+                Duration::from_secs(1),
+                "optional_feature"
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(link
+            .request_with_capability(
+                json!({"type":"create", "config":{"provider":"claude-code","model":"sonnet"}}),
+                Duration::from_secs(1),
+                "claude_code_children"
+            )
+            .await
+            .unwrap()
+            .is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_daemon_accepts_gated_commands_and_ordinary_old_client_commands() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("sup.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for expected in ["optional_feature", "list"] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                writer
+                    .write_all(
+                        b"{\"type\":\"daemon_hello\",\"serverCapabilities\":[\"optional_feature\"]}\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["command"]["type"], expected);
+                let response =
+                    response_line(&response_success(request["id"].as_str(), expected, None));
+                let mut bytes = serde_json::to_vec(&response).unwrap();
+                bytes.push(b'\n');
+                writer.write_all(&bytes).await.unwrap();
+            }
+        });
+        let link = SupervisorLink::new(socket);
+        assert!(
+            link.request_with_capability(
+                json!({"type":"optional_feature"}),
+                Duration::from_secs(1),
+                "optional_feature"
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .success
+        );
+        assert!(
+            link.request(json!({"type":"list"}), Duration::from_secs(1))
+                .await
+                .unwrap()
+                .success
+        );
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn long_request_does_not_block_roster_or_message_on_the_same_link() {

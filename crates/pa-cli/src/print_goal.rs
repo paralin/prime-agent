@@ -550,6 +550,12 @@ impl PrintGoalSurface {
         engine: &Arc<SessionEngine>,
         model: &pa_types::ai::Model,
     ) -> NaturalContinuation {
+        if engine.runtime_policy.rpc_only
+            || engine.external_events.has_running_watches()
+            || engine.local_external_event_admission.has_pending()
+        {
+            return NaturalContinuation::QueuedInput;
+        }
         // TS `_getContinuationMessages`: queued session input owns
         // the boundary before any goal work — the armed budget steer
         // ends the run so the queue drains it.
@@ -909,6 +915,8 @@ mod tests {
                     prompt_guidelines: Vec::new(),
                     generic_mcp_servers: Vec::new(),
                     allow_recursion: None,
+                    runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy::default(
+                    ),
                     session_manager: Some(session_manager),
                     extra_host_handlers: None,
                     conversation_log_path: None,
@@ -961,7 +969,7 @@ mod tests {
             harness_dir,
             _accounting: accounting,
             _autonomous_run: autonomous_run,
-            _dir: dir,
+            dir,
         }
     }
 
@@ -975,7 +983,7 @@ mod tests {
         /// Keeps the composed hook's autonomous arm alive for the bed's
         /// lifetime (the hook holds it weakly).
         _autonomous_run: Arc<crate::headless_autonomous::HeadlessAutonomous>,
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
     }
 
     impl GoalBed {
@@ -1471,6 +1479,8 @@ mod tests {
                     prompt_guidelines: Vec::new(),
                     generic_mcp_servers: Vec::new(),
                     allow_recursion: None,
+                    runtime_policy: pa_core::session_engine::runtime_policy::RuntimePolicy::default(
+                    ),
                     session_manager: Some(session_manager),
                     extra_host_handlers: None,
                     conversation_log_path: None,
@@ -1521,7 +1531,51 @@ mod tests {
             harness_dir: dir.path().join("harness"),
             _accounting: accounting,
             _autonomous_run: autonomous_run,
-            _dir: dir,
+            dir,
         }
+    }
+    #[tokio::test]
+    async fn external_completion_does_not_start_an_autonomous_episode() {
+        let _guard = FAUX_TEST_LOCK.lock().await;
+        let bed = goal_bed(
+            script(&json!(["handled completion"]), 128_000),
+            json!({}),
+            None,
+        )
+        .await;
+        let autonomous = Arc::new(crate::headless_autonomous::HeadlessAutonomous::from_cli(
+            &crate::args::AutonomousConfig {
+                max_continuations: Some(2),
+                ..Default::default()
+            },
+            bed.dir.path(),
+        ));
+        crate::print_autonomous::wire_continuation_hook(
+            &bed.engine,
+            bed.engine.session.agent(),
+            &bed.model,
+            &bed.surface,
+            &autonomous,
+        );
+        let emit = bed
+            .engine
+            .local_external_event_admission
+            .emitter(bed.engine.session.shared_persistence());
+        emit(
+            pa_core::session_engine::external_events::ExternalEventInput {
+                name: "build".into(),
+                event_id: "done".into(),
+                text: "build passed".into(),
+            },
+        )
+        .await
+        .unwrap();
+        bed.engine.wait_for_external_events().await;
+        assert_eq!(assistant_texts(&bed.engine).await, ["handled completion"]);
+        assert_eq!(
+            pa_core::autonomous::autonomous_status(&*autonomous.state_handle().lock().await)
+                .continuations_used,
+            0
+        );
     }
 }

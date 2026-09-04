@@ -158,6 +158,7 @@ fn append_replaces_older_digest_rows_and_strips_snapshot_blocks() {
     let converted = AgentMessage::Standard(Message::User(UserMessage {
         content: UserContent::Text(harness_digest_message_text("older digest")),
         timestamp: 1,
+        rest: serde_json::Map::default(),
     }));
     assert!(is_digest_row(&converted, Some("older digest")));
     // A user turn that quotes the digest — trailing text follows, or
@@ -170,6 +171,7 @@ fn append_replaces_older_digest_rows_and_strips_snapshot_blocks() {
             harness_digest_message_text("older digest")
         )),
         timestamp: 2,
+        rest: serde_json::Map::default(),
     }));
     assert!(!is_digest_row(&quoted, Some("older digest")));
     assert!(!is_digest_row(&converted, Some("another digest")));
@@ -178,6 +180,7 @@ fn append_replaces_older_digest_rows_and_strips_snapshot_blocks() {
     let plain = AgentMessage::Standard(Message::User(UserMessage {
         content: UserContent::Text("a question".to_string()),
         timestamp: 2,
+        rest: serde_json::Map::default(),
     }));
     assert!(!is_digest_row(&plain, Some("older digest")));
     let unrelated = AgentMessage::Custom(pa_agent::types::CustomAgentMessage {
@@ -197,6 +200,7 @@ fn append_replaces_older_digest_rows_and_strips_snapshot_blocks() {
                 "{HARNESS_DIGEST_PREFIX}stale snapshot{HARNESS_DIGEST_SUFFIX}\n\n{summary_text}"
             )),
             timestamp: 3,
+            rest: serde_json::Map::default(),
         }))
     };
     let summary_with_block = block_with(summary_text.clone());
@@ -211,6 +215,7 @@ fn append_replaces_older_digest_rows_and_strips_snapshot_blocks() {
     let plain_summary = AgentMessage::Standard(Message::User(UserMessage {
         content: UserContent::Text(summary_text),
         timestamp: 4,
+        rest: serde_json::Map::default(),
     }));
     let untouched = strip_compaction_digest_block(plain_summary.clone(), Some("stale snapshot"));
     assert_eq!(untouched, plain_summary);
@@ -233,6 +238,7 @@ fn out_of_context_file_entries_never_count_as_context_digests() {
             "{HARNESS_DIGEST_PREFIX}compaction head digest{HARNESS_DIGEST_SUFFIX}\n\n[compaction] summary text"
         )),
         timestamp: 5,
+        rest: serde_json::Map::default(),
     }));
     assert_eq!(
         latest_context_digest_details(&[wrapped]).map(|details| details.digest),
@@ -241,6 +247,7 @@ fn out_of_context_file_entries_never_count_as_context_digests() {
     let no_digest = AgentMessage::Standard(Message::User(UserMessage {
         content: UserContent::Text("[compaction] summary text".to_string()),
         timestamp: 6,
+        rest: serde_json::Map::default(),
     }));
     assert_eq!(latest_context_digest_details(&[no_digest]), None);
 }

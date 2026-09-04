@@ -62,6 +62,10 @@ impl SessionEngine {
         objective: &str,
         token_budget: Option<u64>,
     ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            !self.runtime_policy.rpc_only,
+            "Goals are disabled in rpc-only harness mode"
+        );
         let persistence = self.session.shared_persistence();
         // The driver-first lock order the other arms use: the accounting
         // subscription and the continuation hook can never be mid-mutation
@@ -125,6 +129,12 @@ impl SessionEngine {
     /// catch arm: `_finishGoalWithError(error)`, then no continuation —
     /// the hook must not reject).
     pub async fn mint_goal_continuation(&self) -> Option<CustomMessage> {
+        if self.runtime_policy.rpc_only
+            || self.external_events.has_running_watches()
+            || self.local_external_event_admission.has_pending()
+        {
+            return None;
+        }
         // The progress check's input (the 402 diagnosis's (a)) + the
         // failed pair's drop ((c)), read before the driver lock: the
         // just-settled turn gates the mint (a provider failure finishes

@@ -172,6 +172,81 @@ impl SessionManager {
         Ok(id)
     }
 
+    /// Record the usage baseline for a retained Act assignment.
+    ///
+    /// # Errors
+    /// Returns the persistence error without adopting the start record.
+    pub fn append_act_start(
+        &mut self,
+        payload: pa_types::session::ActStartEntry,
+    ) -> std::io::Result<String> {
+        let base = self.next_base();
+        let id = base.id.clone().unwrap_or_default();
+        self.append_entry(FileEntry::ActStart { payload, base })?;
+        Ok(id)
+    }
+
+    /// Record an Act's terminal outcome and billable usage.
+    ///
+    /// # Errors
+    /// Returns the persistence error without adopting the terminal record.
+    pub fn append_act_terminal(
+        &mut self,
+        payload: pa_types::session::ActTerminalEntry,
+    ) -> std::io::Result<String> {
+        let base = self.next_base();
+        let id = base.id.clone().unwrap_or_default();
+        self.append_entry(FileEntry::ActTerminal { payload, base })?;
+        Ok(id)
+    }
+
+    /// Commit a retained message and its compaction boundary in one append.
+    ///
+    /// # Errors
+    /// Returns the persistence error without changing the live entry chain.
+    pub fn append_message_compaction(
+        &mut self,
+        message: AgentMessage,
+        mut payload: pa_types::session::CompactionEntry,
+    ) -> std::io::Result<(String, String)> {
+        let message_base = self.next_base();
+        let message_id = message_base.id.clone().unwrap_or_default();
+        payload.first_kept_entry_id.clone_from(&message_id);
+        let mut compaction_base = self.next_base();
+        compaction_base.id = Some(uuid::Uuid::new_v4().to_string());
+        compaction_base.parent_id = Some(message_id.clone());
+        let compaction_id = compaction_base.id.clone().unwrap_or_default();
+        let start = self.file_entries.len();
+        let previous_assistant = self.has_assistant_entry;
+        let previous_flushed = self.flushed;
+        self.has_assistant_entry |= matches!(message, AgentMessage::Assistant(_));
+        self.file_entries.push(FileEntry::Message {
+            message,
+            base: message_base,
+        });
+        self.file_entries.push(FileEntry::Compaction {
+            payload,
+            base: compaction_base,
+        });
+        if let Err(error) = self.persist_entries(start, start + 2) {
+            self.file_entries.truncate(start);
+            self.has_assistant_entry = previous_assistant;
+            self.flushed = previous_flushed;
+            return Err(error);
+        }
+        for index in start..start + 2 {
+            let entry = &self.file_entries[index];
+            if let Some(window) = &mut self.window {
+                window.append_entry(entry.clone());
+            }
+            if let Some(id) = entry.id() {
+                self.by_id.insert(id.to_string(), index);
+            }
+        }
+        self.leaf_id = Some(compaction_id.clone());
+        Ok((message_id, compaction_id))
+    }
+
     /// Append a custom entry; returns the new entry id.
     ///
     /// # Errors

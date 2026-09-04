@@ -62,7 +62,7 @@ fn graceful_shutdown(socket: &Path) {
     let command = serde_json::json!({
         "type": "command",
         "id": "test-shutdown",
-        "protocol": { "name": "prime-agent.daemon", "version": 7 },
+        "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
         "command": { "type": "shutdown" },
     });
     let Ok(mut line) = serde_json::to_string(&command) else {
@@ -154,7 +154,7 @@ fn ask(socket: &Path, command: &serde_json::Value) -> Option<serde_json::Value> 
     let mut line = serde_json::to_string(&serde_json::json!({
         "type": "command",
         "id": "reply-e2e-ask",
-        "protocol": { "name": "prime-agent.daemon", "version": 7 },
+        "protocol": { "name": "prime-agent.daemon", "version": pa_types::daemon::DAEMON_PROTOCOL_VERSION },
         "command": command,
     }))
     .ok()?;

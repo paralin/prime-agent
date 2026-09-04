@@ -80,6 +80,14 @@ fn resolve_child_model_unchecked(
             .ok_or_else(|| anyhow!("No model selected. Use /model to pick one."));
     };
     let reference = reference.trim();
+    if let Some(model) = reference.strip_prefix("claude-code/") {
+        anyhow::ensure!(!model.trim().is_empty(), "Claude Code model is required");
+        anyhow::ensure!(
+            target == "subagent",
+            "Claude Code is available only for recursive child tasks"
+        );
+        return Ok(reference.to_string());
+    }
     let normalized = reference.to_lowercase();
     if let Some(parent) = parent_model {
         if parent.to_lowercase() == normalized {
@@ -138,6 +146,10 @@ pub fn assert_thinking_supported(
     let Some((provider, id)) = selector.split_once('/') else {
         return Ok(());
     };
+    if provider == "claude-code" {
+        anyhow::ensure!(matches!(level, "low" | "medium" | "high" | "xhigh" | "max"), "Requested Claude Code effort is not supported; supported levels: low, medium, high, xhigh, max");
+        return Ok(());
+    }
     let registry = crate::state_getters::worker_model_registry(agent_dir);
     let Some(model) = registry
         .get_rlm_searchable_models()

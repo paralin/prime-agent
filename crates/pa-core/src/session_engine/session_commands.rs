@@ -49,6 +49,7 @@ pub struct SessionCommandParams<'a> {
 /// client-facing result.
 #[derive(Debug, Clone)]
 pub struct CompactionExecution {
+    pub continuation: Option<pa_types::session::AgentMessage>,
     pub entry: pa_types::session::CompactionEntry,
     pub result: super::compaction_exec::CompactionResult,
     /// The post-compaction `ipython_state` notice row when a kernel was
@@ -204,6 +205,10 @@ pub async fn execute_session_command(
         telemetry.note_command_used(command.name);
     }
     let result = match command.name {
+        "goal" | "autonomous" | "refine" if engine.runtime_policy.rpc_only => Err(format!(
+            "/{} is disabled in rpc-only harness mode",
+            command.name
+        )),
         "compact" => execute_compact(engine, params, command, &mut execution).await,
         "refine" => execute_refine(engine, params, command, &mut execution).await,
         "goal" => execute_goal(engine, command, &mut execution).await,
@@ -274,6 +279,7 @@ async fn execute_compact(
                 telemetry.note_compaction(Some(run.duration_ms));
             }
             execution.compaction = Some(CompactionExecution {
+                continuation: run.continuation,
                 entry: run.entry,
                 result: run.result,
                 ipython_state: run.ipython_state,

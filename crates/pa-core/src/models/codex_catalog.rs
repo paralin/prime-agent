@@ -111,6 +111,9 @@ pub(super) async fn executable_models(
     key: Option<String>,
     headers: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Vec<Model> {
+    if super::private_auth::is_offline_mode_enabled() {
+        return models;
+    }
     let Some(seed) = models.iter().find(|model| model.provider == "openai-codex") else {
         return models;
     };

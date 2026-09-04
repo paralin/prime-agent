@@ -56,12 +56,12 @@ impl Generation {
 /// aggregate — so the window's prefix totals match a full read. The
 /// sidecar is plain serde JSON without `deny_unknown_fields`: keys this
 /// format does not read are ignored on load.
-pub(super) const SNAPSHOT_VERSION: u32 = 7;
+pub(super) const SNAPSHOT_VERSION: u32 = 8;
 // `retained_whole_file` (added after v7) is `#[serde(default)]` false:
 // older sidecars deserialize it as false and simply skip the
 // full-history fast paths until the next walk rewrites the sidecar —
 // the default is the conservative pre-change behavior, so v7 caches
-// stay servable (a version bump would force a full re-walk instead).
+// remain conservatively readable. Version 8 rebuilds Act metadata and usage.
 
 #[derive(Clone, Serialize, Deserialize)]
 // The mirrored TS API shape is deliberate (the booleans are the

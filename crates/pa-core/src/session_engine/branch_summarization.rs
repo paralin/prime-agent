@@ -136,6 +136,7 @@ fn get_message_from_entry(entry: &FileEntry) -> Option<AgentMessage> {
         )),
         FileEntry::Compaction { payload, .. } => {
             Some(AgentMessage::CompactionSummary(CompactionSummaryMessage {
+                provider_payload: None,
                 summary: payload.summary.clone(),
                 tokens_before: payload.tokens_before,
                 retained_message_count: None,
@@ -583,6 +584,7 @@ mod tests {
     fn compaction_entries_become_summary_messages() {
         let compaction = FileEntry::Compaction {
             payload: pa_types::session::CompactionEntry {
+                provider_native_compaction: None,
                 summary: "prior state".to_string(),
                 first_kept_entry_id: "x".to_string(),
                 tokens_before: 10,

@@ -823,6 +823,10 @@ impl SessionUi {
         }
         // TS `app.subagents.focus` (default alt+a): the dock takes focus
         // (it renders in every session).
+        if view.editor.keybindings().matches(&id, "app.watches.open") {
+            self.open_watches_panel(view);
+            return Ok(());
+        }
         if view
             .editor
             .keybindings()

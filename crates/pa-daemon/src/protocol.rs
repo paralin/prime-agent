@@ -55,6 +55,8 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "append_custom_message",
     "resume_queue",
     "send_message",
+    "agent_message_inbox",
+    "agent_message_wait",
     "agent_messages_status",
     "agent_messages_pause",
     "agent_messages_resume",
@@ -332,6 +334,11 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "abort_and_send_queued",
                 "agent_roster",
                 "direct_peer_transport",
+                "agent_message_mailbox",
+                "claude_code_children",
+                "act_projection",
+                "external_event_watches",
+                "runtime_launch_policy",
             ]
             .iter()
             .map(std::string::ToString::to_string),
@@ -868,6 +875,12 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::SetSessionEntryLabel {
             active_session_id, ..
         }
+        | DaemonCommand::AgentMessageInbox {
+            active_session_id, ..
+        }
+        | DaemonCommand::AgentMessageWait {
+            active_session_id, ..
+        }
         | DaemonCommand::MarkAnthropicWarningShown {
             active_session_id, ..
         }
@@ -956,6 +969,8 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::AppendCustomMessage { .. } => "append_custom_message",
         DaemonCommand::ResumeQueue { .. } => "resume_queue",
         DaemonCommand::SendMessage { .. } => "send_message",
+        DaemonCommand::AgentMessageInbox { .. } => "agent_message_inbox",
+        DaemonCommand::AgentMessageWait { .. } => "agent_message_wait",
         DaemonCommand::AgentMessagesStatus { .. } => "agent_messages_status",
         DaemonCommand::AgentMessagesPause { .. } => "agent_messages_pause",
         DaemonCommand::AgentMessagesResume { .. } => "agent_messages_resume",

@@ -153,6 +153,12 @@ async fn try_daemon_attached_acp(options: &RunOptions) -> Option<i32> {
         // `runtimeConfigFromArgs` names. `--api-key` stays off: the
         // in-process path ignores it too, and the create config is persisted.
         let mut create_config = serde_json::json!({ "cwd": config.cwd.display().to_string() });
+        if let Some(ceiling) = config.runtime_policy.rlm_max_depth_ceiling {
+            create_config["rlmMaxDepthCeiling"] = serde_json::json!(ceiling);
+        }
+        if !config.runtime_policy.act_enabled() {
+            create_config["disableRlmAct"] = serde_json::json!(true);
+        }
         if let Some(provider) = &config.provider {
             create_config["provider"] = serde_json::json!(provider);
         }
@@ -599,6 +605,7 @@ async fn build_headless_engine_with(
             prompt_guidelines: config.append_system_prompt.clone(),
             generic_mcp_servers: vec![],
             allow_recursion: None,
+            runtime_policy: config.runtime_policy,
             session_manager,
             extra_host_handlers: None,
             conversation_log_path: None,
@@ -1272,10 +1279,22 @@ async fn run_prompts_and_emit(
 ) -> Result<i32, String> {
     let json_mode = options.app_mode == AppMode::Json;
     let mut unsubscribe: Option<pa_agent::agent::Subscription> = None;
+    let mut act_events = None;
     if json_mode {
         if let Some(header) = session_header_json(engine).await {
             println!("{header}");
         }
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let emitting = active.clone();
+        engine.act_runtime.set_event_sink(Arc::new(move |event| {
+            if emitting.load(std::sync::atomic::Ordering::Acquire) {
+                println!("{event}");
+            }
+        }));
+        act_events = Some(PrintActEvents {
+            runtime: engine.act_runtime.clone(),
+            active,
+        });
         unsubscribe = Some(
             engine
                 .session
@@ -1405,7 +1424,7 @@ async fn run_prompts_and_emit(
             )
             .await
             .map_err(|error| format!("{error:#}"))?;
-        engine.session.agent().wait_for_idle().await;
+        engine.wait_for_external_events().await;
         // The settled-turn boundary (TS `agent_end`): the overflow
         // compact-and-retry arm, the turn-boundary requests the kernel
         // scheduled mid-turn (`compact.run` / `refine.run`), and the
@@ -1458,6 +1477,7 @@ async fn run_prompts_and_emit(
     if let Some(subscription) = unsubscribe {
         subscription.unsubscribe().await;
     }
+    drop(act_events);
     // The rejected prompt wait (TS print-mode's catch): print the raw
     // command error to stderr and exit 1 — no later prompts ran, the
     // terminal selection is skipped, and the disposal drain still runs.
@@ -1516,6 +1536,19 @@ async fn run_prompts_and_emit(
         .drain_compact_auto_refine_at_disposal(engine, model, api_key, global_harness_dir)
         .await;
     Ok(exit_code)
+}
+
+struct PrintActEvents {
+    runtime: Arc<pa_core::session_engine::act_runtime::ActRuntime>,
+    active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for PrintActEvents {
+    fn drop(&mut self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.runtime.clear_event_sink();
+    }
 }
 
 /// The faux-script engine: identical session assembly, scripted provider.
@@ -1655,6 +1688,7 @@ async fn build_faux_engine_with(
             prompt_guidelines: config.append_system_prompt.clone(),
             generic_mcp_servers: vec![],
             allow_recursion: None,
+            runtime_policy: config.runtime_policy,
             session_manager,
             extra_host_handlers: None,
             conversation_log_path: None,

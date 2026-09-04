@@ -97,6 +97,7 @@ fn faux_session(responses: Vec<FauxResponseStep>) -> FauxSession {
             cost: None,
             context_window: Some(100_000),
             max_tokens: Some(4_096),
+            thinking_level_map: None,
         }]),
         ..Default::default()
     });

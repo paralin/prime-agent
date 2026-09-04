@@ -15,8 +15,11 @@ pub(crate) use config::WorkerConfig;
 // itself does not reference it directly, so allow the unused-import lint deliberately.
 #[allow(unused_imports)]
 use env::KillCloseReason;
+mod external_events;
 mod input;
 mod lifecycle;
+mod mailbox;
+mod nudges;
 mod summary;
 
 mod connection;
@@ -172,6 +175,8 @@ pub struct Worker {
     /// Agent-message ingestion state (`agent_messages_*` arms): the pause
     /// flag the delivery gate checks.
     pub(crate) agent_messages: crate::agent_message_ingest::AgentMessageIngest,
+    mailbox: Arc<Mutex<Option<mailbox::WorkerMailbox>>>,
+    mailbox_closed: Arc<std::sync::atomic::AtomicBool>,
     /// Session input-pause leases (`acquire`/`release_session_input_pause`):
     /// the admission gate the turn runner consults.
     pub(crate) input_pauses: crate::session_input_pause::InputPauseTable,
@@ -339,6 +344,8 @@ impl Worker {
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
         let core = Arc::new(Mutex::new(core));
+        let mailbox: Arc<Mutex<Option<mailbox::WorkerMailbox>>> = Arc::new(Mutex::new(None));
+        let mailbox_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // TS `_steeringStopPending` (the session's stop hooks): the
         // steering lane owning the probe makes a queued steer stop the
         // running turn at its next turn boundary — the runner delivers
@@ -475,6 +482,87 @@ impl Worker {
             // registry's settle hook (registered inside) delivers a
             // continuation owed behind descendant work.
             if let Some(concrete) = agent_engine.as_ref() {
+                let nudge_core = Arc::downgrade(&core);
+                let nudge_recovery = Arc::clone(&recovery);
+                let nudge_notify = Arc::clone(&work_notify);
+                let nudge_closed = Arc::clone(&mailbox_closed);
+                let nudge_events = Arc::clone(&events);
+                *concrete
+                    .nudge_admission
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(Arc::new(move |message| {
+                        nudges::admit(
+                            &nudge_core.upgrade().context("Session was disposed")?,
+                            &nudge_recovery,
+                            &nudge_notify,
+                            &nudge_closed,
+                            message,
+                            &nudge_events,
+                        )
+                    }));
+                let watch_engine = Arc::downgrade(concrete);
+                let watch_core = Arc::downgrade(&core);
+                let watch_events = Arc::clone(&events);
+                *concrete
+                    .external_watch_sink
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+                    move |watches| {
+                        if let Some(core) = watch_core.upgrade() {
+                            emit_worker_event_with(
+                                &core,
+                                &watch_events,
+                                json!({"type":"external_event_watches_changed", "watches":watches}),
+                            );
+                        }
+                        if watches.iter().all(|watch| {
+                            watch.status
+                                != pa_core::session_engine::external_events::ExternalEventWatchStatus::Running
+                        }) {
+                            if let Some(engine) = watch_engine.upgrade() {
+                                engine.retry_owed_goal_continuation();
+                                engine.retry_owed_autonomous_continuation();
+                            }
+                        }
+                    },
+                ));
+                let event_core = Arc::downgrade(&core);
+                let event_recovery = Arc::clone(&recovery);
+                let event_notify = Arc::clone(&work_notify);
+                let event_closed = Arc::clone(&mailbox_closed);
+                let event_pump = Arc::clone(&events);
+                *concrete
+                    .external_event_emit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(Arc::new(move |input| {
+                        let result = event_core
+                            .upgrade()
+                            .context("Session was disposed")
+                            .and_then(|core| {
+                                external_events::admit(
+                                    &core,
+                                    &event_recovery,
+                                    &event_notify,
+                                    &event_closed,
+                                    &input,
+                                    &event_pump,
+                                )
+                            });
+                        Box::pin(std::future::ready(result))
+                    }));
+                let mailbox_core = Arc::downgrade(&core);
+                let mailbox_cache = Arc::clone(&mailbox);
+                let mailbox_closed = Arc::clone(&mailbox_closed);
+                *concrete
+                    .mailbox_provider
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(Arc::new(move || {
+                        let core = mailbox_core.upgrade().context("Session was disposed")?;
+                        mailbox::restore_worker_mailbox(&core, &mailbox_cache, &mailbox_closed)
+                    }));
                 // The in-run autonomous continuation seam (TS
                 // `getContinuationMessages` -> the autonomous arm): the
                 // engine's hook holds itself weakly through the registered
@@ -788,6 +876,8 @@ impl Worker {
             user_bash,
             roster_pushes,
             agent_messages: crate::agent_message_ingest::AgentMessageIngest::new(),
+            mailbox,
+            mailbox_closed,
             input_pauses,
             navigation,
             prompt_admissions,

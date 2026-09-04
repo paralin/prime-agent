@@ -144,9 +144,11 @@ impl Worker {
         // identity and status over the cached bodies; the background walk
         // in `context_tree_cache` keeps them as fresh as its last
         // refresh) — the walk itself never blocks this response.
-        let children = self
-            .context_tree
-            .serve_children(session_id.as_deref(), &snapshots);
+        let mut children = self.engine.act_context_tree_nodes().await;
+        children.extend(
+            self.context_tree
+                .serve_children(session_id.as_deref(), &snapshots),
+        );
         // Re-arm the background refresh for the next read.
         self.poke_context_tree_refresh();
         let mut tree = json!({

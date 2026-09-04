@@ -520,6 +520,48 @@ fn failed_persist_keeps_the_store_walkable() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn scratch_continuation_and_boundary_reload_as_one_chain() {
+    let dir = temp_dir();
+    let path = dir.join("scratch.jsonl");
+    let mut store = SessionFile::create("/repo", None, 0);
+    store.set_path(path.clone());
+    store
+        .persist_entry(
+            "message",
+            json!({"message":{"role":"user","content":"old history","timestamp":1}}),
+        )
+        .unwrap();
+    let message = json!({"role":"user","content":[{"type":"image","data":"image","mimeType":"image/png"},{"type":"text","text":"Org checkpoint"}],"timestamp":2});
+    let id = store.persist_message_compaction(&message, json!({"summary":"","firstKeptEntryId":"engine-id","tokensBefore":100,"details":{"scratchHandoff":{"version":1,"path":"agent/checkpoint.org"}}})).unwrap();
+    let loaded = SessionFile::open(&path).unwrap();
+    let boundary = loaded.entries().last().unwrap();
+    assert_eq!(boundary.parent_id.as_deref(), Some(id.as_str()));
+    assert_eq!(boundary.fields["firstKeptEntryId"], id);
+    let messages = loaded.messages();
+    assert_eq!(messages.last(), Some(&message));
+    assert!(!messages.iter().any(|row| row["content"] == "old history"));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn failed_scratch_pair_does_not_adopt_either_entry() {
+    let dir = temp_dir();
+    let mut store = SessionFile::create("/repo", None, 0);
+    let previous = store.append_message(&json!({"role":"user","content":"kept"}));
+    store.set_path(dir.clone());
+    let before = store.entries().len();
+    assert!(store
+        .persist_message_compaction(
+            &json!({"role":"user","content":"checkpoint"}),
+            json!({"summary":"","tokensBefore":10})
+        )
+        .is_err());
+    assert_eq!(store.entries().len(), before);
+    assert_eq!(store.leaf_id(), Some(previous.as_str()));
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// The replay's dedup predicate is the disclosure row's fields: the
 /// create handler recognizes the exact row wherever it came from —
 /// this replacement's own declaration-stamped persist, an earlier
@@ -1183,6 +1225,7 @@ fn skips_malformed_lines() {
 #[test]
 fn durable_compaction_row_serializes_in_the_ts_key_order() {
     let entry = pa_types::session::CompactionEntry {
+        provider_native_compaction: None,
         summary: "pre-compaction reply 6".to_string(),
         first_kept_entry_id: "ebd5e444".to_string(),
         tokens_before: 110,

@@ -59,6 +59,8 @@ fn message_ids_and_validation() {
     assert!(normalize_agent_session_message(&long).is_err());
     let at_limit = "x".repeat(DEFAULT_AGENT_MESSAGE_MAX_CHARS);
     assert!(normalize_agent_session_message(&at_limit).is_ok());
+    assert!(normalize_agent_session_message_limited("😀😀", 4).is_ok());
+    assert!(normalize_agent_session_message_limited("😀😀", 3).is_err());
 }
 
 #[test]
@@ -239,6 +241,11 @@ fn family() -> Vec<AgentFamilyMember> {
 struct RecordingMessageController;
 
 impl AgentMessageController for RecordingMessageController {
+    fn roster(&self) -> impl std::future::Future<Output = anyhow::Result<Value>> {
+        std::future::ready(Ok(
+            json!({"current":{"name":"self", "id":"self", "depth":0}, "entries":family().iter().map(|member| json!({"relationship":member.relationship.as_str(), "id":member.id, "name":member.member_name()})).collect::<Vec<_>>()}),
+        ))
+    }
     fn family(&self) -> impl std::future::Future<Output = anyhow::Result<Vec<AgentFamilyMember>>> {
         std::future::ready(Ok(family()))
     }
@@ -248,7 +255,9 @@ impl AgentMessageController for RecordingMessageController {
         input: AgentMessageSendInput,
     ) -> impl std::future::Future<Output = anyhow::Result<AgentMessageReceipt>> {
         std::future::ready(Ok(AgentMessageReceipt {
-            id: create_agent_session_message_id(),
+            id: input
+                .message_id
+                .unwrap_or_else(create_agent_session_message_id),
             target_session_id: Some(format!("{}-session", input.target)),
             target: input.target,
             target_session_name: None,
@@ -259,6 +268,7 @@ impl AgentMessageController for RecordingMessageController {
             receiver_role: input.receiver_role,
             delivered_at: Some("2024-01-01T00:00:00.000Z".to_string()),
             queued_at: None,
+            mailbox_metadata: input.reply_to.map(|reply_to| json!({"replyTo":reply_to})),
         }))
     }
 }
@@ -298,6 +308,21 @@ async fn message_host_handler_round_trip() {
     assert_eq!(receipt["deliveryStatus"], "delivered");
     assert_eq!(receipt["receiverRole"], "sibling");
     assert!(receipt["id"].as_str().unwrap().starts_with("agentmsg_"));
+
+    let stable = send_request(
+        &send,
+        json!({"message":"answer", "receiver_role":"parent", "id":"stable", "reply_to":"question"}),
+    )
+    .unwrap();
+    assert_eq!(stable["id"], "stable");
+    assert_eq!(stable["replyTo"], "question");
+    for invalid in [json!(false), json!(" "), json!("x".repeat(513))] {
+        assert!(send_request(
+            &send,
+            json!({"message":"answer", "receiver_role":"parent", "id":invalid})
+        )
+        .is_err());
+    }
 
     // Unnamed members resolve by id (TS agentFamilyMemberName).
     let by_id = send_request(
@@ -384,12 +409,11 @@ async fn message_host_handler_round_trip() {
         .iter()
         .all(|receipt| receipt["message"] == "everyone"));
 
-    // The removed roster request answers with the TS migration error.
     let list_agents = handlers.get("agent_message.list_agents").unwrap().clone();
-    let removed = send_request(&list_agents, json!({})).unwrap_err();
-    assert!(removed.to_string().starts_with(
-        "agent_message.list_agents was removed; the family roster now lives in agent_observe.list_agents()"
-    ));
+    let roster = send_request(&list_agents, json!({})).unwrap();
+    assert_eq!(roster["current"]["id"], "self");
+    assert_eq!(roster["entries"].as_array().unwrap().len(), 5);
+    assert_eq!(roster["entries"][0]["relationship"], "parent");
 }
 
 #[tokio::test]

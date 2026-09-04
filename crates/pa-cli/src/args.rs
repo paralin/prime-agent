@@ -153,6 +153,9 @@ pub struct Args {
     pub help: bool,
     pub version: bool,
     pub mode: Option<Mode>,
+    pub harness_rpc_only: bool,
+    pub rlm_max_depth_ceiling: Option<u32>,
+    pub disable_rlm_act: bool,
     pub daemon_socket: Option<String>,
     pub no_session: bool,
     pub fork: Option<String>,
@@ -279,6 +282,24 @@ pub fn parse_args(args: &[String]) -> Args {
                     result.diagnostics.push(Diagnostic::error(format!(
                         "Invalid --mode \"{mode}\". Valid values: text, json, rpc, acp, daemon"
                     )));
+                }
+            }
+            "--harness-mode" => {
+                let value = require_value!(arg);
+                if value == "rpc-only" {
+                    result.harness_rpc_only = true;
+                } else {
+                    result
+                        .diagnostics
+                        .push(Diagnostic::error("--harness-mode must be rpc-only"));
+                }
+            }
+            "--disable-rlm-act" => result.disable_rlm_act = true,
+            "--rlm-max-depth-ceiling" => {
+                let value = require_value!(arg);
+                match value.trim().parse::<u32>() {
+                    Ok(depth) => result.rlm_max_depth_ceiling = Some(depth),
+                    Err(_) => result.diagnostics.push(Diagnostic::error("--rlm-max-depth-ceiling must be a non-negative integer no larger than u32::MAX")),
                 }
             }
             "--daemon-socket" => {
@@ -559,6 +580,30 @@ mod tests {
             .find(|d| d.is_error)
             .map(|d| d.message.as_str())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn recursive_runtime_launch_flags_validate_values() {
+        let parsed = parse(&[
+            "--mode",
+            "rpc",
+            "--harness-mode",
+            "rpc-only",
+            "--disable-rlm-act",
+            "--rlm-max-depth-ceiling",
+            "0",
+        ]);
+        assert!(parsed.diagnostics.is_empty());
+        assert!(parsed.harness_rpc_only && parsed.disable_rlm_act);
+        assert_eq!(parsed.rlm_max_depth_ceiling, Some(0));
+        for value in ["-1", "1.5", "4294967296", "invalid"] {
+            assert!(!parse(&["--rlm-max-depth-ceiling", value])
+                .diagnostics
+                .is_empty());
+        }
+        assert!(!parse(&["--harness-mode", "ordinary"])
+            .diagnostics
+            .is_empty());
     }
 
     #[test]

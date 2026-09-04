@@ -11,6 +11,7 @@ use super::{
     RlmSubagentHost, SpawnNameReservationGuard, SupervisorChildSessions,
     SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS,
 };
+use pa_core::models::{parse_rlm_runtime_candidate, resolve_rlm_role_candidates, RlmRuntimeKind};
 
 /// Resolve the child model with the daemon `allowedModels` allowlist
 /// enforced (the parent's cwd scopes the settings read), refusing a model
@@ -24,24 +25,112 @@ async fn resolve_child_model_allowlisted(
     reference: Option<&str>,
     surface: &'static str,
     target: &str,
-) -> Result<String> {
+) -> Result<(String, Option<String>, Vec<String>)> {
     let identity = this.identity.lock().expect("identity lock").clone();
     let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
     let load_cwd = cwd.clone();
     let agent_dir = this.agent_dir.clone();
-    let allowlist = tokio::task::spawn_blocking(move || {
-        crate::model_allowlist::load(Path::new(&load_cwd), &agent_dir)
+    let (roles, claude_executable, allowlist) = tokio::task::spawn_blocking(move || {
+        let settings = pa_core::settings::SettingsManager::create(Path::new(&load_cwd), &agent_dir);
+        (
+            settings.get_model_roles(),
+            settings.get_claude_code_executable(),
+            crate::model_allowlist::load(Path::new(&load_cwd), &agent_dir),
+        )
     })
     .await
-    .context("the allowlist load task join failed")?;
-    match resolve_child_model(
-        &this.agent_dir,
-        reference,
-        identity.model.as_deref(),
-        target,
-        &allowlist,
-    ) {
-        Ok(model) => Ok(model),
+    .context("the child settings load task join failed")?;
+    let reference = reference
+        .or_else(|| (target == "subagent" && roles.contains_key("task")).then_some("@task"));
+    let candidates = match reference.map(str::trim) {
+        Some(role) if role.starts_with('@') => {
+            Some(resolve_rlm_role_candidates(&role[1..], &roles)?)
+        }
+        Some(selector) if selector.starts_with("claude-code/") => {
+            Some(vec![parse_rlm_runtime_candidate(selector)?])
+        }
+        Some(selector) if selector.contains('/') => parse_rlm_runtime_candidate(selector)
+            .ok()
+            .filter(|candidate| candidate.thinking_level.is_some())
+            .map(|candidate| vec![candidate]),
+        _ => None,
+    };
+    let named_role = reference.is_some_and(|value| value.trim().starts_with('@'));
+    let selected = if let Some(candidates) = candidates {
+        let ordered = if (named_role
+            || candidates
+                .first()
+                .is_some_and(|candidate| candidate.thinking_level.is_some()))
+            && candidates
+                .first()
+                .is_some_and(|candidate| candidate.runtime == RlmRuntimeKind::Native)
+        {
+            candidates
+                .iter()
+                .map(|candidate| match candidate.thinking_level {
+                    Some(level) => format!("{}:{}", candidate.selector, level.wire_name()),
+                    None => candidate.selector.clone(),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut selected = None;
+        let mut last_error = None;
+        for candidate in candidates {
+            if candidate.runtime == RlmRuntimeKind::ClaudeCode {
+                anyhow::ensure!(
+                    claude_executable.is_some(),
+                    "Requested subagent runtime has no configured Claude Code executable"
+                );
+            }
+            match resolve_child_model(
+                &this.agent_dir,
+                Some(&candidate.selector),
+                identity.model.as_deref(),
+                target,
+                &allowlist,
+            ) {
+                Ok(model) => {
+                    selected = Some((
+                        model,
+                        candidate
+                            .thinking_level
+                            .map(|level| level.wire_name().to_string()),
+                        ordered,
+                    ));
+                    break;
+                }
+                Err(error) => {
+                    if let Some(refusal) =
+                        error.downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+                    {
+                        this.model_refusal_telemetry.note_refused(
+                            surface,
+                            &refusal.selector,
+                            Path::new(&cwd),
+                        );
+                        return Err(error);
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        selected.ok_or_else(|| {
+            last_error.unwrap_or_else(|| anyhow::anyhow!("No available RLM model role candidate"))
+        })
+    } else {
+        resolve_child_model(
+            &this.agent_dir,
+            reference,
+            identity.model.as_deref(),
+            target,
+            &allowlist,
+        )
+        .map(|model| (model, None, Vec::new()))
+    };
+    match selected {
+        Ok(selection) => Ok(selection),
         Err(error) => {
             if let Some(refusal) = error.downcast_ref::<pa_core::models::ModelAllowlistRefusal>() {
                 this.model_refusal_telemetry.note_refused(
@@ -55,8 +144,61 @@ async fn resolve_child_model_allowlisted(
     }
 }
 
+async fn resolve_child_service_tier(
+    this: &SupervisorChildSessionsInner,
+    requested: Option<pa_types::ai::ServiceTier>,
+    identity: &super::ParentIdentity,
+    model: &str,
+) -> Result<Option<pa_types::ai::ServiceTier>> {
+    let cwd = identity.cwd.clone().unwrap_or_else(|| "/".into());
+    let agent_dir = this.agent_dir.clone();
+    let model = model.to_string();
+    let inherited = identity.service_tier;
+    tokio::task::spawn_blocking(move || {
+        if let Some(requested) = requested {
+            let settings = pa_core::settings::SettingsManager::create(Path::new(&cwd), &agent_dir);
+            anyhow::ensure!(
+                settings
+                    .get_rlm_allowed_service_tiers()
+                    .contains(&requested),
+                "rlm.spawn service_tier {} is not allowed by rlmAllowedServiceTiers",
+                serde_json::to_value(requested)?
+                    .as_str()
+                    .unwrap_or_default()
+            );
+        }
+        let tier = requested.or(inherited);
+        if tier != Some(pa_types::ai::ServiceTier::Priority) {
+            return Ok(tier);
+        }
+        let registry = crate::state_getters::worker_model_registry(&agent_dir);
+        let supported = registry
+            .get_all()
+            .iter()
+            .find(|candidate| {
+                format!("{}/{}", candidate.provider, candidate.id).eq_ignore_ascii_case(&model)
+            })
+            .is_some_and(pa_types::ai::supports_fast_mode);
+        Ok(Some(if supported {
+            pa_types::ai::ServiceTier::Priority
+        } else {
+            pa_types::ai::ServiceTier::Default
+        }))
+    })
+    .await
+    .context("the child service tier load task failed")?
+}
+
 impl RlmSubagentHost for SupervisorChildSessions {
     fn spawn(&self, request: RlmSpawnRequest) -> RlmHostFuture<RlmSpawnHandle> {
+        self.spawn_with_service_tier(request, None)
+    }
+
+    fn spawn_with_service_tier(
+        &self,
+        request: RlmSpawnRequest,
+        service_tier: Option<pa_types::ai::ServiceTier>,
+    ) -> RlmHostFuture<RlmSpawnHandle> {
         let this = Arc::clone(&self.inner);
         Box::pin(async move {
             let identity = this.identity.lock().expect("identity lock").clone();
@@ -95,15 +237,28 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let admission = async {
                 this.assert_name_available(&name, identity.rlm_depth + 1)
                     .await?;
-                let model = resolve_child_model_allowlisted(
-                    &this,
-                    request.model.as_deref(),
-                    "spawn",
-                    "subagent",
-                )
-                .await?;
-                assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
-                let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
+                let (model, candidate_thinking, ordered_candidates) =
+                    resolve_child_model_allowlisted(
+                        &this,
+                        request.model.as_deref(),
+                        "spawn",
+                        "subagent",
+                    )
+                    .await?;
+                let tier =
+                    resolve_child_service_tier(&this, service_tier, &identity, &model).await?;
+                let thinking = request
+                    .thinking
+                    .as_deref()
+                    .or(candidate_thinking.as_deref())
+                    .or_else(|| {
+                        (!model.starts_with("claude-code/"))
+                            .then_some(identity.thinking.as_deref())
+                            .flatten()
+                    });
+                if request.thinking.is_some() || candidate_thinking.is_none() {
+                    assert_thinking_supported(&this.agent_dir, thinking, &model)?;
+                }
                 let child_dir = this.child_session_dir(&child_id, &identity)?;
                 let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
                 let runtime_metadata = json!({
@@ -112,6 +267,8 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     "parentActiveSessionId": this.parent_active_session_id,
                     "rlmDepth": identity.rlm_depth + 1,
                     "createdAt": now_ms(),
+                    "rlmModelCandidates": ordered_candidates,
+                    "serviceTier": tier,
                 });
                 let created = this
                     .create_child(
@@ -241,14 +398,13 @@ impl RlmSubagentHost for SupervisorChildSessions {
             if identity.rlm_depth != 0 {
                 bail!("rlm.create_session is available only from a depth-0 session");
             }
-            let model = resolve_child_model_allowlisted(
+            let (model, candidate_thinking, ordered_candidates) = resolve_child_model_allowlisted(
                 &this,
                 request.model.as_deref(),
                 "create_session",
                 "top-level session",
             )
             .await?;
-            assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
             // A depth-0 resident session is created exactly like a client
             // `create`: the shared sessions dir and the requested cwd
             // (TS `resolve(this._cwd, rawCwd)`), no per-child artifacts dir.
@@ -260,7 +416,14 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let sessions_dir = crate::paths::sessions_dir(&this.agent_dir)?;
             std::fs::create_dir_all(&sessions_dir)
                 .with_context(|| format!("create sessions dir {}", sessions_dir.display()))?;
-            let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
+            let thinking = request
+                .thinking
+                .as_deref()
+                .or(candidate_thinking.as_deref())
+                .or(identity.thinking.as_deref());
+            if request.thinking.is_some() || candidate_thinking.is_none() {
+                assert_thinking_supported(&this.agent_dir, thinking, &model)?;
+            }
             let created = this
                 .launch_child(
                     "root",
@@ -271,7 +434,8 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     thinking,
                     &cwd.to_string_lossy(),
                     &sessions_dir,
-                    None,
+                    (!ordered_candidates.is_empty())
+                        .then(|| json!({"rlmModelCandidates":ordered_candidates})),
                     &identity,
                 )
                 .await?;
@@ -532,4 +696,143 @@ fn session_file_carries_prompt(session_file: Option<&str>, prompt: &str) -> bool
             }),
             _ => false,
         })
+}
+
+#[cfg(test)]
+mod model_selection_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn service_tiers_inherit_and_overrides_obey_the_allowlist_and_priority_clamp() {
+        use pa_types::ai::ServiceTier;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SupervisorChildSessions::new(
+            Arc::new(crate::supervisor_link::SupervisorLink::new(
+                dir.path().join("absent.sock"),
+            )),
+            dir.path().into(),
+            "parent".into(),
+            Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                dir.path().into(),
+                true,
+            )),
+        );
+        let identity = super::super::ParentIdentity {
+            cwd: Some(dir.path().to_string_lossy().into_owned()),
+            service_tier: Some(ServiceTier::Flex),
+            ..super::super::ParentIdentity::with_default_depth()
+        };
+        assert_eq!(
+            resolve_child_service_tier(&sessions.inner, None, &identity, "claude-code/sonnet")
+                .await
+                .unwrap(),
+            Some(ServiceTier::Flex)
+        );
+        assert!(resolve_child_service_tier(
+            &sessions.inner,
+            Some(ServiceTier::Priority),
+            &identity,
+            "claude-code/sonnet"
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("not allowed"));
+        std::fs::write(
+            dir.path().join("settings.json"),
+            json!({"rlmAllowedServiceTiers":["priority", "default"]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_child_service_tier(
+                &sessions.inner,
+                Some(ServiceTier::Priority),
+                &identity,
+                "claude-code/sonnet"
+            )
+            .await
+            .unwrap(),
+            Some(ServiceTier::Default)
+        );
+        assert_eq!(
+            resolve_child_service_tier(
+                &sessions.inner,
+                Some(ServiceTier::Default),
+                &identity,
+                "claude-code/sonnet"
+            )
+            .await
+            .unwrap(),
+            Some(ServiceTier::Default)
+        );
+    }
+
+    #[tokio::test]
+    async fn task_roles_and_claude_effort_are_resolved_before_child_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            json!({
+                "claudeCode":{"executable":"/configured/claude"},
+                "modelRoles":{"task":["claude-code/sonnet:high", "claude-code/opus:max"]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let sessions = SupervisorChildSessions::new(
+            Arc::new(crate::supervisor_link::SupervisorLink::new(
+                dir.path().join("absent.sock"),
+            )),
+            dir.path().into(),
+            "parent".into(),
+            Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                dir.path().into(),
+                true,
+            )),
+        );
+        sessions.set_identity(super::super::ParentIdentity {
+            model: Some("mock/model".into()),
+            cwd: Some(dir.path().to_string_lossy().into_owned()),
+            ..super::super::ParentIdentity::with_default_depth()
+        });
+        for reference in [None, Some("@task"), Some("claude-code/sonnet:high")] {
+            let selection =
+                resolve_child_model_allowlisted(&sessions.inner, reference, "spawn", "subagent")
+                    .await
+                    .unwrap();
+            assert_eq!(
+                selection,
+                ("claude-code/sonnet".into(), Some("high".into()), Vec::new())
+            );
+        }
+        assert!(resolve_child_model_allowlisted(
+            &sessions.inner,
+            Some("@missing"),
+            "spawn",
+            "subagent"
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Unknown RLM model role"));
+        assert!(resolve_child_model_allowlisted(
+            &sessions.inner,
+            Some("claude-code/sonnet"),
+            "create_session",
+            "top-level session"
+        )
+        .await
+        .is_err());
+        std::fs::write(dir.path().join("settings.json"), "{}").unwrap();
+        assert!(resolve_child_model_allowlisted(
+            &sessions.inner,
+            Some("claude-code/sonnet"),
+            "spawn",
+            "subagent"
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("no configured Claude Code executable"));
+    }
 }

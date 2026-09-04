@@ -209,6 +209,8 @@ pub fn acp_updates_for_event(
                 tool_name
             };
             vec![AcpSessionUpdate::ToolCall {
+                content: None,
+                meta: None,
                 tool_call_id: tool_call_id.clone(),
                 title: title.to_string(),
                 kind: AcpToolKind::of_tool(tool_name),
@@ -306,6 +308,8 @@ pub fn acp_updates_for_event(
         AcpEngineEvent::BashStart { command, run_id } => {
             state.active_bash_run_id.clone_from(run_id);
             vec![AcpSessionUpdate::ToolCall {
+                content: None,
+                meta: None,
                 tool_call_id: bash_tool_call_id(run_id.clone()),
                 title: command.clone(),
                 kind: AcpToolKind::Execute,

@@ -15,15 +15,25 @@ use super::events::{AcpToolKind, AcpToolStatus, IPYTHON_TOOL_NAME};
 use super::meta::{prime_agent_meta, PrimeAgentCompactionMeta, PrimeAgentSessionMeta};
 use super::types::{AcpSessionUpdate, TextBlock};
 
+mod act;
+
 /// Correlates streamed chunks with their owning assistant message (the
 /// daemon stream carries the delta on `assistantMessageEvent`).
 #[derive(Debug, Default)]
 pub struct WireMappingState {
     next_assistant_message_sequence: u64,
     active_assistant_message_id: Option<String>,
+    acts: act::ActMappingState,
+    act_projection_enabled: bool,
 }
 
 impl WireMappingState {
+    pub(super) fn with_act_projection(enabled: bool) -> Self {
+        Self {
+            act_projection_enabled: enabled,
+            ..Self::default()
+        }
+    }
     fn start_assistant_message(&mut self) -> String {
         self.next_assistant_message_sequence += 1;
         let id = format!(
@@ -73,6 +83,7 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
         .and_then(Value::as_str)
         .unwrap_or_default();
     match event_type {
+        "act_event" if state.act_projection_enabled => state.acts.updates(event),
         "message_start" => {
             if event
                 .get("message")
@@ -151,6 +162,8 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
                 tool_name.clone()
             };
             vec![AcpSessionUpdate::ToolCall {
+                content: None,
+                meta: None,
                 tool_call_id,
                 title,
                 kind: AcpToolKind::of_tool(&tool_name),

@@ -290,6 +290,7 @@ fn user_prompt_message(text: &str, images: &[pa_agent::types::ImageContent]) -> 
         pa_agent::types::UserMessage {
             content: pa_agent::types::UserContent::Parts(parts),
             timestamp: now_millis() as i64,
+            rest: serde_json::Map::default(),
         },
     ))
 }

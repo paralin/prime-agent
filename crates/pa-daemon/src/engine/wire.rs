@@ -143,7 +143,11 @@ pub enum EngineEvent {
     /// `compaction` record to persist (null when the run skipped or
     /// failed), `event` the complete client-facing event (result on
     /// success, errorMessage with its severity otherwise).
-    Compaction { entry: Value, event: Value },
+    Compaction {
+        entry: Value,
+        event: Value,
+        continuation: Option<Value>,
+    },
     /// The prompt completed (successfully or not).
     Done(std::result::Result<(), String>),
     /// The prompt settled as aborted: the run was aborted before an
@@ -361,6 +365,8 @@ pub struct CompactionRequest {
 /// response, mirroring the TS `CompactionResult`/entry split).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionRun {
+    /// The scratch continuation to persist with the compaction boundary.
+    pub continuation: Option<Value>,
     /// TS `CompactionResult`: summary, firstKeptEntryId, tokensBefore,
     /// details.
     pub result: Value,

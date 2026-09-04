@@ -382,6 +382,15 @@ impl WindowedSessionStore {
             }
             let on_path = expected.as_deref() == Some(id);
             if on_path {
+                if window_done && matches!(meta.kind.as_str(), "act_start" | "act_terminal") {
+                    metadata_entries.push(text.to_owned());
+                    if meta.kind == "act_terminal" {
+                        let value: serde_json::Value = serde_json::from_str(text)?;
+                        if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+                            older_usage.push((id.to_owned(), OlderPathUsage::from_usage(usage)));
+                        }
+                    }
+                }
                 if window_done && meta.kind == "message" {
                     if let Some(message) = &meta.message {
                         older_path_stats.total_messages += 1;
@@ -518,10 +527,23 @@ impl WindowedSessionStore {
         let retained_ids: HashSet<&str> = retained.iter().filter_map(FileEntry::id).collect();
         let mut latest = std::collections::HashMap::new();
         let mut keep = HashSet::new();
+        let mut latest_acts = HashMap::new();
+        let mut act_terminals = HashMap::new();
         for (index, row) in metadata_entries.iter().enumerate() {
             let value: serde_json::Value = serde_json::from_str(row)?;
             let kind = value["type"].as_str().unwrap_or("");
             match kind {
+                "act_start" => {
+                    let depth = value["depth"].as_u64().unwrap_or(1);
+                    if let Some(id) = value["actId"].as_str() {
+                        latest_acts.insert(depth, (id.to_owned(), index));
+                    }
+                }
+                "act_terminal" => {
+                    if let Some(id) = value["actId"].as_str() {
+                        act_terminals.insert(id.to_owned(), index);
+                    }
+                }
                 "session_info" | "session_state" | "git_state" => {
                     latest.insert(kind.to_owned(), index);
                 }
@@ -547,6 +569,12 @@ impl WindowedSessionStore {
             }
         }
         keep.extend(latest.into_values());
+        for (id, start) in latest_acts.into_values() {
+            keep.insert(start);
+            if let Some(terminal) = act_terminals.get(&id) {
+                keep.insert(*terminal);
+            }
+        }
         metadata_entries = metadata_entries
             .into_iter()
             .enumerate()
@@ -1041,3 +1069,6 @@ pub(super) fn update_snapshot(snapshot: &mut Snapshot, entry: &FileEntry) {
 #[cfg(test)]
 #[path = "window_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod act_tests;

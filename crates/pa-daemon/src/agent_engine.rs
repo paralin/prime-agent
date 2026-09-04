@@ -51,6 +51,7 @@ pub(crate) mod tests;
 #[cfg(test)]
 pub(crate) use tests::FAUX_TEST_LOCK;
 
+mod claude_code;
 mod goalcore;
 mod lifecycle;
 mod turn_types;
@@ -141,8 +142,16 @@ pub(crate) const QUOTA_WAKE_MAX_RETRIES: u32 = 3;
 pub(crate) type SettledKernelRelease =
     std::sync::Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
+#[derive(Default)]
+struct RoleCandidateState {
+    selectors: Vec<String>,
+    current_index: Option<usize>,
+    stale_sources: Vec<pa_core::auth::AuthSourceToken>,
+}
+
 /// A [`SessionEngine`] running real agent turns.
 pub struct AgentSessionEngine {
+    claude_query: std::sync::Mutex<Option<claude_code::ClaudeQuery>>,
     pub(crate) runtime: crate::async_safe_runtime::AsyncSafeRuntime,
     pub(crate) config: AgentEngineConfig,
     /// The session-scoped ACP MCP store (TS `session._mcpManager`): shared
@@ -297,6 +306,7 @@ pub struct AgentSessionEngine {
     /// during a live turn stay side-effect-free.
     effective_thinking: std::sync::RwLock<Option<pa_types::ai::ModelThinkingLevel>>,
     pub(crate) service_tier: std::sync::RwLock<Option<pa_types::ai::ServiceTier>>,
+    role_candidate_state: std::sync::Mutex<RoleCandidateState>,
     /// Built once on the first prompt, reused across prompts, shared
     /// behind an Arc: a running model turn (the admission in
     /// `run_turn_once`), a compaction summarizer, and a refinement run
@@ -347,6 +357,24 @@ pub struct AgentSessionEngine {
     /// pump (tests, headless embeds): no streaming, no deltas.
     compaction_summary_sink:
         std::sync::Mutex<Option<pa_core::session_engine::compaction_exec::SummaryDeltaSink>>,
+    pub(crate) act_record_sink:
+        std::sync::Mutex<Option<pa_core::session_engine::act_runtime::ActRecordSink>>,
+    pub(crate) act_runtime:
+        std::sync::Mutex<Option<std::sync::Weak<pa_core::session_engine::act_runtime::ActRuntime>>>,
+    pub(crate) act_event_sink:
+        std::sync::Mutex<Option<pa_core::session_engine::act_runtime::projection::ActEventSink>>,
+    pub(crate) external_events: std::sync::Mutex<
+        std::sync::Arc<pa_core::session_engine::external_events::ExternalEventRuntime>,
+    >,
+    pub(crate) external_event_emit:
+        std::sync::Mutex<Option<pa_core::session_engine::external_events::ExternalEventEmit>>,
+    pub(crate) external_watch_sink:
+        std::sync::Mutex<Option<pa_core::session_engine::external_events::ExternalEventWatchSink>>,
+    pub(crate) nudge_admission:
+        std::sync::Mutex<Option<pa_core::session_engine::tool_error_nudge::NudgeAdmissionSink>>,
+    pub(crate) mailbox_provider: std::sync::Mutex<
+        Option<pa_core::session_engine::agent_messaging::mailbox::runtime::MailboxProvider>,
+    >,
     /// The attribution producer the children registry's sink last got:
     /// the session's live children outlive an engine rebuild, and their
     /// spawn registrations live on the producer of the build that

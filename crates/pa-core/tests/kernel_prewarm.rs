@@ -85,6 +85,7 @@ fn faux_session(responses: Vec<String>) -> FauxSession {
                 id: "faux-1".to_string(),
                 name: Some("Faux".to_string()),
                 reasoning: Some(false),
+                thinking_level_map: None,
                 input: Some(vec![pa_types::ai::ModelInput::Text]),
                 cost: None,
                 context_window: Some(100_000),

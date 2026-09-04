@@ -162,6 +162,10 @@ pub enum AcpSessionUpdate {
         status: AcpToolStatus,
         #[serde(rename = "rawInput")]
         raw_input: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<Vec<ToolCallContent>>,
+        #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     /// A tool call progressed or finished.
     #[serde(rename = "tool_call_update")]
@@ -514,6 +518,8 @@ mod tests {
             kind: AcpToolKind::Execute,
             status: AcpToolStatus::InProgress,
             raw_input: json!({ "code": "1+1" }),
+            content: None,
+            meta: None,
         };
         let value = call.to_bare_value();
         assert_eq!(value["sessionUpdate"], "tool_call");

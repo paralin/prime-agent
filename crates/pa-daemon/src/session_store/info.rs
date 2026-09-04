@@ -765,6 +765,7 @@ pub(super) fn fold_scan_entry(acc: &mut SessionScanAccumulator, raw: &str) -> Op
             acc.usage_scan
                 .fold_summarization(entry.usage.map(Usage::from));
         }
+        "act_terminal" => acc.usage_scan.fold_act(entry.usage.map(Usage::from)),
         "message" => {
             acc.message_count += 1;
             if let Some(message) = entry.message {

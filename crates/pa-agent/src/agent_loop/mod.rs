@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use crate::abort::AbortSignal;
 use crate::types::{
-    AfterToolCallContext, AfterToolCallResult, AgentEvent, AgentMessage, BeforeToolCallContext,
-    BeforeToolCallResult, GetContinuationMessagesContext, Message, Model,
+    AfterToolCallContext, AfterToolCallResult, AgentEvent, AgentMessage, AssistantMessage,
+    BeforeToolCallContext, BeforeToolCallResult, GetContinuationMessagesContext, Message, Model,
     ShouldStopAfterTurnContext, ThinkingLevel, ToolExecutionMode,
 };
 
@@ -51,6 +51,10 @@ pub type TransformContextFn = Arc<
         + Send
         + Sync,
 >;
+
+/// Filters completed responses before context insertion and persistence events.
+pub type FilterAssistantMessageFn =
+    Arc<dyn Fn(AssistantMessage) -> anyhow::Result<Option<AssistantMessage>> + Send + Sync>;
 
 /// Resolves the system prompt immediately before each LLM call.
 pub type GetSystemPromptFn = Arc<dyn Fn() -> String + Send + Sync>;
@@ -129,6 +133,7 @@ pub struct AgentLoopConfig {
     pub service_tier: Option<crate::types::ServiceTier>,
     pub convert_to_llm: ConvertToLlmFn,
     pub transform_context: Option<TransformContextFn>,
+    pub filter_assistant_message: Option<FilterAssistantMessageFn>,
     pub get_system_prompt: Option<GetSystemPromptFn>,
     pub get_api_key: Option<GetApiKeyFn>,
     pub should_stop_after_turn: Option<ShouldStopAfterTurnFn>,
@@ -159,6 +164,7 @@ impl AgentLoopConfig {
             service_tier: None,
             convert_to_llm,
             transform_context: None,
+            filter_assistant_message: None,
             get_system_prompt: None,
             get_api_key: None,
             should_stop_after_turn: None,

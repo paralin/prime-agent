@@ -823,6 +823,10 @@ pub fn stream_simple_openai_codex_responses(
 pub struct OpenAICodexResponsesProvider;
 
 impl Provider for OpenAICodexResponsesProvider {
+    fn supports_native_compaction(&self) -> bool {
+        true
+    }
+
     fn compact<'a>(
         &'a self,
         model: &'a Model,

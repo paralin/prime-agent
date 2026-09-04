@@ -126,6 +126,11 @@ pub(crate) fn compute_own_and_total_usage(
             }
         }
     }
+    for entry in branch.iter().filter(|entry| entry.type_ == "act_terminal") {
+        if let Some(usage) = entry.fields.get("usage") {
+            add_usage(&mut total, usage);
+        }
+    }
     (own, total)
 }
 
@@ -320,6 +325,24 @@ pub(crate) fn compute_own_usage_by_model(
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    #[test]
+    fn act_spend_is_in_total_usage_and_outside_root_own_model_buckets() {
+        let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+        store.persist_entry("message",json!({"message":{"role":"assistant","provider":"faux","model":"root","content":[],"usage":{"input":10,"output":0,"totalTokens":10,"cost":{"total":0.25}}}})).unwrap();
+        store.persist_entry("act_terminal",json!({"actId":"act","depth":1,"status":"done","model":{"provider":"faux","id":"act-model"},"usage":{"input":7,"output":3,"totalTokens":10,"cost":{"total":0.5}}})).unwrap();
+        let branch = store.branch_bridged();
+        let (own, total) = compute_own_and_total_usage(&branch, store.entries());
+        assert_eq!(own["input"], 10);
+        assert_eq!(own["cost"]["total"], 0.25);
+        assert_eq!(total["input"], 17);
+        assert_eq!(total["output"], 3);
+        assert_eq!(total["cost"]["total"], 0.75);
+        let buckets = compute_own_usage_by_model(&branch, store.entries(), &own, None).unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0]["id"], "root");
+        assert_eq!(buckets[0]["ownUsage"], own);
+    }
 
     /// The own/total split (TS `computeOwnAndTotalUsage`): attributions
     /// subtract from own usage only, matched by target across every entry.

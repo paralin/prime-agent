@@ -30,6 +30,7 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "fireworks" => "accounts/fireworks/models/kimi-k2p6",
         "kimi-coding" => "kimi-for-coding",
         "runinfra" => "deepseek-v4-flash",
+        "venice" => "stealth-ox-alpha",
         "cloudflare-workers-ai" => "@cf/moonshotai/kimi-k2.6",
         "cloudflare-ai-gateway" => "claude-sonnet-4.5",
         "xiaomi" | "xiaomi-token-plan-cn" | "xiaomi-token-plan-ams" | "xiaomi-token-plan-sgp" => {
@@ -188,7 +189,14 @@ pub fn find_preferred_default_model(available_models: &[Model]) -> Option<&Model
     }
     available_models
         .iter()
+        .filter(|model| model.provider != "venice")
         .find(|model| default_model_per_provider(&model.provider).is_some_and(|id| model.id == id))
+        .or_else(|| {
+            available_models.iter().find(|model| {
+                model.provider == "venice"
+                    && default_model_per_provider("venice").is_some_and(|id| model.id == id)
+            })
+        })
 }
 
 fn is_valid_thinking_level(value: &str) -> bool {
@@ -656,6 +664,31 @@ mod tests {
             model("prime-inference", "z-ai/glm-5.3", "GLM"),
             model("openrouter", "openai/gpt-4o", "GPT-4o"),
         ]
+    }
+
+    #[test]
+    fn venice_is_the_last_default_provider() {
+        let mut venice = pa_ai::fork_catalog::get_models("venice")
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone();
+        venice.id = default_model_per_provider("venice").unwrap().into();
+        let other = pa_ai::fork_catalog::get_model("runinfra", "deepseek-v4-flash")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            find_preferred_default_model(&[venice.clone()])
+                .unwrap()
+                .provider,
+            "venice"
+        );
+        assert_eq!(
+            find_preferred_default_model(&[venice, other])
+                .unwrap()
+                .provider,
+            "runinfra"
+        );
     }
 
     #[test]

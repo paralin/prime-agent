@@ -20,7 +20,10 @@ mod openrouter_responses;
 
 #[cfg(test)]
 mod runinfra_tests;
+
 pub mod simple_options;
 #[cfg(test)]
 mod test_http;
 pub mod transform_messages;
+#[cfg(test)]
+mod venice_tests;

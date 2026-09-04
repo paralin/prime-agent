@@ -31,6 +31,10 @@ mod tests;
 // child's bare calls into the facade's candidate/staleness machinery
 // resolve through the use-super glob (the descendant visibility rule).
 mod lookup;
+mod runtime_chain;
+pub use runtime_chain::{
+    CodexHomeAuthResult, RuntimeApiKeyChainCredential, RuntimeApiKeyChainState,
+};
 
 // The Prime Inference credential writes (update_prime_inference_credential,
 // set_prime_inference_api_key, set_prime_inference_team_selection,
@@ -263,6 +267,7 @@ pub struct AuthStorage {
     env_credentials: Arc<dyn EnvCredentialSource>,
     data: AuthStorageData,
     runtime_overrides: HashMap<String, String>,
+    runtime_chain: Arc<RuntimeApiKeyChainState>,
     stale_auth_sources: HashMap<String, Vec<AuthSourceToken>>,
     fallback_resolver: Option<FallbackResolver>,
     load_error: Option<String>,
@@ -287,6 +292,7 @@ impl AuthStorage {
             env_credentials: Arc::new(ProcessEnvCredentials),
             data: AuthStorageData::default(),
             runtime_overrides: HashMap::new(),
+            runtime_chain: Arc::new(RuntimeApiKeyChainState::default()),
             stale_auth_sources: HashMap::new(),
             fallback_resolver: None,
             load_error: None,
@@ -318,7 +324,18 @@ impl AuthStorage {
         let backend: Arc<dyn AuthStorageBackend> = Arc::new(
             super::storage::FileAuthStorageBackend::new(agent_dir.as_ref().join("auth.json")),
         );
-        Self::from_storage(backend, oauth)
+        let mut auth = Self::from_storage(backend, oauth);
+        auth.set_runtime_api_key_chain_state(runtime_chain::shared_chain(agent_dir.as_ref()));
+        let settings = crate::settings::SettingsManager::create(".", agent_dir.as_ref());
+        match settings.get_codex_homes() {
+            Ok(homes) => {
+                if let Err(error) = auth.apply_codex_homes(&homes) {
+                    auth.errors.push(error.to_string());
+                }
+            }
+            Err(error) => auth.errors.push(error.to_string()),
+        }
+        auth
     }
 
     pub fn in_memory(data: &AuthStorageData, oauth: Arc<dyn OAuthIntegration>) -> Self {
@@ -365,6 +382,7 @@ impl AuthStorage {
             env_credentials,
             data: AuthStorageData::default(),
             runtime_overrides: HashMap::new(),
+            runtime_chain: Arc::new(RuntimeApiKeyChainState::default()),
             stale_auth_sources: HashMap::new(),
             fallback_resolver: None,
             load_error: None,
@@ -505,7 +523,13 @@ impl AuthStorage {
     }
 
     fn stored_candidate(&self, provider: &str) -> Option<AuthSourceCandidate> {
-        let credential = self.data.credential(provider)?;
+        let data = self
+            .storage
+            .read()
+            .ok()
+            .and_then(|content| parse_storage_data(content.as_deref()).ok())
+            .unwrap_or_else(|| self.data.clone());
+        let credential = data.credential(provider)?;
         let value_material = self.stored_value_material(&credential);
         // The key is the hashed material itself (TS #2479: keyed by
         // credential fields, never object identity, so the key
@@ -598,6 +622,15 @@ impl AuthStorage {
         provider: &str,
         include_fallback: bool,
     ) -> Vec<AuthSourceCandidate> {
+        if self.runtime_chain.has_chain(provider) {
+            let mut candidates: Vec<_> = self.runtime_candidate(provider).into_iter().collect();
+            candidates.extend(
+                self.runtime_chain_candidates(provider)
+                    .into_iter()
+                    .map(|(_, candidate)| candidate),
+            );
+            return candidates;
+        }
         let fallback = include_fallback
             .then(|| self.fallback_candidate(provider))
             .flatten();
@@ -641,6 +674,10 @@ impl AuthStorage {
     }
 
     fn is_stale(&self, provider: &str, candidate: &AuthSourceCandidate) -> bool {
+        if candidate.source == AuthSource::RuntimeChain {
+            return Self::token_for(provider, candidate)
+                .is_some_and(|token| self.runtime_chain.is_stale(&token));
+        }
         let matching = self.matching_stale(provider, candidate);
         if matching.is_empty() {
             return false;
@@ -731,6 +768,9 @@ impl AuthStorage {
         if token.provider.is_empty() {
             return false;
         }
+        if token.source == AuthSource::RuntimeChain {
+            return self.runtime_chain.mark_stale(token);
+        }
         let stale = self
             .stale_auth_sources
             .entry(token.provider.clone())
@@ -744,6 +784,7 @@ impl AuthStorage {
     /// Forget every stale marking for a provider.
     pub fn clear_auth_stale(&mut self, provider: &str) {
         self.stale_auth_sources.remove(provider);
+        self.runtime_chain.clear_stale(provider);
     }
 
     fn clear_stale_auth_source(&mut self, provider: &str, source: AuthSource) {

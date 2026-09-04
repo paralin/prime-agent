@@ -16,6 +16,7 @@ impl AuthStorage {
         provider_id: &str,
         include_fallback: bool,
     ) -> AuthApiKeyResult {
+        self.reload();
         // 1. Runtime override.
         if let Some(candidate) = self.runtime_candidate(provider_id) {
             if !self.is_stale(provider_id, &candidate) {
@@ -27,6 +28,19 @@ impl AuthStorage {
                     };
                 }
             }
+        }
+
+        if self.runtime_chain.has_chain(provider_id) {
+            for (credential, candidate) in self.runtime_chain_candidates(provider_id) {
+                if !self.is_stale(provider_id, &candidate) {
+                    return AuthApiKeyResult {
+                        api_key: Some(credential.key),
+                        source_token: Self::token_for(provider_id, &candidate),
+                        credential_type: Some("api_key"),
+                    };
+                }
+            }
+            return AuthApiKeyResult::default();
         }
 
         let env_key = self.env_credentials.api_key(provider_id);

@@ -211,6 +211,7 @@ impl AgentSessionEngine {
                         if !first {
                             drop_trailing_assistant(&agent).await;
                         }
+                        self.refresh_codex_home_target()?;
                         match self
                             .run_turn_once(
                                 &agent,
@@ -229,6 +230,7 @@ impl AgentSessionEngine {
                                 // and renders it like any outcome); this
                                 // arm only carries the final message to the
                                 // retry classifier.
+                                self.rotate_exhausted_codex_home(&assistant);
                                 Ok(*assistant)
                             }
                             Ok(TurnOnce::None) => Err(anyhow::anyhow!("No response produced.")),
@@ -414,5 +416,126 @@ impl AgentSessionEngine {
                 assistant: None,
             },
         }
+    }
+}
+
+impl AgentSessionEngine {
+    fn refresh_codex_home_target(&self) -> anyhow::Result<()> {
+        if self.current_selection().api_key.is_some() {
+            return Ok(());
+        }
+        let served = self
+            .provider_target
+            .read()
+            .expect("provider target lock")
+            .clone();
+        let Some(served) = served.filter(|target| target.model.provider == "openai-codex") else {
+            return Ok(());
+        };
+        let mut auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
+        if !auth.has_runtime_api_key_chain("openai-codex") {
+            return Ok(());
+        }
+        let key = auth.get_api_key("openai-codex").ok_or_else(|| anyhow::anyhow!("Configured Codex home credentials are exhausted. Sign in again or update codexHomes."))?;
+        let mut target = self.provider_target.write().expect("provider target lock");
+        if let Some(target) = target
+            .as_mut()
+            .filter(|target| target.model.provider == served.model.provider)
+        {
+            target.api_key = Some(key);
+        }
+        Ok(())
+    }
+
+    fn rotate_exhausted_codex_home(&self, message: &pa_agent::types::AssistantMessage) {
+        if !codex_home_exhausted(message) {
+            return;
+        }
+        if self.current_selection().api_key.is_some() {
+            return;
+        }
+        let served = self
+            .provider_target
+            .read()
+            .expect("provider target lock")
+            .clone();
+        let Some(served) = served.filter(|target| target.model.provider == message.provider) else {
+            return;
+        };
+        let Some(key) = served.api_key.as_deref() else {
+            return;
+        };
+        let mut auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
+        if !auth.mark_runtime_api_key_chain_stale(&message.provider, key) {
+            return;
+        }
+        let next_key = auth.get_api_key(&message.provider);
+        let mut target = self.provider_target.write().expect("provider target lock");
+        if let Some(target) = target.as_mut().filter(|target| {
+            target.model.provider == message.provider && target.api_key.as_deref() == Some(key)
+        }) {
+            target.api_key = next_key;
+        }
+    }
+}
+
+fn codex_home_exhausted(message: &pa_agent::types::AssistantMessage) -> bool {
+    if message.provider != "openai-codex" || message.stop_reason != StopReason::Error {
+        return false;
+    }
+    let error_type = message
+        .diagnostics
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter(|diagnostic| diagnostic.kind == "provider_stream_failure")
+        .find_map(|diagnostic| {
+            diagnostic
+                .details
+                .as_ref()?
+                .get("providerErrorType")?
+                .as_str()
+        });
+    let exhausted = error_type.map_or_else(
+        || {
+            message
+                .error_message
+                .as_deref()
+                .is_some_and(|error| error.to_ascii_lowercase().contains("chatgpt usage limit"))
+        },
+        |kind| matches!(kind, "usage_limit_reached" | "usage_not_included"),
+    );
+    exhausted
+}
+
+#[cfg(test)]
+mod codex_home_tests {
+    use super::codex_home_exhausted;
+
+    fn failure(error_type: Option<&str>) -> pa_agent::types::AssistantMessage {
+        let mut value = serde_json::json!({
+            "role": "assistant", "content": [], "api": "openai-codex-responses",
+            "provider": "openai-codex", "model": "gpt-5", "usage": {},
+            "stopReason": "error", "timestamp": 0,
+            "errorMessage": "You have hit your ChatGPT usage limit. Try again later."
+        });
+        if let Some(kind) = error_type {
+            value["diagnostics"] = serde_json::json!([{
+                "type": "provider_stream_failure", "timestamp": 0,
+                "details": {"kind": "rate_limit", "providerErrorType": kind, "status": 429}
+            }]);
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn usage_exhaustion_rotates_but_transient_429_does_not() {
+        assert!(codex_home_exhausted(&failure(Some("usage_limit_reached"))));
+        assert!(codex_home_exhausted(&failure(Some("usage_not_included"))));
+        assert!(!codex_home_exhausted(&failure(Some("rate_limit_exceeded"))));
+        assert!(codex_home_exhausted(&failure(None)));
+        let mut other = failure(None);
+        other.provider = "openai".to_string();
+        assert!(!codex_home_exhausted(&other));
     }
 }

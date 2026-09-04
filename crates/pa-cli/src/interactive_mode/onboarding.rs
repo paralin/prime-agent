@@ -90,7 +90,7 @@ impl StartupModelProbe {
                 || "stored".to_string(),
                 |credential| credential.credential_type().to_string(),
             ),
-            Some(AuthSource::Runtime) => "runtime_api_key".to_string(),
+            Some(AuthSource::Runtime | AuthSource::RuntimeChain) => "runtime_api_key".to_string(),
             Some(AuthSource::Environment) => "environment".to_string(),
             Some(AuthSource::PrimeCli) => "prime_cli".to_string(),
             Some(AuthSource::ModelsJsonKey | AuthSource::ModelsJsonCommand) => {

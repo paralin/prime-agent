@@ -1,0 +1,1 @@
+- Added ordered Codex home credential rotation shared across sessions, with external token reloads and explicit API-key precedence.

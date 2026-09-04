@@ -167,6 +167,7 @@ impl AuthStorageData {
 pub enum AuthSource {
     Stored,
     Runtime,
+    RuntimeChain,
     Environment,
     PrimeCli,
     Fallback,

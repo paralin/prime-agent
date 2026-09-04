@@ -173,6 +173,7 @@ fn api_key_source_label(source: AuthSource, label: Option<&str>) -> String {
         }
         AuthSource::PrimeCli => label.unwrap_or("Prime CLI").to_string(),
         AuthSource::Runtime => "runtime API key".to_string(),
+        AuthSource::RuntimeChain => label.unwrap_or("runtime credential chain").to_string(),
         AuthSource::Fallback => "custom API key".to_string(),
         AuthSource::ModelsJsonKey => "key in models.json".to_string(),
         AuthSource::ModelsJsonCommand => "command in models.json".to_string(),

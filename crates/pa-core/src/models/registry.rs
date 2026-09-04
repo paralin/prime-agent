@@ -260,7 +260,8 @@ impl ModelRegistry {
 
     pub fn has_configured_auth(&self, model: &Model) -> bool {
         self.auth.has_auth(&model.provider)
-            || self.has_configured_provider_request_auth(&model.provider)
+            || (!self.auth.has_runtime_api_key_chain(&model.provider)
+                && self.has_configured_provider_request_auth(&model.provider))
     }
 
     /// The provider's auth status without credential values (TS
@@ -856,7 +857,7 @@ impl ModelRegistry {
             .get_api_key_with_source_token(&model.provider, false);
         let mut api_key = stored.api_key;
         let provider_config = self.provider_request_configs.get(&model.provider).cloned();
-        if api_key.is_none() {
+        if api_key.is_none() && !self.auth.has_runtime_api_key_chain(&model.provider) {
             if let Some(config) = &provider_config {
                 if let Some(configured) = &config.api_key {
                     if let Some(resolved) =

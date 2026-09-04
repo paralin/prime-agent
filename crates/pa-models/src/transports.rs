@@ -18,9 +18,9 @@ use crate::Model;
 #[must_use]
 pub fn compiled_models() -> &'static [Model] {
     static COMPILED: LazyLock<Vec<Model>> = LazyLock::new(|| {
-        let mut models: Vec<Model> = pa_ai::models_generated::get_providers()
+        let mut models: Vec<Model> = pa_ai::fork_catalog::get_providers()
             .into_iter()
-            .flat_map(pa_ai::models_generated::get_models)
+            .flat_map(pa_ai::fork_catalog::get_models)
             .cloned()
             .collect();
         models.shrink_to_fit();

@@ -18,6 +18,7 @@
 #![allow(clippy::large_enum_variant, clippy::result_large_err)]
 
 pub mod env_api_keys;
+pub mod fork_catalog;
 pub mod models;
 pub mod models_generated;
 pub mod oauth;

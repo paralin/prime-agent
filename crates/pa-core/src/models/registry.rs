@@ -507,9 +507,9 @@ impl ModelRegistry {
         };
         let mut result = load_custom_models(
             &content,
-            &|provider| !pa_ai::models_generated::get_models(provider).is_empty(),
+            &|provider| !pa_ai::fork_catalog::get_models(provider).is_empty(),
             &|provider| {
-                pa_ai::models_generated::get_models(provider)
+                pa_ai::fork_catalog::get_models(provider)
                     .first()
                     .map(|model| (model.api.clone(), model.base_url.clone()))
             },

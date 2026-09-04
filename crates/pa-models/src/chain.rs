@@ -221,6 +221,7 @@ impl ModelCatalog {
                 None => self.compiled.as_ref().clone(),
             },
         };
+        let base = pa_ai::fork_catalog::fill_missing_models(base);
         let live = credentials
             .and_then(|credentials| self.prime_inference.get(&credentials.as_inference()));
         match live {
@@ -393,10 +394,22 @@ mod tests {
         let catalog = ModelCatalog::with_bundled_dir(None, Some(dir.path().into()));
         let models = catalog.resolve(None);
         assert_eq!(
-            models.len(),
-            111,
-            "1 pinned bundled entry + 110 offline prime-inference entries"
+            models
+                .iter()
+                .filter(|model| model.provider == "anthropic")
+                .count(),
+            1
         );
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model.provider == "prime-inference")
+                .count(),
+            transports::prime_inference_offline_entries().len()
+        );
+        for provider in ["runinfra", "venice", "merge-gateway"] {
+            assert!(models.iter().any(|model| model.provider == provider));
+        }
         assert!(models.iter().any(|m| m.id == "bundled-a"));
     }
 

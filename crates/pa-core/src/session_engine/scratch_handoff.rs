@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use pa_agent::types::{
-    AgentMessage, ImageContent, Message, TextContent, UserContent, UserMessage, UserPart,
+    AgentMessage, Message, TextContent, UserContent, UserMessage, UserPart,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -176,11 +176,12 @@ fn escape_attribute(text: &str) -> String {
 pub fn build_scratch_handoff_continuation(
     path: &str,
     scratch_text: &str,
-    images: &[ImageContent],
+    history: &HistorySnapshot,
     timestamp: i64,
 ) -> AgentMessage {
-    let mut content: Vec<_> = images.iter().cloned().map(UserPart::Image).collect();
-    content.push(UserPart::Text(TextContent { text:format!("<scratch-handoff-file path=\"{}\">\n{scratch_text}\n</scratch-handoff-file>\n\n{SCRATCH_HANDOFF_CONTINUE_INSTRUCTION}", escape_attribute(path)), text_signature:None }));
+    let mut content: Vec<_> = history.images.iter().cloned().map(UserPart::Image).collect();
+    let history_notice = if history.truncated { "The preceding images are a bounded historical snapshot with omissions, not the complete transcript. Use the Org checkpoint below for current work; consult the conversation log for missing details.\n\n" } else { "" };
+    content.push(UserPart::Text(TextContent { text:format!("{history_notice}<scratch-handoff-file path=\"{}\">\n{scratch_text}\n</scratch-handoff-file>\n\n{SCRATCH_HANDOFF_CONTINUE_INSTRUCTION}", escape_attribute(path)), text_signature:None }));
     AgentMessage::Standard(Message::User(UserMessage {
         content: UserContent::Parts(content),
         timestamp,
@@ -327,7 +328,7 @@ mod tests {
         assert!(history.text.starts_with("prior\n\nUSER\nnext"));
         assert!(has_committed_scratch_handoff(&entries, "agent/work.org"));
         let message =
-            build_scratch_handoff_continuation("a\"<&.org", "* TODO next", &history.images, 7);
+            build_scratch_handoff_continuation("a\"<&.org", "* TODO next", &history, 7);
         let value = serde_json::to_value(message).unwrap();
         assert_eq!(value["content"][0]["type"], "image");
         assert!(value["content"][1]["text"]

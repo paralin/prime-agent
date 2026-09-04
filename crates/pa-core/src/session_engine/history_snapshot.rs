@@ -305,14 +305,7 @@ pub fn build_history_snapshot(
             })
         })
         .collect::<std::io::Result<Vec<_>>>()?;
-    let text = if layout.truncated {
-        truncate(
-            &normalized,
-            MAX_CELLS.min(normalized.encode_utf16().count().saturating_sub(1).max(1)),
-        )
-    } else {
-        normalized
-    };
+    let text = normalized;
     Ok(HistorySnapshot {
         text,
         images,

@@ -106,10 +106,7 @@ pub(crate) async fn execute_scratch_handoff(
             anyhow::anyhow!("Scratch handoff closeout did not produce an assistant response")
         })?;
     anyhow::ensure!(
-        !matches!(
-            final_assistant.stop_reason,
-            StopReason::Error | StopReason::Aborted
-        ),
+        final_assistant.stop_reason == StopReason::Stop,
         "Scratch handoff closeout failed: {}",
         final_assistant
             .error_message
@@ -128,7 +125,7 @@ pub(crate) async fn execute_scratch_handoff(
     let continuation = build_scratch_handoff_continuation(
         &path.display_path,
         &text,
-        &history.images,
+        &history,
         i64::try_from(super::super::now_millis()).unwrap_or(i64::MAX),
     );
     let continuation: pa_types::session::AgentMessage =

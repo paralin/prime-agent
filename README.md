@@ -3,7 +3,7 @@
     <picture>
       <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/40c36e38-c5bd-4c5a-9cb3-f7b902cd155d">
       <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/6414bc9b-126b-41ca-9307-9e982430cde8">
-      <img alt="Prime Intellect" src="https://github.com/user-attachments/assets/6414bc9b-126b-41ca-9307-9e982430cde8" width="312" style="max-width: 100%;">
+      <img alt="Prime Agent" src="https://github.com/user-attachments/assets/6414bc9b-126b-41ca-9307-9e982430cde8" width="312" style="max-width: 100%;">
     </picture>
   </a>
 </p>
@@ -40,7 +40,7 @@ Prime Agent is an open-source coding and research agent for general and long-run
 
 ## Install
 
-Install the latest build with the one-command installer (every push to the `rust` branch publishes a fresh rolling beta; the stable channel ships on release):
+Install the latest build with the one-command installer (every push to the `main` branch publishes a fresh rolling beta; the stable channel ships on release):
 
 ```bash
 curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
@@ -59,6 +59,18 @@ Prime Agent combines a persistent Python control environment with durable harnes
 - **Sessions run in the background:** daemon-backed agents keep running when the terminal disconnects and can be reattached later.
 - **Agents communicate directly:** running agents can exchange messages and orchestrate one another without routing everything through the user.
 - **Long tasks keep moving:** automatic compaction, persistent goals, heartbeats, schedules, autonomous mode, and retained subagents preserve progress across turns and terminal sessions.
+
+## Build from source
+
+```bash
+git clone https://github.com/PrimeIntellect-ai/prime-agent.git
+cd prime-agent
+cargo build --release -p pa-cli
+mkdir -p ~/.local/bin
+ln -sf "$PWD/target/release/prime-agent" ~/.local/bin/prime-agent
+```
+
+Add `~/.local/bin` to `PATH`. The native executable locates its bundled Python runtime independently of the caller's working directory.
 
 ## Getting Started
 

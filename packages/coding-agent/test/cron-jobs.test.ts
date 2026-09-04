@@ -587,19 +587,60 @@ describe("AgentCronJobStore", () => {
 			cwd: "/tmp/project-restored",
 		});
 
-		expect(rebound.map((job) => job.id)).toEqual(expect.arrayContaining([userHeartbeat.id, rlmHeartbeat.id]));
-		expect(store.getHeartbeat("old-active")).toBeUndefined();
+		expect(rebound.map((job) => job.id)).toEqual([userHeartbeat.id]);
+		expect(store.listRlmHeartbeats("old-active")[0]).toMatchObject({
+			id: rlmHeartbeat.id,
+			sessionId: "old-session",
+			sessionFile: "/tmp/session.jsonl",
+		});
+		expect(store.listRlmHeartbeats("new-active")).toEqual([]);
 		expect(store.getHeartbeat("new-active")).toMatchObject({
 			id: userHeartbeat.id,
 			sessionId: "new-session",
 			cwd: "/tmp/project-restored",
 		});
-		expect(store.listRlmHeartbeats("new-active")[0]).toMatchObject({
-			id: rlmHeartbeat.id,
+		expect(store.getHeartbeat("other-active")).toMatchObject({ prompt: "check on a different session" });
+	});
+
+	it("rebinds an RLM heartbeat only on an exact durable-session restore", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const rlmHeartbeat = store.createRlmHeartbeat({
+			activeSessionId: "old-active",
+			sessionId: "old-session",
+			sessionFile: "/tmp/old-session.jsonl",
+			cwd: "/tmp/project",
+			label: "review",
+			scheduleText: "every 10m",
+			prompt: "review the latest output",
+			now: start,
+		});
+
+		store.rebindSessionJobs({
+			activeSessionId: "old-active",
 			sessionId: "new-session",
+			sessionFile: "/tmp/new-session.jsonl",
+			cwd: "/tmp/project",
+		});
+		expect(store.listRlmHeartbeats("old-active")[0]).toMatchObject({
+			id: rlmHeartbeat.id,
+			sessionId: "old-session",
+			sessionFile: "/tmp/old-session.jsonl",
+			cwd: "/tmp/project",
+		});
+
+		const rebound = store.rebindSessionJobs({
+			activeSessionId: "new-active",
+			sessionId: "old-session",
+			sessionFile: "/tmp/old-session.jsonl",
 			cwd: "/tmp/project-restored",
 		});
-		expect(store.getHeartbeat("other-active")).toMatchObject({ prompt: "check on a different session" });
+		expect(rebound.map((job) => job.id)).toEqual([rlmHeartbeat.id]);
+		expect(store.listRlmHeartbeats("new-active")[0]).toMatchObject({
+			id: rlmHeartbeat.id,
+			sessionId: "old-session",
+			sessionFile: "/tmp/old-session.jsonl",
+			cwd: "/tmp/project-restored",
+		});
 	});
 
 	it("moves live session jobs to a replacement session file", () => {
@@ -640,9 +681,8 @@ describe("AgentCronJobStore", () => {
 			cwd: "/tmp/project",
 		});
 
-		expect(rebound.map((job) => job.id)).toEqual(
-			expect.arrayContaining([cronJob.id, userHeartbeat.id, rlmHeartbeat.id]),
-		);
+		expect(rebound.map((job) => job.id)).toEqual(expect.arrayContaining([cronJob.id, userHeartbeat.id]));
+		expect(rebound.map((job) => job.id)).not.toContain(rlmHeartbeat.id);
 		expect(store.list().filter((job) => job.activeSessionId === "active-1")).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({
@@ -655,13 +695,13 @@ describe("AgentCronJobStore", () => {
 					sessionId: "new-session",
 					sessionFile: "/tmp/new-session.jsonl",
 				}),
-				expect.objectContaining({
-					id: rlmHeartbeat.id,
-					sessionId: "new-session",
-					sessionFile: "/tmp/new-session.jsonl",
-				}),
 			]),
 		);
+		expect(store.listRlmHeartbeats("active-1")[0]).toMatchObject({
+			id: rlmHeartbeat.id,
+			sessionId: "old-session",
+			sessionFile: "/tmp/old-session.jsonl",
+		});
 	});
 
 	it("keeps multiple RLM heartbeats separate from the single user heartbeat", () => {

@@ -1,64 +1,24 @@
 /**
- * Global, environment-scoped startup notices (app update, extension updates, tmux setup).
+ * Global, environment-scoped startup notices (tmux setup).
  *
  * These are not tied to any single conversation, so they are surfaced on the agents
- * view rather than appended to a session's chat stream. The checks and styled
- * formatters live here so both the agents view and the interactive fallback render
+ * view rather than appended to a session's chat stream. The check and styled
+ * formatter live here so both the agents view and the interactive fallback render
  * identical wording.
  */
 
 import { spawn } from "node:child_process";
-import { DefaultPackageManager } from "../../core/package-manager.js";
-import type { SettingsManager } from "../../core/settings-manager.js";
-import { checkForNewPiVersion } from "../../utils/version-check.js";
 import { theme } from "../interactive/theme/theme.js";
 
 export interface StartupNotices {
-	/** Newer Prime Agent version available, if any. */
-	newVersion?: string;
-	/** Display names of extensions with available updates. */
-	packageUpdates: string[];
 	/** tmux keyboard setup warning, if the current tmux config is suboptimal. */
 	tmuxWarning?: string;
 }
 
-export interface StartupNoticeCheckOptions {
-	version: string;
-	cwd: string;
-	agentDir: string;
-	settingsManager: SettingsManager;
-}
-
-/** Run every startup check in parallel and collect the results. */
-export async function gatherStartupNotices(options: StartupNoticeCheckOptions): Promise<StartupNotices> {
-	const [newVersion, packageUpdates, tmuxWarning] = await Promise.all([
-		checkForNewPiVersion(options.version),
-		checkForPackageUpdates(options),
-		checkTmuxKeyboardSetup(),
-	]);
-	return { newVersion, packageUpdates, tmuxWarning };
-}
-
-export async function checkForPackageUpdates(options: {
-	cwd: string;
-	agentDir: string;
-	settingsManager: SettingsManager;
-}): Promise<string[]> {
-	if (process.env.PI_OFFLINE) {
-		return [];
-	}
-
-	try {
-		const packageManager = new DefaultPackageManager({
-			cwd: options.cwd,
-			agentDir: options.agentDir,
-			settingsManager: options.settingsManager,
-		});
-		const updates = await packageManager.checkForAvailableUpdates();
-		return updates.map((update) => update.displayName);
-	} catch {
-		return [];
-	}
+/** Run every startup check and collect the results. */
+export async function gatherStartupNotices(): Promise<StartupNotices> {
+	const tmuxWarning = await checkTmuxKeyboardSetup();
+	return { tmuxWarning };
 }
 
 export async function checkTmuxKeyboardSetup(): Promise<string | undefined> {
@@ -106,21 +66,6 @@ export async function checkTmuxKeyboardSetup(): Promise<string | undefined> {
 	}
 
 	return undefined;
-}
-
-export function formatUpdateAvailableNotice(newVersion: string): string {
-	return (
-		`${theme.bold(theme.fg("accent", "Update available:"))} ` +
-		`${theme.fg("muted", `v${newVersion}. Run `)}${theme.fg("accent", "/update")}`
-	);
-}
-
-export function formatPackageUpdateNotice(packages: string[]): string {
-	const packageList = packages.join(", ");
-	return (
-		`${theme.bold(theme.fg("warning", "Package updates available:"))} ` +
-		`${theme.fg("muted", `${packageList}. Run `)}${theme.fg("accent", "/update --extensions")}`
-	);
 }
 
 export function formatTmuxWarningNotice(message: string): string {

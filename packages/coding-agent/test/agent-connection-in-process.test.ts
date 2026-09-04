@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { emptyGoalState } from "../src/core/goals.js";
+import { createManualContinueMessage, MANUAL_CONTINUE_PROMPT } from "../src/core/messages.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type { AgentConnectionEvent, AgentConnectionState } from "../src/modes/agent-connection/types.js";
 
@@ -174,6 +175,24 @@ describe("InProcessAgentConnection", () => {
 			finishTurn();
 		},
 	);
+	it("forwards hidden internal continuation prompts to the session", async () => {
+		const session = createFakeSession("manual-continue", []);
+		const prompt = vi.fn((_message: string, options?: PromptOptions) => {
+			options?.preflightResult?.(true);
+			return Promise.resolve();
+		});
+		Object.assign(session.session, { prompt });
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+		const customMessage = createManualContinueMessage(123);
+
+		await connection.prompt(MANUAL_CONTINUE_PROMPT, { customMessage, internalPrompt: true });
+
+		expect(prompt).toHaveBeenCalledWith(
+			MANUAL_CONTINUE_PROMPT,
+			expect.objectContaining({ customMessage, internalPrompt: true }),
+		);
+	});
+
 	it("forwards prompt admission cancellation to the session", async () => {
 		const session = createFakeSession("prompt-cancellation", []);
 		const prompt = vi.fn(
@@ -268,16 +287,12 @@ describe("InProcessAgentConnection", () => {
 				leafId: "snapshot-leaf",
 			},
 			messages: [userMessage("snapshot context", 1)],
-			sessionContext: {
-				messages: [userMessage("snapshot context", 1)],
-				thinkingLevel: "medium",
-				model: null,
-			},
 			sessionTree: {
 				tree: [],
 				leafId: "snapshot-leaf",
 			},
 		});
+		expect(snapshot.sessionContext).toBeUndefined();
 		messages.push(userMessage("later context", 2));
 		expect(snapshot.messages).toEqual([userMessage("snapshot context", 1)]);
 	});
@@ -327,6 +342,16 @@ describe("InProcessAgentConnection", () => {
 			type: "session_action_update",
 			actions: { queuedCount: 2, steering: ["new"], followUps: ["later"] },
 		});
+		newSession.emit({
+			type: "act_event",
+			actId: "act-1",
+			outerToolCallId: "outer-tool-1",
+			sequence: 2,
+			event: "assistant_delta",
+			stream: "text",
+			text: "working",
+			textTruncated: false,
+		});
 
 		expect(events).toEqual([
 			{
@@ -334,6 +359,19 @@ describe("InProcessAgentConnection", () => {
 				event: {
 					type: "session_action_update",
 					actions: { queuedCount: 2, steering: ["new"], followUps: ["later"] },
+				},
+			},
+			{
+				type: "session_event",
+				event: {
+					type: "act_event",
+					actId: "act-1",
+					outerToolCallId: "outer-tool-1",
+					sequence: 2,
+					event: "assistant_delta",
+					stream: "text",
+					text: "working",
+					textTruncated: false,
 				},
 			},
 		]);

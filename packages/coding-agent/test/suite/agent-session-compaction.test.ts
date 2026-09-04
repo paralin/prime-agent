@@ -1,13 +1,20 @@
 import { appendFileSync } from "node:fs";
-import { AgentContinueError, type AgentMessage, type ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
+import {
+	AgentContinueError,
+	type AgentEvent,
+	type AgentMessage,
+	type ShouldStopAfterTurnContext,
+} from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	fauxAssistantMessage,
 	type Model,
 	type ToolResultMessage,
 	type Usage,
+	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { PROVIDER_NATIVE_COMPACTION_SUMMARY } from "../../src/core/compaction/compaction.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { createHarness, getMessageText, type Harness } from "./harness.js";
 import { createDeferred } from "./scheduling.js";
@@ -25,6 +32,12 @@ type SessionWithCompactionInternals = {
 		outcome: "skipped" | "cancelled" | "failed",
 		message: string,
 	) => void;
+	_handleAgentEvent: (event: AgentEvent) => void;
+	_notifyKernelStateAfterCompaction: () => Promise<void>;
+	_ipythonKernelProvisioner?: {
+		hasRunningKernel: boolean;
+		listNamespaceNames(signal?: AbortSignal): Promise<string[] | null>;
+	};
 };
 
 function createUsage(totalTokens: number) {
@@ -133,6 +146,453 @@ describe("AgentSession compaction characterization", () => {
 		expect(result.summary).toBe("summary from extension");
 		expect(compactionEntries).toHaveLength(1);
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
+	});
+
+	it("uses provider-native compaction by default and persists replay history", async () => {
+		const nativeCompact = vi.fn(async () => ({
+			provider: "faux",
+			replacementHistory: [{ type: "compaction", encrypted_content: "opaque-state" }],
+			compactionItem: { type: "compaction" as const, encrypted_content: "opaque-state" },
+		}));
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			nativeCompact,
+			persistSession: true,
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one response"), fauxAssistantMessage("two response")]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		const result = await harness.session.compact();
+		const internals = harness.session as unknown as SessionWithCompactionInternals;
+		const stablePrefix = [...harness.session.messages];
+		const stableProviderPayload = structuredClone(
+			(harness.session.messages[0] as { providerPayload?: unknown }).providerPayload,
+		);
+		internals._ipythonKernelProvisioner = {
+			hasRunningKernel: true,
+			async listNamespaceNames() {
+				return [
+					"zeta",
+					"name-12",
+					"name-11",
+					"name-10",
+					"name-09",
+					"name-08",
+					"name-07",
+					"name-06",
+					"name-05",
+					"name-04",
+					"name-03",
+					"name-02",
+					"name-01",
+					"alpha",
+				];
+			},
+		};
+		await internals._notifyKernelStateAfterCompaction();
+		const entry = harness.sessionManager.getEntries().find((candidate) => candidate.type === "compaction");
+
+		expect(nativeCompact).toHaveBeenCalledOnce();
+		expect(result.providerNativeCompaction).toEqual({
+			provider: "faux",
+			replacementHistory: [{ type: "compaction", encrypted_content: "opaque-state" }],
+			compactionItem: { type: "compaction", encrypted_content: "opaque-state" },
+		});
+		expect(entry).toMatchObject({
+			type: "compaction",
+			providerNativeCompaction: result.providerNativeCompaction,
+		});
+		expect(harness.session.messages[0]).toMatchObject({
+			role: "compactionSummary",
+			providerPayload: {
+				type: "openaiResponsesHistory",
+				provider: "faux",
+				items: [{ type: "compaction", encrypted_content: "opaque-state" }],
+			},
+		});
+		expect(harness.session.messages.slice(0, stablePrefix.length)).toEqual(stablePrefix);
+		for (const [index, message] of stablePrefix.entries()) {
+			expect(harness.session.messages[index]).toBe(message);
+		}
+		expect((harness.session.messages[0] as { providerPayload?: unknown }).providerPayload).toEqual(
+			stableProviderPayload,
+		);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "custom",
+			customType: "ipython_state",
+			display: false,
+		});
+		expect(getMessageText(harness.session.messages.at(-1)!)).toContain(
+			"These names are still defined: alpha, name-01, name-02, name-03, name-04, name-05, name-06, name-07, name-08, name-09, name-10, name-11 (+2 more).",
+		);
+		expect(getMessageText(harness.session.messages.at(-1)!)).not.toContain("zeta");
+		const reloaded = SessionManager.open(harness.session.sessionFile!);
+		expect(reloaded.buildSessionContext().messages[0]).toMatchObject({
+			role: "compactionSummary",
+			providerPayload: { provider: "faux", items: [{ encrypted_content: "opaque-state" }] },
+		});
+	});
+
+	it("routes custom summary preferences through local compaction", async () => {
+		const nativeCompact = vi.fn(async () => ({
+			provider: "faux",
+			replacementHistory: [{ type: "compaction", encrypted_content: "unused" }],
+			compactionItem: { type: "compaction" as const, encrypted_content: "unused" },
+		}));
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			nativeCompact,
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("local summary"),
+			fauxAssistantMessage("local turn summary"),
+		]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		const result = await harness.session.compact("focus on the failed migration check");
+
+		expect(nativeCompact).not.toHaveBeenCalled();
+		expect(result.providerNativeCompaction).toBeUndefined();
+		expect(result.summary).toContain("local summary");
+	});
+
+	it("drops opaque native history and keeps the summary when setModel changes providers", async () => {
+		let releaseQueuedEvent = () => {};
+		const queuedEventGate = new Promise<void>((resolve) => {
+			releaseQueuedEvent = resolve;
+		});
+		let markQueuedEventStarted = () => {};
+		const queuedEventStarted = new Promise<void>((resolve) => {
+			markQueuedEventStarted = resolve;
+		});
+		const nativeCompact = vi.fn(async () => ({
+			provider: "faux",
+			replacementHistory: [{ type: "compaction", encrypted_content: "opaque-state" }],
+			compactionItem: { type: "compaction" as const, encrypted_content: "opaque-state" },
+		}));
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			nativeCompact,
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_end", async (event) => {
+						if (getMessageText(event.message) !== "queued model-switch message") return;
+						markQueuedEventStarted();
+						await queuedEventGate;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one response"), fauxAssistantMessage("two response")]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		await harness.session.compact();
+		expect(harness.session.messages[0]).toHaveProperty("providerPayload");
+
+		const provider = "portable-fallback";
+		harness.session.modelRegistry.registerProvider(provider, {
+			baseUrl: "https://faux.invalid/v1",
+			apiKey: "portable-key",
+			api: harness.faux.api,
+			models: [
+				{
+					id: "portable",
+					name: "Portable",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 8192,
+				},
+			],
+		});
+		const portableModel = harness.session.modelRegistry.find(provider, "portable");
+		expect(portableModel).toBeDefined();
+
+		await harness.session.setModel(portableModel!);
+
+		// The opaque native payload belongs to the old provider and cannot be
+		// replayed; the compacted summary text stands in instead of the raw
+		// pre-compaction history (which would overflow the context window).
+		expect(harness.session.messages[0]).toMatchObject({
+			role: "compactionSummary",
+			summary: PROVIDER_NATIVE_COMPACTION_SUMMARY,
+		});
+		expect(
+			harness.session.messages.some((message) => (message as { providerPayload?: unknown }).providerPayload),
+		).toBe(false);
+		const rebuiltText = harness.session.messages.map(getMessageText).join("\n");
+		expect(rebuiltText).toContain("two response");
+
+		const liveMessage: UserMessage = {
+			role: "user",
+			content: [{ type: "text", text: "live model-switch message" }],
+			timestamp: Date.now(),
+		};
+		const mutableState = harness.session.agent.state as { isStreaming: boolean; messages: AgentMessage[] };
+		mutableState.messages = [...mutableState.messages, liveMessage];
+		mutableState.isStreaming = true;
+		await harness.session.setModel(harness.models[0]);
+		expect(harness.session.messages).toContain(liveMessage);
+
+		harness.sessionManager.appendMessage(liveMessage);
+		mutableState.isStreaming = false;
+		(harness.session as unknown as SessionWithCompactionInternals)._handleAgentEvent({
+			type: "agent_end",
+			messages: [],
+		});
+		await harness.session.waitForIdle();
+		expect(harness.session.messages.map(getMessageText)).toContain("live model-switch message");
+
+		const queuedMessage: UserMessage = {
+			role: "user",
+			content: [{ type: "text", text: "queued model-switch message" }],
+			timestamp: Date.now(),
+		};
+		mutableState.messages = [...mutableState.messages, queuedMessage];
+		const internals = harness.session as unknown as SessionWithCompactionInternals;
+		internals._handleAgentEvent({ type: "message_end", message: queuedMessage });
+		await queuedEventStarted;
+		await harness.session.setModel(portableModel!);
+		expect(harness.session.messages).toContain(queuedMessage);
+		releaseQueuedEvent();
+		await harness.session.waitForIdle();
+		expect(harness.session.messages.map(getMessageText)).toContain("queued model-switch message");
+		expect(
+			harness.session.messages.some((message) => (message as { providerPayload?: unknown }).providerPayload),
+		).toBe(false);
+	});
+
+	it("uses provider-native compaction for an automatic threshold run", async () => {
+		const nativeCompact = vi.fn(async () => ({
+			provider: "faux",
+			replacementHistory: [{ type: "compaction", encrypted_content: "automatic-state" }],
+			compactionItem: { type: "compaction" as const, encrypted_content: "automatic-state" },
+		}));
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			nativeCompact,
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one response"), fauxAssistantMessage("two response")]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		await (harness.session as unknown as SessionWithCompactionInternals)._runAutoCompaction("threshold", false);
+
+		expect(nativeCompact).toHaveBeenCalledOnce();
+		expect(harness.sessionManager.getEntries()).toContainEqual(
+			expect.objectContaining({
+				type: "compaction",
+				providerNativeCompaction: expect.objectContaining({
+					provider: "faux",
+					compactionItem: expect.objectContaining({ encrypted_content: "automatic-state" }),
+				}),
+			}),
+		);
+	});
+
+	it("cancels native compaction without starting local fallback", async () => {
+		const nativeCompact = vi.fn(
+			async (_model, _context, options) =>
+				new Promise<never>((_resolve, reject) => {
+					const rejectAbort = () => reject(new DOMException("Compaction cancelled", "AbortError"));
+					if (options.signal?.aborted) rejectAbort();
+					else options.signal?.addEventListener("abort", rejectAbort, { once: true });
+				}),
+		);
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			nativeCompact,
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one response"), fauxAssistantMessage("two response")]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		const operation = harness.session.compact();
+		await vi.waitFor(() => expect(nativeCompact).toHaveBeenCalledOnce());
+		harness.session.abortCompaction();
+
+		await expect(operation).rejects.toMatchObject({ name: "AbortError" });
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(0);
+	});
+
+	it("feeds prior native replacement history into repeated compaction", async () => {
+		let compactionNumber = 0;
+		const emittedCompactions: Array<{ id: string; encryptedContent?: unknown }> = [];
+		const nativeCompact = vi.fn(async (_model, context) => {
+			compactionNumber += 1;
+			if (compactionNumber === 2) {
+				expect(context.messages[0]).toMatchObject({
+					role: "user",
+					providerPayload: {
+						type: "openaiResponsesHistory",
+						provider: "faux",
+						items: [{ type: "compaction", encrypted_content: "state-1" }],
+					},
+				});
+			}
+			const item = { type: "compaction" as const, encrypted_content: `state-${compactionNumber}` };
+			return { provider: "faux", replacementHistory: [item], compactionItem: item };
+		});
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			nativeCompact,
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_compact", (event) => {
+						emittedCompactions.push({
+							id: event.compactionEntry.id,
+							encryptedContent: event.compactionEntry.providerNativeCompaction?.compactionItem.encrypted_content,
+						});
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("three response"),
+			fauxAssistantMessage("four response"),
+		]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		await harness.session.compact();
+		await harness.session.prompt("three");
+		await harness.session.prompt("four");
+
+		const result = await harness.session.compact();
+
+		expect(nativeCompact).toHaveBeenCalledTimes(2);
+		expect(result.providerNativeCompaction?.compactionItem).toMatchObject({ encrypted_content: "state-2" });
+		expect(emittedCompactions).toHaveLength(2);
+		expect(emittedCompactions[0]!.id).not.toBe(emittedCompactions[1]!.id);
+		expect(emittedCompactions[1]!.encryptedContent).toBe("state-2");
+		const latestCompaction = harness.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "compaction")
+			.at(-1);
+		expect(emittedCompactions[1]!.id).toBe(latestCompaction?.id);
+	});
+
+	it("falls back to local summarization when native compaction fails", async () => {
+		const nativeCompact = vi.fn(async () => {
+			throw new Error("native endpoint unavailable");
+		});
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			nativeCompact,
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("local summary"),
+			fauxAssistantMessage("local turn summary"),
+		]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		const result = await harness.session.compact();
+
+		expect(nativeCompact).toHaveBeenCalledOnce();
+		expect(result.providerNativeCompaction).toBeUndefined();
+		expect(result.summary).toContain("local summary");
+	});
+
+	it("retains the native failure and skips an oversized local fallback request", async () => {
+		const nativeCompact = vi.fn(async () => {
+			throw new Error("native endpoint unavailable");
+		});
+		const harness = await createHarness({
+			models: [{ id: "small-context", contextWindow: 4096, maxTokens: 512 }],
+			settings: { compaction: { enabled: false, keepRecentTokens: 1, reserveTokens: 512 } },
+			nativeCompact,
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("local summary must remain unused"),
+		]);
+		await harness.session.prompt("界".repeat(5000));
+		await harness.session.prompt("two");
+		harness.settingsManager.applyOverrides({ compaction: { enabled: true } });
+
+		await expect(harness.session.compact()).rejects.toThrow(
+			/Provider-native compaction failed: native endpoint unavailable.*Local fallback failed: Local compaction requires approximately \d+ tokens, exceeding the 4096-token context window/,
+		);
+
+		expect(nativeCompact).toHaveBeenCalledOnce();
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(0);
+	});
+
+	it("uses local summarization when native compaction is disabled", async () => {
+		const nativeCompact = vi.fn(async () => ({
+			provider: "faux",
+			replacementHistory: [{ type: "compaction", encrypted_content: "unused" }],
+			compactionItem: { type: "compaction" as const, encrypted_content: "unused" },
+		}));
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1, native: false } },
+			nativeCompact,
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("local summary"),
+			fauxAssistantMessage("local turn summary"),
+		]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		const result = await harness.session.compact();
+
+		expect(nativeCompact).not.toHaveBeenCalled();
+		expect(result.providerNativeCompaction).toBeUndefined();
+		expect(result.summary).toContain("local summary");
+	});
+
+	it("carries a previous local summary into a later native compaction", async () => {
+		const nativeCompact = vi.fn(async (_model, _context) => ({
+			provider: "faux",
+			replacementHistory: [{ type: "compaction", encrypted_content: "native-after-local" }],
+			compactionItem: { type: "compaction" as const, encrypted_content: "native-after-local" },
+		}));
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1, native: false } },
+			nativeCompact,
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("durable local summary fact"),
+			fauxAssistantMessage("local turn summary"),
+			fauxAssistantMessage("three response"),
+		]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		await harness.session.compact();
+		harness.settingsManager.applyOverrides({ compaction: { native: true } });
+		await harness.session.prompt("three");
+
+		await harness.session.compact();
+
+		expect(nativeCompact).toHaveBeenCalledOnce();
+		const context = nativeCompact.mock.calls[0]![1];
+		expect(context.messages.map(getMessageText).join("\n")).toContain("durable local summary fact");
 	});
 
 	it("compacts through the model summarizer, persists metadata, emits events, and remains usable", async () => {
@@ -1574,5 +2034,64 @@ describe("AgentSession compaction characterization", () => {
 				content: expect.stringContaining("could not be saved to session history"),
 			}),
 		);
+
+		const provider = "outcome-model-switch";
+		harness.session.modelRegistry.registerProvider(provider, {
+			baseUrl: "https://faux.invalid/v1",
+			apiKey: "switch-key",
+			api: harness.faux.api,
+			models: [
+				{
+					id: "next",
+					name: "Next",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 8192,
+				},
+			],
+		});
+		const nextModel = harness.session.modelRegistry.find(provider, "next");
+		expect(nextModel).toBeDefined();
+		await harness.session.setModel(nextModel!);
+
+		expect(harness.session.messages).toContainEqual(
+			expect.objectContaining({
+				role: "custom",
+				customType: "compaction_outcome",
+				content: expect.stringContaining("could not be saved to session history"),
+			}),
+		);
+	});
+
+	describe("repetition loop recovery", () => {
+		const harnesses: Harness[] = [];
+		afterEach(() => {
+			while (harnesses.length > 0) harnesses.pop()?.cleanup();
+		});
+
+		it("queues a system notice and continues after a repetition loop", async () => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+
+			const repeatedSentence = "The roadmap file lives at the repository root. ";
+			const degenerate = fauxAssistantMessage(repeatedSentence.repeat(6));
+			const resumed = fauxAssistantMessage("resumed work");
+			harness.setResponses([degenerate, resumed]);
+
+			await harness.session.prompt("do the task");
+			await harness.session.waitForIdle();
+
+			expect(harness.eventsOfType("compaction_start")).toEqual([]);
+			expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+			const notice = harness.session.messages.find(
+				(message) => message.role === "custom" && message.customType === "repetition_notice",
+			);
+			expect(notice).toBeDefined();
+			expect(getMessageText(notice)).toContain("You are repeating yourself");
+			expect(harness.session.getLastAssistantText()).toBe("resumed work");
+			expect(harness.getPendingResponseCount()).toBe(0);
+		});
 	});
 });

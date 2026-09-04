@@ -65,7 +65,11 @@ import {
 	failure,
 } from "../src/modes/daemon/daemon-protocol.js";
 import { activeActivityForSession, type SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
-import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	DAEMON_WORKER_COMMAND_COMPATIBILITY,
+	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
+
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
 
@@ -434,11 +438,11 @@ describe("daemon mode helpers", () => {
 		internals.write = vi.fn();
 		const client = makeClient("legacy-supervisor", "active");
 
-		await internals.handleWorkerCommand(client, { id: "legacy-1", type: "worker_sync_agent_peers", peers: [] });
+		await internals.handleWorkerCommand(client, { id: "legacy-1", type: "worker_unknown" });
 
 		expect(internals.write).toHaveBeenCalledWith(
 			client,
-			expect.objectContaining({ id: "legacy-1", command: "worker_sync_agent_peers", success: false }),
+			expect.objectContaining({ id: "legacy-1", command: "worker_unknown", success: false }),
 		);
 	});
 
@@ -487,6 +491,7 @@ describe("daemon mode helpers", () => {
 			...targetState.runtime,
 			cwd: "/tmp",
 			session: {
+				sessionManager: makeMailboxSessionManager(),
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
@@ -821,6 +826,7 @@ describe("daemon mode helpers", () => {
 				rlmChildId: "child-1",
 			},
 			session: {
+				sessionManager: makeMailboxSessionManager(),
 				sessionId: "session-child",
 				sessionName: defaultSubagentName,
 				isStreaming: false,
@@ -1015,8 +1021,11 @@ describe("daemon mode helpers", () => {
 				(state) => state.runtime.session === childRuntime.session,
 			);
 			if (!childState?.runtime.session.sessionFile) throw new Error("Missing child state");
+			const hibernateIpythonKernel = vi.fn(async () => {});
+			Object.assign(childRuntime.session, { hibernateIpythonKernel });
 			const host = internals.createSubagentRuntimeHost(parentState);
 			expect(host.completeRlmSubagentRuntime?.("child-1", childRuntime.session)).toBe(true);
+			expect(hibernateIpythonKernel).toHaveBeenCalledOnce();
 			await (
 				daemon as unknown as { closeSession(state: ActiveSessionState, reason: "shutdown"): Promise<void> }
 			).closeSession(childState, "shutdown");
@@ -1114,6 +1123,115 @@ describe("daemon mode helpers", () => {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
+
+	it("persists an external claude-code child for passive discovery, roster, and listing", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-external-child-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const parentManager = SessionManager.create(tempDir, sessionDir);
+			parentManager.newSession();
+			parentManager.appendSessionInfo("parent");
+			const parentSessionFile = parentManager.getSessionFile();
+			if (!parentSessionFile) throw new Error("Missing parent session file");
+			const childSessionDir = join(parentManager.getSessionArtifactDir()!, "child-cc");
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => ({
+				session: makeRuntimeSession(options.sessionManager),
+				extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+					ReturnType<CreateAgentSessionRuntimeFactory>
+				>["extensionsResult"],
+				services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+					ReturnType<CreateAgentSessionRuntimeFactory>
+				>["services"],
+				diagnostics: [],
+			}));
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
+				createRuntime,
+			});
+			const internals = daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost;
+				listPassiveRlmSubagents(): Promise<Array<{ entry: { childId: string; status: string } }>>;
+				buildSessionListWithPassiveRlmSubagents(
+					active: ActiveSessionState[],
+					saved: Awaited<ReturnType<typeof SessionManager.listAll>>,
+					jobs: AgentCronJob[],
+				): Promise<Array<{ sessionFile?: string; rlmChildId?: string; runtimeKind?: string }>>;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: parentSessionFile });
+			Object.assign(parentState.runtime.session, {
+				isSessionActive: false,
+				isStreaming: false,
+				isCompacting: false,
+				isBashRunning: false,
+				state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+				thinkingLevel: "off" as const,
+				hasRunningRlmChildren: () => false,
+				getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+			});
+			const host = internals.createSubagentRuntimeHost(parentState);
+			if (!host.createExternalRlmSubagentTranscript) throw new Error("Missing external transcript hook");
+
+			const transcript = await host.createExternalRlmSubagentTranscript({
+				parentSession: parentState.runtime.session,
+				childId: "child-cc",
+				sessionName: "opus-second-opinion",
+				sessionDir: childSessionDir,
+				rlmDepth: 1,
+				rlmParentNodeId: "child-cc",
+				prompt: "give a second opinion on the kernel patch",
+				modelLabel: "claude-code/opus",
+			});
+			transcript.appendAssistantMessage("The patch clears drvdata too early; defer the release.");
+			transcript.complete();
+
+			const passive = await internals.listPassiveRlmSubagents();
+			expect(passive.map(({ entry }) => entry.childId)).toContain("child-cc");
+			expect(passive.find(({ entry }) => entry.childId === "child-cc")?.entry.status).toBe("completed");
+			const listed = await internals.buildSessionListWithPassiveRlmSubagents(
+				[parentState],
+				await SessionManager.listAll(undefined, sessionDir),
+				[],
+			);
+			expect(listed).toContainEqual(
+				expect.objectContaining({
+					sessionFile: transcript.sessionFile,
+					rlmChildId: "child-cc",
+					runtimeKind: "subagent",
+				}),
+			);
+
+			// The transcript is a real session file: the info scan and the saved
+			// catalog read the prompt as the first message.
+			const info = await readSessionInfo(transcript.sessionFile);
+			expect(info?.firstMessage).toBe("give a second opinion on the kernel patch");
+			const lines = readFileSync(transcript.sessionFile, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as Record<string, unknown>);
+			expect(lines[0]).toMatchObject({ type: "session", parentSession: parentSessionFile, rlmDepth: 1 });
+			expect(lines.at(-1)).toMatchObject({
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "The patch clears drvdata too early; defer the release." }],
+				},
+			});
+			const display = JSON.parse(readFileSync(join(childSessionDir, "rlm-subagent.json"), "utf8")) as Record<
+				string,
+				unknown
+			>;
+			expect(display).toMatchObject({
+				childId: "child-cc",
+				sessionName: "opus-second-opinion",
+				status: "completed",
+				model: { provider: "claude-code", modelId: "opus" },
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("discovers a non-resident child left running in the persisted registry", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-orphan-running-child-"));
 		try {
@@ -1130,6 +1248,7 @@ describe("daemon mode helpers", () => {
 					getCurrentState: () => ActiveSessionState | undefined,
 				): AgentSessionMessageController;
 			};
+			expect(await internals.listPassiveRlmSubagents()).toEqual([]);
 			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
 
 			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry)).toContainEqual(
@@ -1997,6 +2116,8 @@ describe("daemon mode helpers", () => {
 						fromState: ActiveSessionState,
 						targetSelector: string,
 						message: string,
+						messageId?: string,
+						replyTo?: string,
 					): Promise<unknown>;
 				}
 			).sendRemoteAgentSessionMessage.bind(daemon);
@@ -2234,6 +2355,236 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	interface SupervisorClaimFixture {
+		supervisorGeneration: string;
+		supervisorPid?: number;
+		supervisorSocketPath?: string;
+	}
+
+	async function startSupervisorHelloFixture(
+		tempDir: string,
+		socketPath: string,
+		helloGeneration?: string,
+		helloSchemaRevision: number = DAEMON_SCHEMA_REVISION,
+	): Promise<{
+		receivedCommands: Array<Record<string, unknown>>;
+		bindClaim(claim: SupervisorClaimFixture): void;
+		sendRemote(messageId?: string, replyTo?: string): Promise<unknown>;
+		close(): Promise<void>;
+	}> {
+		const receivedCommands: Array<Record<string, unknown>> = [];
+		const server = createServer((socket) => {
+			// Fail-fast clients may drop the socket while this fake server is mid-write.
+			socket.on("error", () => {});
+			socket.write(
+				`${JSON.stringify({
+					type: "daemon_hello",
+					socketPath,
+					protocol: DAEMON_PROTOCOL_INFO,
+					schemaRevision: helloSchemaRevision,
+					serverCapabilities: [],
+					clientId: "replacement-supervisor",
+					...(helloGeneration !== undefined ? { supervisorGeneration: helloGeneration } : {}),
+				})}\n`,
+			);
+			let buffered = "";
+			socket.on("data", (chunk: Buffer) => {
+				buffered += chunk.toString("utf8");
+				let newline = buffered.indexOf("\n");
+				while (newline !== -1) {
+					const wire = JSON.parse(buffered.slice(0, newline)) as {
+						id?: string;
+						command?: Record<string, unknown>;
+					};
+					receivedCommands.push((wire.command ?? wire) as Record<string, unknown>);
+					socket.write(
+						`${JSON.stringify({
+							type: "response",
+							id: wire.id,
+							command: "send_message",
+							success: true,
+							data: { deliveryStatus: "delivered" },
+						})}\n`,
+					);
+					buffered = buffered.slice(newline + 1);
+					newline = buffered.indexOf("\n");
+				}
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(socketPath, resolve);
+		});
+		const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
+			defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+			createRuntime: vi.fn(),
+			worker: { authenticationToken: "token" },
+		});
+		const internals = daemon as unknown as {
+			supervisorClaims: Map<object, { claim: SupervisorClaimFixture; ownerFingerprint: string }>;
+			sendRemoteAgentSessionMessage(
+				fromState: ActiveSessionState,
+				targetSelector: string,
+				message: string,
+				messageId?: string,
+				replyTo?: string,
+			): Promise<unknown>;
+		};
+		return {
+			receivedCommands,
+			bindClaim(claim: SupervisorClaimFixture): void {
+				internals.supervisorClaims.set({ id: "bound-supervisor" }, { claim, ownerFingerprint: "fingerprint" });
+			},
+			sendRemote: (messageId?: string, replyTo?: string) =>
+				internals.sendRemoteAgentSessionMessage(makeState("source"), "remote", "hello", messageId, replyTo),
+			close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+		};
+	}
+
+	it("refuses remote agent-message sends when the answering supervisor generation is stale", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-stale-gen-"));
+		const socketPath = join(tempDir, "s");
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+		try {
+			const fixture = await startSupervisorHelloFixture(tempDir, socketPath, "gen-new");
+			try {
+				fixture.bindClaim({
+					supervisorGeneration: "gen-old",
+					supervisorPid: 1,
+					supervisorSocketPath: socketPath,
+				});
+				// The retry loop must classify staleness through the typed error, not message text.
+				const rejection = await fixture.sendRemote().then(
+					() => {
+						throw new Error("expected sendRemoteAgentSessionMessage to reject");
+					},
+					(error: unknown) => error,
+				);
+				expect(rejection).toBeInstanceOf(Error);
+				expect((rejection as Error).name).toBe("StaleSupervisorGenerationError");
+				expect((rejection as Error).message).toContain("supervisor_generation_stale");
+				expect(fixture.receivedCommands.filter((command) => command.type === "send_message")).toHaveLength(0);
+			} finally {
+				await fixture.close();
+			}
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses remote agent-message sends when the answering supervisor omits its generation", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-stale-gen-missing-"));
+		const socketPath = join(tempDir, "s");
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+		try {
+			const fixture = await startSupervisorHelloFixture(tempDir, socketPath);
+			try {
+				fixture.bindClaim({
+					supervisorGeneration: "gen-old",
+					supervisorPid: 1,
+					supervisorSocketPath: socketPath,
+				});
+				await expect(fixture.sendRemote()).rejects.toThrow("supervisor_generation_stale");
+				expect(fixture.receivedCommands.filter((command) => command.type === "send_message")).toHaveLength(0);
+			} finally {
+				await fixture.close();
+			}
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses remote agent-message sends when the bound claim names another supervisor socket", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-stale-gen-socket-"));
+		const socketPath = join(tempDir, "s");
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+		try {
+			const fixture = await startSupervisorHelloFixture(tempDir, socketPath, "gen-old");
+			try {
+				fixture.bindClaim({
+					supervisorGeneration: "gen-old",
+					supervisorPid: 1,
+					supervisorSocketPath: join(tempDir, "other-s"),
+				});
+				await expect(fixture.sendRemote()).rejects.toThrow("supervisor_generation_stale");
+				expect(fixture.receivedCommands.filter((command) => command.type === "send_message")).toHaveLength(0);
+			} finally {
+				await fixture.close();
+			}
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("refuses stable-identity agent-message sends to a pre-revision supervisor", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-old-supervisor-"));
+		const socketPath = join(tempDir, "s");
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+		try {
+			const fixture = await startSupervisorHelloFixture(
+				tempDir,
+				socketPath,
+				"gen-old",
+				DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_deliver_message.minSchemaRevision - 1,
+			);
+			try {
+				fixture.bindClaim({
+					supervisorGeneration: "gen-old",
+					supervisorPid: 1,
+					supervisorSocketPath: socketPath,
+				});
+				await expect(fixture.sendRemote("agentmsg-cross-2", "agentmsg-question-2")).rejects.toThrow(
+					"supervisor_schema_too_old",
+				);
+				expect(fixture.receivedCommands.filter((command) => command.type === "send_message")).toHaveLength(0);
+			} finally {
+				await fixture.close();
+			}
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps identity-less agent-message sends compatible with a pre-revision supervisor", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-old-supervisor-plain-"));
+		const socketPath = join(tempDir, "s");
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+		try {
+			const fixture = await startSupervisorHelloFixture(
+				tempDir,
+				socketPath,
+				"gen-old",
+				DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_deliver_message.minSchemaRevision - 1,
+			);
+			try {
+				fixture.bindClaim({
+					supervisorGeneration: "gen-old",
+					supervisorPid: 1,
+					supervisorSocketPath: socketPath,
+				});
+				await expect(fixture.sendRemote()).resolves.toMatchObject({ deliveryStatus: "delivered" });
+				expect(fixture.receivedCommands.filter((command) => command.type === "send_message")).toHaveLength(1);
+			} finally {
+				await fixture.close();
+			}
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 	it("reports queued status when a direct accept races into the queue", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -2253,6 +2604,7 @@ describe("daemon mode helpers", () => {
 			...targetState.runtime,
 			cwd: "/tmp",
 			session: {
+				sessionManager: makeMailboxSessionManager(),
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
@@ -2290,7 +2642,7 @@ describe("daemon mode helpers", () => {
 		expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({ streamingBehavior: "steer" });
 	});
 
-	it("rejects an agent message when pause wins core admission", async () => {
+	it("serializes pause after an in-flight agent message admission", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -2324,6 +2676,7 @@ describe("daemon mode helpers", () => {
 			...targetState.runtime,
 			cwd: "/tmp",
 			session: {
+				sessionManager: makeMailboxSessionManager(),
 				sessionId: "session-target",
 				sessionName: "Target",
 				acceptAgentMessagePrompt,
@@ -2347,12 +2700,13 @@ describe("daemon mode helpers", () => {
 			origin: "agent",
 		});
 		await admissionStarted;
-		await internals.handleCommand(makeClient("client-1", targetState.activeSessionId), {
+		const pause = internals.handleCommand(makeClient("client-1", targetState.activeSessionId), {
 			type: "agent_messages_pause",
 		});
 		releaseAdmission();
 
-		await expect(send).rejects.toThrow("Agent messaging is paused");
+		await expect(send).resolves.toMatchObject({ deliveryStatus: "delivered" });
+		await pause;
 	});
 
 	it("ignores a legacy follow-up mode and always steers agent messages", async () => {
@@ -2363,16 +2717,12 @@ describe("daemon mode helpers", () => {
 			},
 		});
 		const targetState = makeState("target");
-		const acceptAgentMessagePrompt = vi.fn(
-			(_message: string, options?: { preflightResult?: (accepted: boolean, queued?: boolean) => void }) => {
-				options?.preflightResult?.(true, true);
-				return Promise.resolve();
-			},
-		);
+		const queueAgentMessagePrompt = vi.fn(async () => true);
 		targetState.runtime = {
 			...targetState.runtime,
 			cwd: "/tmp",
 			session: {
+				sessionManager: makeMailboxSessionManager(),
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: true,
@@ -2380,7 +2730,7 @@ describe("daemon mode helpers", () => {
 				isRetrying: false,
 				isBashRunning: false,
 				unfinishedActionCount: 0,
-				acceptAgentMessagePrompt,
+				queueAgentMessagePrompt,
 			},
 		} as never;
 		const internals = daemon as unknown as {
@@ -2397,12 +2747,10 @@ describe("daemon mode helpers", () => {
 		});
 
 		expect(response).toMatchObject({ data: { deliveryStatus: "queued", deliveryMode: "steer" } });
-		expect(acceptAgentMessagePrompt).toHaveBeenCalledWith(
+		expect(queueAgentMessagePrompt).toHaveBeenCalledWith(
 			expect.stringContaining("do not defer"),
-			expect.objectContaining({
-				streamingBehavior: "steer",
-				customMessage: expect.objectContaining({ customType: "agent_message" }),
-			}),
+			"steer",
+			expect.objectContaining({ customType: "agent_message" }),
 		);
 	});
 
@@ -2425,6 +2773,7 @@ describe("daemon mode helpers", () => {
 				...targetState.runtime,
 				cwd: "/tmp",
 				session: {
+					sessionManager: makeMailboxSessionManager(),
 					sessionId: `session-${targetState.activeSessionId}`,
 					sessionName: targetState.activeSessionId,
 					isStreaming: false,
@@ -2650,6 +2999,7 @@ describe("daemon mode helpers", () => {
 			...targetState.runtime,
 			cwd: "/tmp",
 			session: {
+				sessionManager: makeMailboxSessionManager(),
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
@@ -3141,6 +3491,7 @@ describe("daemon mode helpers", () => {
 			...targetState.runtime,
 			cwd: "/tmp",
 			session: {
+				sessionManager: makeMailboxSessionManager(),
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
@@ -3182,6 +3533,7 @@ describe("daemon mode helpers", () => {
 			...targetState.runtime,
 			cwd: "/tmp",
 			session: {
+				sessionManager: makeMailboxSessionManager(),
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
@@ -3290,6 +3642,60 @@ describe("daemon mode helpers", () => {
 				activeSessionId: "other",
 			}),
 		).toBe(false);
+	});
+
+	it("isolates the Act stream capability per attached session without consuming ordinary event sequence", () => {
+		const client = makeClient("client", "active");
+		const actMessage: DaemonOutbound = {
+			type: "session_event",
+			activeSessionId: "active",
+			event: {
+				type: "act_event",
+				actId: "act-1",
+				outerToolCallId: "outer-tool-1",
+				sequence: 1,
+				event: "assistant_delta",
+				stream: "text",
+				text: "working",
+				textTruncated: false,
+			},
+		};
+		expect(shouldSendDaemonOutboundToClient(client, actMessage)).toBe(false);
+		setDaemonClientSessionCapabilities(client, "active", new Set(["rlm_act_stream"]));
+		setDaemonClientSessionCapabilities(client, "other", new Set());
+		expect(shouldSendDaemonOutboundToClient(client, actMessage)).toBe(true);
+		expect(shouldSendDaemonOutboundToClient(client, { ...actMessage, activeSessionId: "other" })).toBe(false);
+		expect(
+			shouldSendDaemonOutboundToClient(client, {
+				type: "session_event",
+				activeSessionId: "other",
+				event: {
+					type: "session_action_update",
+					actions: { queuedCount: 0, steering: [], followUps: [] },
+				},
+			}),
+		).toBe(true);
+
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const state = makeState("active");
+		state.eventGeneration = "generation-1";
+		state.lastEventSequence = 7;
+		const addMeta = Reflect.get(daemon, "addSessionEventMeta").bind(daemon) as (
+			state: ActiveSessionState,
+			message: DaemonOutbound,
+		) => DaemonOutbound;
+		expect(addMeta(state, actMessage)).toEqual(actMessage);
+		expect(state.lastEventSequence).toBe(7);
+		const ordinary = addMeta(state, {
+			type: "session_event",
+			activeSessionId: "active",
+			event: { type: "turn_start" },
+		});
+		expect(ordinary).toMatchObject({ meta: { sequence: 8 } });
+		expect(state.lastEventSequence).toBe(8);
 	});
 
 	it("delivers session closure while a client is snapshotting and backpressured", () => {
@@ -6204,6 +6610,52 @@ describe("daemon mode helpers", () => {
 		expect(internals.passivateSession).not.toHaveBeenCalledWith(queuedLeaf, expect.anything(), expect.anything());
 	});
 
+	it("passivates the oldest safe child when resident count exceeds the pressure cap", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-passivation-pressure.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const root = makeState("root");
+		const oldestLeaf = makeState("oldest-leaf", "root");
+		const newerLeaf = makeState("newer-leaf", "root");
+		const newestLeaf = makeState("newest-leaf", "root");
+		const states = [root, oldestLeaf, newerLeaf, newestLeaf];
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			listPassiveRlmSubagents: ReturnType<typeof vi.fn>;
+			sessionPassivationSnapshot: ReturnType<typeof vi.fn>;
+			passivateSession: ReturnType<typeof vi.fn>;
+			passivateIdleChildren(
+				threshold: number,
+				now: number,
+				limit: number,
+				maxResidentChildren: number,
+			): Promise<number>;
+		};
+		for (const state of states) internals.sessions.set(state.activeSessionId, state);
+		const order = new Map([
+			[oldestLeaf, 197 * 60_000],
+			[newerLeaf, 198 * 60_000],
+			[newestLeaf, 199 * 60_000],
+			[root, 200 * 60_000],
+		]);
+		internals.listPassiveRlmSubagents = vi.fn(async () => []);
+		internals.sessionPassivationSnapshot = vi.fn(async (state: ActiveSessionState) => ({
+			isSessionActive: false,
+			attachedClients: 0,
+			hasRegisteredHeartbeat: false,
+			hasRegisteredCronJob: false,
+			lastActivityAt: order.get(state) ?? 0,
+			hasParent: state !== root,
+			hasNonPassiveDescendants: false,
+			isHydrating: false,
+		}));
+		internals.passivateSession = vi.fn(async () => true);
+
+		await expect(internals.passivateIdleChildren(90, 200 * 60_000, 8, 2)).resolves.toBe(1);
+		expect(internals.passivateSession).toHaveBeenCalledWith(oldestLeaf, 90, 200 * 60_000, expect.anything(), true);
+	});
+
 	it("passivates an idle leaf and makes list, attach, and message use the normal passive wake path", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passivate-child-"));
 		try {
@@ -7804,6 +8256,9 @@ describe("daemon mode helpers", () => {
 		try {
 			const sessionDir = join(tempDir, "sessions");
 			const session = SessionManager.create(tempDir, sessionDir);
+			// A conversation turn keeps the session visible in the saved-session
+			// catalog, which now hides lifecycle-only sessions.
+			session.appendMessage({ role: "user", content: "run the task", timestamp: 0 });
 			session.appendSessionState({ status: "active" });
 			session.appendAgentStatus({
 				summary: "Finished the task",
@@ -9468,16 +9923,33 @@ function makeAgentFamilyState(
 			unfinishedActionCount: 0,
 			messages: [],
 			state: { pendingToolCalls: new Set(), streamingMessage: undefined },
-			sessionManager: {
+			sessionManager: makeMailboxSessionManager({
 				getCwd: () => "/tmp",
 				getHeader: () => ({ created: new Date(0).toISOString() }),
-			},
+			}),
 			hasRunningRlmChildren: () => false,
 			getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
 			acceptAgentMessagePrompt,
 		},
 	} as never;
 	return { state, acceptAgentMessagePrompt };
+}
+
+function makeMailboxSessionManager(extra: Record<string, unknown> = {}) {
+	const entries: unknown[] = [];
+	return {
+		...extra,
+		getEntries: () => [...entries],
+		appendCustomMessageEntryWithRollback: (
+			customType: string,
+			content: string,
+			display: boolean,
+			details: unknown,
+		) => {
+			entries.push({ type: "custom_message", customType, content, display, details });
+			return `mailbox-${entries.length}`;
+		},
+	};
 }
 
 function makeState(activeSessionId: string, parentActiveSessionId?: string): ActiveSessionState {

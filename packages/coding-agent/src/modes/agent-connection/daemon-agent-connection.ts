@@ -15,10 +15,10 @@ import type {
 	AgentHeartbeatManagementAction,
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
+import type { ExternalEventWatch } from "../../core/external-events.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
-import { SessionAlreadyActiveError } from "../../core/session-lease.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "../agents-view/roster-store.js";
 import {
@@ -30,7 +30,9 @@ import { deserializeDaemonError } from "../daemon/daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	collectDaemonLaunchEnv,
+	DAEMON_SESSION_EVENT_COMPATIBILITY,
 	type DaemonAttachResult,
+	type DaemonClientCapability,
 	type DaemonCommand,
 	type DaemonEventCursor,
 	type DaemonOutbound,
@@ -123,6 +125,33 @@ const updateTransportReconnects = new WeakMap<DaemonTransportClient, Promise<voi
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function daemonSupportsActStream(client: DaemonTransportClient): boolean {
+	const compatibility = DAEMON_SESSION_EVENT_COMPATIBILITY.act_event;
+	const hello = client.hello;
+	return (
+		hello !== undefined &&
+		(hello.protocol?.version ?? 0) >= compatibility.minProtocol &&
+		(hello.schemaRevision ?? 0) >= compatibility.minSchemaRevision &&
+		client.supportsServerCapability(compatibility.capability)
+	);
+}
+
+function daemonAttachCapabilities(
+	client: DaemonTransportClient,
+	supportsExtensionUi: boolean,
+	ownedSession: boolean,
+): DaemonClientCapability[] {
+	return [
+		"attach_snapshot",
+		"event_sequence",
+		...(supportsExtensionUi ? (["extension_ui"] as const) : []),
+		"slim_attach",
+		"chunked_snapshot",
+		...(ownedSession ? (["client_owned_sessions"] as const) : []),
+		...(daemonSupportsActStream(client) ? (["rlm_act_stream"] as const) : []),
+	];
 }
 
 function formatErrorSentence(error: unknown): string {
@@ -381,14 +410,11 @@ export class DaemonAgentConnection implements AgentConnection {
 				activeSessionId: this.activeSessionId,
 				supportsExtensionUi,
 				clientId: this.clientId,
-				capabilities: [
-					"attach_snapshot",
-					"event_sequence",
-					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
-					"slim_attach",
-					"chunked_snapshot",
-					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
-				],
+				capabilities: daemonAttachCapabilities(
+					this.client,
+					supportsExtensionUi,
+					this.options.ownedSession === true,
+				),
 				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
 				launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
 				...(this.options.ownedSession &&
@@ -489,7 +515,11 @@ export class DaemonAgentConnection implements AgentConnection {
 		// getSessionTree() fetches it lazily via get_session_tree on first use.
 		const snapshotCursor = this.lastEventCursor;
 		const snapshotSequence = this.lastEventSequence;
-		const [state, messagesData, sessionContextData] = await Promise.all([
+		// The session tree and session context are intentionally not fetched
+		// here: they are large on long sessions and only needed when the user
+		// opens the tree/branch selector. getSessionTree() and
+		// getSessionContext() fetch them lazily on first use.
+		const [state, messagesData] = await Promise.all([
 			this.requestData<AgentConnectionState>(
 				{ type: "get_connection_state", activeSessionId: this.activeSessionId },
 				undefined,
@@ -500,18 +530,12 @@ export class DaemonAgentConnection implements AgentConnection {
 				undefined,
 				options,
 			),
-			this.requestData<{ context: AgentConnectionSessionContext }>(
-				{ type: "get_session_context", activeSessionId: this.activeSessionId },
-				undefined,
-				options,
-			),
 		]);
 		const children = this.latestSnapshot?.children;
 		const streamingMessage = this.latestSnapshot?.streamingMessage;
 		this.latestSnapshot = {
 			state,
 			messages: messagesData.messages,
-			sessionContext: sessionContextData.context,
 			...(children ? { children } : {}),
 			...(streamingMessage ? { streamingMessage } : {}),
 		};
@@ -784,6 +808,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		return listDaemonHeartbeats(this.client, this.options.ownedSession ? this.activeSessionId : undefined);
 	}
 
+	async listExternalEventWatches(): Promise<ExternalEventWatch[]> {
+		const data = await this.requestData<{ watches: ExternalEventWatch[] }>({
+			type: "list_watches",
+			activeSessionId: this.activeSessionId,
+		});
+		return data.watches;
+	}
+
 	async manageHeartbeat(
 		activeSessionId: string,
 		jobId: string,
@@ -980,6 +1012,8 @@ export class DaemonAgentConnection implements AgentConnection {
 					streamingBehavior: options?.streamingBehavior,
 					queueIfBusy: options?.queueIfBusy,
 					source: options?.source,
+					customMessage: options?.customMessage,
+					internalPrompt: options?.internalPrompt,
 				},
 				DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
 			);
@@ -1005,6 +1039,8 @@ export class DaemonAgentConnection implements AgentConnection {
 			streamingBehavior: options.streamingBehavior,
 			queueIfBusy: options.queueIfBusy,
 			source: options.source,
+			customMessage: options.customMessage,
+			internalPrompt: options.internalPrompt,
 			admissionId,
 		} as Extract<DaemonCommandBody, { type: typeof type }>;
 		let promptError: unknown;
@@ -1104,7 +1140,10 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async abort(): Promise<void> {
-		await this.requestOk({ type: "abort", activeSessionId: this.activeSessionId });
+		await this.requestOk(
+			{ type: "abort", activeSessionId: this.activeSessionId },
+			DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
+		);
 	}
 
 	async cancelRlmChild(childId: string): Promise<boolean> {
@@ -1193,12 +1232,20 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
-	async setModel(provider: string, modelId: string): Promise<AgentConnectionModel> {
+	async setModel(
+		provider: string,
+		modelId: string,
+		options?: { persistDefault?: boolean },
+	): Promise<AgentConnectionModel> {
+		if (options?.persistDefault === false && !this.client.supportsServerCapability("session_model_selection")) {
+			throw new DaemonCapabilityUnavailableError("set_model", "session_model_selection");
+		}
 		return this.requestData<AgentConnectionModel>({
 			type: "set_model",
 			activeSessionId: this.activeSessionId,
 			provider,
 			modelId,
+			...(options?.persistDefault === undefined ? {} : { persistDefault: options.persistDefault }),
 		});
 	}
 
@@ -1301,37 +1348,70 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async newSession(options?: AgentConnectionNewSessionOptions): Promise<{ cancelled: boolean }> {
-		return this.requestData<{ cancelled: boolean }>({
-			type: "new_session",
-			activeSessionId: this.activeSessionId,
-			parentSession: options?.parentSession,
+		if (options?.parentSession) {
+			// Extension-driven child sessions stay inside the current worker's family.
+			return this.requestData<{ cancelled: boolean }>({
+				type: "new_session",
+				activeSessionId: this.activeSessionId,
+				parentSession: options.parentSession,
+				cwd: options.cwd,
+			});
+		}
+		// /new must not disturb the running session. Create a fresh resident
+		// session in the daemon — the old worker keeps serving its session — and
+		// rebind this connection to the new one, the same way opening a different
+		// session from the agents view does.
+		const sourceActiveSessionId = this.activeSessionId;
+		const response = await this.client.request({
+			type: "create",
+			...(options?.cwd ? { config: { cwd: options.cwd } } : {}),
+			env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
+			lifecycle: this.options.ownedSession ? "client_owned" : "resident",
+			launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
 		});
+		if (!response.success) {
+			throw deserializeDaemonError(response);
+		}
+		const summary = response.data as { activeSessionId?: unknown; id?: unknown };
+		if (typeof summary.id !== "string") {
+			throw new Error("Daemon returned an invalid create response");
+		}
+		const targetActiveSessionId = typeof summary.activeSessionId === "string" ? summary.activeSessionId : summary.id;
+		if (targetActiveSessionId === sourceActiveSessionId) {
+			return { cancelled: false };
+		}
+		return this.reattachSession(sourceActiveSessionId, targetActiveSessionId);
 	}
 
 	async switchSession(
 		sessionPath: string,
 		options?: AgentConnectionSwitchSessionOptions,
 	): Promise<{ cancelled: boolean }> {
+		// Switch must not disturb the running session. Create (or reuse) a
+		// resident worker for the target session — the old worker keeps serving
+		// its session — and rebind this connection to the target, the same way
+		// opening a different session from the agents view does.
 		const sourceActiveSessionId = this.activeSessionId;
-		try {
-			return await this.requestData<{ cancelled: boolean }>({
-				type: "switch_session",
-				activeSessionId: sourceActiveSessionId,
-				sessionPath,
-				cwdOverride: options?.cwdOverride,
-			});
-		} catch (error) {
-			if (!(error instanceof SessionAlreadyActiveError) || !error.activeSessionId) {
-				throw error;
-			}
-			if (this.options.ownedSession) {
-				throw error;
-			}
-			if (error.activeSessionId === sourceActiveSessionId) {
-				return { cancelled: false };
-			}
-			return this.reattachSession(sourceActiveSessionId, error.activeSessionId);
+		const response = await this.client.request({
+			type: "create",
+			sessionPath,
+			...(options?.cwdOverride ? { config: { cwd: options.cwdOverride } } : {}),
+			env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
+			lifecycle: this.options.ownedSession ? "client_owned" : "resident",
+			launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
+		});
+		if (!response.success) {
+			throw deserializeDaemonError(response);
 		}
+		const summary = response.data as { activeSessionId?: unknown; id?: unknown };
+		if (typeof summary.id !== "string") {
+			throw new Error("Daemon returned an invalid create response");
+		}
+		const targetActiveSessionId = typeof summary.activeSessionId === "string" ? summary.activeSessionId : summary.id;
+		if (targetActiveSessionId === sourceActiveSessionId) {
+			return { cancelled: false };
+		}
+		return this.reattachSession(sourceActiveSessionId, targetActiveSessionId);
 	}
 
 	private async reattachSession(
@@ -1361,14 +1441,11 @@ export class DaemonAgentConnection implements AgentConnection {
 				targetActiveSessionId,
 				supportsExtensionUi,
 				clientId: this.clientId,
-				capabilities: [
-					"attach_snapshot",
-					"event_sequence",
-					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
-					"slim_attach",
-					"chunked_snapshot",
-					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
-				],
+				capabilities: daemonAttachCapabilities(
+					this.client,
+					supportsExtensionUi,
+					this.options.ownedSession === true,
+				),
 				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
 				launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
 				telemetryDisabled: this.options.telemetryDisabled,
@@ -1419,12 +1496,36 @@ export class DaemonAgentConnection implements AgentConnection {
 		entryId: string,
 		options?: AgentConnectionForkOptions,
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
-		return this.requestData<{ cancelled: boolean; selectedText?: string }>({
+		// Fork must not disturb the running session. The worker writes the
+		// branched transcript, the daemon launches a fresh resident worker for
+		// it — the source worker keeps serving its session — and this connection
+		// rebinds to the fork through the existing reattach path.
+		const sourceActiveSessionId = this.activeSessionId;
+		const forked = await this.requestData<{ sessionPath: string; selectedText?: string }>({
 			type: "fork",
-			activeSessionId: this.activeSessionId,
+			activeSessionId: sourceActiveSessionId,
 			entryId,
 			position: options?.position,
 		});
+		const response = await this.client.request({
+			type: "create",
+			sessionPath: forked.sessionPath,
+			env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
+			lifecycle: this.options.ownedSession ? "client_owned" : "resident",
+			launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
+		});
+		if (!response.success) {
+			throw deserializeDaemonError(response);
+		}
+		const summary = response.data as { activeSessionId?: unknown; id?: unknown };
+		if (typeof summary.id !== "string") {
+			throw new Error("Daemon returned an invalid create response");
+		}
+		const targetActiveSessionId = typeof summary.activeSessionId === "string" ? summary.activeSessionId : summary.id;
+		if (targetActiveSessionId !== sourceActiveSessionId) {
+			await this.reattachSession(sourceActiveSessionId, targetActiveSessionId);
+		}
+		return { cancelled: false, ...(forked.selectedText ? { selectedText: forked.selectedText } : {}) };
 	}
 
 	async navigateTree(
@@ -1667,8 +1768,8 @@ export class DaemonAgentConnection implements AgentConnection {
 		return this.reconnectPromise;
 	}
 
-	private async requestOk(command: DaemonCommandBody): Promise<void> {
-		await this.requestData<unknown>(command);
+	private async requestOk(command: DaemonCommandBody, timeoutMs?: number): Promise<void> {
+		await this.requestData<unknown>(command, timeoutMs);
 	}
 
 	private async requestData<T>(
@@ -1735,6 +1836,13 @@ export class DaemonAgentConnection implements AgentConnection {
 					this.snapshotRecoveryPromises.delete(message.snapshotId);
 				}
 			}
+			return;
+		}
+		if (
+			message.type === "session_event" &&
+			message.event.type === "act_event" &&
+			!daemonSupportsActStream(this.client)
+		) {
 			return;
 		}
 		if (this.isStaleSequencedMessage(message)) {
@@ -2227,7 +2335,15 @@ export class DaemonAgentConnection implements AgentConnection {
 			);
 		}
 		const sequence = getDaemonMessageSequence(message);
-		return sequence !== undefined && this.lastEventSequence !== undefined && sequence <= this.lastEventSequence;
+		if (sequence === undefined || this.lastEventSequence === undefined) {
+			return false;
+		}
+		if (this.lastEventCursor !== undefined) {
+			// Generation-scoped cursors order events; a legacy sequence counts a
+			// different stream of frames and cannot be compared against it.
+			return false;
+		}
+		return sequence <= this.lastEventSequence;
 	}
 
 	private observeDaemonEventSequence(message: DaemonOutbound): void {
@@ -2243,12 +2359,6 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		this.lastEventSequence =
 			this.lastEventSequence === undefined ? sequence : Math.max(this.lastEventSequence, sequence);
-		if (this.lastEventCursor) {
-			this.lastEventCursor = {
-				...this.lastEventCursor,
-				sequence: Math.max(this.lastEventCursor.sequence, sequence),
-			};
-		}
 	}
 
 	private observeEventCursor(cursor: DaemonEventCursor): void {

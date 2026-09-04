@@ -27,6 +27,8 @@ The editor can be replaced temporarily by built-in UI such as `/settings` or by 
 | Images | Paste with Ctrl+V, Alt+V on Windows, or drag into the terminal |
 | Shell command | `!command` runs and sends output to the model |
 | Hidden shell command | `!!command` runs without sending output to the model |
+| Continue | Enter `.` by itself to resume the most recent intent without adding a visible user message |
+| Clear draft | Ctrl+C clears text when the editor is non-empty; with an empty editor it keeps the existing interrupt/exit behavior |
 | External editor | Ctrl+G opens `$VISUAL` or `$EDITOR` |
 
 See [Keybindings](keybindings.md) for all shortcuts and customization.
@@ -194,6 +196,8 @@ See [Prime Agent Packages](packages.md) for package sources and security notes.
 | `-p`, `--print` | Print response and exit |
 | `--mode json` | Output all events as JSON lines; see [JSON mode](json.md) |
 | `--mode rpc` | RPC mode over stdin/stdout; see [RPC mode](rpc.md) |
+
+In text print mode, the final directing-model answer remains on stdout. Each completed nested Act depth adds one compact `Act terminal:` JSON record to stderr with normalized depth, optional parent Act id, correlation, resolved model, exact cancellation capability, status, bounded prompt/error fields, and that depth's usage. Progress stays out of text output, and unsupported connections retain the ordinary final-answer behavior.
 
 In print mode, Prime Agent also reads piped stdin and merges it into the initial prompt:
 

@@ -21,7 +21,12 @@ import type { AgentCronJob } from "../src/core/cron-jobs.js";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.js";
 import { emptyGoalState, type GoalState } from "../src/core/goals.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
-import { createSessionSlashCommandMessage, createSessionSlashCommandResultMessage } from "../src/core/messages.js";
+import {
+	createSessionSlashCommandMessage,
+	createSessionSlashCommandResultMessage,
+	MANUAL_CONTINUE_CUSTOM_TYPE,
+	MANUAL_CONTINUE_PROMPT,
+} from "../src/core/messages.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -47,6 +52,7 @@ import type { AuthenticationResult } from "../src/modes/interactive/auth-flows.j
 import { AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
 import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.js";
 import type { ConfigurationMenuComponent } from "../src/modes/interactive/components/configuration-menu.js";
+import { ElapsedToolLabelGate } from "../src/modes/interactive/components/elapsed-tool-marker.js";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
@@ -119,40 +125,6 @@ function createConnectionState(overrides: Partial<AgentConnectionState> = {}): A
 	};
 }
 
-describe("InteractiveMode update notifications", () => {
-	beforeAll(() => {
-		initTheme("dark");
-	});
-
-	test("shows the slash update command in one compact line", () => {
-		const chatContainer = new Container();
-		const fakeThis = {
-			chatContainer,
-			ui: { requestRender: vi.fn() },
-		} as unknown as InteractiveMode;
-
-		InteractiveMode.prototype.showNewVersionNotification.call(fakeThis, "1.2.3");
-
-		const output = normalizeRenderedOutput(chatContainer);
-		expect(chatContainer.children).toHaveLength(1);
-		expect(output).toBe("Update available: v1.2.3. Run /update");
-	});
-
-	test("shows package updates in one compact line", () => {
-		const chatContainer = new Container();
-		const fakeThis = {
-			chatContainer,
-			ui: { requestRender: vi.fn() },
-		} as unknown as InteractiveMode;
-
-		InteractiveMode.prototype.showPackageUpdateNotification.call(fakeThis, ["npm:@foo/bar", "npm:@baz/qux"]);
-
-		const output = normalizeRenderedOutput(chatContainer);
-		expect(chatContainer.children).toHaveLength(1);
-		expect(output).toBe("Package updates available: npm:@foo/bar, npm:@baz/qux. Run /update --extensions");
-	});
-});
-
 type ExtensionFixture = {
 	path: string;
 	sourceInfo?: AgentConnectionSourceInfo;
@@ -195,7 +167,10 @@ describe("InteractiveMode.showStatus", () => {
 		expect(fakeThis.chatContainer.children).toHaveLength(2);
 
 		// Something else gets added to the chat in between status updates
-		fakeThis.chatContainer.addChild({ render: () => ["OTHER"], invalidate: () => {} });
+		fakeThis.chatContainer.addChild({
+			render: () => ["OTHER"],
+			invalidate: () => {},
+		});
 		expect(fakeThis.chatContainer.children).toHaveLength(3);
 
 		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "STATUS_TWO");
@@ -210,6 +185,7 @@ type RenderSessionContextHarness = {
 	ipythonToolComponents: Map<string, unknown>;
 	lateIpythonSentAgentMessages: Map<string, unknown[]>;
 	toolOutputExpanded: boolean;
+	elapsedToolLabelGate: ElapsedToolLabelGate;
 	chatContainer: Container;
 	editor: { addToHistory?: (text: string) => void };
 	footer: { invalidate: () => void };
@@ -250,7 +226,10 @@ function createRenderSessionContextHarness(overrides: Partial<RenderSessionConte
 } {
 	const chatContainer = overrides.chatContainer ?? new Container();
 	const addMessageToChat = vi.fn(() => {
-		chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
+		chatContainer.addChild({
+			render: () => ["assistant"],
+			invalidate: () => {},
+		});
 	});
 	const addToHistory = vi.fn();
 	const harness: RenderSessionContextHarness = {
@@ -258,6 +237,7 @@ function createRenderSessionContextHarness(overrides: Partial<RenderSessionConte
 		ipythonToolComponents: new Map<string, unknown>(),
 		lateIpythonSentAgentMessages: new Map<string, unknown[]>(),
 		toolOutputExpanded: false,
+		elapsedToolLabelGate: new ElapsedToolLabelGate(),
 		chatContainer,
 		editor: { addToHistory },
 		footer: { invalidate: vi.fn() },
@@ -298,7 +278,14 @@ function toolResultMessage(
 	name: string,
 	content: Extract<AgentMessage, { role: "toolResult" }>["content"],
 ): Extract<AgentMessage, { role: "toolResult" }> {
-	return { role: "toolResult", toolCallId: id, toolName: name, content, isError: false, timestamp: 0 };
+	return {
+		role: "toolResult",
+		toolCallId: id,
+		toolName: name,
+		content,
+		isError: false,
+		timestamp: 0,
+	};
 }
 
 async function renderMessages(
@@ -329,6 +316,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 				ipythonToolComponents,
 				lateIpythonSentAgentMessages,
 				toolOutputExpanded: false,
+				elapsedToolLabelGate: new ElapsedToolLabelGate(),
 				chatContainer,
 				footer: { invalidate: vi.fn() },
 				updateEditorBorderColor: vi.fn(),
@@ -342,7 +330,10 @@ describe("InteractiveMode.renderSessionContext", () => {
 				getRetryAttempt: () => 0,
 				ui: { requestRender: vi.fn() },
 				addMessageToChat: vi.fn(() => {
-					chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
+					chatContainer.addChild({
+						render: () => ["assistant"],
+						invalidate: () => {},
+					});
 				}),
 			};
 			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
@@ -351,7 +342,14 @@ describe("InteractiveMode.renderSessionContext", () => {
 				messages: [
 					{
 						role: "assistant",
-						content: [{ type: "toolCall", name: "custom_tool", id: "tool-1", arguments: {} }],
+						content: [
+							{
+								type: "toolCall",
+								name: "custom_tool",
+								id: "tool-1",
+								arguments: {},
+							},
+						],
 					},
 					{
 						role: "toolResult",
@@ -383,6 +381,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 				ipythonToolComponents: new Map(),
 				lateIpythonSentAgentMessages: new Map(),
 				toolOutputExpanded: false,
+				elapsedToolLabelGate: new ElapsedToolLabelGate(),
 				chatContainer,
 				footer: { invalidate: vi.fn() },
 				updateEditorBorderColor: vi.fn(),
@@ -396,7 +395,10 @@ describe("InteractiveMode.renderSessionContext", () => {
 				getRetryAttempt: () => 0,
 				ui: { requestRender: vi.fn() },
 				addMessageToChat: vi.fn(() => {
-					chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
+					chatContainer.addChild({
+						render: () => ["assistant"],
+						invalidate: () => {},
+					});
 				}),
 			};
 			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
@@ -405,7 +407,14 @@ describe("InteractiveMode.renderSessionContext", () => {
 				messages: [
 					{
 						role: "assistant",
-						content: [{ type: "toolCall", name: "custom_tool", id: "tool-1", arguments: {} }],
+						content: [
+							{
+								type: "toolCall",
+								name: "custom_tool",
+								id: "tool-1",
+								arguments: {},
+							},
+						],
 					},
 				],
 				thinkingLevel: "medium",
@@ -414,7 +423,10 @@ describe("InteractiveMode.renderSessionContext", () => {
 
 			const component = pendingTools.get("tool-1");
 			expect(component).toBeDefined();
-			component!.updateResult({ content: [{ type: "image", data: "AAAA", mimeType: "image/png" }], isError: false });
+			component!.updateResult({
+				content: [{ type: "image", data: "AAAA", mimeType: "image/png" }],
+				isError: false,
+			});
 
 			const rendered = normalizeRenderedOutput(chatContainer);
 			expect(rendered).not.toContain("\x1b_G");
@@ -431,7 +443,9 @@ describe("InteractiveMode.renderSessionContext", () => {
 		await renderMessages(harness, messages, { limitTranscript: true });
 
 		expect(addMessageToChat).toHaveBeenCalledTimes(400);
-		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ content: "message 5" });
+		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({
+			content: "message 5",
+		});
 		expect(renderAll(chatContainer)).toContain("Showing latest 400 of 405 messages for faster open.");
 	});
 
@@ -462,35 +476,47 @@ describe("InteractiveMode.renderSessionContext", () => {
 		} as AgentMessage;
 		const later = Array.from({ length: 399 }, (_, index) => userMessage(`later ${index}`, 5));
 
-		await renderMessages(harness, [summary, ...retained, ...later], { limitTranscript: true });
+		await renderMessages(harness, [summary, ...retained, ...later], {
+			limitTranscript: true,
+		});
 
 		expect(addMessageToChat).toHaveBeenCalledTimes(400);
 		expect(addMessageToChat.mock.calls[0]?.[0]).toBe(summary);
-		expect(addMessageToChat.mock.calls[1]?.[0]).toMatchObject({ content: "later 0" });
+		expect(addMessageToChat.mock.calls[1]?.[0]).toMatchObject({
+			content: "later 0",
+		});
 	});
 
 	test("preserves the full transcript when rebuilding a cleared transcript", async () => {
 		const { harness, chatContainer, addMessageToChat } = createRenderSessionContextHarness();
-		chatContainer.addChild({ render: () => ["old transcript"], invalidate: () => {} });
+		chatContainer.addChild({
+			render: () => ["old transcript"],
+			invalidate: () => {},
+		});
 		const messages = Array.from({ length: 405 }, (_, index) => userMessage(`message ${index}`, index));
 
 		await renderMessages(harness, messages, { clearChat: true });
 
 		expect(addMessageToChat).toHaveBeenCalledTimes(405);
-		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ content: "message 0" });
+		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({
+			content: "message 0",
+		});
 		expect(renderAll(chatContainer)).not.toContain("old transcript");
 		expect(renderAll(chatContainer)).not.toContain("for faster open");
 	});
 
-	test("populates editor history from the full transcript when initial rendering is capped", async () => {
+	test("populates editor history from only the editor's retained tail", async () => {
 		const { harness, addMessageToChat, addToHistory } = createRenderSessionContextHarness();
 		const messages = Array.from({ length: 405 }, (_, index) => userMessage(`message ${index}`, index));
 
-		await renderMessages(harness, messages, { populateHistory: true, limitTranscript: true });
+		await renderMessages(harness, messages, {
+			populateHistory: true,
+			limitTranscript: true,
+		});
 
 		expect(addMessageToChat).toHaveBeenCalledTimes(400);
-		expect(addToHistory).toHaveBeenCalledTimes(405);
-		expect(addToHistory.mock.calls[0]?.[0]).toBe("message 0");
+		expect(addToHistory).toHaveBeenCalledTimes(100);
+		expect(addToHistory.mock.calls[0]?.[0]).toBe("message 305");
 		expect(addToHistory.mock.calls.at(-1)?.[0]).toBe("message 404");
 	});
 
@@ -505,7 +531,11 @@ describe("InteractiveMode.renderSessionContext", () => {
 			sessionFile: "/tmp/session.jsonl",
 			cwd: "/tmp/project",
 			prompt: "check whether there is follow-up work",
-			schedule: { kind: "interval", expression: "every 5m", intervalMs: 300_000 },
+			schedule: {
+				kind: "interval",
+				expression: "every 5m",
+				intervalMs: 300_000,
+			},
 			createdAt: "2026-01-01T00:00:00.000Z",
 			updatedAt: "2026-01-01T00:00:00.000Z",
 			lastRunAt: "2026-01-01T00:05:00.000Z",
@@ -541,7 +571,9 @@ describe("InteractiveMode.renderSessionContext", () => {
 		await renderMessages(harness, messages, { limitTranscript: true });
 
 		expect(addMessageToChat).toHaveBeenCalledTimes(399);
-		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ content: "message 0" });
+		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({
+			content: "message 0",
+		});
 		expect(renderAll(chatContainer)).toContain("Showing latest 399 of 401 messages for faster open.");
 	});
 
@@ -556,9 +588,15 @@ describe("InteractiveMode.renderSessionContext", () => {
 		await renderMessages(harness, messages, { limitTranscript: true });
 
 		expect(addMessageToChat).toHaveBeenCalledTimes(399);
-		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ role: "assistant" });
-		expect(addMessageToChat.mock.calls[1]?.[0]).toMatchObject({ content: "message 1" });
-		expect(addMessageToChat.mock.calls.at(-1)?.[0]).toMatchObject({ content: "message 398" });
+		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({
+			role: "assistant",
+		});
+		expect(addMessageToChat.mock.calls[1]?.[0]).toMatchObject({
+			content: "message 1",
+		});
+		expect(addMessageToChat.mock.calls.at(-1)?.[0]).toMatchObject({
+			content: "message 398",
+		});
 		expect(renderAll(chatContainer)).toContain("Showing latest 400 of 401 messages for faster open.");
 	});
 
@@ -567,7 +605,12 @@ describe("InteractiveMode.renderSessionContext", () => {
 		const toolCallIds = Array.from({ length: 400 }, (_, index) => `tool-${index}`);
 		const assistantMessage: Extract<AgentMessage, { role: "assistant" }> = {
 			...toolCallMessage(toolCallIds[0]!, "custom_tool"),
-			content: toolCallIds.map((id) => ({ type: "toolCall" as const, name: "custom_tool", id, arguments: {} })),
+			content: toolCallIds.map((id) => ({
+				type: "toolCall" as const,
+				name: "custom_tool",
+				id,
+				arguments: {},
+			})),
 		};
 		const messages = [
 			assistantMessage,
@@ -577,7 +620,9 @@ describe("InteractiveMode.renderSessionContext", () => {
 		await renderMessages(harness, messages, { limitTranscript: true });
 
 		expect(addMessageToChat).toHaveBeenCalledOnce();
-		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ role: "assistant" });
+		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({
+			role: "assistant",
+		});
 		expect(harness.preloadToolDefinitions).toHaveBeenCalledWith(Array(399).fill("custom_tool"));
 		expect(renderAll(chatContainer)).toContain("Showing latest 400 of 401 messages for faster open.");
 	});
@@ -636,7 +681,11 @@ type SubmitHandlerHarness = {
 function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {}): SubmitHandlerHarness {
 	const fakeThis: SubmitHandlerHarness = {
 		defaultEditor: {},
-		editor: { getText: vi.fn(() => ""), setText: vi.fn(), addToHistory: vi.fn() },
+		editor: {
+			getText: vi.fn(() => ""),
+			setText: vi.fn(),
+			addToHistory: vi.fn(),
+		},
 		clearSideQuestion: vi.fn(),
 		clearShortcutGuide: vi.fn(),
 		showWarning: vi.fn(),
@@ -651,7 +700,9 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 		getPromptStashImages: vi.fn(() => []),
 		snapshotPromptStash: vi.fn((text) => ({ text })),
 		retainSubmittedDraft: (
-			InteractiveMode.prototype as unknown as { retainSubmittedDraft(stash: unknown, generation: number): void }
+			InteractiveMode.prototype as unknown as {
+				retainSubmittedDraft(stash: unknown, generation: number): void;
+			}
 		).retainSubmittedDraft,
 		retainStartupPromptDrafts: (
 			InteractiveMode.prototype as unknown as {
@@ -780,7 +831,9 @@ describe("InteractiveMode working timer", () => {
 		const now = vi.spyOn(Date, "now").mockReturnValue(500);
 		try {
 			(
-				InteractiveMode.prototype as unknown as { startWorkingLoader(this: InitialTimerHarness): void }
+				InteractiveMode.prototype as unknown as {
+					startWorkingLoader(this: InitialTimerHarness): void;
+				}
 			).startWorkingLoader.call(harness);
 		} finally {
 			now.mockRestore();
@@ -792,9 +845,33 @@ describe("InteractiveMode working timer", () => {
 });
 
 describe("InteractiveMode submit handling", () => {
+	test("keeps a running Act steering instruction on the standard submit path", async () => {
+		const prompt = vi.fn(async () => {});
+		const fakeThis = createSubmitHandlerHarness({
+			agentConnection: {
+				prompt,
+				executeBash: vi.fn(async () => {}),
+				getState: vi.fn(async () => ({ isBashRunning: false })),
+			},
+		});
+
+		// ActExecutionComponent is presentation-only. While its running control
+		// hint is visible, submit still uses the Phase 4 connection steering path.
+		await fakeThis.defaultEditor.onSubmit?.("redirect the active Act");
+
+		expect(prompt).toHaveBeenCalledWith("redirect the active Act", {
+			images: [],
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+		});
+	});
+
 	test.each(["normal Enter", "installed custom editor"])("captures exact rich state for %s", async () => {
 		const image = { type: "image", data: "base64", mimeType: "image/png" };
-		const pasteSnapshot = { pastes: [[1, "expanded paste"]] as const, pasteCounter: 2 };
+		const pasteSnapshot = {
+			pastes: [[1, "expanded paste"]] as const,
+			pasteCounter: 2,
+		};
 		const rawText = "draft [paste #1] [image #7]";
 		let editorText = rawText;
 		const editor = {
@@ -814,7 +891,9 @@ describe("InteractiveMode submit handling", () => {
 		});
 		delete fakeThis.promptStash;
 		fakeThis.snapshotPromptStash = (
-			InteractiveMode.prototype as unknown as { snapshotPromptStash(text: string): unknown }
+			InteractiveMode.prototype as unknown as {
+				snapshotPromptStash(text: string): unknown;
+			}
 		).snapshotPromptStash.bind({
 			editor,
 			snapshotPromptStashFrom: (
@@ -845,7 +924,10 @@ describe("InteractiveMode submit handling", () => {
 		async (supportsSnapshotRestore) => {
 			initTheme("dark");
 			const image = { type: "image", data: "base64", mimeType: "image/png" };
-			const pasteSnapshot = { pastes: [[5, "expanded paste"]] as const, pasteCounter: 6 };
+			const pasteSnapshot = {
+				pastes: [[5, "expanded paste"]] as const,
+				pasteCounter: 6,
+			};
 			const rawText = "draft [paste #5] [image #7]";
 			const expandedText = "draft expanded paste [image #7]";
 			let oldText = rawText;
@@ -906,17 +988,23 @@ describe("InteractiveMode submit handling", () => {
 				},
 			});
 			fakeThis.snapshotPromptStash = (
-				InteractiveMode.prototype as unknown as { snapshotPromptStash(text: string): unknown }
+				InteractiveMode.prototype as unknown as {
+					snapshotPromptStash(text: string): unknown;
+				}
 			).snapshotPromptStash.bind(fakeThis as never);
 			(
-				fakeThis as unknown as { snapshotPromptStashFrom(editor: unknown, text: string): unknown }
+				fakeThis as unknown as {
+					snapshotPromptStashFrom(editor: unknown, text: string): unknown;
+				}
 			).snapshotPromptStashFrom = (
 				InteractiveMode.prototype as unknown as {
 					snapshotPromptStashFrom(editor: unknown, text: string): unknown;
 				}
 			).snapshotPromptStashFrom;
 			(
-				InteractiveMode.prototype as unknown as { setupEditorSubmitHandler(this: SubmitHandlerHarness): void }
+				InteractiveMode.prototype as unknown as {
+					setupEditorSubmitHandler(this: SubmitHandlerHarness): void;
+				}
 			).setupEditorSubmitHandler.call(fakeThis);
 			oldEditor.onChange = (text: string) => {
 				if (text.length > 0) fakeThis.latestEditorPromptStash = fakeThis.snapshotPromptStash(text);
@@ -945,7 +1033,9 @@ describe("InteractiveMode submit handling", () => {
 			});
 			restoredSnapshot = undefined;
 			(
-				InteractiveMode.prototype as unknown as { restorePromptStashIfEditorEmpty(this: unknown): boolean }
+				InteractiveMode.prototype as unknown as {
+					restorePromptStashIfEditorEmpty(this: unknown): boolean;
+				}
 			).restorePromptStashIfEditorEmpty.call(fakeThis);
 			expect(customText).toBe(supportsSnapshotRestore ? rawText : expandedText);
 			expect(restoredSnapshot).toBe(supportsSnapshotRestore ? pasteSnapshot : undefined);
@@ -955,7 +1045,10 @@ describe("InteractiveMode submit handling", () => {
 
 	test("captures exact rich state for Alt+Enter before clearing", async () => {
 		const image = { type: "image", data: "base64", mimeType: "image/png" };
-		const pasteSnapshot = { pastes: [[3, "expanded paste"]] as const, pasteCounter: 4 };
+		const pasteSnapshot = {
+			pastes: [[3, "expanded paste"]] as const,
+			pasteCounter: 4,
+		};
 		let editorText = "alt [paste #3] [image #9]";
 		const fakeThis = createSubmitHandlerHarness({
 			editor: {
@@ -973,7 +1066,9 @@ describe("InteractiveMode submit handling", () => {
 		delete fakeThis.promptStash;
 		fakeThis.editor.onSubmit = fakeThis.defaultEditor.onSubmit;
 		fakeThis.snapshotPromptStash = (
-			InteractiveMode.prototype as unknown as { snapshotPromptStash(text: string): unknown }
+			InteractiveMode.prototype as unknown as {
+				snapshotPromptStash(text: string): unknown;
+			}
 		).snapshotPromptStash.bind({
 			editor: fakeThis.editor,
 			snapshotPromptStashFrom: (
@@ -985,7 +1080,9 @@ describe("InteractiveMode submit handling", () => {
 		} as never);
 
 		await (
-			InteractiveMode.prototype as unknown as { handleFollowUp(this: SubmitHandlerHarness): Promise<void> }
+			InteractiveMode.prototype as unknown as {
+				handleFollowUp(this: SubmitHandlerHarness): Promise<void>;
+			}
 		).handleFollowUp.call(fakeThis);
 
 		expect(editorText).toBe("");
@@ -997,12 +1094,32 @@ describe("InteractiveMode submit handling", () => {
 		});
 	});
 
+	test("turns a lone dot into a hidden manual continuation", async () => {
+		const fakeThis = createSubmitHandlerHarness();
+
+		await fakeThis.defaultEditor.onSubmit?.(".");
+
+		expect(fakeThis.agentConnection.prompt).toHaveBeenCalledWith(
+			MANUAL_CONTINUE_PROMPT,
+			expect.objectContaining({
+				customMessage: expect.objectContaining({
+					customType: MANUAL_CONTINUE_CUSTOM_TYPE,
+					display: false,
+				}),
+				internalPrompt: true,
+			}),
+		);
+		expect(fakeThis.editor.addToHistory).not.toHaveBeenCalled();
+	});
+
 	test("routes ! shortcuts to executeBash on the agent connection", async () => {
 		const fakeThis = createSubmitHandlerHarness();
 
 		await fakeThis.defaultEditor.onSubmit?.("!pwd");
 
-		expect(fakeThis.agentConnection.executeBash).toHaveBeenCalledWith("pwd", { excludeFromContext: false });
+		expect(fakeThis.agentConnection.executeBash).toHaveBeenCalledWith("pwd", {
+			excludeFromContext: false,
+		});
 		expect(fakeThis.editor.addToHistory).toHaveBeenCalledWith("!pwd");
 		expect(fakeThis.editor.setText).toHaveBeenCalledWith("");
 		expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
@@ -1051,7 +1168,9 @@ describe("InteractiveMode submit handling", () => {
 		await fakeThis.defaultEditor.onSubmit?.("!pwd");
 
 		expect(fakeThis.showError).toHaveBeenCalledWith(expect.stringContaining("older build"));
-		expect(fakeThis.patchConnectionState).toHaveBeenLastCalledWith({ isBashRunning: false });
+		expect(fakeThis.patchConnectionState).toHaveBeenLastCalledWith({
+			isBashRunning: false,
+		});
 	});
 
 	test("re-syncs the bash flag from connection state when executeBash is rejected", async () => {
@@ -1068,7 +1187,9 @@ describe("InteractiveMode submit handling", () => {
 
 		await fakeThis.defaultEditor.onSubmit?.("!pwd");
 
-		expect(fakeThis.patchConnectionState).toHaveBeenLastCalledWith({ isBashRunning: true });
+		expect(fakeThis.patchConnectionState).toHaveBeenLastCalledWith({
+			isBashRunning: true,
+		});
 	});
 });
 
@@ -1117,9 +1238,15 @@ describe("InteractiveMode MCP command", () => {
 	function createRenderedMcpHarness(manager: SettingsManager) {
 		const chatContainer = new Container();
 		const ui = { requestRender: vi.fn() };
-		const showStatus = (InteractiveMode.prototype as unknown as { showStatus(message: string): void }).showStatus;
+		const showStatus = (
+			InteractiveMode.prototype as unknown as {
+				showStatus(message: string): void;
+			}
+		).showStatus;
 		return {
-			modelRegistry: { authStorage: { get: vi.fn(() => undefined), removeVerified: vi.fn() } },
+			modelRegistry: {
+				authStorage: { get: vi.fn(() => undefined), removeVerified: vi.fn() },
+			},
 			settingsManager: manager,
 			uiServices: { refreshMcpProviders: vi.fn() },
 			chatContainer,
@@ -1276,7 +1403,9 @@ describe("InteractiveMode pending bash components", () => {
 		} as unknown as InteractiveMode;
 
 		(
-			InteractiveMode.prototype as unknown as { updatePendingMessagesDisplay(this: unknown): void }
+			InteractiveMode.prototype as unknown as {
+				updatePendingMessagesDisplay(this: unknown): void;
+			}
 		).updatePendingMessagesDisplay.call(fakeThis);
 
 		expect(pendingMessagesContainer.children).toContain(component);
@@ -1305,7 +1434,9 @@ describe("InteractiveMode pending bash components", () => {
 		} as unknown as InteractiveMode;
 
 		(
-			InteractiveMode.prototype as unknown as { updatePendingMessagesDisplay(this: unknown): void }
+			InteractiveMode.prototype as unknown as {
+				updatePendingMessagesDisplay(this: unknown): void;
+			}
 		).updatePendingMessagesDisplay.call(fakeThis);
 
 		const raw = queuedMessagesContainer.render(100).join("\n");
@@ -1336,7 +1467,9 @@ describe("InteractiveMode pending bash components", () => {
 		} as unknown as InteractiveMode;
 
 		(
-			InteractiveMode.prototype as unknown as { flushPendingBashComponents(this: unknown): void }
+			InteractiveMode.prototype as unknown as {
+				flushPendingBashComponents(this: unknown): void;
+			}
 		).flushPendingBashComponents.call(fakeThis);
 
 		expect(pendingMessagesContainer.children).not.toContain(component);
@@ -1366,12 +1499,20 @@ describe("InteractiveMode pending bash components", () => {
 			},
 		} as unknown as InteractiveMode;
 
-		(InteractiveMode.prototype as unknown as { subscribeToAgent(this: unknown): void }).subscribeToAgent.call(
-			fakeThis,
-		);
+		(
+			InteractiveMode.prototype as unknown as {
+				subscribeToAgent(this: unknown): void;
+			}
+		).subscribeToAgent.call(fakeThis);
 
-		const first = listener?.({ type: "session_event", event: { type: "bash_start" } });
-		const second = listener?.({ type: "session_event", event: { type: "bash_end" } });
+		const first = listener?.({
+			type: "session_event",
+			event: { type: "bash_start" },
+		});
+		const second = listener?.({
+			type: "session_event",
+			event: { type: "bash_end" },
+		});
 		await Promise.all([first, second]);
 
 		expect(order).toEqual(["start:bash_start", "end:bash_start", "start:bash_end", "end:bash_end"]);
@@ -1420,7 +1561,9 @@ describe("InteractiveMode pending bash components", () => {
 		} as unknown as InteractiveMode;
 
 		(
-			InteractiveMode.prototype as unknown as { resetCurrentSessionRenderState(this: unknown): void }
+			InteractiveMode.prototype as unknown as {
+				resetCurrentSessionRenderState(this: unknown): void;
+			}
 		).resetCurrentSessionRenderState.call(fakeThis);
 
 		expect(loader.intervalId).toBeNull();
@@ -1453,7 +1596,9 @@ describe("InteractiveMode connection events", () => {
 
 	test("degrades heartbeat refresh failures while updating the pending display during rebind", async () => {
 		const rebindCurrentSession = (
-			InteractiveMode.prototype as unknown as { rebindCurrentSession(this: InteractiveMode): Promise<void> }
+			InteractiveMode.prototype as unknown as {
+				rebindCurrentSession(this: InteractiveMode): Promise<void>;
+			}
 		).rebindCurrentSession;
 		const updatePendingMessagesDisplay = vi.fn();
 		const subscribeToAgent = vi.fn();
@@ -1499,12 +1644,18 @@ describe("InteractiveMode connection events", () => {
 		} as AgentConnectionSnapshot["streamingMessage"];
 		const snapshots: AgentConnectionSnapshot[] = [
 			{ state: createConnectionState(), messages: [] },
-			{ state: createConnectionState({ isStreaming: true }), messages: [], streamingMessage },
+			{
+				state: createConnectionState({ isStreaming: true }),
+				messages: [],
+				streamingMessage,
+			},
 		];
 		const renderSessionContextMock = vi.fn(async () => {});
 		const restoreStreamingMessageFromSnapshot = vi.fn(async () => {});
 		const fakeThis = {
-			agentConnection: { getInitialSnapshot: vi.fn(async () => snapshots.shift()!) },
+			agentConnection: {
+				getInitialSnapshot: vi.fn(async () => snapshots.shift()!),
+			},
 			getSessionContextFromConnectionSnapshot: vi.fn(() => ({
 				messages: [],
 				thinkingLevel: "medium",
@@ -1519,14 +1670,19 @@ describe("InteractiveMode connection events", () => {
 		} as unknown as InteractiveMode;
 
 		const renderInitialMessages = (
-			InteractiveMode.prototype as unknown as { renderInitialMessages(this: InteractiveMode): Promise<void> }
+			InteractiveMode.prototype as unknown as {
+				renderInitialMessages(this: InteractiveMode): Promise<void>;
+			}
 		).renderInitialMessages;
 		await renderInitialMessages.call(fakeThis);
 		await renderInitialMessages.call(fakeThis);
 
 		expect(
-			(fakeThis as unknown as { agentConnection: { getInitialSnapshot: ReturnType<typeof vi.fn> } }).agentConnection
-				.getInitialSnapshot,
+			(
+				fakeThis as unknown as {
+					agentConnection: { getInitialSnapshot: ReturnType<typeof vi.fn> };
+				}
+			).agentConnection.getInitialSnapshot,
 		).toHaveBeenCalledTimes(2);
 		expect(renderSessionContextMock).toHaveBeenCalledTimes(2);
 		expect(renderSessionContextMock).toHaveBeenNthCalledWith(1, expect.anything(), {
@@ -1544,7 +1700,11 @@ describe("InteractiveMode connection events", () => {
 	});
 
 	test("clears extension UI when a connection-backed session is replaced", async () => {
-		type SessionReplacedEvent = { type: "session_replaced"; state: AgentConnectionState; messages: [] };
+		type SessionReplacedEvent = {
+			type: "session_replaced";
+			state: AgentConnectionState;
+			messages: [];
+		};
 		let listener: ((event: SessionReplacedEvent) => Promise<void> | void) | undefined;
 		const fakeThis = {
 			agentConnection: {
@@ -1567,9 +1727,11 @@ describe("InteractiveMode connection events", () => {
 			showError: vi.fn(),
 		};
 
-		(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
-			fakeThis,
-		);
+		(
+			InteractiveMode.prototype as unknown as {
+				subscribeToAgent(this: typeof fakeThis): void;
+			}
+		).subscribeToAgent.call(fakeThis);
 
 		const state = createConnectionState();
 		await listener?.({ type: "session_replaced", state, messages: [] });
@@ -1616,9 +1778,11 @@ describe("InteractiveMode connection events", () => {
 			showError: vi.fn(),
 		};
 
-		(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
-			fakeThis,
-		);
+		(
+			InteractiveMode.prototype as unknown as {
+				subscribeToAgent(this: typeof fakeThis): void;
+			}
+		).subscribeToAgent.call(fakeThis);
 
 		const snapshot = { state: createConnectionState(), messages: [] as [] };
 		await listener?.({ type: "session_resynced", snapshot });
@@ -1636,7 +1800,10 @@ describe("InteractiveMode connection events", () => {
 
 	test("drops a resync superseded while its command catalog refreshes", async () => {
 		type ConnectionEvent =
-			| { type: "session_resynced"; snapshot: { state: AgentConnectionState; messages: [] } }
+			| {
+					type: "session_resynced";
+					snapshot: { state: AgentConnectionState; messages: [] };
+			  }
 			| { type: "session_replaced"; state: AgentConnectionState; messages: [] };
 		let listener: ((event: ConnectionEvent) => Promise<void> | void) | undefined;
 		let releaseCatalog = () => {};
@@ -1665,16 +1832,22 @@ describe("InteractiveMode connection events", () => {
 			handleConnectionExtensionUiRequest: vi.fn(),
 			showError: vi.fn(),
 		};
-		(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
-			fakeThis,
-		);
+		(
+			InteractiveMode.prototype as unknown as {
+				subscribeToAgent(this: typeof fakeThis): void;
+			}
+		).subscribeToAgent.call(fakeThis);
 
 		const resync = listener?.({
 			type: "session_resynced",
 			snapshot: { state: createConnectionState(), messages: [] },
 		});
 		await vi.waitFor(() => expect(fakeThis.refreshCommandCatalogForCurrentSession).toHaveBeenCalledOnce());
-		const replacement = listener?.({ type: "session_replaced", state: createConnectionState(), messages: [] });
+		const replacement = listener?.({
+			type: "session_replaced",
+			state: createConnectionState(),
+			messages: [],
+		});
 		releaseCatalog();
 		await Promise.all([resync, replacement]);
 
@@ -1749,7 +1922,11 @@ describe("InteractiveMode connection events", () => {
 			content: [{ type: "thinking", thinking: "Still reasoning" }],
 		} as AgentConnectionSnapshot["streamingMessage"];
 		const snapshot: AgentConnectionSnapshot = {
-			state: createConnectionState({ isCompacting: true, isBashRunning: true, isStreaming: true }),
+			state: createConnectionState({
+				isCompacting: true,
+				isBashRunning: true,
+				isStreaming: true,
+			}),
 			messages: [userMessage("Still working", 100)],
 			streamingMessage,
 		};
@@ -1805,13 +1982,24 @@ describe("InteractiveMode connection events", () => {
 		).toBe(extensionRequests);
 		expect((fakeThis as unknown as { activeBashComponent: unknown }).activeBashComponent).toBe(activeBashComponent);
 		expect(
-			(fakeThis as unknown as { renderSessionContext: ReturnType<typeof vi.fn> }).renderSessionContext,
-		).toHaveBeenCalledWith(expect.anything(), { clearChat: true, updateFooter: true });
+			(
+				fakeThis as unknown as {
+					renderSessionContext: ReturnType<typeof vi.fn>;
+				}
+			).renderSessionContext,
+		).toHaveBeenCalledWith(expect.anything(), {
+			clearChat: true,
+			updateFooter: true,
+		});
 		expect(startAssistantStreamingMessage).toHaveBeenCalledWith(streamingMessage);
 		expect((fakeThis as unknown as { turnStartedAt: number | undefined }).turnStartedAt).toBe(100);
 		expect((fakeThis as unknown as { workingStartedAt: number | undefined }).workingStartedAt).toBe(100);
 		expect(
-			(fakeThis as unknown as { updateWorkingLoaderMessage: ReturnType<typeof vi.fn> }).updateWorkingLoaderMessage,
+			(
+				fakeThis as unknown as {
+					updateWorkingLoaderMessage: ReturnType<typeof vi.fn>;
+				}
+			).updateWorkingLoaderMessage,
 		).toHaveBeenCalledOnce();
 		expect(refreshCommandCatalogForCurrentSession).not.toHaveBeenCalled();
 	});
@@ -1820,7 +2008,11 @@ describe("InteractiveMode connection events", () => {
 		const bashComponent = { setComplete: vi.fn() };
 		const flushPendingBashComponents = vi.fn();
 		const snapshot: AgentConnectionSnapshot = {
-			state: createConnectionState({ isCompacting: false, isBashRunning: false, isStreaming: false }),
+			state: createConnectionState({
+				isCompacting: false,
+				isBashRunning: false,
+				isStreaming: false,
+			}),
 			messages: [],
 		};
 		const fakeThis = {
@@ -1919,12 +2111,20 @@ describe("InteractiveMode connection events", () => {
 			ui: { requestRender: vi.fn() },
 			showError: vi.fn(),
 		};
-		(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
-			fakeThis,
-		);
+		(
+			InteractiveMode.prototype as unknown as {
+				subscribeToAgent(this: typeof fakeThis): void;
+			}
+		).subscribeToAgent.call(fakeThis);
 
-		const staleEvent = listener?.({ type: "session_event", event: { type: "message_update" } });
-		const replacement = listener?.({ type: "session_replaced", state: createConnectionState() });
+		const staleEvent = listener?.({
+			type: "session_event",
+			event: { type: "message_update" },
+		});
+		const replacement = listener?.({
+			type: "session_replaced",
+			state: createConnectionState(),
+		});
 		releaseQueue?.();
 		await Promise.all([staleEvent, replacement]);
 
@@ -2100,7 +2300,11 @@ describe("InteractiveMode tool event rendering", () => {
 		const event = {
 			type: "message_update",
 			message,
-			assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial: message },
+			assistantMessageEvent: {
+				type: "toolcall_start",
+				contentIndex: 0,
+				partial: message,
+			},
 		} as unknown as AgentConnectionSessionEvent;
 		const handleEvent = (
 			InteractiveMode.prototype as unknown as {
@@ -2124,7 +2328,9 @@ describe("InteractiveMode tool event rendering", () => {
 describe("InteractiveMode transcript rebuild", () => {
 	type RebuildHarness = {
 		chatContainer: Container;
-		agentConnection: { getSessionContext(): Promise<AgentConnectionSessionContext> };
+		agentConnection: {
+			getSessionContext(): Promise<AgentConnectionSessionContext>;
+		};
 		renderSessionContext(context: AgentConnectionSessionContext, options: RenderSessionContextOptions): Promise<void>;
 		rebuildChatFromMessages(): Promise<void>;
 	};
@@ -2161,7 +2367,9 @@ describe("InteractiveMode transcript rebuild", () => {
 			serviceTier: "default",
 			model: null,
 		};
-		fakeThis.agentConnection = { getSessionContext: vi.fn(async () => context) };
+		fakeThis.agentConnection = {
+			getSessionContext: vi.fn(async () => context),
+		};
 		fakeThis.renderSessionContext = vi.fn(async (_context, options) => {
 			if (options.clearChat) fakeThis.chatContainer.clear();
 			fakeThis.chatContainer.addChild(rebuiltChild);
@@ -2169,7 +2377,9 @@ describe("InteractiveMode transcript rebuild", () => {
 
 		await fakeThis.rebuildChatFromMessages();
 
-		expect(fakeThis.renderSessionContext).toHaveBeenCalledWith(context, { clearChat: true });
+		expect(fakeThis.renderSessionContext).toHaveBeenCalledWith(context, {
+			clearChat: true,
+		});
 		expect(fakeThis.chatContainer.children).toEqual([rebuiltChild]);
 		expect(fakeThis.chatContainer.children).not.toContain(staleChild);
 	});
@@ -2189,7 +2399,10 @@ describe("InteractiveMode startup onboarding warnings", () => {
 		getModelFallbackWarningAction,
 	});
 
-	const liveModel = { id: "gpt-5.5", provider: "prime-inference" } as AgentConnectionModel;
+	const liveModel = {
+		id: "gpt-5.5",
+		provider: "prime-inference",
+	} as AgentConnectionModel;
 
 	test("suppresses the no-model warning when the live session has a model", () => {
 		const fakeThis = createHarness({ currentModel: liveModel });
@@ -2217,7 +2430,9 @@ describe("InteractiveMode startup onboarding warnings", () => {
 
 describe("InteractiveMode model candidates", () => {
 	type ModelCandidatesHarness = {
-		agentConnection: { getModelCatalog: () => Promise<AgentConnectionModelCatalog> };
+		agentConnection: {
+			getModelCatalog: () => Promise<AgentConnectionModelCatalog>;
+		};
 		connectionModelCatalog: AgentConnectionModel[];
 		connectionConfiguredProviders: Set<string>;
 		connectionModelsFetchedAt: number;
@@ -2244,7 +2459,10 @@ describe("InteractiveMode model candidates", () => {
 
 	test("loads unscoped model candidates through AgentConnection", async () => {
 		const model = createModel("openai", "gpt-5.5");
-		const getModelCatalog = vi.fn(async () => ({ models: [model], configuredProviders: [model.provider] }));
+		const getModelCatalog = vi.fn(async () => ({
+			models: [model],
+			configuredProviders: [model.provider],
+		}));
 		const fakeThis: ModelCandidatesHarness = {
 			agentConnection: { getModelCatalog },
 			connectionModelCatalog: [],
@@ -2314,7 +2532,9 @@ describe("InteractiveMode model selection persistence", () => {
 			getState(): Promise<AgentConnectionState>;
 		};
 		uiServices: {
-			settingsManager: { setDefaultModelAndProvider(provider: string, modelId: string): void };
+			settingsManager: {
+				setDefaultModelAndProvider(provider: string, modelId: string): void;
+			};
 		};
 		footer: { invalidate(): void };
 		subagentSummaryLine: { invalidate(): void };
@@ -2530,7 +2750,11 @@ describe("InteractiveMode model selection persistence", () => {
 				order.push("connection");
 			}),
 			getState: vi.fn(async () =>
-				createConnectionState({ model, serviceTier: "default", availableThinkingLevels: ["off"] }),
+				createConnectionState({
+					model,
+					serviceTier: "default",
+					availableThinkingLevels: ["off"],
+				}),
 			),
 		};
 		fakeThis.uiServices = {
@@ -2548,7 +2772,7 @@ describe("InteractiveMode model selection persistence", () => {
 
 		await fakeThis.applySelectedModel(model);
 
-		expect(fakeThis.agentConnection.setModel).toHaveBeenCalledWith("openai", "gpt-5.5");
+		expect(fakeThis.agentConnection.setModel).toHaveBeenCalledWith("openai", "gpt-5.5", { persistDefault: true });
 		expect(fakeThis.uiServices.settingsManager.setDefaultModelAndProvider).toHaveBeenCalledWith("openai", "gpt-5.5");
 		expect(order).toEqual(["connection", "settings"]);
 		expect(fakeThis.patchConnectionState).toHaveBeenCalledWith({
@@ -2593,7 +2817,11 @@ describe("InteractiveMode model selection persistence", () => {
 		fakeThis.agentConnection = {
 			setModel: vi.fn(async () => {}),
 			getState: vi.fn(async () =>
-				createConnectionState({ model, serviceTier: "default", availableThinkingLevels: ["off"] }),
+				createConnectionState({
+					model,
+					serviceTier: "default",
+					availableThinkingLevels: ["off"],
+				}),
 			),
 		};
 		fakeThis.uiServices = {
@@ -2621,7 +2849,7 @@ describe("InteractiveMode model selection persistence", () => {
 
 		await fakeThis.handleModelCommand("gpt-5.5");
 
-		expect(fakeThis.agentConnection.setModel).toHaveBeenCalledWith("openai", "gpt-5.5");
+		expect(fakeThis.agentConnection.setModel).toHaveBeenCalledWith("openai", "gpt-5.5", { persistDefault: true });
 		expect(fakeThis.uiServices.settingsManager.setDefaultModelAndProvider).toHaveBeenCalledWith("openai", "gpt-5.5");
 		expect(fakeThis.patchConnectionState).toHaveBeenCalledWith({
 			model,
@@ -2857,7 +3085,11 @@ describe("InteractiveMode model selection persistence", () => {
 
 	test("authenticates an unavailable model provider before applying the model", async () => {
 		const model = createModel("openai", "gpt-5.5");
-		const provider: AuthSelectorProvider = { id: "openai", name: "OpenAI", authType: "api_key" };
+		const provider: AuthSelectorProvider = {
+			id: "openai",
+			name: "OpenAI",
+			authType: "api_key",
+		};
 		let authenticated = false;
 		const getModelCatalog = vi.fn(async () => ({
 			models: [model],
@@ -2891,14 +3123,18 @@ describe("InteractiveMode model selection persistence", () => {
 
 		expect(loginProvider).toHaveBeenCalledWith(provider);
 		expect(getModelCatalog).toHaveBeenCalledTimes(1);
-		expect(applySelectedModel).toHaveBeenCalledWith(model);
+		expect(applySelectedModel).toHaveBeenCalledWith(model, true);
 		expect(hide).toHaveBeenCalledTimes(1);
 		await expect(result).resolves.toBeUndefined();
 	});
 
 	test("keeps the model selector open when provider authentication is cancelled", async () => {
 		const model = createModel("openai", "gpt-5.5");
-		const provider: AuthSelectorProvider = { id: "openai", name: "OpenAI", authType: "api_key" };
+		const provider: AuthSelectorProvider = {
+			id: "openai",
+			name: "OpenAI",
+			authType: "api_key",
+		};
 		const loginProvider = vi.fn(async () => ({ status: "cancelled" as const }));
 		const applySelectedModel = vi.fn(async () => {});
 		const { fakeThis, getSelector, hide } = createSelectorOverlayHarness({
@@ -2976,7 +3212,10 @@ describe("InteractiveMode model selection persistence", () => {
 		const getModelCatalog = vi
 			.fn<() => Promise<AgentConnectionModelCatalog>>()
 			.mockImplementationOnce(() => oldModels.promise)
-			.mockImplementationOnce(async () => ({ models: [freshModel], configuredProviders: [freshModel.provider] }));
+			.mockImplementationOnce(async () => ({
+				models: [freshModel],
+				configuredProviders: [freshModel.provider],
+			}));
 		const fakeThis = Object.create(InteractiveMode.prototype) as ModelSelectorOverlayHarness & {
 			connectionCommands: unknown[];
 			connectionResourceSnapshot: unknown;
@@ -3001,19 +3240,28 @@ describe("InteractiveMode model selection persistence", () => {
 		fakeThis.applyConnectionModelCatalog = overlayPrototype.applyConnectionModelCatalog;
 		fakeThis.getConnectionAvailableModels = overlayPrototype.getConnectionAvailableModels;
 		fakeThis.refreshConnectionCatalog = (
-			InteractiveMode.prototype as unknown as { refreshConnectionCatalog(): Promise<void> }
+			InteractiveMode.prototype as unknown as {
+				refreshConnectionCatalog(): Promise<void>;
+			}
 		).refreshConnectionCatalog;
 		fakeThis.invalidateConnectionModels = (
-			InteractiveMode.prototype as unknown as { invalidateConnectionModels(): void }
+			InteractiveMode.prototype as unknown as {
+				invalidateConnectionModels(): void;
+			}
 		).invalidateConnectionModels;
 		fakeThis.invalidateConnectionModelRefresh = (
-			InteractiveMode.prototype as unknown as { invalidateConnectionModelRefresh(): void }
+			InteractiveMode.prototype as unknown as {
+				invalidateConnectionModelRefresh(): void;
+			}
 		).invalidateConnectionModelRefresh;
 		fakeThis.applyConnectionStateSnapshot = vi.fn();
 
 		const staleRefresh = fakeThis.getConnectionAvailableModels();
 		await fakeThis.refreshConnectionCatalog();
-		oldModels.resolve({ models: [oldModel], configuredProviders: [oldModel.provider] });
+		oldModels.resolve({
+			models: [oldModel],
+			configuredProviders: [oldModel.provider],
+		});
 
 		await expect(staleRefresh).resolves.toEqual([freshModel]);
 
@@ -3048,10 +3296,14 @@ describe("InteractiveMode model selection persistence", () => {
 		fakeThis.connectionModelsRefreshInFlight = undefined;
 		fakeThis.applyConnectionModelCatalog = overlayPrototype.applyConnectionModelCatalog;
 		fakeThis.refreshConnectionCatalog = (
-			InteractiveMode.prototype as unknown as { refreshConnectionCatalog(): Promise<void> }
+			InteractiveMode.prototype as unknown as {
+				refreshConnectionCatalog(): Promise<void>;
+			}
 		).refreshConnectionCatalog;
 		fakeThis.invalidateConnectionModelRefresh = (
-			InteractiveMode.prototype as unknown as { invalidateConnectionModelRefresh(): void }
+			InteractiveMode.prototype as unknown as {
+				invalidateConnectionModelRefresh(): void;
+			}
 		).invalidateConnectionModelRefresh;
 		fakeThis.applyConnectionStateSnapshot = vi.fn();
 
@@ -3103,7 +3355,12 @@ function createFakeConnectionSession(commandName: string): AgentSessionRuntime["
 			getExtensions: () => ({ extensions: [], errors: [] }),
 			getAgentsFiles: () => ({ agentsFiles: [] }),
 		},
-		modelRegistry: { refreshModelCatalog: async () => ({ models: [], configuredProviders: [] }) },
+		modelRegistry: {
+			refreshModelCatalog: async () => ({
+				models: [],
+				configuredProviders: [],
+			}),
+		},
 		sessionManager: {
 			getCwd: () => "/tmp/project",
 			getSessionDir: () => "/tmp/sessions",
@@ -3124,7 +3381,11 @@ function createFakeConnectionSession(commandName: string): AgentSessionRuntime["
 		sessionId: commandName,
 		autoCompactionEnabled: true,
 		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
-		getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+		getSessionActionSnapshot: () => ({
+			queuedCount: 0,
+			steering: [],
+			followUps: [],
+		}),
 		goalState: emptyGoalState(),
 		scopedModels: [],
 		subscribe: () => () => {},
@@ -3294,7 +3555,9 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		checkDaxnutsEasterEgg?: (model: { provider: string; id: string }) => void;
 		findExactModelMatch?: (searchTerm: string) => Promise<AgentConnectionModel | undefined>;
 		showOnboardingSplash?: (continueActionLabel?: string) => Promise<OnboardingSplashHandle | undefined>;
-		createAuthFlows?: () => { runPrimeInferenceLogin(): Promise<AuthenticationResult> };
+		createAuthFlows?: () => {
+			runPrimeInferenceLogin(): Promise<AuthenticationResult>;
+		};
 		showConfigurationMenu?: (tab: "providers" | "models" | "mcp-connections") => Promise<void>;
 		getModelCandidates?: () => Promise<AgentConnectionModel[]>;
 	};
@@ -3441,14 +3704,24 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		"reports %s startup admission once and retains every remaining prompt with collision-safe images",
 		async (status) => {
 			const inputDone = createDeferred<void>();
-			const firstImage = { type: "image", data: "first", mimeType: "image/png" } as const;
-			const secondImage = { type: "image", data: "second", mimeType: "image/jpeg" } as const;
+			const firstImage = {
+				type: "image",
+				data: "first",
+				mimeType: "image/png",
+			} as const;
+			const secondImage = {
+				type: "image",
+				data: "second",
+				mimeType: "image/jpeg",
+			} as const;
 			let rejectStartup!: (error: Error) => void;
 			const startupAdmission = new Promise<void>((_resolve, reject) => {
 				rejectStartup = reject;
 			});
 			const prompt = vi.fn(() => startupAdmission);
-			const promptStashState: PromptStashState = { stash: { text: "existing draft [image #3]" } };
+			const promptStashState: PromptStashState = {
+				stash: { text: "existing draft [image #3]" },
+			};
 			const submitHarness = createSubmitHandlerHarness({
 				promptStashState,
 				agentConnection: {
@@ -3494,7 +3767,11 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 				{ text: "existing draft [image #3]" },
 				{ text: "blocked user" },
 			]);
-			expect(fakeThis.pastedImages.get(1)).toEqual({ type: "image", data: "existing", mimeType: "image/png" });
+			expect(fakeThis.pastedImages.get(1)).toEqual({
+				type: "image",
+				data: "existing",
+				mimeType: "image/png",
+			});
 			expect(fakeThis.pastedImages.get(5)).toBeUndefined();
 			expect(fakeThis.pastedImages.get(6)).toBe(firstImage);
 			expect(fakeThis.pastedImages.get(7)).toBe(secondImage);
@@ -3667,8 +3944,15 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			const store = new ClientPromptStashStore();
 			const promptStashState = store.forSession("session-a");
 			if (hasExistingStash) promptStashState.stash = { text: "older durable draft" };
-			const image = { type: "image", data: "base64", mimeType: "image/png" } as const;
-			const pasteSnapshot = { pastes: [[1, "expanded paste"]], pasteCounter: 2 } as const;
+			const image = {
+				type: "image",
+				data: "base64",
+				mimeType: "image/png",
+			} as const;
+			const pasteSnapshot = {
+				pastes: [[1, "expanded paste"]],
+				pasteCounter: 2,
+			} as const;
 			const submittedText = "submitted [paste #1] [image #7]";
 			let editorText = submittedText;
 			const submitHarness = createSubmitHandlerHarness({
@@ -3770,8 +4054,11 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			promptStashState: state,
 			retainedSubmissionGenerations: new WeakMap(),
 		};
-		const release = (InteractiveMode.prototype as unknown as { releasePromptStashSession(this: unknown): void })
-			.releasePromptStashSession;
+		const release = (
+			InteractiveMode.prototype as unknown as {
+				releasePromptStashSession(this: unknown): void;
+			}
+		).releasePromptStashSession;
 		const retain = (
 			InteractiveMode.prototype as unknown as {
 				retainSubmittedDraft(this: unknown, stash: { text: string }, generation: number): void;
@@ -3904,10 +4191,16 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 
 		const run = InteractiveMode.prototype.run.call(fakeThis as never);
 		while (!fakeThis.admitPendingStartupPrompts) await Promise.resolve();
-		fakeThis.latestEditorPromptStash = { text: "first rich draft", expandedText: "first expanded" };
+		fakeThis.latestEditorPromptStash = {
+			text: "first rich draft",
+			expandedText: "first expanded",
+		};
 		editorText = "";
 		const first = fakeThis.defaultEditor.onSubmit?.("first rich draft");
-		fakeThis.latestEditorPromptStash = { text: "second rich draft", expandedText: "second expanded" };
+		fakeThis.latestEditorPromptStash = {
+			text: "second rich draft",
+			expandedText: "second expanded",
+		};
 		const second = fakeThis.defaultEditor.onSubmit?.("second rich draft");
 		await Promise.resolve();
 
@@ -3917,7 +4210,10 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		await expect(run).resolves.toMatchObject({ type: "agents_view" });
 		await Promise.all([first, second]);
 
-		expect(promptStashState.stash).toEqual({ text: "first rich draft", expandedText: "first expanded" });
+		expect(promptStashState.stash).toEqual({
+			text: "first rich draft",
+			expandedText: "first expanded",
+		});
 		expect(promptStashState.queuedStashes).toEqual([{ text: "second rich draft", expandedText: "second expanded" }]);
 	});
 
@@ -4026,7 +4322,10 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		const fakeThis = createPrimeCliHarness(false);
 		const configuration = createDeferred<void>();
 		const dismiss = vi.fn();
-		fakeThis.showOnboardingSplash = vi.fn(async () => ({ showProgress: vi.fn(), dismiss }));
+		fakeThis.showOnboardingSplash = vi.fn(async () => ({
+			showProgress: vi.fn(),
+			dismiss,
+		}));
 		fakeThis.showConfigurationMenu = vi.fn(() => configuration.promise);
 
 		const onboarding = runOnboardingFlow.call(fakeThis);
@@ -4059,7 +4358,10 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		fakeThis.getModelCandidates = vi.fn(async () => []);
 		const showProgress = vi.fn();
 		const dismiss = vi.fn();
-		fakeThis.showOnboardingSplash = vi.fn(async () => ({ showProgress, dismiss }));
+		fakeThis.showOnboardingSplash = vi.fn(async () => ({
+			showProgress,
+			dismiss,
+		}));
 		fakeThis.createAuthFlows = vi.fn(() => ({
 			runPrimeInferenceLogin: vi.fn(async () => ({
 				status: "success" as const,
@@ -4121,7 +4423,11 @@ describe("InteractiveMode post-login model preparation", () => {
 	} as AgentConnectionModel;
 
 	test("persists GLM 5.2 before model selection after Prime Inference login", async () => {
-		const fallbackModel = { ...loginPrimeModel, id: "z-ai/glm-5.2", name: "GLM 5.2" };
+		const fallbackModel = {
+			...loginPrimeModel,
+			id: "z-ai/glm-5.2",
+			name: "GLM 5.2",
+		};
 		const flushSettings = vi.fn(async () => {});
 		const fakeThis = Object.create(InteractiveMode.prototype) as LoginHarness;
 		fakeThis.invalidateConnectionModels = vi.fn();
@@ -4253,7 +4559,12 @@ describe("InteractiveMode goal status announcements", () => {
 });
 
 describe("InteractiveMode tray goal label", () => {
-	type TrayUsage = { contextWindow: number; tokens: number | null; percent: number | null };
+	type TrayUsage = {
+		contextWindow: number;
+		tokens: number | null;
+		compactionTrigger: number;
+		percent: number | null;
+	};
 	type TrayLabelHarness = {
 		heartbeatCatalog: AgentConnectionHeartbeat[];
 		subagentSnapshots: Map<string, never>;
@@ -4279,7 +4590,11 @@ describe("InteractiveMode tray goal label", () => {
 			sessionFile: "/tmp/session.jsonl",
 			cwd: "/tmp/project",
 			prompt: "check whether there is follow-up work",
-			schedule: { kind: "interval", expression: "every 5m", intervalMs: 300_000 },
+			schedule: {
+				kind: "interval",
+				expression: "every 5m",
+				intervalMs: 300_000,
+			},
 			createdAt: "2026-01-01T00:00:00.000Z",
 			updatedAt: "2026-01-01T00:00:00.000Z",
 			nextRunAt: "2026-01-01T00:05:00.000Z",
@@ -4324,7 +4639,7 @@ describe("InteractiveMode tray goal label", () => {
 				timeUsedSeconds: 65,
 				continuationsUsed: 1,
 			} satisfies GoalState,
-			contextUsage: { contextWindow: 100_000, tokens: 75_000, percent: 75 },
+			contextUsage: { contextWindow: 100_000, tokens: 75_000, compactionTrigger: 100_000, percent: 75 },
 		};
 		fakeThis.uiServices = { getContextUsage: () => undefined };
 
@@ -4347,7 +4662,7 @@ describe("InteractiveMode tray goal label", () => {
 				continuationsUsed: 1,
 			} satisfies GoalState,
 			heartbeat: createHeartbeat("active"),
-			contextUsage: { contextWindow: 100_000, tokens: 75_000, percent: 75 },
+			contextUsage: { contextWindow: 100_000, tokens: 75_000, compactionTrigger: 100_000, percent: 75 },
 		};
 		fakeThis.uiServices = { getContextUsage: () => undefined };
 
@@ -4369,7 +4684,12 @@ describe("InteractiveMode tray goal label", () => {
 				timeUsedSeconds: 65,
 				continuationsUsed: 1,
 			} satisfies GoalState,
-			contextUsage: { contextWindow: 100_000, tokens: null, percent: null },
+			contextUsage: {
+				contextWindow: 100_000,
+				tokens: null,
+				compactionTrigger: 100_000,
+				percent: null,
+			},
 		};
 		fakeThis.uiServices = { getContextUsage: () => undefined };
 
@@ -4392,7 +4712,9 @@ describe("InteractiveMode live context usage", () => {
 	): LiveContextHarness {
 		const fakeThis = Object.create(InteractiveMode.prototype) as LiveContextHarness;
 		fakeThis.connectionState = { contextUsage: undefined };
-		fakeThis.activityTracker = { getStatus: () => ({ tokens: opts.inFlight ?? 0 }) };
+		fakeThis.activityTracker = {
+			getStatus: () => ({ tokens: opts.inFlight ?? 0 }),
+		};
 		fakeThis.isAgentStreaming = () => opts.streaming ?? false;
 		fakeThis.contextUsageTokenBaseline = opts.baseline ?? 0;
 		return fakeThis;
@@ -4400,44 +4722,94 @@ describe("InteractiveMode live context usage", () => {
 
 	test("returns the snapshot verbatim when idle", () => {
 		const fakeThis = createHarness();
-		fakeThis.connectionState = { contextUsage: { contextWindow: 100_000, tokens: 42_000, percent: 42 } };
+		fakeThis.connectionState = {
+			contextUsage: {
+				contextWindow: 100_000,
+				tokens: 42_000,
+				compactionTrigger: 100_000,
+				percent: 42,
+			},
+		};
 
 		expect(prototype.getConnectionContextUsage.call(fakeThis)).toEqual({
 			contextWindow: 100_000,
 			tokens: 42_000,
+			compactionTrigger: 100_000,
 			percent: 42,
 		});
 	});
 
 	test("adds in-flight streaming output to the snapshot baseline while streaming", () => {
 		const fakeThis = createHarness({ streaming: true, inFlight: 3_000 });
-		fakeThis.connectionState = { contextUsage: { contextWindow: 100_000, tokens: 42_000, percent: 42 } };
+		fakeThis.connectionState = {
+			contextUsage: {
+				contextWindow: 100_000,
+				tokens: 42_000,
+				compactionTrigger: 100_000,
+				percent: 42,
+			},
+		};
 
 		// 42k baseline + 3k in-flight = 45k; ticks up live as the model writes.
-		expect(prototype.getConnectionContextUsage.call(fakeThis)).toMatchObject({ tokens: 45_000, percent: 45 });
+		expect(prototype.getConnectionContextUsage.call(fakeThis)).toMatchObject({
+			tokens: 45_000,
+			percent: 45,
+		});
 	});
 
 	test("only adds output beyond the refresh baseline (auto-retry does not double count)", () => {
 		// Tracker holds 5k from a failed attempt (baseline), now 6k after 1k of the retry.
-		const fakeThis = createHarness({ streaming: true, inFlight: 6_000, baseline: 5_000 });
-		fakeThis.connectionState = { contextUsage: { contextWindow: 100_000, tokens: 42_000, percent: 42 } };
+		const fakeThis = createHarness({
+			streaming: true,
+			inFlight: 6_000,
+			baseline: 5_000,
+		});
+		fakeThis.connectionState = {
+			contextUsage: {
+				contextWindow: 100_000,
+				tokens: 42_000,
+				compactionTrigger: 100_000,
+				percent: 42,
+			},
+		};
 
 		// Only the 1k generated since the refresh is in-flight, not the failed attempt's 5k.
-		expect(prototype.getConnectionContextUsage.call(fakeThis)).toMatchObject({ tokens: 43_000 });
+		expect(prototype.getConnectionContextUsage.call(fakeThis)).toMatchObject({
+			tokens: 43_000,
+		});
 	});
 
 	test("does not add in-flight output when not streaming", () => {
 		const fakeThis = createHarness({ streaming: false, inFlight: 3_000 });
-		fakeThis.connectionState = { contextUsage: { contextWindow: 100_000, tokens: 42_000, percent: 42 } };
+		fakeThis.connectionState = {
+			contextUsage: {
+				contextWindow: 100_000,
+				tokens: 42_000,
+				compactionTrigger: 100_000,
+				percent: 42,
+			},
+		};
 
-		expect(prototype.getConnectionContextUsage.call(fakeThis)).toMatchObject({ tokens: 42_000 });
+		expect(prototype.getConnectionContextUsage.call(fakeThis)).toMatchObject({
+			tokens: 42_000,
+		});
 	});
 
 	test("passes through an unknown (post-compaction) snapshot without inflating it", () => {
 		const fakeThis = createHarness({ streaming: true, inFlight: 3_000 });
-		fakeThis.connectionState = { contextUsage: { contextWindow: 100_000, tokens: null, percent: null } };
+		fakeThis.connectionState = {
+			contextUsage: {
+				contextWindow: 100_000,
+				tokens: null,
+				compactionTrigger: 100_000,
+				percent: null,
+			},
+		};
 
-		expect(prototype.getConnectionContextUsage.call(fakeThis)).toMatchObject({ tokens: null, percent: null });
+		expect(prototype.getConnectionContextUsage.call(fakeThis)).toMatchObject({
+			tokens: null,
+			percent: null,
+		});
 	});
 
 	test("returns undefined when there is no snapshot yet", () => {
@@ -4448,7 +4820,9 @@ describe("InteractiveMode live context usage", () => {
 	});
 
 	type RefreshHarness = {
-		agentConnection: { getSessionStats(): Promise<{ contextUsage: unknown } | undefined> };
+		agentConnection: {
+			getSessionStats(): Promise<{ contextUsage: unknown } | undefined>;
+		};
 		connectionState: { sessionId?: string; contextUsage?: unknown };
 		activityTracker: { getStatus(): { tokens: number } };
 		contextUsageTokenBaseline: number;
@@ -4468,7 +4842,10 @@ describe("InteractiveMode live context usage", () => {
 		fakeThis.activityTracker = { getStatus: () => ({ tokens: 0 }) };
 		fakeThis.contextUsageTokenBaseline = 0;
 		fakeThis.contextUsageRefresh = { generation: 0, lastSuccessGeneration: 0 };
-		fakeThis.connectionState = { sessionId: "session-A", contextUsage: undefined };
+		fakeThis.connectionState = {
+			sessionId: "session-A",
+			contextUsage: undefined,
+		};
 		fakeThis.patchConnectionState = (patch) => fakeThis.patched.push(patch);
 		fakeThis.agentConnection = { getSessionStats };
 		return fakeThis;
@@ -4478,8 +4855,13 @@ describe("InteractiveMode live context usage", () => {
 		let fakeThis: ReturnType<typeof createRefreshHarness>;
 		fakeThis = createRefreshHarness(async () => {
 			// User switches sessions while the stats call is in flight.
-			fakeThis.connectionState = { sessionId: "session-B", contextUsage: undefined };
-			return { contextUsage: { contextWindow: 100_000, tokens: 50_000, percent: 50 } };
+			fakeThis.connectionState = {
+				sessionId: "session-B",
+				contextUsage: undefined,
+			};
+			return {
+				contextUsage: { contextWindow: 100_000, tokens: 50_000, percent: 50 },
+			};
 		});
 
 		await refresh.call(fakeThis);
@@ -4496,9 +4878,13 @@ describe("InteractiveMode live context usage", () => {
 
 		const olderRefresh = refresh.call(fakeThis);
 		const newerRefresh = refresh.call(fakeThis);
-		second.resolve({ contextUsage: { tokens: 10, contextWindow: 100, percent: 10 } });
+		second.resolve({
+			contextUsage: { tokens: 10, contextWindow: 100, percent: 10 },
+		});
 		await newerRefresh;
-		first.resolve({ contextUsage: { tokens: 90, contextWindow: 100, percent: 90 } });
+		first.resolve({
+			contextUsage: { tokens: 90, contextWindow: 100, percent: 90 },
+		});
 		await olderRefresh;
 
 		expect(fakeThis.patched).toEqual([{ contextUsage: { tokens: 10, contextWindow: 100, percent: 10 } }]);
@@ -4518,7 +4904,9 @@ describe("InteractiveMode live context usage", () => {
 
 			const olderRefresh = refresh.call(fakeThis);
 			await refresh.call(fakeThis);
-			first.resolve({ contextUsage: { tokens: 90, contextWindow: 100, percent: 90 } });
+			first.resolve({
+				contextUsage: { tokens: 90, contextWindow: 100, percent: 90 },
+			});
 			await olderRefresh;
 
 			expect(fakeThis.patched).toEqual([{ contextUsage: { tokens: 90, contextWindow: 100, percent: 90 } }]);
@@ -4570,7 +4958,11 @@ describe("InteractiveMode.setToolsExpanded", () => {
 
 	test("toggles agent messages separately from tools", () => {
 		const toolChild = { setExpanded: vi.fn() };
-		const ipythonChild = { setExpanded: vi.fn(), setAgentMessagesExpanded: vi.fn(), setEditDiffsExpanded: vi.fn() };
+		const ipythonChild = {
+			setExpanded: vi.fn(),
+			setAgentMessagesExpanded: vi.fn(),
+			setEditDiffsExpanded: vi.fn(),
+		};
 		const messageChild = new AgentMessageComponent({
 			role: "custom",
 			customType: "agent_message",
@@ -4601,7 +4993,11 @@ describe("InteractiveMode.setToolsExpanded", () => {
 	});
 
 	test("toggles edit diffs separately from tools and agent messages", () => {
-		const child = { setExpanded: vi.fn(), setAgentMessagesExpanded: vi.fn(), setEditDiffsExpanded: vi.fn() };
+		const child = {
+			setExpanded: vi.fn(),
+			setAgentMessagesExpanded: vi.fn(),
+			setEditDiffsExpanded: vi.fn(),
+		};
 		const fakeThis = createExpansionFakeThis([child]);
 
 		fakeThis.toggleEditDiffExpansion();
@@ -4756,7 +5152,9 @@ describe("InteractiveMode.showLoadedResources", () => {
 		useRealDiagnostics?: boolean;
 	}) {
 		const connectionResourceSnapshot: AgentConnectionResourceSnapshot = {
-			contextFiles: (options.contextFiles ?? []).map((contextFile) => ({ path: contextFile.path })),
+			contextFiles: (options.contextFiles ?? []).map((contextFile) => ({
+				path: contextFile.path,
+			})),
 			skills: options.skills ?? [],
 			prompts: [],
 			extensions: options.extensions ?? [],
@@ -5512,9 +5910,15 @@ test("only the queued user /refine settlement stops its loader", async () => {
 	expect(statusContainer.children.length).toBe(1);
 
 	// The waited-on agent/auto refinement settles first; the user /refine is still running.
-	await prototype.handleEvent.call(fakeThis, { type: "refine_complete", result: {} });
+	await prototype.handleEvent.call(fakeThis, {
+		type: "refine_complete",
+		result: {},
+	});
 	expect(statusContainer.children.length).toBe(1);
-	await prototype.handleEvent.call(fakeThis, { type: "refine_failed", error: "background failure" });
+	await prototype.handleEvent.call(fakeThis, {
+		type: "refine_failed",
+		error: "background failure",
+	});
 	expect(statusContainer.children.length).toBe(1);
 
 	await prototype.handleEvent.call(fakeThis, {

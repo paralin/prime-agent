@@ -52,7 +52,8 @@ import {
 	createAgentSessionServices,
 } from "./core/agent-session-services.js";
 import { formatNoModelsAvailableMessage } from "./core/auth-guidance.js";
-import { AuthStorage } from "./core/auth-storage.js";
+import { AuthStorage, RuntimeApiKeyChainState } from "./core/auth-storage.js";
+import { applyCodexHomes } from "./core/codex-homes.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import type { ExtensionFactory } from "./core/extensions/types.js";
 import { KeybindingsManager } from "./core/keybindings.js";
@@ -256,11 +257,21 @@ export interface AgentsViewStartupDecision {
 	resume?: true | string;
 	continue?: boolean;
 	fork?: string;
+	/** True when this launch carries an initial prompt; it must open a chat directly. */
+	hasStartupPrompt?: boolean;
 }
 
 export function shouldOpenAgentsViewForDaemonInteractive(options: AgentsViewStartupDecision): boolean {
 	const bareResume = options.resume === true;
-	const requestsAgentsView = bareResume || (options.explicitAgentsView && !options.needsOnboarding);
+	// A bare launch is the launcher: it opens the agents view instead of the most
+	// recently running agent. An initial prompt still opens a chat directly.
+	const bareLaunch =
+		options.resume === undefined &&
+		!options.continue &&
+		!options.fork &&
+		!options.hasStartupPrompt &&
+		!options.needsOnboarding;
+	const requestsAgentsView = bareResume || bareLaunch || (options.explicitAgentsView && !options.needsOnboarding);
 	return (
 		options.useDaemonInteractive &&
 		// A selector, continuation, or fork must open its target directly rather than the agents view.
@@ -676,6 +687,9 @@ function runtimeConfigFromArgs(
 		// instead of its own appMode="daemon".
 		serializedRefine: appMode !== "interactive" && appMode !== "daemon",
 		initialGoal: parsed.goal ? { objective: parsed.goal, tokenBudget: parsed.goalTokenBudget } : undefined,
+		rlmMaxDepthCeiling: parsed.harnessMode === "rpc-only" ? 0 : parsed.rlmMaxDepthCeiling,
+		disableRlmAct: parsed.harnessMode === "rpc-only" || parsed.disableRlmAct ? true : undefined,
+		harnessMode: parsed.harnessMode,
 	};
 }
 
@@ -719,6 +733,7 @@ export function resolveRuntimeSessionOptions(
 		rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,
 		rlmParentNodeId: runtimeSessionOptions?.rlmParentNodeId,
 		rlmParentAgent: runtimeSessionOptions?.rlmParentAgent,
+		rlmModelCandidates: runtimeSessionOptions?.rlmModelCandidates,
 		semanticParentSessionId: runtimeSessionOptions?.semanticParentSessionId,
 		semanticSpawnedByRequestId: runtimeSessionOptions?.semanticSpawnedByRequestId,
 		subagentRuntimeHost: runtimeSessionOptions?.subagentRuntimeHost,
@@ -787,11 +802,13 @@ async function prepareRuntimeServices(options: {
 	sessionManager: SessionManager;
 	extensionFactories?: ExtensionFactory[];
 	sessionOptionsOverride?: CreateAgentSessionOptions;
+	sharedRuntimeApiKeyChainState?: RuntimeApiKeyChainState;
 }): Promise<PreparedRuntimeServices> {
 	const { config, sessionManager } = options;
 	const effectiveAgentDir = config.agentDir ?? options.agentDir;
 	const authStorage = AuthStorage.create(join(effectiveAgentDir, "auth.json"), {
 		usePrimeCliConfig: effectiveAgentDir === options.agentDir,
+		runtimeApiKeyChainState: options.sharedRuntimeApiKeyChainState,
 	});
 	const services = await createAgentSessionServices({
 		cwd: options.cwd,
@@ -818,6 +835,9 @@ async function prepareRuntimeServices(options: {
 		},
 	});
 	const { settingsManager, modelRegistry, resourceLoader } = services;
+	if (!options.sharedRuntimeApiKeyChainState) {
+		applyCodexHomes(authStorage, settingsManager.getCodexHomes());
+	}
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [
 		...services.diagnostics,
 		...collectSettingsDiagnostics(settingsManager, "runtime creation"),
@@ -1138,6 +1158,17 @@ export async function main(args: string[], options?: MainOptions) {
 	time("parseArgs");
 	const appMode = resolveAppMode(parsed, process.stdin.isTTY);
 
+	if (parsed.harnessMode === "rpc-only" && appMode !== "rpc") {
+		console.error(chalk.red("Error: --harness-mode rpc-only requires --mode rpc"));
+		process.exit(1);
+	}
+	if (
+		parsed.harnessMode === "rpc-only" &&
+		(parsed.daemonSocket !== undefined || publicCommand.attachAgent !== undefined)
+	) {
+		console.error(chalk.red("Error: rpc-only harness mode does not support daemon or attach options"));
+		process.exit(1);
+	}
 	if (shouldRejectNonInteractiveAttach(publicCommand.attachAgent, appMode)) {
 		console.error(chalk.red("Error: attach requires an interactive terminal"));
 		process.exit(1);
@@ -1211,14 +1242,16 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	// Programmatic factories are process-local functions and cannot be serialized to a daemon worker.
 	const hasProcessLocalExtensionFactories = (options?.extensionFactories?.length ?? 0) > 0;
-	const useDaemonClient = shouldUseDaemonClientRuntime({
-		appMode,
-		startupBenchmark,
-		noSession: parsed.noSession,
-		listModels: parsed.listModels,
-		ownedSessionWorker: isOwnedSessionWorkerProcess(),
-		hasProcessLocalExtensionFactories,
-	});
+	const useDaemonClient =
+		parsed.harnessMode !== "rpc-only" &&
+		shouldUseDaemonClientRuntime({
+			appMode,
+			startupBenchmark,
+			noSession: parsed.noSession,
+			listModels: parsed.listModels,
+			ownedSessionWorker: isOwnedSessionWorkerProcess(),
+			hasProcessLocalExtensionFactories,
+		});
 	const useDaemonInteractive = useDaemonClient && appMode === "interactive";
 
 	// Decide the final runtime cwd before creating cwd-bound runtime services.
@@ -1326,7 +1359,69 @@ export async function main(args: string[], options?: MainOptions) {
 	// daemon fallback must not seed that goal into unrelated future sessions.
 	const daemonDefaultSessionConfig = daemonServerDefaultSessionConfig(defaultSessionConfig);
 	const runtimeDefaultSessionConfig = appMode === "daemon" ? daemonDefaultSessionConfig : defaultSessionConfig;
-	const createRuntime = createDefaultRuntimeFactory(runtimeDefaultSessionConfig, options?.extensionFactories);
+	const daemonRuntimeApiKeyChainState =
+		appMode === "daemon" && isDaemonWorkerProcess() ? new RuntimeApiKeyChainState() : undefined;
+	if (daemonRuntimeApiKeyChainState) {
+		applyCodexHomes(daemonRuntimeApiKeyChainState, startupSettingsManager.getCodexHomes());
+	}
+	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
+		cwd,
+		agentDir,
+		sessionManager,
+		sessionStartEvent,
+		sessionConfig,
+		sessionOptions: runtimeSessionOptions,
+	}) => {
+		const config = mergeAgentSessionRuntimeConfig(runtimeDefaultSessionConfig, sessionConfig);
+		const prepared = await prepareRuntimeServices({
+			config,
+			cwd,
+			agentDir,
+			sessionManager,
+			extensionFactories: options?.extensionFactories,
+			sessionOptionsOverride: runtimeSessionOptions,
+			sharedRuntimeApiKeyChainState: daemonRuntimeApiKeyChainState,
+		});
+		const { services, sessionOptions, diagnostics } = prepared;
+		const resolvedSessionOptions = resolveRuntimeSessionOptions(sessionOptions, runtimeSessionOptions);
+
+		const created = await createAgentSessionFromServices({
+			services,
+			sessionManager,
+			sessionStartEvent,
+			...resolvedSessionOptions,
+			rlmHeartbeatController:
+				config.harnessMode === "rpc-only" ? undefined : resolvedSessionOptions.rlmHeartbeatController,
+			agentMessageController:
+				config.harnessMode === "rpc-only" ? undefined : resolvedSessionOptions.agentMessageController,
+			includeGoals: config.harnessMode === "rpc-only" ? false : resolvedSessionOptions.includeGoals,
+			autonomous: config.harnessMode === "rpc-only" ? { enabled: false } : resolvedSessionOptions.autonomous,
+			// Main agents boot their kernel in the background at session creation;
+			// subagent sessions (rlmDepth > 0) keep the lazy first-call start.
+			prewarmIpythonKernel: true,
+			rlmMaxDepthCeiling: config.rlmMaxDepthCeiling,
+			actEnabled: !config.disableRlmAct,
+			harnessMode: config.harnessMode,
+			// Read serializedRefine from the merged runtime config (passed
+			// from the JSON/print client through AgentSessionRuntimeConfig)
+			// so it survives the daemon worker's appMode="daemon" context.
+			serializedRefine: config.serializedRefine ?? false,
+			executionMode: config.executionMode,
+			telemetryDisabled: config.telemetryDisabled,
+			// Only seed initial goal for top-level sessions (rlmDepth 0).
+			initialGoal: (runtimeSessionOptions?.rlmDepth ?? 0) === 0 ? config.initialGoal : undefined,
+		});
+		const cliThinkingOverride = config.thinking !== undefined || prepared.cliThinkingFromModel;
+		if (created.session.model && cliThinkingOverride) {
+			created.session.setThinkingLevel(created.session.thinkingLevel);
+		}
+
+		return {
+			...created,
+			services,
+			diagnostics,
+		};
+	};
 	time("createRuntime");
 	// Daemon mode never uses the bootstrap runtime, so skip the heavy
 	// createAgentSessionRuntime below and start listening immediately; sessions
@@ -1449,6 +1544,7 @@ export async function main(args: string[], options?: MainOptions) {
 				resume: parsed.resume,
 				continue: parsed.continue,
 				fork: parsed.fork,
+				hasStartupPrompt: initialMessage !== undefined || initialImages !== undefined || parsed.messages.length > 0,
 			})
 		) {
 			daemonReady = (await awaitDaemonReady(daemonReady)).ready;
@@ -1586,7 +1682,7 @@ export async function main(args: string[], options?: MainOptions) {
 
 		printTimings();
 		if (appMode === "rpc") {
-			return await runRpcModeWithConnection(connection);
+			return await runRpcModeWithConnection(connection, { harnessMode: parsed.harnessMode });
 		}
 		if (appMode === "acp") {
 			return await runAcpModeWithConnection(connection);

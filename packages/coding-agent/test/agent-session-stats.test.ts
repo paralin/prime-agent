@@ -3,6 +3,7 @@ import { type AssistantMessage, getModel, type Usage } from "@earendil-works/pi-
 import { describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import { DEFAULT_COMPACTION_SETTINGS } from "../src/core/compaction/compaction.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -90,7 +91,10 @@ describe("AgentSession.getSessionStats", () => {
 			expect(stats.contextUsage).toEqual(session.getContextUsage());
 			expect(stats.contextUsage?.tokens).toBe(200);
 			expect(stats.contextUsage?.contextWindow).toBe(model.contextWindow);
-			expect(stats.contextUsage?.percent).toBe((200 / model.contextWindow) * 100);
+			// The percent reads against the compaction trigger (window - reserve).
+			expect(stats.contextUsage?.percent).toBe(
+				(200 / (model.contextWindow - DEFAULT_COMPACTION_SETTINGS.reserveTokens)) * 100,
+			);
 		} finally {
 			session.dispose();
 		}
@@ -135,7 +139,10 @@ describe("AgentSession.getSessionStats", () => {
 			expect(stats.tokens.input).toBe(220_000);
 			expect(stats.contextUsage).toBeDefined();
 			expect(stats.contextUsage?.tokens).toBe(25_000);
-			expect(stats.contextUsage?.percent).toBe((25_000 / model.contextWindow) * 100);
+			// The percent reads against the compaction trigger (window - reserve).
+			expect(stats.contextUsage?.percent).toBe(
+				(25_000 / (model.contextWindow - DEFAULT_COMPACTION_SETTINGS.reserveTokens)) * 100,
+			);
 		} finally {
 			session.dispose();
 		}

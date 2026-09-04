@@ -67,7 +67,7 @@ p.write_text(txt.replace("old", "new"))`;
 		const subprocessCode = `import subprocess
 subprocess.run(["npm", "run", "check"])
 `;
-		expect(previewPythonCode(subprocessCode)).toEqual({ language: "python", text: "npm check" });
+		expect(previewPythonCode(subprocessCode)).toEqual({ language: "bash", text: "npm check" });
 
 		const controlCode = `from pathlib import Path
 p = Path("packages/foo.ts")
@@ -125,6 +125,22 @@ EOF`;
 		expect(previewBashCommand(command)).toEqual({ language: "bash", text: "hello world" });
 	});
 
+	it("routes python subprocess.run cells to the bash preview", () => {
+		const cell = `import subprocess
+r = subprocess.run(['go','test','./cli/','-count=1','-run','TestTUIProduct'],cwd='/tmp/repo',capture_output=True,text=True,timeout=600)
+print(r.stdout[-1500:])
+print("ERR:", r.stderr[:1500])
+`;
+		expect(previewIpythonCode(cell)).toEqual({
+			language: "bash",
+			text: "go test ./cli/ -count=1 -run TestTUIProduct",
+		});
+		expect(
+			previewIpythonCode(`r =
+subprocess.run(["git", "status", "--porcelain"])`),
+		).toEqual({ language: "bash", text: "git status --porcelain" });
+	});
+
 	it("routes bash-skill calls with literal commands to the bash preview", () => {
 		expect(previewIpythonCode("r = await bash('git status --porcelain')")).toEqual({
 			language: "bash",
@@ -166,6 +182,25 @@ git add packages/foo.ts
 		expect(previewIpythonCode("r = await bash(r'grep \\'x\\' f')")).toEqual({
 			language: "bash",
 			text: "grep \\'x\\' f",
+		});
+	});
+
+	it("routes bash-skill calls that pass a string variable", () => {
+		const cell = `code = """
+ssh debian@thumper 'bash -s' << 'EOF'
+tmux new-session -d -s llb-rust-smoke
+tmux send-keys -t llb-rust-smoke "python -m pufferlib.pufferl train llb-rust" Enter
+EOF
+"""
+r = await bash(code, timeout=60)
+print(r.output)`;
+		const preview = previewIpythonCode(cell);
+		expect(preview.language).toBe("bash");
+		expect(preview.text).toContain("tmux");
+		expect(preview.text).not.toContain("await bash");
+		expect(previewIpythonCode('cmd = "git status --porcelain"\nr = await bash(cmd)')).toEqual({
+			language: "bash",
+			text: "git status --porcelain",
 		});
 	});
 

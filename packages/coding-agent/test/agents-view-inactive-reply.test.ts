@@ -644,6 +644,26 @@ describe("agents view slash commands", () => {
 		expect(self.refreshSavedSessions).toHaveBeenCalledTimes(1);
 	});
 
+	it("shows a status error when a rename collides with an existing session name", async () => {
+		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
+		const setStatusMessage = vi.fn();
+		const self: Record<string, unknown> = {
+			requireClient: () => ({
+				request: vi.fn(async () => ({
+					success: false,
+					error: 'Agent name "target name" is unavailable: an agent of that name already exists at depth 0 under this parent',
+				})),
+			}),
+			setStatusMessage,
+			refreshSessions: vi.fn(async () => true),
+			refreshSavedSessionsIfLoaded: vi.fn(),
+		};
+
+		await expect(invoke("renameSession", self, live, "target name")).resolves.toBe(false);
+		expect(setStatusMessage).toHaveBeenCalledWith(expect.stringContaining('Agent name "target name" is unavailable'));
+		expect(self.refreshSessions).not.toHaveBeenCalled();
+	});
+
 	it("arms the saved-search fetch once and lets only the current fetch re-arm the latch", async () => {
 		const latchHarness = (text: string, responses: unknown[]) => {
 			const request = vi.fn(async () => responses.shift());

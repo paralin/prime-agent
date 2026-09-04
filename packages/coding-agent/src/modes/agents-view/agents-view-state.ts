@@ -633,9 +633,11 @@ export function getAgentsViewSelectionKey(summary: SessionSummary): AgentsViewSe
 	return { sessionId: summary.sessionId, activeSessionId: summary.activeSessionId };
 }
 
-// Matches by identity, then activeSessionId, then sessionId: a row's identity
-// changes when a session is persisted or re-attached, so the latter two keys
-// re-find the same session across those transitions. Returns -1 when gone.
+// Matches by identity, then activeSessionId, then sessionId. Exact identity
+// must win while its row exists: /new keeps the runtime id but moves it to a
+// new session file, and the old file remains a separate selectable session.
+// The fallback keys re-find a row only when its identity changed because it
+// was persisted or re-attached. Returns -1 when the session is gone.
 export function resolveAgentsViewSelectionIndex(
 	rows: readonly AgentsViewRow[],
 	identity: string | undefined,
@@ -646,21 +648,13 @@ export function resolveAgentsViewSelectionIndex(
 
 	if (identity !== undefined) {
 		const index = findSelectable((row) => row.identity === identity);
-		// Synthetic nested rows deliberately reuse their parent's session key, so
-		// their exact row identity must win over the active-runtime fallback.
-		if (index >= 0 && rows[index]?.kind !== "agent") {
+		if (index >= 0) {
 			return index;
 		}
 	}
 	if (key?.activeSessionId !== undefined) {
 		const activeSessionId = key.activeSessionId;
 		const index = findSelectable((row) => (row.summary.activeSessionId ?? row.summary.id) === activeSessionId);
-		if (index >= 0) {
-			return index;
-		}
-	}
-	if (identity !== undefined) {
-		const index = findSelectable((row) => row.identity === identity);
 		if (index >= 0) {
 			return index;
 		}

@@ -31,6 +31,9 @@ export function createAgentConnectionState(
 		model: toConnectionModel(session.model),
 		thinkingLevel: session.thinkingLevel,
 		serviceTier: session.serviceTier,
+		rlmMaxDepth: session.rlmMaxDepth,
+		actEnabled: session.actEnabled,
+		retryEnabled: session.autoRetryEnabled,
 		availableThinkingLevels: session.getAvailableThinkingLevels(),
 		isStreaming: session.isStreaming,
 		isCompacting: session.isCompacting,
@@ -69,7 +72,6 @@ export function createAgentConnectionSnapshot(
 		state: createAgentConnectionState(runtime, activeSessionId),
 		messages: [...session.messages],
 		...(session.state?.streamingMessage ? { streamingMessage: session.state.streamingMessage } : {}),
-		sessionContext: session.buildSessionContext(),
 		sessionTree: {
 			tree: sessionManager.getTree(),
 			leafId: sessionManager.getLeafId(),

@@ -10,7 +10,7 @@ import type { AgentAutonomousConfig } from "./autonomous.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
-import { convertToLlm } from "./messages.js";
+import { addElapsedSystemPrompt, convertToLlm } from "./messages.js";
 import { ModelRegistry } from "./model-registry.js";
 import { findInitialModel } from "./model-resolver.js";
 import type { ResourceLoader } from "./resource-loader.js";
@@ -239,37 +239,55 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	let agent: Agent;
 
+	let conversationStartedAt = sessionManager.getConversationStartedAt();
+
+	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
-		const converted = convertToLlm(messages);
-		if (!settingsManager.getBlockImages()) {
-			return converted;
-		}
-		return converted.map((msg) => {
-			if (msg.role === "user" || msg.role === "toolResult") {
-				const content = msg.content;
-				if (Array.isArray(content)) {
-					const hasImages = content.some((c) => c.type === "image");
-					if (hasImages) {
-						const filteredContent = content
-							.map((c) =>
-								c.type === "image" ? { type: "text" as const, text: "Image reading is disabled." } : c,
-							)
-							.filter(
-								(c, i, arr) =>
-									!(
-										c.type === "text" &&
-										c.text === "Image reading is disabled." &&
-										i > 0 &&
-										arr[i - 1].type === "text" &&
-										(arr[i - 1] as { type: "text"; text: string }).text === "Image reading is disabled."
-									),
-							);
-						return { ...msg, content: filteredContent };
+		let converted = convertToLlm(messages);
+		// Check setting dynamically so mid-session changes take effect
+		if (settingsManager.getBlockImages()) {
+			// Filter out ImageContent from all messages, replacing with text placeholder
+			converted = converted.map((msg) => {
+				if (msg.role === "user" || msg.role === "toolResult") {
+					const content = msg.content;
+					if (Array.isArray(content)) {
+						const hasImages = content.some((c) => c.type === "image");
+						if (hasImages) {
+							const filteredContent = content
+								.map((c) =>
+									c.type === "image" ? { type: "text" as const, text: "Image reading is disabled." } : c,
+								)
+								.filter(
+									(c, i, arr) =>
+										// Dedupe consecutive "Image reading is disabled." texts
+										!(
+											c.type === "text" &&
+											c.text === "Image reading is disabled." &&
+											i > 0 &&
+											arr[i - 1].type === "text" &&
+											(arr[i - 1] as { type: "text"; text: string }).text === "Image reading is disabled."
+										),
+								);
+							return { ...msg, content: filteredContent };
+						}
 					}
 				}
+				return msg;
+			});
+		}
+		if (conversationStartedAt === undefined) {
+			conversationStartedAt = sessionManager.getConversationStartedAt();
+			if (conversationStartedAt === undefined && converted.length > 0) {
+				for (const message of converted) {
+					if (!Number.isFinite(message.timestamp)) continue;
+					conversationStartedAt =
+						conversationStartedAt === undefined
+							? message.timestamp
+							: Math.min(conversationStartedAt, message.timestamp);
+				}
 			}
-			return msg;
-		});
+		}
+		return converted;
 	};
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
@@ -284,17 +302,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
+			const providerContext = {
+				...context,
+				systemPrompt: settingsManager.getSessionElapsedTimeEnabled()
+					? addElapsedSystemPrompt(context.systemPrompt, conversationStartedAt ?? Number.NaN)
+					: context.systemPrompt,
+			};
 			const auth = await modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok) {
 				throw new Error(auth.error);
 			}
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
-			return streamSimple(model, context, {
+			return streamSimple(model, providerContext, {
 				...options,
 				apiKey: auth.apiKey,
 				timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
 				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+				openRouterResponses: settingsManager.getOpenRouterResponses(),
 				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
 			});
 		},
@@ -330,7 +355,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	});
 
 	if (hasExistingSession) {
-		agent.state.messages = existingSession.messages;
+		agent.state.messages = sessionManager.buildSessionContext(model?.provider).messages;
 		if (!hasThinkingEntry) {
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
@@ -367,11 +392,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		extensionRunnerRef,
 		rlmDepth: options.rlmDepth,
 		rlmMaxDepth: options.rlmMaxDepth,
+		rlmMaxDepthCeiling: options.rlmMaxDepthCeiling,
+		actEnabled: options.actEnabled,
+		harnessMode: options.harnessMode,
 		rlmSessionDir: options.rlmSessionDir,
 		rlmParentNodeId: options.rlmParentNodeId,
 		rlmParentAgent: options.rlmParentAgent,
 		semanticParentSessionId: options.semanticParentSessionId,
 		semanticSpawnedByRequestId: options.semanticSpawnedByRequestId,
+		rlmModelCandidates: options.rlmModelCandidates,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		sessionStartEvent: options.sessionStartEvent,
 		prewarmIpythonKernel: options.prewarmIpythonKernel,

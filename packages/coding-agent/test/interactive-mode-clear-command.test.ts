@@ -5,8 +5,9 @@ import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 type ClearCommandContext = {
 	stopWorkingLoader: () => void;
+	connectionState?: { cwd?: string };
 	agentConnection: {
-		newSession: () => Promise<{ cancelled: boolean }>;
+		newSession: (options?: { cwd?: string }) => Promise<{ cancelled: boolean }>;
 		setSessionName?: (name: string) => Promise<void>;
 		prompt?: (prompt: string, options?: { images?: unknown[] }) => Promise<void>;
 	};
@@ -70,7 +71,7 @@ describe("InteractiveMode /clear", () => {
 		});
 
 		expect(context.stopWorkingLoader).toHaveBeenCalledWith();
-		expect(newSession).toHaveBeenCalledWith();
+		expect(newSession).toHaveBeenCalledWith({ cwd: context.connectionState?.cwd });
 		expect(renderCurrentSessionState).toHaveBeenCalledWith();
 		expect(setSessionName).toHaveBeenCalledWith("stable");
 		expect(addToHistory).toHaveBeenCalledWith("-- exact\n  text [image #7]  ");
@@ -99,7 +100,7 @@ describe("InteractiveMode /clear", () => {
 
 		await interactiveModePrototype.handleClearCommand.call(context, { prompt: "keep me" });
 
-		expect(newSession).toHaveBeenCalledWith();
+		expect(newSession).toHaveBeenCalledWith({ cwd: context.connectionState?.cwd });
 		expect(setText).toHaveBeenCalledWith("keep me");
 		expect(context.renderCurrentSessionState).not.toHaveBeenCalled();
 		expect(context.ui.requestRender).not.toHaveBeenCalled();

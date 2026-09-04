@@ -1,5 +1,13 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, ServiceTier, TextContent, Usage } from "@earendil-works/pi-ai";
+import type {
+	AssistantMessage,
+	ImageContent,
+	Message,
+	ProviderNativeCompactionResult,
+	ServiceTier,
+	TextContent,
+	Usage,
+} from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
@@ -12,6 +20,7 @@ import {
 	realpathSync,
 	renameSync,
 	rmSync,
+	type Stats,
 	statSync,
 	writeFileSync,
 } from "fs";
@@ -19,7 +28,7 @@ import { readdir, readFile, stat } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
-import { readFirstLineSync, readLinesAsBuffers } from "../utils/file-lines.js";
+import { readFirstLineSync, readLineContainingSync, readLinesAsBuffers } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
 import {
 	type BashExecutionMessage,
@@ -44,9 +53,9 @@ const SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS = 256;
 const SESSION_STREAMING_LOAD_THRESHOLD_BYTES = 128 * 1024 * 1024;
 const SESSION_ASYNC_PARSE_YIELD_BYTES = 4 * 1024 * 1024;
 
-// Entry types that can represent user intent (vs. daemon bookkeeping like
-// session_state/agent_status/git_state/child_usage_attributed). Used by
-// hasUserContent to decide whether a message-less draft is safe to discard.
+// Entry types that can represent user intent. Runtime bookkeeping such as
+// session state, agent status, git state, child usage, and Act lifecycle does
+// not. Used by hasUserContent to decide whether a message-less draft is safe to discard.
 const CONTENT_ENTRY_TYPES = new Set([
 	"message",
 	"custom_message",
@@ -133,10 +142,23 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	summary: string;
 	firstKeptEntryId: string;
 	tokensBefore: number;
+	/** Opaque history returned by a provider-native compaction operation. */
+	providerNativeCompaction?: ProviderNativeCompactionResult;
+	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
 	fromHook?: boolean;
 	customInstructions?: string;
 	usage?: Usage;
+}
+
+const lazyCompactionProviders = new WeakMap<CompactionEntry, string>();
+
+export function canReplayCompactionWithProvider(compaction: CompactionEntry, provider?: string): boolean {
+	const lazyProvider = lazyCompactionProviders.get(compaction);
+	if (lazyProvider !== undefined) return lazyProvider === provider;
+	return (
+		compaction.providerNativeCompaction === undefined || compaction.providerNativeCompaction.provider === provider
+	);
 }
 
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
@@ -167,6 +189,33 @@ export interface ChildUsageAttributionEntry extends SessionEntryBase {
 	origin?: "spawn_task" | "agent_message" | "direct_user";
 }
 
+/** Start of one retained-lane Act. The usage baseline makes crash recovery auditable. */
+export interface ActStartEntry extends SessionEntryBase {
+	type: "act_start";
+	actId: string;
+	depth?: number;
+	parentActId?: string;
+	sessionKey?: string;
+	outerToolCallId?: string;
+	usageBaseline: Usage;
+}
+
+export type ActTerminalStatus = "done" | "cancelled" | "error" | "interrupted";
+
+/** Terminal fact for one Act. Python values and executable work are never persisted. */
+export interface ActTerminalEntry extends SessionEntryBase {
+	type: "act_terminal";
+	actId: string;
+	depth?: number;
+	parentActId?: string;
+	sessionKey?: string;
+	status: ActTerminalStatus;
+	usage: Usage;
+	model?: { provider: string; id: string };
+	error?: string;
+}
+
+/** Label entry for user-defined bookmarks/markers on entries. */
 export interface LabelEntry extends SessionEntryBase {
 	type: "label";
 	targetId: string;
@@ -224,6 +273,8 @@ export type SessionEntry =
 	| BranchSummaryEntry
 	| CustomEntry
 	| ChildUsageAttributionEntry
+	| ActStartEntry
+	| ActTerminalEntry
 	| CustomMessageEntry
 	| LabelEntry
 	| SessionInfoEntry
@@ -261,6 +312,10 @@ export interface SessionInfo {
 	created: Date;
 	modified: Date;
 	messageCount: number;
+	// User/assistant message entries. toolResult and lifecycle entries do not
+	// count. Absent in fixtures and protocol objects that predate the scan;
+	// zero means the session never had a conversation turn.
+	conversationMessageCount?: number;
 	firstMessage: string;
 	allMessagesText: string;
 	agentStatus?: AgentStatus;
@@ -425,10 +480,17 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 	return null;
 }
 
+/**
+ * Build the session context from entries using tree traversal.
+ * If leafId is provided, walks from that entry to root.
+ * Handles compaction and branch summaries along the path.
+ * Pass null as activeProvider to restrict selection to portable compaction boundaries.
+ */
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
+	activeProvider?: string | null,
 ): SessionContext {
 	if (!byId) {
 		byId = new Map<string, SessionEntry>();
@@ -475,8 +537,19 @@ export function buildSessionContext(
 			model = { provider: entry.provider, modelId: entry.modelId };
 		} else if (entry.type === "message" && entry.message.role === "assistant") {
 			model = { provider: entry.message.provider, modelId: entry.message.model };
-		} else if (entry.type === "compaction") {
+		}
+	}
+
+	// The latest compaction boundary always bounds the rebuilt context. A
+	// provider-native boundary whose opaque history belongs to another provider
+	// still applies — replaying the full pre-compaction history would exceed the
+	// context window — but its opaque payload is dropped below.
+	const replayProvider = activeProvider === undefined ? model?.provider : (activeProvider ?? undefined);
+	for (let i = path.length - 1; i >= 0; i--) {
+		const entry = path[i];
+		if (entry.type === "compaction") {
 			compaction = entry;
+			break;
 		}
 	}
 
@@ -497,6 +570,10 @@ export function buildSessionContext(
 		}
 	};
 
+	// Opaque history only replays on its originating provider; any other
+	// provider receives the summary text instead of a foreign payload.
+	const providerNativeCompaction = compaction?.providerNativeCompaction;
+
 	if (compaction) {
 		const compactionIdx = path.findIndex((e) => e.type === "compaction" && e.id === compaction.id);
 
@@ -515,22 +592,35 @@ export function buildSessionContext(
 			}
 		}
 
-		messages.push(
-			createCompactionSummaryMessage(
-				compaction.summary,
-				compaction.tokensBefore,
-				compaction.timestamp,
-				compaction.customInstructions,
-				retainedMessages.length,
-			),
-			...retainedMessages,
-		);
+		if (
+			compaction.summary ||
+			(providerNativeCompaction && canReplayCompactionWithProvider(compaction, replayProvider))
+		) {
+			messages.push(
+				createCompactionSummaryMessage(
+					compaction.summary,
+					compaction.tokensBefore,
+					compaction.timestamp,
+					compaction.customInstructions,
+					retainedMessages.length,
+					providerNativeCompaction && canReplayCompactionWithProvider(compaction, replayProvider)
+						? {
+								type: "openaiResponsesHistory",
+								provider: providerNativeCompaction.provider,
+								items: providerNativeCompaction.replacementHistory,
+							}
+						: undefined,
+				),
+			);
+		}
+		messages.push(...retainedMessages);
 
 		for (let i = compactionIdx + 1; i < path.length; i++) {
 			const entry = path[i];
 			appendMessage(entry);
 		}
 	} else {
+		// No compatible compaction boundary: rebuild from original append-only entries.
 		for (const entry of path) {
 			appendMessage(entry);
 		}
@@ -742,7 +832,7 @@ function normalizeCwd(cwd: string): string {
 	return resolve(cwd);
 }
 
-function sessionInfoMatchesCwd(session: SessionInfo, cwd: string): boolean {
+export function sessionInfoMatchesCwd(session: SessionInfo, cwd: string): boolean {
 	return !!session.cwd && normalizeCwd(session.cwd) === normalizeCwd(cwd);
 }
 
@@ -859,6 +949,15 @@ function looksLikeMessageEntry(line: string): boolean {
 	return line.includes('"type":"message"') || line.includes('"type": "message"');
 }
 
+function isCatalogIrrelevantBookkeepingEntry(line: string): boolean {
+	return (
+		line.startsWith('{"type":"child_usage_attributed"') ||
+		line.startsWith('{"type":"git_state"') ||
+		line.startsWith('{"type":"act_start"') ||
+		line.startsWith('{"type":"act_terminal"')
+	);
+}
+
 function extractJsonStringPropertyPrefix(
 	text: string,
 	propertyName: string,
@@ -928,17 +1027,47 @@ function extractOversizedMessageSummary(line: string): {
 }
 
 interface SessionInfoCacheEntry {
+	dev: number;
+	ino: number;
 	size: number;
 	mtimeMs: number;
 	info: SessionInfo | null;
+	scan?: SessionInfoScan;
+}
+
+interface SessionInfoScan {
+	header?: SessionHeader;
+	messageCount: number;
+	conversationMessageCount: number;
+	firstMessage: string;
+	allMessagesText: string;
+	name?: string;
+	state?: SessionState;
+	agentStatus?: AgentStatus;
+	lastActivityTime?: number;
+	// Fold attribution aggregates like the loader: either disk representation cancels to the same own spend.
+	assistantUsageById: Map<string, Usage>;
+	attributedChildUsages: Usage[];
+	summarizationUsages: Usage[];
 }
 
 // Session files are append-only, so an unchanged (size, mtimeMs) means identical
 // content: cache list metadata and rescan only files that changed.
 const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
+const sessionInfoLoads = new Map<string, Promise<SessionInfo | null>>();
 
-export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
-	let stats: Awaited<ReturnType<typeof stat>>;
+export function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
+	const pending = sessionInfoLoads.get(filePath);
+	if (pending) return pending;
+	const load = readSessionInfoOnce(filePath).finally(() => {
+		if (sessionInfoLoads.get(filePath) === load) sessionInfoLoads.delete(filePath);
+	});
+	sessionInfoLoads.set(filePath, load);
+	return load;
+}
+
+async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null> {
+	let stats: Stats;
 	try {
 		stats = await stat(filePath);
 	} catch {
@@ -948,42 +1077,66 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
 		return cached.info;
 	}
-	const info = await scanSessionInfo(filePath, stats);
-	sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, info });
+	const appendCache =
+		cached?.scan && cached.dev === stats.dev && cached.ino === stats.ino && cached.size < stats.size
+			? { scan: cached.scan, size: cached.size }
+			: undefined;
+	const scan = appendCache
+		? await scanSessionInfoRange(filePath, stats, { ...appendCache.scan }, appendCache.size)
+		: await scanSessionInfoRange(filePath, stats, createSessionInfoScan(), 0);
+	const info = sessionInfoFromScan(filePath, stats, scan);
+	sessionInfoCache.set(filePath, {
+		dev: stats.dev,
+		ino: stats.ino,
+		size: stats.size,
+		mtimeMs: stats.mtimeMs,
+		info,
+		...(scan.header ? { scan } : {}),
+	});
 	return info;
 }
 
-async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeof stat>>): Promise<SessionInfo | null> {
-	try {
-		let header: SessionHeader | undefined;
-		let messageCount = 0;
-		let firstMessage = "";
-		let allMessagesText = "";
-		let name: string | undefined;
-		let state: SessionState | undefined;
-		let agentStatus: AgentStatus | undefined;
-		let lastActivityTime: number | undefined;
+function createSessionInfoScan(): SessionInfoScan {
+	return {
+		messageCount: 0,
+		conversationMessageCount: 0,
+		firstMessage: "",
+		allMessagesText: "",
 		// Fold attribution aggregates like the loader: either disk representation cancels to the same own spend.
-		const assistantUsageById = new Map<string, Usage>();
-		const attributedChildUsages: Usage[] = [];
-		const summarizationUsages: Usage[] = [];
+		assistantUsageById: new Map<string, Usage>(),
+		attributedChildUsages: [],
+		summarizationUsages: [],
+	};
+}
 
-		for await (const lineBuffer of readLinesAsBuffers(filePath)) {
+async function scanSessionInfoRange(
+	filePath: string,
+	stats: Stats,
+	scan: SessionInfoScan,
+	start: number,
+): Promise<SessionInfoScan> {
+	try {
+		if (start >= stats.size) return scan;
+		for await (const lineBuffer of readLinesAsBuffers(filePath, { start, end: stats.size - 1 })) {
 			const line = lineBuffer.toString("utf8");
 			if (!line.trim()) continue;
+			if (isCatalogIrrelevantBookkeepingEntry(line)) continue;
 
 			// Large tool-result entries can be many MB. They do not carry the
 			// session-list metadata we need, and parsing them during every refresh
 			// can exhaust the daemon heap.
 			if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
 				if (looksLikeMessageEntry(line)) {
-					messageCount++;
+					scan.messageCount++;
 					const summary = extractOversizedMessageSummary(line);
-					if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
-						lastActivityTime = Math.max(lastActivityTime ?? 0, summary.timestamp);
+					if (summary.role === "user" || summary.role === "assistant") {
+						scan.conversationMessageCount++;
 					}
-					if (summary.role === "user" && !firstMessage) {
-						firstMessage = summary.textPreview || "(large message)";
+					if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
+						scan.lastActivityTime = Math.max(scan.lastActivityTime ?? 0, summary.timestamp);
+					}
+					if (summary.role === "user" && !scan.firstMessage) {
+						scan.firstMessage = summary.textPreview || "(large message)";
 					}
 				}
 				continue;
@@ -999,94 +1152,96 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 
 			if (entry.type === "session_info") {
 				const infoEntry = entry as SessionInfoEntry;
-				name = infoEntry.name?.trim() || undefined;
+				scan.name = infoEntry.name?.trim() || undefined;
 			}
 			if (entry.type === "session_state") {
 				const stateEntry = entry as SessionStateEntry;
 				const status = normalizeSessionStateStatus(stateEntry.state?.status);
 				if (status) {
-					state = { status };
+					scan.state = { status };
 				}
 			}
 			// Keep the latest recap/verdict so off-daemon sessions don't all show as
 			// unjudged in the agents view. Append-only, so last seen wins.
 			if (entry.type === "agent_status") {
-				agentStatus = (entry as AgentStatusEntry).status;
+				scan.agentStatus = (entry as AgentStatusEntry).status;
 			}
 			if (entry.type === "child_usage_attributed") {
 				const attribution = entry as ChildUsageAttributionEntry;
-				if (assistantUsageById.has(attribution.targetId)) {
-					assistantUsageById.set(attribution.targetId, attribution.aggregateUsage);
-					attributedChildUsages.push(attribution.childUsage);
+				if (scan.assistantUsageById.has(attribution.targetId)) {
+					scan.assistantUsageById.set(attribution.targetId, attribution.aggregateUsage);
+					scan.attributedChildUsages.push(attribution.childUsage);
 				}
 			}
 			if (entry.type === "compaction" || entry.type === "branch_summary") {
 				const summarizationUsage = (entry as CompactionEntry | BranchSummaryEntry).usage;
-				if (summarizationUsage) summarizationUsages.push(summarizationUsage);
-			}
-			if (!header) {
-				if (entry.type !== "session") {
-					return null;
-				}
-				header = entry as SessionHeader;
+				if (summarizationUsage) scan.summarizationUsages.push(summarizationUsage);
 			}
 
-			lastActivityTime = updateLastActivityTime(lastActivityTime, entry);
+			if (!scan.header) {
+				if (entry.type !== "session") {
+					return scan;
+				}
+				scan.header = entry as SessionHeader;
+			}
+
+			scan.lastActivityTime = updateLastActivityTime(scan.lastActivityTime, entry);
 
 			if (entry.type !== "message") continue;
-			messageCount++;
+			scan.messageCount++;
 
 			const message = (entry as SessionMessageEntry).message;
 			if (message.role === "assistant" && (message as { usage?: Usage }).usage) {
-				assistantUsageById.set(entry.id, (message as { usage: Usage }).usage);
+				scan.assistantUsageById.set(entry.id, (message as { usage: Usage }).usage);
 			}
 			if (!isMessageWithContent(message)) continue;
 			if (message.role !== "user" && message.role !== "assistant") continue;
+			scan.conversationMessageCount++;
 
 			const textContent = extractTextContent(message);
 			if (!textContent) continue;
 
-			allMessagesText = appendCappedSearchText(allMessagesText, textContent);
-			if (!firstMessage && message.role === "user") {
-				firstMessage = textContent;
+			scan.allMessagesText = appendCappedSearchText(scan.allMessagesText, textContent);
+			if (!scan.firstMessage && message.role === "user") {
+				scan.firstMessage = textContent;
 			}
 		}
-
-		if (!header) return null;
-		const usageTotal = emptyUsage();
-		for (const usage of assistantUsageById.values()) {
-			addAssistantUsage(usageTotal, usage);
-		}
-		for (const usage of summarizationUsages) {
-			addAssistantUsage(usageTotal, usage);
-		}
-		for (const childUsage of attributedChildUsages) {
-			subtractAssistantUsage(usageTotal, childUsage);
-		}
-		const cwd = typeof header.cwd === "string" ? header.cwd : "";
-		const parentSessionPath = header.parentSession;
-		const rlmDepth = resolveSessionRlmDepth(header, filePath);
-		const modified = getSessionModifiedDateFromLastActivity(lastActivityTime, header, stats.mtime);
-
-		return {
-			path: filePath,
-			id: header.id,
-			cwd,
-			name,
-			state,
-			parentSessionPath,
-			rlmDepth,
-			created: new Date(header.timestamp),
-			modified,
-			messageCount,
-			firstMessage: firstMessage || "(no messages)",
-			allMessagesText,
-			agentStatus,
-			usage: sessionUsageSummaryFrom(usageTotal),
-		};
+		return scan;
 	} catch {
-		return null;
+		return scan;
 	}
+}
+
+function sessionInfoFromScan(filePath: string, stats: Stats, scan: SessionInfoScan): SessionInfo | null {
+	const header = scan.header;
+	if (!header) return null;
+	const usageTotal = emptyUsage();
+	for (const usage of scan.assistantUsageById.values()) {
+		addAssistantUsage(usageTotal, usage);
+	}
+	for (const usage of scan.summarizationUsages) {
+		addAssistantUsage(usageTotal, usage);
+	}
+	for (const childUsage of scan.attributedChildUsages) {
+		subtractAssistantUsage(usageTotal, childUsage);
+	}
+	return {
+		path: filePath,
+		id: header.id,
+		cwd: typeof header.cwd === "string" ? header.cwd : "",
+		name: scan.name,
+		state: scan.state,
+		parentSessionPath: header.parentSession,
+		rlmDepth: resolveSessionRlmDepth(header, filePath),
+		created: new Date(header.timestamp),
+		modified: getSessionModifiedDateFromLastActivity(scan.lastActivityTime, header, stats.mtime),
+		messageCount: scan.messageCount,
+		conversationMessageCount: scan.conversationMessageCount,
+		firstMessage: scan.firstMessage || "(no messages)",
+		allMessagesText: scan.allMessagesText,
+		agentStatus: scan.agentStatus,
+		usage: sessionUsageSummaryFrom(usageTotal),
+	};
 }
 
 export type SessionListProgress = (loaded: number, total: number) => void;
@@ -1097,11 +1252,23 @@ export interface SessionListCallbacks {
 	onSession?: SessionListItem;
 }
 
+// Sessions whose only entries are lifecycle, state, or toolResult rows are
+// internal event logs. They are hidden from catalog listings but stay
+// resolvable by ID and openable through readSessionInfo/listResolvable.
+// conversationMessageCount is undefined in fixtures that predate the scan;
+// only an exact zero hides a session.
+export function isSessionVisibleInCatalog(session: SessionInfo): boolean {
+	if (session.conversationMessageCount !== 0) return true;
+	const status = session.state?.status;
+	return session.agentStatus !== undefined && status !== "archived" && status !== "crash";
+}
+
 async function listSessionsFromDir(
 	dir: string,
 	callbacks?: SessionListCallbacks,
 	progressOffset = 0,
 	progressTotal?: number,
+	excludedPaths?: ReadonlySet<string>,
 ): Promise<SessionInfo[]> {
 	const sessions: SessionInfo[] = [];
 	if (!existsSync(dir)) {
@@ -1110,10 +1277,14 @@ async function listSessionsFromDir(
 
 	try {
 		const dirEntries = await readdir(dir);
-		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
+		const normalizedExcludedPaths = excludedPaths
+			? new Set([...excludedPaths].map((path) => resolve(path)))
+			: undefined;
+		const presentFiles = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
+		const files = presentFiles.filter((path) => !normalizedExcludedPaths?.has(resolve(path)));
 		const total = progressTotal ?? files.length;
 
-		const present = new Set(files);
+		const present = new Set(presentFiles);
 		for (const key of sessionInfoCache.keys()) {
 			if (dirname(key) === dir && !present.has(key)) {
 				sessionInfoCache.delete(key);
@@ -1206,6 +1377,7 @@ export class SessionManager {
 			}
 
 			this._buildIndex();
+			this._deferHistoricalProviderCompactions();
 			this.flushed = true;
 		} else {
 			const explicitPath = this.sessionFile;
@@ -1291,6 +1463,53 @@ export class SessionManager {
 		}
 	}
 
+	private _deferHistoricalProviderCompactions(): void {
+		if (!this.sessionFile) return;
+		const nativeCompactions = this.fileEntries.filter(
+			(entry): entry is CompactionEntry =>
+				entry.type === "compaction" &&
+				(lazyCompactionProviders.has(entry) || entry.providerNativeCompaction !== undefined),
+		);
+		if (nativeCompactions.length <= 1) return;
+		const retained = nativeCompactions.at(-1);
+		for (const entry of nativeCompactions) {
+			if (entry === retained || lazyCompactionProviders.has(entry)) continue;
+			const provider = entry.providerNativeCompaction?.provider;
+			if (!provider) continue;
+			lazyCompactionProviders.set(entry, provider);
+			Object.defineProperty(entry, "providerNativeCompaction", {
+				configurable: true,
+				enumerable: true,
+				get: () => this._loadDeferredProviderCompaction(entry),
+				set: (value: ProviderNativeCompactionResult | undefined) => {
+					lazyCompactionProviders.delete(entry);
+					Object.defineProperty(entry, "providerNativeCompaction", {
+						configurable: true,
+						enumerable: true,
+						writable: true,
+						value,
+					});
+				},
+			});
+		}
+	}
+
+	private _loadDeferredProviderCompaction(entry: CompactionEntry): ProviderNativeCompactionResult | undefined {
+		let value: ProviderNativeCompactionResult | undefined;
+		if (this.sessionFile) {
+			const line = readLineContainingSync(this.sessionFile, ['"type":"compaction"', `"id":"${entry.id}"`]);
+			if (line) {
+				try {
+					value = (JSON.parse(line) as CompactionEntry).providerNativeCompaction;
+				} catch {
+					value = undefined;
+				}
+			}
+		}
+		entry.providerNativeCompaction = value;
+		return value;
+	}
+
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
@@ -1310,6 +1529,7 @@ export class SessionManager {
 			rmSync(tempPath, { force: true });
 		}
 		this._notifyPersistListeners();
+		this._deferHistoricalProviderCompactions();
 	}
 
 	private _notifyPersistListeners(): void {
@@ -1406,7 +1626,12 @@ export class SessionManager {
 		if (!this.persist || !this.sessionFile) return;
 
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		const shouldPersistWithoutAssistant = entry.type === "session_state" || entry.type === "session_info";
+		const shouldPersistWithoutAssistant =
+			entry.type === "session_state" ||
+			entry.type === "session_info" ||
+			entry.type === "agent_status" ||
+			entry.type === "act_start" ||
+			entry.type === "act_terminal";
 		if (!hasAssistant && !shouldPersistWithoutAssistant) {
 			this.flushed = false;
 			return;
@@ -1486,6 +1711,7 @@ export class SessionManager {
 		fromHook?: boolean,
 		customInstructions?: string,
 		usage?: Usage,
+		providerNativeCompaction?: ProviderNativeCompactionResult,
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
@@ -1495,13 +1721,68 @@ export class SessionManager {
 			summary,
 			firstKeptEntryId,
 			tokensBefore,
+			providerNativeCompaction,
 			details,
 			fromHook,
 			customInstructions,
 			usage,
 		};
 		this._appendEntry(entry);
+		this._deferHistoricalProviderCompactions();
 		return entry.id;
+	}
+
+	/** Commit a retained user message and its compaction boundary through one atomic file rewrite. */
+	appendMessageCompaction<T = unknown>(
+		message: Message,
+		input: {
+			summary: string;
+			tokensBefore: number;
+			details?: T;
+			customInstructions?: string;
+		},
+	): { messageEntryId: string; compactionEntryId: string } {
+		const previousLeafId = this.leafId;
+		const previousLength = this.fileEntries.length;
+		const messageEntry: SessionMessageEntry = {
+			type: "message",
+			id: generateId(this.byId),
+			parentId: previousLeafId,
+			timestamp: new Date().toISOString(),
+			message,
+		};
+		const compactionEntry: CompactionEntry<T> = {
+			type: "compaction",
+			id: generateId({
+				has: (id) => id === messageEntry.id || this.byId.has(id),
+			}),
+			parentId: messageEntry.id,
+			timestamp: new Date().toISOString(),
+			summary: input.summary,
+			firstKeptEntryId: messageEntry.id,
+			tokensBefore: input.tokensBefore,
+			details: input.details,
+			customInstructions: input.customInstructions,
+		};
+
+		this.fileEntries.push(messageEntry, compactionEntry);
+		this.byId.set(messageEntry.id, messageEntry);
+		this.byId.set(compactionEntry.id, compactionEntry);
+		this.leafId = compactionEntry.id;
+		try {
+			if (this.persist && this.sessionFile) {
+				this._rewriteFile();
+				this.flushed = true;
+			}
+			this._deferHistoricalProviderCompactions();
+			return { messageEntryId: messageEntry.id, compactionEntryId: compactionEntry.id };
+		} catch (error) {
+			this.fileEntries.length = previousLength;
+			this.byId.delete(messageEntry.id);
+			this.byId.delete(compactionEntry.id);
+			this.leafId = previousLeafId;
+			throw error;
+		}
 	}
 
 	appendCustomEntry(customType: string, data?: unknown): string {
@@ -1547,6 +1828,60 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Append a retained-lane Act start fact. Returns entry id. */
+	appendActStart(
+		actId: string,
+		usageBaseline: Usage,
+		options?: { depth?: number; parentActId?: string; sessionKey?: string; outerToolCallId?: string },
+	): string {
+		const entry: ActStartEntry = {
+			type: "act_start",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			actId,
+			depth: options?.depth ?? 1,
+			...(options?.parentActId ? { parentActId: options.parentActId } : {}),
+			...(options?.sessionKey ? { sessionKey: options.sessionKey } : {}),
+			...(options?.outerToolCallId ? { outerToolCallId: options.outerToolCallId } : {}),
+			usageBaseline: cloneUsage(usageBaseline),
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append a retained-lane Act terminal fact. Returns entry id. */
+	appendActTerminal(
+		actId: string,
+		status: ActTerminalStatus,
+		usage: Usage,
+		options?: {
+			model?: { provider: string; id: string };
+			error?: string;
+			depth?: number;
+			parentActId?: string;
+			sessionKey?: string;
+		},
+	): string {
+		const entry: ActTerminalEntry = {
+			type: "act_terminal",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			actId,
+			depth: options?.depth ?? 1,
+			...(options?.parentActId ? { parentActId: options.parentActId } : {}),
+			...(options?.sessionKey ? { sessionKey: options.sessionKey } : {}),
+			status,
+			usage: cloneUsage(usage),
+			...(options?.model ? { model: { ...options.model } } : {}),
+			...(options?.error ? { error: options.error } : {}),
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append a session info entry (e.g., display name). Returns entry id. */
 	appendSessionInfo(name: string): string {
 		const entry: SessionInfoEntry = {
 			type: "session_info",
@@ -1598,7 +1933,7 @@ export class SessionManager {
 
 	/**
 	 * True when the session holds user-meaningful persisted content, as opposed to
-	 * only daemon-written bookkeeping (session_state, agent_status, git_state) or
+	 * only runtime bookkeeping (session_state, agent_status, git_state, Act lifecycle) or
 	 * the default model/thinking entries every new session is created with. Used by
 	 * the daemon discard guard to decide whether a message-less draft is safe to
 	 * delete (that guard always also requires zero messages).
@@ -1623,6 +1958,20 @@ export class SessionManager {
 	}
 
 	appendAgentStatus(status: AgentStatus): string {
+		let current = this.leafId ? this.byId.get(this.leafId) : undefined;
+		while (current) {
+			if (current.type === "agent_status") {
+				if (
+					current.status.summary === status.summary &&
+					current.status.taskState === status.taskState &&
+					current.status.basedOnMessageCount === status.basedOnMessageCount
+				) {
+					return current.id;
+				}
+				break;
+			}
+			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+		}
 		const entry: AgentStatusEntry = {
 			type: "agent_status",
 			id: generateId(this.byId),
@@ -1803,13 +2152,17 @@ export class SessionManager {
 		return path;
 	}
 
-	buildSessionContext(): SessionContext {
+	/**
+	 * Build the session context (what gets sent to the LLM).
+	 * Uses tree traversal from current leaf.
+	 */
+	buildSessionContext(activeProvider?: string): SessionContext {
 		// Pass fileEntries directly rather than getEntries(): the resolved context
 		// is computed from the leaf-to-root walk over byId (which already excludes
 		// the header), so the entries argument is only a fallback for an undefined
 		// leaf — never hit here since leafId is always set or null. Avoids an O(n)
 		// array copy on every call (attach, get_session_context, agent init, ...).
-		return buildSessionContext(this.fileEntries as SessionEntry[], this.leafId, this.byId);
+		return buildSessionContext(this.fileEntries as SessionEntry[], this.leafId, this.byId, activeProvider);
 	}
 
 	getHeader(): SessionHeader | null {
@@ -1817,6 +2170,23 @@ export class SessionManager {
 		return h ? (h as SessionHeader) : null;
 	}
 
+	/**
+	 * Get the earliest finite message timestamp on the current conversation branch.
+	 */
+	getConversationStartedAt(): number | undefined {
+		let earliest: number | undefined;
+		for (const entry of this.getBranch()) {
+			if (entry.type !== "message" || !Number.isFinite(entry.message.timestamp)) continue;
+			earliest = earliest === undefined ? entry.message.timestamp : Math.min(earliest, entry.message.timestamp);
+		}
+		return earliest;
+	}
+
+	/**
+	 * Get all session entries (excludes header). Returns a shallow copy.
+	 * The session is append-only: use appendXXX() to add entries, branch() to
+	 * change the leaf pointer. Entries cannot be modified or deleted.
+	 */
 	getEntries(): SessionEntry[] {
 		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
 	}
@@ -2112,25 +2482,61 @@ export class SessionManager {
 	static async list(cwd: string, sessionDir?: string, callbacks?: SessionListCallbacks): Promise<SessionInfo[]> {
 		const dir = sessionDir ?? getDefaultSessionDir(cwd);
 		const matchesCwd = (session: SessionInfo) => sessionInfoMatchesCwd(session, cwd);
+		const visibleInCwd = (session: SessionInfo) => isSessionVisibleInCatalog(session) && matchesCwd(session);
 		const sessions = (
 			await listSessionsFromDir(dir, {
 				onProgress: callbacks?.onProgress,
 				onSession: callbacks?.onSession
 					? (session) => {
-							if (matchesCwd(session)) {
+							if (visibleInCwd(session)) {
 								callbacks.onSession?.(session);
 							}
 						}
 					: undefined,
 			})
-		).filter(matchesCwd);
+		).filter(visibleInCwd);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 		return sessions;
 	}
 
-	static async listAll(callbacks?: SessionListCallbacks, sessionDir?: string): Promise<SessionInfo[]> {
+	static async listAll(
+		callbacks?: SessionListCallbacks,
+		sessionDir?: string,
+		excludedPaths?: ReadonlySet<string>,
+	): Promise<SessionInfo[]> {
 		const sessionsDir = sessionDir ?? getSessionsDir();
-		const sessions = await listSessionsFromDir(sessionsDir, callbacks);
+		const sessions: SessionInfo[] = [];
+		await listSessionsFromDir(
+			sessionsDir,
+			{
+				onProgress: callbacks?.onProgress,
+				onSession: (session) => {
+					if (!isSessionVisibleInCatalog(session)) return;
+					sessions.push(session);
+					callbacks?.onSession?.(session);
+				},
+			},
+			0,
+			undefined,
+			excludedPaths,
+		);
+		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+		return sessions;
+	}
+
+	/**
+	 * Full directory scan without the conversational-visibility filter.
+	 * Selector resolution uses this so event-only sessions still open by exact
+	 * ID or unique prefix even though catalogs hide them.
+	 */
+	static async listResolvable(cwd: string | undefined, sessionDir?: string): Promise<SessionInfo[]> {
+		const dir = cwd === undefined ? (sessionDir ?? getSessionsDir()) : (sessionDir ?? getDefaultSessionDir(cwd));
+		const sessions = await listSessionsFromDir(dir);
+		if (cwd !== undefined) {
+			const visible = sessions.filter((session) => sessionInfoMatchesCwd(session, cwd));
+			visible.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+			return visible;
+		}
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 		return sessions;
 	}

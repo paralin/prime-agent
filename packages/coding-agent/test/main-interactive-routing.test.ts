@@ -150,11 +150,30 @@ describe("interactive startup routing", () => {
 });
 
 describe("daemon-backed interactive session manager routing", () => {
-	test("opens a new chat (not the agents view) for default daemon-backed interactive startup", () => {
+	test("opens the agents view for default daemon-backed interactive startup", () => {
 		expect(
 			shouldOpenAgentsViewForDaemonInteractive({
 				useDaemonInteractive: true,
 				needsOnboarding: false,
+			}),
+		).toBe(true);
+	});
+
+	test("opens a chat directly when the launch carries an initial prompt", () => {
+		expect(
+			shouldOpenAgentsViewForDaemonInteractive({
+				useDaemonInteractive: true,
+				needsOnboarding: false,
+				hasStartupPrompt: true,
+			}),
+		).toBe(false);
+	});
+
+	test("opens a chat directly while onboarding is pending", () => {
+		expect(
+			shouldOpenAgentsViewForDaemonInteractive({
+				useDaemonInteractive: true,
+				needsOnboarding: true,
 			}),
 		).toBe(false);
 	});
@@ -376,6 +395,16 @@ describe("runtime session option resolution", () => {
 			rlmDepth: 1,
 			rlmSessionDir: "/tmp/rlm-session",
 		});
+	});
+
+	test("preserves the ordered RLM provider fallback candidates", () => {
+		const primary = { provider: "merge-gateway", id: "primary" } as NonNullable<CreateAgentSessionOptions["model"]>;
+		const fallback = { provider: "opencode-go", id: "fallback" } as NonNullable<CreateAgentSessionOptions["model"]>;
+		const rlmModelCandidates = [{ model: primary }, { model: fallback }];
+
+		const resolved = resolveRuntimeSessionOptions({}, { rlmDepth: 1, rlmModelCandidates });
+
+		expect(resolved.rlmModelCandidates).toBe(rlmModelCandidates);
 	});
 
 	test("preserves the runtime child parent-agent identity", () => {

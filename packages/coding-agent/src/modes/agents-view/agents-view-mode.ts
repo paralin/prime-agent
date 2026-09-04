@@ -13,7 +13,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSION } from "../../config.js";
+import { APP_TITLE, appendRotatingLog, getClientErrorLogPath, VERSION } from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
 import { SessionManager } from "../../core/session-manager.js";
@@ -59,13 +59,7 @@ import {
 	theme,
 } from "../interactive/theme/theme.js";
 import { WORKING_ICON_INTERVAL_MS, workingIconFrame } from "../interactive/theme/working-icon.js";
-import {
-	formatPackageUpdateNotice,
-	formatTmuxWarningNotice,
-	formatUpdateAvailableNotice,
-	gatherStartupNotices,
-	type StartupNotices,
-} from "../shared/startup-notices.js";
+import { formatTmuxWarningNotice, gatherStartupNotices, type StartupNotices } from "../shared/startup-notices.js";
 import {
 	type AgentsViewRow,
 	type AgentsViewScopeFrame,
@@ -332,8 +326,12 @@ async function openAgentsViewSession(
 ): Promise<OpenedAgentsViewSession> {
 	const socketPath = options.socketPath;
 	if (!socketPath) throw new Error("Agents view daemon socket is not configured");
-	let client = await connectAgentsViewDaemonClient(socketPath);
-	if (summary.activeSessionId) {
+	const client = await connectAgentsViewDaemonClient(socketPath);
+	if (!summary.sessionFile) {
+		if (!summary.activeSessionId) {
+			client.close();
+			throw new Error("Cannot open agent without an active runtime or saved session file");
+		}
 		try {
 			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
 				closeClientOnDispose: true,
@@ -344,19 +342,15 @@ async function openAgentsViewSession(
 			return { connection, summary };
 		} catch (error) {
 			client.close();
-			if (!summary.sessionFile || !isUnknownActiveSessionError(error)) {
-				throw error;
-			}
-			client = await connectAgentsViewDaemonClient(socketPath);
+			throw error;
 		}
 	}
 
-	if (!summary.sessionFile) {
-		client.close();
-		throw new Error("Cannot open agent without an active runtime or saved session file");
-	}
-
 	try {
+		// The file is the durable session identity. /new reuses the runtime id for
+		// another file, so attaching through a stale summary can open that new
+		// session instead of the selected one. The daemon's create-by-path call is
+		// idempotent when this file is still resident.
 		const resumed = await resumeSavedAgentsViewSession(client, options.config, summary);
 		const connection = await DaemonAgentConnection.attach(client, resumed.activeSessionId, {
 			closeClientOnDispose: true,
@@ -767,7 +761,9 @@ export class AgentsViewMode implements Component, Focusable {
 		this.editor.focused = true;
 		this.editor.getHeaderLine = () => this.renderReplyHeaderLine();
 		this.editor.onSubmit = (value) => {
-			void this.submit(value);
+			void this.submit(value).catch((error) => {
+				if (!this.stopped) this.setStatusMessage(formatError("Failed to apply input", error));
+			});
 		};
 		this.editor.setText(persistentState.query ?? "");
 		this.editor.onCtrlD = () => {
@@ -1025,14 +1021,7 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		// Reuse an in-flight gather from an earlier agents-view instance so re-entry does
 		// not re-run the checks or lose a result that resolved meanwhile.
-		const promise =
-			this.persistentState.startupNoticesPromise ??
-			gatherStartupNotices({
-				version: VERSION,
-				cwd: this.options.uiServices.getInitialCwd(),
-				agentDir: getAgentDir(),
-				settingsManager: this.options.uiServices.settingsManager,
-			});
+		const promise = this.persistentState.startupNoticesPromise ?? gatherStartupNotices();
 		this.persistentState.startupNoticesPromise = promise;
 		void promise
 			.then((notices) => {
@@ -1048,12 +1037,6 @@ export class AgentsViewMode implements Component, Focusable {
 			return [];
 		}
 		const formatted: string[] = [];
-		if (notices.newVersion) {
-			formatted.push(formatUpdateAvailableNotice(notices.newVersion));
-		}
-		if (notices.packageUpdates.length > 0) {
-			formatted.push(formatPackageUpdateNotice(notices.packageUpdates));
-		}
 		if (notices.tmuxWarning) {
 			formatted.push(formatTmuxWarningNotice(notices.tmuxWarning));
 		}
@@ -2543,9 +2526,13 @@ export class AgentsViewMode implements Component, Focusable {
 		const icon = this.formatRowIcon(row.section, rawIcon);
 		const indent = "  ".repeat(row.depth);
 		const age = formatSessionDuration(row.summary);
-		const usageText = formatRowUsage(row);
-		const details = usageText ? `${usageText} · ${age}` : age;
-		const detailsWidth = Math.max(10, visibleWidth(details));
+		const showUsage = this.options.uiServices.settingsManager.getAgentsViewUsageEnabled();
+		const details = showUsage
+			? `${formatRowUsage(row)} · ${age}`
+			: row.section === "inactive"
+				? `${row.summary.messageCount} · ${age}`
+				: age;
+		const detailsWidth = showUsage || row.section === "inactive" ? Math.max(10, visibleWidth(details)) : 10;
 		const heartbeatBadge = !pendingDelete && !pendingKill ? formatHeartbeatBadge(row.heartbeat) : "";
 		const heartbeatPausedOnly = (row.heartbeat?.activeCount ?? 0) < 1;
 		const heartbeatCell = heartbeatBadge ? theme.fg(heartbeatPausedOnly ? "dim" : "error", heartbeatBadge) : "";

@@ -14,6 +14,7 @@ import type {
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
 import type { ExtensionUIContext } from "../../core/extensions/types.js";
+import type { ExternalEventWatch } from "../../core/external-events.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
@@ -256,6 +257,10 @@ export class InProcessAgentConnection implements AgentConnection {
 		return [];
 	}
 
+	async listExternalEventWatches(): Promise<ExternalEventWatch[]> {
+		return [...this.session.listExternalEventWatches()];
+	}
+
 	async manageHeartbeat(
 		_activeSessionId: string,
 		_jobId: string,
@@ -353,6 +358,8 @@ export class InProcessAgentConnection implements AgentConnection {
 				...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
 				...(options?.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
 				...(options?.source ? { source: options.source } : {}),
+				...(options?.customMessage ? { customMessage: options.customMessage } : {}),
+				...(options?.internalPrompt !== undefined ? { internalPrompt: options.internalPrompt } : {}),
 				...(options?.signal ? { signal: options.signal } : {}),
 				preflightResult: (success) => {
 					if (success) {
@@ -374,6 +381,8 @@ export class InProcessAgentConnection implements AgentConnection {
 			...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
 			...(options?.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
 			...(options?.source ? { source: options.source } : {}),
+			...(options?.customMessage ? { customMessage: options.customMessage } : {}),
+			...(options?.internalPrompt !== undefined ? { internalPrompt: options.internalPrompt } : {}),
 			...(options?.signal ? { signal: options.signal } : {}),
 		});
 	}
@@ -418,7 +427,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async abort(): Promise<void> {
-		this.session.requestAbort();
+		await this.session.abort();
 	}
 
 	async cancelRlmChild(childId: string): Promise<boolean> {
@@ -445,7 +454,11 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.session.abortBash();
 	}
 
-	async setModel(provider: string, modelId: string): Promise<AgentConnectionModel> {
+	async setModel(
+		provider: string,
+		modelId: string,
+		options?: { persistDefault?: boolean },
+	): Promise<AgentConnectionModel> {
 		const availableModels = await this.session.modelRegistry.refreshAvailableModels();
 		const model = availableModels.find((candidate) => {
 			return candidate.provider === provider && candidate.id === modelId;
@@ -453,7 +466,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		if (!model) {
 			throw new Error(`Model not found: ${provider}/${modelId}`);
 		}
-		await this.session.setModel(model);
+		await this.session.setModel(model, options);
 		return model;
 	}
 

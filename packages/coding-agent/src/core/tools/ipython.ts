@@ -5,6 +5,7 @@ import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { IMAGE_MIME_TYPES } from "../../utils/mime.js";
 import { resolveKernelBashShell } from "../../utils/shell.js";
+import { getToolPath } from "../../utils/tools-manager.js";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
 import { withKernelBootPermit } from "../kernel/boot-gate.js";
 import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
@@ -13,12 +14,12 @@ import {
 	type HostRequestHandlers,
 	type KernelAttachment,
 	KernelBusyAfterInterruptError,
-	type KernelClient,
 	type KernelDiffDisplay,
 	type KernelSentAgentMessage,
 	ReplKernelManager,
 } from "../kernel/index.js";
 import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
+import type { RootForegroundLease } from "../root-foreground-lease.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
@@ -34,6 +35,9 @@ try:
     import rlm as _prime_agent_rlm_module
     rlm = _prime_agent_rlm_module.rlm
     bash = _prime_agent_rlm_module.bash
+    rg = _prime_agent_rlm_module.rg
+    rsync = _prime_agent_rlm_module.rsync
+    ssh_forward = _prime_agent_rlm_module.ssh_forward
     import rlm.mcp as mcp
 except Exception as _prime_agent_rlm_error:
     _PRIME_AGENT_RLM_IMPORT_ERROR = str(_prime_agent_rlm_error)
@@ -46,6 +50,12 @@ except Exception as _prime_agent_rlm_error:
                 "PRIME_AGENT_KERNEL_PYTHON to a kernel environment with prime-agent-runtime installed. "
                 f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
             )
+
+        async def act(self, prompt):
+            self._raise_missing()
+
+        def done(self, value):
+            self._raise_missing()
 
         async def run(self, prompt, **kwargs):
             self._raise_missing()
@@ -64,7 +74,16 @@ except Exception as _prime_agent_rlm_error:
 
     rlm = _PrimeAgentMissingRlm()
 
-    def bash(command):
+    def bash(command, timeout=None, **kwargs):
+        rlm._raise_missing()
+
+    def rg(pattern, *paths, options=(), timeout=None):
+        rlm._raise_missing()
+
+    def rsync(*paths, options=("-a",), timeout=None, protect_args=True):
+        rlm._raise_missing()
+
+    def ssh_forward(destination, *forwards, ssh_options=None):
         rlm._raise_missing()
 `.trim();
 
@@ -254,8 +273,6 @@ export interface IpythonToolDetails {
 	stdout?: string;
 	stderr?: string;
 	result?: string;
-	/** Output that arrived without this cell's id (threads, other cells' leftovers), shown separately from stdout. */
-	backgroundOutput?: string;
 	/** Diffs streamed from file edits, rendered by the cell view. */
 	diffs?: KernelDiffDisplay[];
 	/** Media attachments loaded into context (e.g. by the attach-image skill). */
@@ -282,6 +299,7 @@ export interface IpythonToolOptions {
 	sessionId?: string;
 	/** Typed host request handlers for the kernel↔host bridge (rlm.run, goal.*, …). */
 	hostHandlers?: HostRequestHandlers;
+	foregroundLease?: RootForegroundLease;
 	pythonSkills?: readonly PythonSkillRuntimeInfo[];
 	/** Per-session artifact dir where the kernel namespace snapshot is stored. Omit to disable snapshots. */
 	snapshotDir?: string;
@@ -299,6 +317,20 @@ export interface IpythonToolOptions {
 }
 
 /**
+ * Restore reporting is honest: only a start that found an on-disk snapshot
+ * reports one, and a missing restore result over an existing snapshot reports
+ * an explicitly empty revival at that snapshot's path.
+ */
+function resolveRestoreReport(
+	snapshotDir: string,
+	snapshotExisted: boolean,
+	restore: RestoreResult | null,
+): RestoreResult | undefined {
+	if (!snapshotExisted) return undefined;
+	return restore ?? { restored: [], failed: [], path: snapshotPathIn(snapshotDir) };
+}
+
+/**
  * Owns the lazy create+start+runtime-bootstrap of one session's Python kernel.
  *
  * Concurrent ensure() calls await the same in-flight startup, a failed startup
@@ -306,12 +338,13 @@ export interface IpythonToolOptions {
  * attach mid-flight (a tool call racing a background prewarm()).
  */
 export class IpythonKernelProvisioner {
-	private managerPromise?: Promise<KernelClient>;
-	private startedManager?: KernelClient;
+	private managerPromise?: Promise<ReplKernelManager>;
+	private startedManager?: ReplKernelManager;
 	private readonly startupListeners = new Set<KernelBootstrapProgressHandler>();
 	private lastStartupMessage?: string;
 	private _lastRestore?: RestoreResult;
 	private readonly disposeController = new AbortController();
+	private restartGate?: Promise<void>;
 	/** Snapshot policy of the dispose that aborted a startup, honored by startKernel's failure teardown. */
 	private disposeSnapshot = true;
 
@@ -321,7 +354,7 @@ export class IpythonKernelProvisioner {
 	) {}
 
 	/** The kernel manager, once a startup has completed successfully. */
-	get manager(): KernelClient | undefined {
+	get manager(): ReplKernelManager | undefined {
 		return this.startedManager;
 	}
 
@@ -330,9 +363,9 @@ export class IpythonKernelProvisioner {
 		return this._lastRestore;
 	}
 
-	/** Start the kernel in the background. Failures are swallowed here and surface on the next ensure(). */
+	/** Start the kernel in the background. Failures surface on the next ensure(). */
 	prewarm(): void {
-		void this.ensure().catch(() => {});
+		void this.ensure(undefined, this.disposeController.signal).catch(() => {});
 	}
 
 	/** Whether a kernel has finished starting and is currently running. */
@@ -363,12 +396,32 @@ export class IpythonKernelProvisioner {
 		const pending = this.managerPromise;
 		this.managerPromise = undefined;
 		this.startedManager = undefined;
+		await this.restartGate?.catch(() => undefined);
 		if (!pending) return;
 		try {
 			const m = await pending;
 			await m.shutdown({ snapshot: this.disposeSnapshot, drainHostRequests: true });
 		} catch {
 			// a failed startup already cleaned up after itself
+		}
+	}
+
+	/** Persist and stop an idle kernel while keeping the provisioner reusable. */
+	async hibernate(): Promise<void> {
+		if (this.restartGate) return this.restartGate;
+		const pending = this.managerPromise;
+		this.managerPromise = undefined;
+		this.startedManager = undefined;
+		if (!pending) return;
+		const gate = pending.then(
+			(manager) => manager.shutdown({ snapshot: true }).then(() => undefined),
+			() => undefined,
+		);
+		this.restartGate = gate;
+		try {
+			await gate;
+		} finally {
+			if (this.restartGate === gate) this.restartGate = undefined;
 		}
 	}
 
@@ -385,9 +438,19 @@ export class IpythonKernelProvisioner {
 		}
 	}
 
-	ensure(onProgress?: KernelBootstrapProgressHandler, signal?: AbortSignal): Promise<KernelClient> {
+	ensure(onProgress?: KernelBootstrapProgressHandler, signal?: AbortSignal): Promise<ReplKernelManager> {
 		if (signal?.aborted) {
 			return Promise.reject(createAbortError());
+		}
+		// A kernel that died unexpectedly is replaced by the next call: drop the
+		// dead cache entry so the memoized startup below launches exactly one
+		// fresh kernel (concurrent callers join it), which restores the last
+		// persisted snapshot. dispose()/kill() cleared the flag on the manager,
+		// so an explicitly torn-down kernel is never resurrected here.
+		const dead = this.startedManager;
+		if (dead && !dead.isRunning) {
+			this.managerPromise = undefined;
+			this.startedManager = undefined;
 		}
 		let cleanupProgressListener: (() => void) | undefined;
 		if (onProgress && !this.startedManager) {
@@ -403,7 +466,13 @@ export class IpythonKernelProvisioner {
 			}
 		}
 		if (!this.managerPromise) {
-			const startup = this.startKernel(signal);
+			// Admit the memoized startup itself. Wrapping only prewarm() can deadlock
+			// when another caller creates managerPromise first: prewarm then holds the
+			// lease while waiting for bootstrap, and bootstrap queues behind that lease.
+			const foreground = this.options?.foregroundLease;
+			const startup = foreground
+				? foreground.run("root-cell", () => this.startKernel(signal), signal)
+				: this.startKernel(signal);
 			this.managerPromise = startup;
 			startup.then(
 				(m) => {
@@ -439,7 +508,7 @@ export class IpythonKernelProvisioner {
 		}
 	}
 
-	private async startKernel(signal?: AbortSignal): Promise<KernelClient> {
+	private async startKernel(signal?: AbortSignal): Promise<ReplKernelManager> {
 		const startupAbort = createLinkedAbortSignal([this.disposeController.signal, signal]);
 		const startupSignal = startupAbort.signal;
 		// Wait for a previous provisioner (e.g. on /reload) to finish disposing — and
@@ -447,6 +516,9 @@ export class IpythonKernelProvisioner {
 		// kernels can't race over the same on-disk file. Guarded so the common
 		// no-gate path stays synchronous (callers rely on prompt startup progress).
 		try {
+			if (this.restartGate) {
+				await raceWithAbort(this.restartGate, startupSignal);
+			}
 			if (this.options?.readyGate) {
 				await raceWithAbort(
 					this.options.readyGate.catch(() => {}),
@@ -458,18 +530,20 @@ export class IpythonKernelProvisioner {
 			// without bash, where the runtime's teaching error fires instead).
 			const shellPath = resolveKernelBashShell(this.options?.shellPath);
 			const commandPrefix = this.options?.commandPrefix;
+			const rgPath = getToolPath("rg");
 			const bootstrapCode = buildRlmBootstrapCode(this.options?.pythonSkills);
 			const m = new ReplKernelManager({
 				python: this.options?.python,
 				cwd: this.cwd,
-				// bash() reads these to pick its shell and command prefix.
 				env: {
 					...this.options?.env,
 					...(shellPath ? { PRIME_AGENT_BASH_SHELL: shellPath } : {}),
+					...(rgPath ? { PRIME_AGENT_RG: rgPath } : {}),
 					...(commandPrefix ? { PRIME_AGENT_BASH_COMMAND_PREFIX: commandPrefix } : {}),
 				},
 				sessionId: this.options?.sessionId,
 				hostHandlers: this.options?.hostHandlers,
+				foregroundLease: this.options?.foregroundLease,
 				pythonSkills: this.options?.pythonSkills,
 				// Only persistent sessions (which have an artifact dir) get a revivable snapshot.
 				snapshot: snapshotDir
@@ -502,9 +576,7 @@ export class IpythonKernelProvisioner {
 					const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
 					this.emitStartupProgress("Restoring Python state...");
 					const restore = await raceWithAbort(m.restoreState(), startupSignal);
-					if (snapshotExisted) {
-						pendingRestore = restore ?? { restored: [], failed: [], path: snapshotPathIn(snapshotDir) };
-					}
+					pendingRestore = resolveRestoreReport(snapshotDir, snapshotExisted, restore);
 				}
 				this.emitStartupProgress("Preparing Python runtime...");
 				const bootstrap = await m.execute(bootstrapCode, {
@@ -572,6 +644,7 @@ async function executeWithBusyKernelChoice(
 			return {
 				result: await m.execute(code, {
 					signal,
+					outerToolCallId: toolCallId,
 					onStream,
 					onLateSentAgentMessage: onLateSentAgentMessage
 						? (message) => onLateSentAgentMessage(toolCallId, message)
@@ -617,8 +690,9 @@ export function createIpythonToolDefinition(
 		name: "ipython",
 		label: "ipython",
 		description:
-			"Execute Python code in a persistent Python REPL. Top-level `await` is supported. Variables, imports, and loaded data persist across calls, and are revived on a best-effort basis when a session is resumed (objects that cannot be serialized are dropped and reported). Run shell commands with `bash('cmd')` / `await bash('cmd')`. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
-		promptSnippet: "ipython - persistent Python REPL for code, state, and bash() orchestration",
+			"Execute Python code in a persistent Python REPL. Top-level `await` is supported. Variables, imports, and loaded data persist across calls, and are revived on a best-effort basis when a session is resumed (objects that cannot be serialized are dropped and reported). The kernel preloads bash(), argv-safe rg() and rsync(), callable rlm, mcp, and installed Python skills. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
+		promptSnippet:
+			"ipython - persistent Python REPL with retained state and preloaded process, RLM, MCP, and skill APIs",
 		// The kernel is single-threaded — pi must not run two ipython calls in parallel within a batch.
 		executionMode: "sequential",
 		parameters: ipythonSchema,
@@ -660,9 +734,6 @@ export function createIpythonToolDefinition(
 				if (r.status === "error" && r.error) {
 					text += (text ? "\n" : "") + r.error.traceback.join("\n");
 				}
-				if (r.backgroundOutput) {
-					text += `${text ? "\n" : ""}[background output (unattributed)]\n${r.backgroundOutput}`;
-				}
 				if (kernelRestarted) {
 					text = text ? `${KERNEL_RESTART_NOTICE}\n\n${text}` : KERNEL_RESTART_NOTICE;
 				}
@@ -679,7 +750,6 @@ export function createIpythonToolDefinition(
 						stdout: r.stdout,
 						stderr: r.stderr,
 						result: r.result,
-						backgroundOutput: r.backgroundOutput,
 						diffs: r.diffs,
 						attachments: r.attachments,
 						sentAgentMessages: r.sentAgentMessages,

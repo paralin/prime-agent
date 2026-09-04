@@ -37,6 +37,52 @@ export function countDirectSubagentStatuses(
 	return counts;
 }
 
+export function countSubagentTreeStatuses(
+	children: Iterable<AgentConnectionRlmChildAgentSnapshot>,
+	parentId: string | undefined,
+	activeHeartbeatSessionIds: ReadonlySet<string>,
+): SubagentSummaryCounts {
+	const snapshots = [...children].filter((child) => child.status !== "cancelled");
+	const descendants = new Map<string | undefined, AgentConnectionRlmChildAgentSnapshot[]>();
+	for (const child of snapshots) {
+		const siblings = descendants.get(child.parentId) ?? [];
+		siblings.push(child);
+		descendants.set(child.parentId, siblings);
+	}
+	const roots = descendants.get(parentId) ?? [];
+	let running = 0;
+	let idle = 0;
+	for (const root of roots) {
+		let treeStatus: "inactive" | "idle" | "running" = "inactive";
+		const pending = [root];
+		const visited = new Set<string>();
+		while (pending.length > 0) {
+			const child = pending.pop();
+			if (!child || visited.has(child.id)) continue;
+			visited.add(child.id);
+			const childRunning =
+				child.status === "running" ||
+				child.status === "queued" ||
+				child.activity !== undefined ||
+				(child.activeSessionId !== undefined && activeHeartbeatSessionIds.has(child.activeSessionId));
+			if (childRunning) {
+				treeStatus = "running";
+				break;
+			}
+			if (
+				treeStatus === "inactive" &&
+				(child.status === "done" || child.status === "error") &&
+				child.activeSessionId !== undefined
+			) {
+				treeStatus = "idle";
+			}
+			pending.push(...(descendants.get(child.id) ?? []));
+		}
+		if (treeStatus === "running") running += 1;
+		else if (treeStatus === "idle") idle += 1;
+	}
+	return { total: roots.length, running, idle, inactive: roots.length - running - idle };
+}
 export function countRosterSubagentStatuses(
 	summaries: Iterable<SessionSummary>,
 	parent: { activeSessionId?: string | undefined; sessionId?: string | undefined; sessionFile?: string | undefined },

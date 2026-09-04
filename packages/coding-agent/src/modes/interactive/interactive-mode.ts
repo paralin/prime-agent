@@ -43,12 +43,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
-import {
-	buildDaemonUpdateRestartReport,
-	launchDaemonUpdateRestartCoordinator,
-	resolveDaemonUpdateRestartSocketPath,
-} from "../../cli/daemon-update-restart.js";
-import { type CliSubprocessLaunchSpec, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
+import type { CliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	APP_NAME,
 	APP_TITLE,
@@ -57,10 +52,9 @@ import {
 	getDebugLogPath,
 	getLogsDir,
 	getShareViewerUrl,
-	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
-	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	VERSION,
 } from "../../config.js";
+import { type ActProjectionEvent, actEventDepth } from "../../core/act-events.js";
 import {
 	AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL,
 	isAgentSessionMessage,
@@ -82,6 +76,7 @@ import {
 	DEFAULT_HEARTBEAT_DELIVERY_MODE,
 	parseHeartbeatCommand,
 } from "../../core/cron-jobs.js";
+import { ENGLISH_OUTPUT_NUDGE_PREVIEW_LABEL } from "../../core/english-output-nudge.js";
 import type {
 	AutocompleteProviderFactory,
 	ContextUsage,
@@ -93,6 +88,7 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
 } from "../../core/extensions/index.js";
+import type { ExternalEventWatch } from "../../core/external-events.js";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.js";
 import { emptyGoalState, formatGoalUsage, GOAL_CONTEXT_PREVIEW_LABEL, type GoalState } from "../../core/goals.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
@@ -103,12 +99,15 @@ import {
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
 	createHeartbeatPromptMessage,
+	createManualContinueMessage,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	isCompactionOutcomeMessage,
 	isRefinementOutcomeMessage,
 	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
+	MANUAL_CONTINUE_PROMPT,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
+	REPETITION_NOTICE_PREVIEW_LABEL,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../../core/messages.js";
@@ -133,6 +132,7 @@ import {
 	captureOnboardingCompleted,
 	type TelemetryOnboardingOutcome,
 } from "../../core/telemetry.js";
+import { TOOL_ERROR_NUDGE_PREVIEW_LABEL } from "../../core/tool-error-nudge.js";
 import { type TruncationResult, truncateTail } from "../../core/tools/truncate.js";
 import { PRIME_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
@@ -143,7 +143,6 @@ import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { ensureTool, ensureToolWithStatus, formatMissingRipgrepMessage } from "../../utils/tools-manager.js";
-import { checkForNewPiVersion } from "../../utils/version-check.js";
 import type {
 	AgentConnection,
 	AgentConnectionExtensionUiRequest,
@@ -169,12 +168,7 @@ import type {
 import { AgentConnectionPromptAdmissionError } from "../agent-connection/index.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import { getModelArgumentCompletions } from "../model-autocomplete.js";
-import {
-	checkForPackageUpdates,
-	checkTmuxKeyboardSetup,
-	formatPackageUpdateNotice,
-	formatUpdateAvailableNotice,
-} from "../shared/startup-notices.js";
+import { checkTmuxKeyboardSetup } from "../shared/startup-notices.js";
 import { AGENT_ACTIVITY_LABELS, AgentActivityTracker, formatTokenCount } from "./agent-activity.js";
 import { type AuthenticationResult, getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "./auth-flows.js";
 import { AgentMessageComponent } from "./components/agent-message.js";
@@ -199,6 +193,7 @@ import { DaxnutsComponent } from "./components/daxnuts.js";
 import { DynamicBorder } from "./components/dynamic-border.js";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.js";
 import { type FileChangeSummary, formatTotalChangeSummary, mergeTurnFileChanges } from "./components/edit-summary.js";
+import { collectElapsedToolMarkers, ElapsedToolLabelGate } from "./components/elapsed-tool-marker.js";
 import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
@@ -277,11 +272,18 @@ import {
 	type ThemeColor,
 	theme,
 } from "./theme/theme.js";
-import { setWorkingPulseFrame, WORKING_ICON_INTERVAL_MS } from "./theme/working-icon.js";
+import {
+	getWorkingPulseFrame,
+	setWorkingPulseFrame,
+	WORKING_ICON_INTERVAL_MS,
+	workingIconFrame,
+} from "./theme/working-icon.js";
 
 interface Expandable {
 	setExpanded(expanded: boolean): void;
 }
+
+const MAX_LATE_ACT_EVENTS = 128;
 
 interface PendingToolCallRenderInput {
 	id: string;
@@ -293,6 +295,8 @@ const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS = 15_000;
 const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
 const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
 const FEATURE_HINT_DELAY_MS = 5_000;
+/** Distinct slow idle spinner for the waiting-for-background-events state. */
+const IDLE_WATCH_SPINNER_FRAMES = ["⠀⠶⠀", "⠰⣿⠆", "⢾⣉⡷", "⣏⠀⣹", "⡁⠀⢈"];
 
 export const START_HINTS = [
 	'Try "refactor @<filepath>"',
@@ -310,6 +314,9 @@ function isLabeledQueuedPreview(message: string): boolean {
 	return (
 		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) ||
 		message.startsWith(`${GOAL_CONTEXT_PREVIEW_LABEL}: `) ||
+		message.startsWith(`${REPETITION_NOTICE_PREVIEW_LABEL}: `) ||
+		message.startsWith(`${TOOL_ERROR_NUDGE_PREVIEW_LABEL}: `) ||
+		message.startsWith(`${ENGLISH_OUTPUT_NUDGE_PREVIEW_LABEL}: `) ||
 		message.startsWith(`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `)
 	);
 }
@@ -571,25 +578,15 @@ const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 // evicted past the cap to keep a long session bounded.
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
 const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT = 400;
+const EDITOR_HISTORY_LIMIT = 100;
 
 function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
 	if (messages.length <= INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT) {
 		return messages;
 	}
-	const toolCallMessages = new Map<string, { index: number; message: Extract<AgentMessage, { role: "assistant" }> }>();
-	for (const [index, message] of messages.entries()) {
-		if (message.role !== "assistant") {
-			continue;
-		}
-		for (const content of message.content) {
-			if (content.type === "toolCall") {
-				toolCallMessages.set(content.id, { index, message });
-			}
-		}
-	}
 
-	const initialStartIndex = messages.length - INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT;
-	for (let startIndex = initialStartIndex; startIndex < messages.length; startIndex++) {
+	let startIndex = messages.length - INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT;
+	while (startIndex < messages.length) {
 		const visibleMessages = messages.slice(startIndex);
 		const visibleToolCallIds = new Set<string>();
 		for (const message of visibleMessages) {
@@ -603,27 +600,42 @@ function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
 			}
 		}
 
+		const unresolvedToolCallIds = new Set<string>();
+		for (const message of visibleMessages) {
+			if (message.role === "toolResult" && !visibleToolCallIds.has(message.toolCallId)) {
+				unresolvedToolCallIds.add(message.toolCallId);
+			}
+		}
+
 		const requiredToolCallIdsByMessage = new Map<
 			number,
 			{ message: Extract<AgentMessage, { role: "assistant" }>; toolCallIds: Set<string> }
 		>();
-		for (const message of visibleMessages) {
-			if (message.role !== "toolResult" || visibleToolCallIds.has(message.toolCallId)) {
+		for (let index = startIndex - 1; index >= 0 && unresolvedToolCallIds.size > 0; index--) {
+			const message = messages[index];
+			if (message?.role !== "assistant") {
 				continue;
 			}
-			const toolCallMessage = toolCallMessages.get(message.toolCallId);
-			if (!toolCallMessage || toolCallMessage.index >= startIndex) {
+			const matchingToolCallIds = message.content.flatMap((content) =>
+				content.type === "toolCall" && unresolvedToolCallIds.has(content.id) ? [content.id] : [],
+			);
+			if (matchingToolCallIds.length === 0) {
 				continue;
 			}
-			const requiredMessage = requiredToolCallIdsByMessage.get(toolCallMessage.index) ?? {
-				message: toolCallMessage.message,
-				toolCallIds: new Set<string>(),
+			const requiredMessage = {
+				message,
+				toolCallIds: new Set(matchingToolCallIds),
 			};
-			requiredMessage.toolCallIds.add(message.toolCallId);
-			requiredToolCallIdsByMessage.set(toolCallMessage.index, requiredMessage);
+			requiredToolCallIdsByMessage.set(index, requiredMessage);
+			for (const toolCallId of matchingToolCallIds) {
+				unresolvedToolCallIds.delete(toolCallId);
+			}
 		}
 
-		if (visibleMessages.length + requiredToolCallIdsByMessage.size > INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT) {
+		const overflow =
+			visibleMessages.length + requiredToolCallIdsByMessage.size - INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT;
+		if (overflow > 0) {
+			startIndex += overflow;
 			continue;
 		}
 
@@ -988,6 +1000,9 @@ export class InteractiveMode {
 
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
+	// Spaces displayed elapsed tool labels; reset whenever the transcript is
+	// rebuilt from the session messages so replay stays deterministic.
+	private readonly elapsedToolLabelGate = new ElapsedToolLabelGate();
 	private sideQuestionComponent: SideQuestionComponent | undefined;
 	private sideQuestionEvent: AgentConnectionSideQuestionEvent | undefined;
 	private sideQuestionTurns: AgentConnectionSideQuestionEvent[] = [];
@@ -1017,6 +1032,9 @@ export class InteractiveMode {
 	private pendingTools = new Map<string, ToolExecutionComponent>();
 	private ipythonToolComponents = new Map<string, ToolExecutionComponent>();
 	private lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
+	private activeActTrays = new Map<number, { actId: string; depth: number; model: string; thinkingLevel?: string }>();
+	private lateActEvents = new Map<string, ActProjectionEvent[]>();
+	private lateActEventOrder: Array<{ outerToolCallId: string; event: ActProjectionEvent }> = [];
 	private pendingToolCreations = new Set<string>();
 	private startedToolCalls = new Set<string>();
 	private pendingToolGeneration = 0;
@@ -1049,6 +1067,8 @@ export class InteractiveMode {
 	private connectionState: AgentConnectionState | undefined;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
 	private heartbeatCatalog: AgentConnectionHeartbeat[] = [];
+	private watchCatalog: ExternalEventWatch[] = [];
+	private idleWatchLoader: Loader | undefined;
 	private heartbeatRefreshPromise: Promise<void> | undefined;
 	private heartbeatRefreshRequested = false;
 	private heartbeatManager: HeartbeatManagerComponent | undefined;
@@ -1333,10 +1353,12 @@ export class InteractiveMode {
 			takesArgument: command.takesArgument,
 		}));
 
-		const modelCommand = slashCommands.find((command) => command.name === "model");
-		if (modelCommand) {
-			modelCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
-				getModelArgumentCompletions(prefix, this.getCachedModelCandidates());
+		for (const commandName of ["model", "switch"]) {
+			const modelCommand = slashCommands.find((command) => command.name === commandName);
+			if (modelCommand) {
+				modelCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
+					getModelArgumentCompletions(prefix, this.getCachedModelCandidates());
+			}
 		}
 
 		const effortCommand = slashCommands.find((command) => command.name === "effort");
@@ -1542,14 +1564,6 @@ export class InteractiveMode {
 		// `returnToAgentsView`, which is also set for direct daemon attaches that never
 		// rendered the agents view and still want the in-session fallback.)
 		const ownsGlobalStartupNotices = !this.options.agentsViewOwnsStartupNotices;
-		const newVersionPromise = ownsGlobalStartupNotices ? checkForNewPiVersion(this.version) : undefined;
-		const packageUpdatesPromise = ownsGlobalStartupNotices
-			? checkForPackageUpdates({
-					cwd: this.getCurrentCwd(),
-					agentDir: getAgentDir(),
-					settingsManager: this.settingsManager,
-				})
-			: undefined;
 		const tmuxKeyboardWarningPromise = ownsGlobalStartupNotices ? checkTmuxKeyboardSetup() : undefined;
 
 		const {
@@ -1669,22 +1683,6 @@ export class InteractiveMode {
 			if (!ownsGlobalStartupNotices || !this.isNewChat()) {
 				return;
 			}
-
-			void newVersionPromise
-				?.then((newVersion) => {
-					if (newVersion) {
-						this.showNewVersionNotification(newVersion);
-					}
-				})
-				.catch(() => {});
-
-			void packageUpdatesPromise
-				?.then((updates) => {
-					if (updates.length > 0) {
-						this.showPackageUpdateNotification(updates);
-					}
-				})
-				.catch(() => {});
 
 			void tmuxKeyboardWarningPromise
 				?.then((warning) => {
@@ -2618,7 +2616,96 @@ export class InteractiveMode {
 	}
 
 	private getScopedHeartbeats(): AgentConnectionHeartbeat[] {
-		return scopeHeartbeatsToSession(this.heartbeatCatalog, this.connectionState, this.subagentSnapshots.values());
+		return scopeHeartbeatsToSession(
+			this.heartbeatCatalog ?? [],
+			this.connectionState,
+			this.subagentSnapshots?.values() ?? [],
+		);
+	}
+
+	private applyWatchCatalog(watches: ExternalEventWatch[]): void {
+		this.watchCatalog = watches;
+		this.syncIdleWatchLoader();
+		this.ui.requestRender();
+	}
+
+	private getActiveWatchCount(): number {
+		return (this.watchCatalog ?? []).filter((watch) => watch.status === "running").length;
+	}
+
+	/**
+	 * Idle wake-up indicator: the turn ended and the agent is idle, but watched
+	 * background jobs (or active heartbeats) can still deliver a follow-up and
+	 * resume the session. Uses a distinct slow spinner so idle-with-wakeups never
+	 * looks like an active turn.
+	 */
+	private syncIdleWatchLoader(): void {
+		const watchCount = this.getActiveWatchCount();
+		const heartbeatCount = this.getScopedHeartbeats().filter((heartbeat) => heartbeat.job.status === "active").length;
+		const shouldShow =
+			!this.isAgentStreaming() &&
+			!this.loadingAnimation &&
+			!this.autoCompactionLoader &&
+			!this.retryLoader &&
+			!this.refineLoader &&
+			(watchCount > 0 || heartbeatCount > 0);
+		if (!shouldShow) {
+			if (this.idleWatchLoader) {
+				this.idleWatchLoader.stop();
+				if (this.statusContainer.children.includes(this.idleWatchLoader)) {
+					this.statusContainer.removeChild(this.idleWatchLoader);
+				}
+				this.idleWatchLoader = undefined;
+				this.ui.requestRender();
+			}
+			return;
+		}
+		const parts: string[] = ["Waiting for background events"];
+		if (watchCount > 0) {
+			parts.push(`${watchCount} watch${watchCount === 1 ? "" : "es"}`);
+		}
+		if (heartbeatCount > 0) {
+			parts.push(`${heartbeatCount} heartbeat${heartbeatCount === 1 ? "" : "s"}`);
+		}
+		const label = parts.join(" · ");
+		if (this.idleWatchLoader && this.statusContainer.children.includes(this.idleWatchLoader)) {
+			this.idleWatchLoader.setMessage(label);
+		} else {
+			if (this.idleWatchLoader) {
+				// Another owner cleared the status container; rebuild rather than
+				// setMessage on an orphaned loader.
+				this.idleWatchLoader.stop();
+			}
+			this.idleWatchLoader = new Loader(
+				this.ui,
+				(spinner) => theme.fg("muted", spinner),
+				(text) => theme.fg("dim", text),
+				label,
+				{ frames: IDLE_WATCH_SPINNER_FRAMES, intervalMs: 180 },
+			);
+			this.statusContainer.addChild(this.idleWatchLoader);
+		}
+		this.ui.requestRender();
+	}
+
+	private async showWatchesSelector(): Promise<void> {
+		if (this.watchCatalog.length === 0) {
+			try {
+				this.applyWatchCatalog(await this.agentConnection.listExternalEventWatches());
+			} catch {
+				// The mirror may be unavailable on older daemons; the empty status stands.
+			}
+		}
+		if (this.watchCatalog.length === 0) {
+			this.showStatus("No background event watches");
+			return;
+		}
+		const options = this.watchCatalog.map((watch) => {
+			const target = watch.ssh ? ` · ${watch.ssh}` : "";
+			return `${watch.label} — ${watch.status}${target}`;
+		});
+		// Read-only: selection acknowledges and closes the menu.
+		await this.showExtensionSelector("Background event watches", options);
 	}
 
 	private applyConnectionStateSnapshot(state: AgentConnectionState): void {
@@ -2655,7 +2742,8 @@ export class InteractiveMode {
 			contextUsage: {
 				tokens,
 				contextWindow: snapshot.contextWindow,
-				percent: (tokens / snapshot.contextWindow) * 100,
+				compactionTrigger: snapshot.compactionTrigger,
+				percent: (tokens / (snapshot.compactionTrigger || snapshot.contextWindow)) * 100,
 			},
 		});
 	}
@@ -2741,6 +2829,10 @@ export class InteractiveMode {
 				break;
 			case "goal_update":
 				this.patchConnectionState({ goal: event.goal });
+				break;
+			case "external_event_watches_changed":
+				this.watchCatalog = [...event.watches];
+				this.syncIdleWatchLoader();
 				break;
 			case "bash_start":
 				this.patchConnectionState({ isBashRunning: true });
@@ -2830,10 +2922,12 @@ export class InteractiveMode {
 			return snapshot;
 		}
 		const tokens = snapshot.tokens + inFlight;
+		const compactionTrigger = snapshot.compactionTrigger || snapshot.contextWindow;
 		return {
 			tokens,
 			contextWindow: snapshot.contextWindow,
-			percent: (tokens / snapshot.contextWindow) * 100,
+			compactionTrigger: snapshot.compactionTrigger,
+			percent: (tokens / compactionTrigger) * 100,
 		} satisfies ContextUsage;
 	}
 
@@ -2866,6 +2960,11 @@ export class InteractiveMode {
 		this.refreshQueueSelectionFromState();
 		this.updatePendingMessagesDisplay();
 		await this.refreshHeartbeatCatalog().catch(() => undefined);
+		try {
+			this.applyWatchCatalog(await this.agentConnection.listExternalEventWatches());
+		} catch {
+			// Older daemons have no watch mirror; the tray simply stays empty.
+		}
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
@@ -2928,6 +3027,9 @@ export class InteractiveMode {
 		this.renderRecap();
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
+		this.lateActEvents?.clear();
+		this.lateActEventOrder?.splice(0);
+		this.activeActTrays?.clear();
 		this.resetSubagentSummary();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
@@ -3022,6 +3124,34 @@ export class InteractiveMode {
 		);
 	}
 
+	private getLateActEvents(): Map<string, ActProjectionEvent[]> {
+		if (!this.lateActEvents) this.lateActEvents = new Map();
+		return this.lateActEvents;
+	}
+
+	private getLateActEventOrder(): Array<{ outerToolCallId: string; event: ActProjectionEvent }> {
+		if (!this.lateActEventOrder) this.lateActEventOrder = [];
+		return this.lateActEventOrder;
+	}
+
+	private retainLateActEvent(event: ActProjectionEvent): void {
+		const events = this.getLateActEvents();
+		const retained = events.get(event.outerToolCallId) ?? [];
+		retained.push(event);
+		events.set(event.outerToolCallId, retained);
+		const order = this.getLateActEventOrder();
+		order.push({ outerToolCallId: event.outerToolCallId, event });
+		while (order.length > MAX_LATE_ACT_EVENTS) {
+			const oldest = order.shift();
+			if (!oldest) break;
+			const oldestEvents = events.get(oldest.outerToolCallId);
+			if (!oldestEvents) continue;
+			const index = oldestEvents.indexOf(oldest.event);
+			if (index !== -1) oldestEvents.splice(index, 1);
+			if (oldestEvents.length === 0) events.delete(oldest.outerToolCallId);
+		}
+	}
+
 	private registerIpythonToolComponent(toolName: string, toolCallId: string, component: ToolExecutionComponent): void {
 		if (toolName !== "ipython") {
 			return;
@@ -3030,6 +3160,13 @@ export class InteractiveMode {
 		for (const lateMessage of this.lateIpythonSentAgentMessages.get(toolCallId) ?? []) {
 			component.appendSentAgentMessage(lateMessage);
 		}
+		const events = this.getLateActEvents();
+		for (const event of events.get(toolCallId) ?? []) {
+			component.appendActEvent(event);
+		}
+		events.delete(toolCallId);
+		const order = this.getLateActEventOrder();
+		order.splice(0, order.length, ...order.filter((entry) => entry.outerToolCallId !== toolCallId));
 	}
 
 	private async getOrCreatePendingToolComponent(
@@ -3080,10 +3217,25 @@ export class InteractiveMode {
 			this.chatContainer.addChild(component);
 			this.pendingTools.set(latestToolCall.id, component);
 			this.registerIpythonToolComponent(latestToolCall.name, latestToolCall.id, component);
+			this.applyElapsedToolLabel(component, latestToolCall.id);
 			return component;
 		} finally {
 			this.pendingToolCreations.delete(toolCall.id);
 		}
+	}
+
+	/**
+	 * applyElapsedToolLabel moves an exact `[T+<seconds>s]` marker that precedes
+	 * this tool call onto its status line, gated by the label interval.
+	 */
+	private applyElapsedToolLabel(component: ToolExecutionComponent, toolCallId: string): void {
+		const marker = this.streamingMessage
+			? collectElapsedToolMarkers(this.streamingMessage.content).get(toolCallId)
+			: undefined;
+		if (!marker) {
+			return;
+		}
+		component.setElapsedLabel(this.elapsedToolLabelGate.admit(marker.seconds, marker.label));
 	}
 
 	private createToolExecutionDefinition(
@@ -3521,6 +3673,7 @@ export class InteractiveMode {
 		} else if (this.loadingAnimation) {
 			this.stopWorkingLoader();
 		}
+		this.syncIdleWatchLoader();
 		this.ui.requestRender();
 	}
 
@@ -4212,6 +4365,9 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
 		});
+		this.defaultEditor.onAction("app.watches.open", () => {
+			void this.showWatchesSelector();
+		});
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
 		this.defaultEditor.onAction("app.prompt.stash", () => this.handlePromptStash());
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
@@ -4742,10 +4898,10 @@ export class InteractiveMode {
 					await this.showModelsSelector();
 					return;
 				}
-				if (commandName === "model") {
+				if (commandName === "model" || commandName === "switch") {
 					const searchTerm = commandArgs || undefined;
 					this.editor.setText("");
-					await this.handleModelCommand(searchTerm);
+					await this.handleModelCommand(searchTerm, commandName === "model");
 					return;
 				}
 				if (commandName === "effort") {
@@ -4831,6 +4987,11 @@ export class InteractiveMode {
 					await this.showHeartbeatManager();
 					return;
 				}
+				if (commandName === "watches" && !commandArgs) {
+					this.editor.setText("");
+					await this.showWatchesSelector();
+					return;
+				}
 				if (commandName === "changelog" && !commandArgs) {
 					this.echoLocalCommand(text);
 					this.handleChangelogCommand();
@@ -4905,19 +5066,6 @@ export class InteractiveMode {
 				if (commandName === "reload" && !commandArgs) {
 					this.editor.setText("");
 					await this.handleReloadCommand();
-					return;
-				}
-				if (commandName === "update") {
-					this.editor.setText("");
-					const updateArgs = parseCommandArgs(commandArgs);
-					if (
-						!updateArgsIncludeSelf(updateArgs) &&
-						(this.isAgentCompacting() || this.isAgentStreaming() || this.isBashRunning())
-					) {
-						this.showWarning("Wait for the current work to finish before updating.");
-						return;
-					}
-					await this.handleUpdateCommand(commandArgs);
 					return;
 				}
 				if (commandName === "fullscreen") {
@@ -5056,7 +5204,8 @@ export class InteractiveMode {
 				this.clearSideQuestion({ abort: true });
 				this.flushPendingBashComponents();
 				const images = this.collectImagesFor(text);
-				this.editor.addToHistory?.(text);
+				const manualContinue = text === "." && (images?.length ?? 0) === 0;
+				if (!manualContinue) this.editor.addToHistory?.(text);
 				this.editor.setText("");
 				const promptStashAfterClear = this.promptStash;
 				submissionOutcome = (await this.admitPendingStartupPrompts?.()) ?? "admitted";
@@ -5083,10 +5232,11 @@ export class InteractiveMode {
 					return;
 				}
 				try {
-					await this.agentConnection.prompt(text, {
+					await this.agentConnection.prompt(manualContinue ? MANUAL_CONTINUE_PROMPT : text, {
 						streamingBehavior,
 						queueIfBusy: true,
 						images,
+						...(manualContinue ? { customMessage: createManualContinueMessage(), internalPrompt: true } : {}),
 					});
 				} catch (error) {
 					// Generation guards editor ownership, not draft durability: a stale
@@ -5456,6 +5606,10 @@ export class InteractiveMode {
 				this.subagentSummaryLine.invalidate();
 				break;
 
+			case "external_event_watches_changed":
+				this.applyWatchCatalog([...event.watches]);
+				break;
+
 			case "bash_start": {
 				if (this.sideQuestionBashDiscarded !== undefined) {
 					if (event.runId === this.sideQuestionBashDiscarded) {
@@ -5601,7 +5755,9 @@ export class InteractiveMode {
 								: `Operation aborted${elapsedSuffix}`;
 						this.streamingMessage.errorMessage = errorMessage;
 					}
-					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage, false);
+					const component = this.ensureAssistantStreamingComponent(event.message);
+					component.setStreaming(false);
+					component.updateContent(this.streamingMessage, false);
 
 					if (this.streamingMessage.stopReason === "aborted" || this.streamingMessage.stopReason === "error") {
 						if (!errorMessage) {
@@ -5626,6 +5782,30 @@ export class InteractiveMode {
 				}
 				this.ui.requestRender();
 				break;
+
+			case "act_event": {
+				const depth = actEventDepth(event);
+				if (event.event === "start") {
+					this.activeActTrays.set(depth, {
+						actId: event.actId,
+						depth,
+						model: event.model.name?.trim() || event.model.id,
+						thinkingLevel: event.thinkingLevel,
+					});
+					this.subagentSummaryLine.invalidate();
+				} else if (event.event === "terminal" && this.activeActTrays.get(depth)?.actId === event.actId) {
+					this.activeActTrays.delete(depth);
+					this.subagentSummaryLine.invalidate();
+				}
+				const component = this.ipythonToolComponents.get(event.outerToolCallId);
+				if (component) {
+					component.appendActEvent(event);
+				} else {
+					this.retainLateActEvent(event);
+				}
+				this.ui.requestRender();
+				break;
+			}
 
 			case "tool_execution_start": {
 				this.startedToolCalls.add(event.toolCallId);
@@ -5816,6 +5996,13 @@ export class InteractiveMode {
 	}
 
 	private startAssistantStreamingMessage(message: AssistantMessage): void {
+		// A stall retry restarts the stream without ending the previous partial;
+		// replace the abandoned component instead of appending a duplicate fragment.
+		if (this.streamingComponent !== undefined) {
+			this.chatContainer.removeChild(this.streamingComponent);
+			this.resetPendingToolState();
+			this.streamingComponent = undefined;
+		}
 		this.streamingComponent = new AssistantMessageComponent(
 			undefined,
 			this.hideThinkingBlock,
@@ -5823,6 +6010,7 @@ export class InteractiveMode {
 			this.hiddenThinkingLabel,
 			{
 				expanded: this.toolOutputExpanded,
+				streaming: true,
 				precededByToolActivity:
 					this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 					this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
@@ -6111,11 +6299,22 @@ export class InteractiveMode {
 		const modelLabel = this.getModelTrayLabel();
 		const hasChildren = this.options.sessionHasChildren === true || (this.subagentSnapshots?.size ?? 0) > 0;
 		const depthLabel = formatAgentDepthLabel(this.options.sessionDepth, hasChildren);
+		const actLabel = this.getActTrayLabel();
 		const shortcutsHint = this.getShortcutsTrayHint();
 		const agentsHint = this.getAgentsViewTrayHint();
-		return [agentsHint, depthLabel, modelLabel, shortcutsHint]
+		return [agentsHint, depthLabel, modelLabel, actLabel, shortcutsHint]
 			.filter((label): label is string => label !== undefined)
 			.join("  ");
+	}
+
+	private getActTrayLabel(): string | undefined {
+		const active = [...(this.activeActTrays?.values() ?? [])].sort((left, right) => right.depth - left.depth)[0];
+		if (!active) return undefined;
+		const parts = [active.model];
+		if (active.thinkingLevel && active.thinkingLevel !== "off") parts.push(active.thinkingLevel);
+		const pulse = theme.fg("bashMode", workingIconFrame(getWorkingPulseFrame()));
+		const label = active.depth > 1 ? `act ${active.depth}` : "act";
+		return `${theme.fg("dim", "│")}  ${pulse} ${theme.fg("accent", `${label}: ${parts.join(" • ")}`)}`;
 	}
 
 	private getShortcutsTrayHint(): string | undefined {
@@ -6157,12 +6356,25 @@ export class InteractiveMode {
 	private getTrayContextLabel(): string | undefined {
 		const goalLabel = this.getTrayGoalLabel();
 		const heartbeatLabel = this.getTrayHeartbeatLabel();
+		const watchLabel = this.getTrayWatchLabel();
 		const usage = this.getConnectionContextUsage();
 		const contextLabel =
 			usage && typeof usage.tokens === "number" && typeof usage.percent === "number"
 				? `${formatTokenCount(usage.tokens)} (${Math.round(usage.percent)}%)`
 				: undefined;
-		return [goalLabel, heartbeatLabel, contextLabel].filter((label) => label !== undefined).join(" · ") || undefined;
+		return (
+			[goalLabel, heartbeatLabel, watchLabel, contextLabel].filter((label) => label !== undefined).join(" · ") ||
+			undefined
+		);
+	}
+
+	private getTrayWatchLabel(): string | undefined {
+		const count = this.getActiveWatchCount();
+		if (count === 0) {
+			return undefined;
+		}
+		const shortcut = keyText("app.watches.open");
+		return `${count} watch${count === 1 ? "" : "es"}${shortcut ? ` (${shortcut})` : ""}`;
 	}
 
 	private getTrayHeartbeatLabel(): string | undefined {
@@ -6527,10 +6739,15 @@ export class InteractiveMode {
 		} = {},
 	): Promise<void> {
 		this.resetPendingToolState();
+		// The rebuild recomputes every elapsed label from the transcript, so the
+		// interval gate starts clean for deterministic replay.
+		this.elapsedToolLabelGate.reset();
 		const transcriptMessages = this.orderMessagesForTranscript(sessionContext.messages);
 		const messagesToRender = options.limitTranscript ? initialRenderMessages(transcriptMessages) : transcriptMessages;
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
+		this.lateActEvents?.clear();
+		this.lateActEventOrder?.splice(0);
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 		const toolNames: string[] = [];
 		for (const message of messagesToRender) {
@@ -6555,7 +6772,16 @@ export class InteractiveMode {
 		}
 
 		if (options.populateHistory) {
-			for (const message of sessionContext.messages) {
+			const recentUserMessages: AgentMessage[] = [];
+			for (
+				let index = sessionContext.messages.length - 1;
+				index >= 0 && recentUserMessages.length < EDITOR_HISTORY_LIMIT;
+				index--
+			) {
+				const message = sessionContext.messages[index];
+				if (message?.role === "user") recentUserMessages.push(message);
+			}
+			for (const message of recentUserMessages.reverse()) {
 				this.addMessageToEditorHistory(message);
 			}
 		}
@@ -6581,8 +6807,10 @@ export class InteractiveMode {
 			if (message.role === "assistant") {
 				this.addMessageToChat(message);
 				// Render tool call components
+				const elapsedMarkers = collectElapsedToolMarkers(message.content);
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
+						const marker = elapsedMarkers.get(content.id);
 						const component = new ToolExecutionComponent(
 							content.name,
 							content.id,
@@ -6590,6 +6818,9 @@ export class InteractiveMode {
 							{
 								showImages: this.settingsManager.getShowImages(),
 								includeImageDimensions: false,
+								elapsedLabel: marker
+									? this.elapsedToolLabelGate.admit(marker.seconds, marker.label)
+									: undefined,
 							},
 							this.getCachedToolDefinition(content.name),
 							this.ui,
@@ -6759,6 +6990,12 @@ export class InteractiveMode {
 	}
 
 	private handleCtrlC(): void {
+		const connectionQueue = this.getConnectionQueue();
+		const hasQueuedMessages = connectionQueue.steering.length + connectionQueue.followUp.length > 0;
+		if (this.editor.getText().length > 0 && (!this.hasInterruptibleWork() || !hasQueuedMessages)) {
+			this.clearInputBar();
+			return;
+		}
 		this.clearEscapeRepeat();
 		if (this.isCtrlCExitHintVisible()) {
 			void this.shutdown();
@@ -7468,16 +7705,6 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	showNewVersionNotification(newVersion: string): void {
-		this.chatContainer.addChild(new Text(formatUpdateAvailableNotice(newVersion), 1, 0));
-		this.ui.requestRender();
-	}
-
-	showPackageUpdateNotification(packages: string[]): void {
-		this.chatContainer.addChild(new Text(formatPackageUpdateNotice(packages), 1, 0));
-		this.ui.requestRender();
-	}
-
 	private getAllQueuedMessages(): { steering: string[]; followUp: string[] } {
 		return this.getConnectionQueue();
 	}
@@ -7726,9 +7953,9 @@ export class InteractiveMode {
 		});
 	}
 
-	private async handleModelCommand(searchTerm?: string): Promise<void> {
+	private async handleModelCommand(searchTerm?: string, persistDefault = true): Promise<void> {
 		if (!searchTerm) {
-			this.showModelSelector();
+			this.showModelSelector(undefined, persistDefault);
 			return;
 		}
 
@@ -7738,14 +7965,14 @@ export class InteractiveMode {
 				const authFlows = this.createAuthFlows();
 				const providerOptions = authFlows.getLoginProviderOptions();
 				if (!(await this.ensureModelProviderConfigured(model, authFlows, providerOptions))) return;
-				await this.completeModelSelection(model);
+				await this.completeModelSelection(model, persistDefault);
 			} catch (error) {
 				this.showError(error instanceof Error ? error.message : String(error));
 			}
 			return;
 		}
 
-		this.showModelSelector(searchTerm);
+		this.showModelSelector(searchTerm, persistDefault);
 	}
 
 	private async findExactModelMatch(searchTerm: string): Promise<Model<Api> | undefined> {
@@ -7766,10 +7993,10 @@ export class InteractiveMode {
 		}
 	}
 
-	private async applySelectedModel(model: AgentConnectionModel): Promise<void> {
+	private async applySelectedModel(model: AgentConnectionModel, persistDefault = true): Promise<void> {
 		const connection = this.agentConnection;
 		const sessionId = this.connectionState?.sessionId;
-		await connection.setModel(model.provider, model.id);
+		await connection.setModel(model.provider, model.id, { persistDefault });
 		const state = await connection.getState();
 		if (
 			this.agentConnection !== connection ||
@@ -7778,7 +8005,7 @@ export class InteractiveMode {
 		) {
 			return;
 		}
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		if (persistDefault) this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 		this.patchConnectionState({
 			model: state.model ?? model,
 			serviceTier: state.serviceTier,
@@ -7791,9 +8018,9 @@ export class InteractiveMode {
 		this.setupAutocompleteProvider();
 	}
 
-	private async completeModelSelection(model: AgentConnectionModel): Promise<void> {
+	private async completeModelSelection(model: AgentConnectionModel, persistDefault = true): Promise<void> {
 		this.showStatus(`Switching model: ${model.id}`);
-		await this.applySelectedModel(model);
+		await this.applySelectedModel(model, persistDefault);
 		this.showStatus(`Model: ${model.id}`);
 		void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 		this.checkDaxnutsEasterEgg(model);
@@ -8106,11 +8333,15 @@ export class InteractiveMode {
 			});
 	}
 
-	private showModelSelector(initialSearchInput?: string): void {
-		void this.showConfigurationMenu("models", initialSearchInput);
+	private showModelSelector(initialSearchInput?: string, persistDefault = true): void {
+		void this.showConfigurationMenu("models", initialSearchInput, persistDefault);
 	}
 
-	private showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
+	private showConfigurationMenu(
+		initialTab: ConfigurationMenuTab,
+		initialModelSearch?: string,
+		persistDefault = true,
+	): Promise<void> {
 		const modelCatalog = this.getCachedModelCandidates();
 		const authFlows = this.createAuthFlows();
 		const providerOptions = authFlows.getLoginProviderOptions();
@@ -8224,7 +8455,7 @@ export class InteractiveMode {
 							);
 							if (!ready || settled) return;
 							conceal();
-							await this.completeModelSelection(model);
+							await this.completeModelSelection(model, persistDefault);
 							completed = true;
 						} catch (error) {
 							show();
@@ -8774,140 +9005,6 @@ export class InteractiveMode {
 		}
 	}
 
-	private async handleUpdateCommand(args: string): Promise<void> {
-		const entrypoint = process.argv[1];
-		if (!entrypoint) {
-			this.showError("Cannot determine current CLI entrypoint for update");
-			return;
-		}
-
-		const updateArgs = parseCommandArgs(args);
-		const includesSelf = updateArgsIncludeSelf(updateArgs);
-		const updateCwd = this.getCurrentCwd();
-		const daemonSocketPath = resolveInteractiveUpdateDaemonSocketPath(
-			updateArgs,
-			resolveDaemonUpdateRestartSocketPath(this.options.daemonSocketPath),
-		);
-		const updateChildArgs = includesSelf ? buildUpdateChildArgs(updateArgs, daemonSocketPath) : updateArgs;
-		this.stopWorkingLoader();
-		await this.ui.terminal.drainInput(1000).catch(() => undefined);
-		this.ui.stop();
-
-		const updateEnv = includesSelf ? { ...process.env, [SELF_UPDATE_INTERACTIVE_CHILD_ENV]: "1" } : process.env;
-		const updateResult = spawnSync(
-			process.execPath,
-			[...process.execArgv, entrypoint, "update", ...updateChildArgs],
-			{
-				stdio: "inherit",
-				cwd: updateCwd,
-				env: updateEnv,
-			},
-		);
-		const updateExitCode = updateResult.status ?? (updateResult.signal ? 1 : 0);
-		const selfUpdateNotAttempted =
-			includesSelf && !updateResult.error && updateExitCode === SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE;
-
-		if (includesSelf && !selfUpdateNotAttempted) {
-			const relaunchArgs = buildUpdateRelaunchArgs(process.argv.slice(2), this.connectionState?.sessionFile);
-			if (updateResult.error) {
-				console.error(`Update failed: ${updateResult.error.message}`);
-				console.error(`Relaunching ${APP_NAME}...`);
-			} else if (updateExitCode !== 0) {
-				console.error(
-					updateResult.signal
-						? `Update terminated by signal ${updateResult.signal}`
-						: `Update exited with code ${updateExitCode}`,
-				);
-				console.error(`Relaunching ${APP_NAME}...`);
-			}
-			this.stop();
-			await this.agentConnection.dispose().catch(() => undefined);
-			try {
-				await this.options.onShutdown?.();
-			} catch {
-				// The update already completed; do not block relaunch on local teardown.
-			}
-			if (!updateResult.error && updateExitCode === 0) {
-				try {
-					const status = await launchDaemonUpdateRestartCoordinator({
-						socketPath: daemonSocketPath,
-						agentDir: getAgentDir(),
-						cwd: updateCwd,
-						originActiveSessionId: this.connectionState?.activeSessionId,
-					});
-					const report = buildDaemonUpdateRestartReport(status);
-					for (const message of report.info) {
-						console.log(message);
-					}
-					for (const warning of report.warnings) {
-						console.error(`Warning: ${warning}`);
-					}
-				} catch (error: unknown) {
-					console.error(
-						`Warning: updated, but could not coordinate the daemon restart (${error instanceof Error ? error.message : String(error)}).`,
-					);
-				}
-			}
-			const relaunch = createCliSubprocessLaunchSpec(relaunchArgs);
-			const updateProcess = process as NodeJS.Process & { execve?: UpdateRelaunchExecve };
-			try {
-				if (
-					tryExecUpdateRelaunch(relaunch, {
-						platform: process.platform,
-						nodeVersion: process.versions.node,
-						cwd: updateCwd,
-						previousCwd: process.cwd(),
-						environment: process.env,
-						chdir: (directory) => process.chdir(directory),
-						execve: updateProcess.execve,
-					})
-				) {
-					return;
-				}
-			} catch (error: unknown) {
-				console.error(
-					`Could not replace the current ${APP_NAME} process (${error instanceof Error ? error.message : String(error)}). Falling back to a child relaunch.`,
-				);
-			}
-			const relaunchResult = spawnSync(relaunch.command, relaunch.args, {
-				stdio: "inherit",
-				cwd: updateCwd,
-				env: process.env,
-			});
-			if (relaunchResult.error) {
-				console.error(`Failed to relaunch ${APP_NAME}: ${relaunchResult.error.message}`);
-				process.exit(1);
-			}
-			process.exit(relaunchResult.status ?? (relaunchResult.signal ? 1 : 0));
-		}
-
-		this.ui.start();
-		if (this.fullscreenEnabled) {
-			this.applyFullscreen(true);
-		}
-		this.ui.requestRender(true);
-
-		if (selfUpdateNotAttempted) {
-			this.showStatus(`Update did not change ${APP_NAME}. Reloading resources...`);
-			await this.handleReloadCommand();
-			return;
-		}
-		if (updateResult.error) {
-			this.showError(`Update failed: ${updateResult.error.message}`);
-			return;
-		}
-		if (updateExitCode !== 0) {
-			this.showError(
-				updateResult.signal
-					? `Update terminated by signal ${updateResult.signal}`
-					: `Update exited with code ${updateExitCode}`,
-			);
-			return;
-		}
-		this.showStatus("Packages updated. Reloading resources...");
-		await this.handleReloadCommand();
-	}
-
 	private async handleReloadCommand(): Promise<boolean> {
 		if (this.isAgentStreaming()) {
 			this.showWarning("Wait for the current response to finish before reloading.");
@@ -9208,7 +9305,12 @@ export class InteractiveMode {
 			return;
 		}
 
-		await this.agentConnection.setSessionName(name);
+		try {
+			await this.agentConnection.setSessionName(name);
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+			return;
+		}
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(theme.fg("dim", `Session name set: ${name}`), 1, 0));
 		this.ui.requestRender();
@@ -10016,7 +10118,9 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		};
 		let created = false;
 		try {
-			const result = await this.agentConnection.newSession();
+			// /new inherits the attached session's working directory so the fresh
+			// session continues where the user is.
+			const result = await this.agentConnection.newSession({ cwd: this.connectionState?.cwd });
 			if (result.cancelled) {
 				restorePrompt();
 				return;

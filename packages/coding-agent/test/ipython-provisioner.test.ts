@@ -5,12 +5,8 @@ import { cleanupSessionResources } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "../src/core/extensions/types.js";
 import type { KernelBootstrapProgressHandler } from "../src/core/kernel/bootstrap.js";
-import {
-	type ExecuteResult,
-	KernelBusyAfterInterruptError,
-	type KernelClient,
-	ReplKernelManager,
-} from "../src/core/kernel/index.js";
+import { type ExecuteResult, KernelBusyAfterInterruptError, ReplKernelManager } from "../src/core/kernel/index.js";
+import { RootForegroundLease } from "../src/core/root-foreground-lease.js";
 import { createIpythonToolDefinition, IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
 let tempDir = "";
@@ -86,7 +82,7 @@ function writeFakeReplRuntime(
 const fs = require("node:fs");
 const readline = require("node:readline");
 const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
-emit({ event: "ready", protocol: 3, python: process.version });
+emit({ event: "ready", protocol: 4, python: process.version });
 const input = readline.createInterface({ input: process.stdin });
 input.on("line", (line) => {
 	const request = JSON.parse(line);
@@ -164,6 +160,31 @@ describe("IpythonKernelProvisioner", () => {
 		expect(countRuns()).toBe(2);
 	});
 
+	it("single-flights replacement after the running kernel exits unexpectedly", async () => {
+		const provisioner = new IpythonKernelProvisioner(tempDir);
+		const dead = { isRunning: false, exitedUnexpectedly: true } as unknown as ReplKernelManager;
+		const fresh = { isRunning: true, exitedUnexpectedly: false } as unknown as ReplKernelManager;
+		const startKernel = vi.fn(async () => fresh);
+		Object.assign(
+			provisioner as unknown as {
+				managerPromise: Promise<ReplKernelManager>;
+				startedManager: ReplKernelManager;
+				startKernel: () => Promise<ReplKernelManager>;
+			},
+			{
+				managerPromise: Promise.resolve(dead),
+				startedManager: dead,
+				startKernel,
+			},
+		);
+
+		const [first, second] = await Promise.all([provisioner.ensure(), provisioner.ensure()]);
+
+		expect(first).toBe(fresh);
+		expect(second).toBe(fresh);
+		expect(startKernel).toHaveBeenCalledTimes(1);
+	});
+
 	it("prewarm() swallows the failure and the next ensure() starts fresh", async () => {
 		const { python, countRuns } = writeFakePython();
 		const provisioner = new IpythonKernelProvisioner(tempDir, { python });
@@ -176,6 +197,29 @@ describe("IpythonKernelProvisioner", () => {
 			await expect(provisioner.ensure()).rejects.toThrow();
 			expect(countRuns()).toBeGreaterThanOrEqual(2);
 		});
+	});
+
+	it("admits prewarm before an immediately following root turn", async () => {
+		const { python } = writeFakePython();
+		const foregroundLease = new RootForegroundLease();
+		let releaseBoot: () => void = () => {};
+		const readyGate = new Promise<void>((resolve) => {
+			releaseBoot = resolve;
+		});
+		const provisioner = new IpythonKernelProvisioner(tempDir, { python, foregroundLease, readyGate });
+		const events: string[] = [];
+
+		provisioner.prewarm();
+		const rootTurn = foregroundLease.run("root-turn", async () => {
+			events.push("root-turn");
+		});
+
+		expect(foregroundLease.busy).toBe(true);
+		expect(foregroundLease.pendingCount).toBe(1);
+		expect(events).toEqual([]);
+		releaseBoot();
+		await rootTurn;
+		expect(events).toEqual(["root-turn"]);
 	});
 
 	it("replays the current startup stage to listeners attaching mid-flight", async () => {
@@ -225,6 +269,38 @@ describe("IpythonKernelProvisioner", () => {
 
 		await provisioner.dispose({ snapshot: false });
 		expect(shutdown).toHaveBeenCalledWith({ snapshot: false, drainHostRequests: true });
+	});
+
+	it("hibernates a running kernel and restarts it lazily", async () => {
+		const { python, countRuns } = writeFakePython();
+		const provisioner = new IpythonKernelProvisioner(tempDir, { python });
+		let releaseDispose: () => void = () => {};
+		const disposeGate = new Promise<void>((resolve) => {
+			releaseDispose = resolve;
+		});
+		const shutdown = vi.fn(() => disposeGate);
+		const oldManager = { shutdown, isRunning: true } as unknown as ReplKernelManager;
+		Object.assign(
+			provisioner as unknown as {
+				managerPromise: Promise<ReplKernelManager>;
+				startedManager: ReplKernelManager;
+			},
+			{
+				managerPromise: Promise.resolve(oldManager),
+				startedManager: oldManager,
+			},
+		);
+
+		const hibernated = provisioner.hibernate();
+		const restarted = provisioner.ensure();
+		expect(provisioner.manager).toBeUndefined();
+		expect(countRuns()).toBe(0);
+
+		releaseDispose();
+		await hibernated;
+		await expect(restarted).rejects.toThrow(/Kernel exited before ready/);
+		expect(shutdown).toHaveBeenCalledOnce();
+		expect(countRuns()).toBe(1);
 	});
 
 	it("dispose() before the boot slot prevents the kernel from spawning", async () => {
@@ -287,11 +363,11 @@ describe("IpythonKernelProvisioner", () => {
 	it("does not dispose a running kernel when an ensure caller is aborted", async () => {
 		const provisioner = new IpythonKernelProvisioner(tempDir, {});
 		const dispose = vi.fn(async () => {});
-		const manager = { dispose, isRunning: true } as unknown as KernelClient;
+		const manager = { dispose, isRunning: true } as unknown as ReplKernelManager;
 		Object.assign(
 			provisioner as unknown as {
-				managerPromise: Promise<KernelClient>;
-				startedManager: KernelClient;
+				managerPromise: Promise<ReplKernelManager>;
+				startedManager: ReplKernelManager;
 			},
 			{
 				managerPromise: Promise.resolve(manager),
@@ -310,10 +386,10 @@ describe("IpythonKernelProvisioner", () => {
 		const provisioner = new IpythonKernelProvisioner(tempDir, {});
 		Object.assign(
 			provisioner as unknown as {
-				managerPromise: Promise<KernelClient>;
+				managerPromise: Promise<ReplKernelManager>;
 			},
 			{
-				managerPromise: new Promise<KernelClient>(() => {}),
+				managerPromise: new Promise<ReplKernelManager>(() => {}),
 			},
 		);
 		const controller = new AbortController();
@@ -329,28 +405,34 @@ describe("IpythonKernelProvisioner", () => {
 		expect(internals.startupListeners.has(onProgress)).toBe(false);
 	});
 
-	it("surfaces backgroundOutput in details without changing model content", async () => {
-		const execute = vi
-			.fn<KernelClient["execute"]>()
-			.mockResolvedValueOnce({ ...okExecuteResult(), backgroundOutput: "bg-line" });
-		const manager = { execute } as unknown as KernelClient;
+	it("passes Python source directly to the REPL", async () => {
+		const execute = vi.fn<ReplKernelManager["execute"]>().mockResolvedValueOnce(okExecuteResult());
+		const manager = { execute } as unknown as ReplKernelManager;
 		const ensure = vi.fn(async () => manager);
 		const kill = vi.fn(async () => {});
 		const provisioner = { ensure, kill } as unknown as IpythonKernelProvisioner;
 		const tool = createIpythonToolDefinition(tempDir, { provisioner });
 
-		const result = await tool.execute("tool-call", { code: "x = 1" }, undefined, undefined, {} as ExtensionContext);
+		await tool.execute(
+			"tool-call",
+			{ code: "await bash('echo body')" },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
 
-		expect(result.details.backgroundOutput).toBe("bg-line");
-		expect(result.content).toEqual([{ type: "text", text: "ok\n[background output (unattributed)]\nbg-line" }]);
+		expect(execute).toHaveBeenCalledWith(
+			"await bash('echo body')",
+			expect.objectContaining({ signal: undefined, onStream: expect.any(Function) }),
+		);
 	});
 
 	it("lets the user wait when an interrupted kernel is still busy", async () => {
 		const execute = vi
-			.fn<KernelClient["execute"]>()
+			.fn<ReplKernelManager["execute"]>()
 			.mockRejectedValueOnce(new KernelBusyAfterInterruptError())
 			.mockResolvedValueOnce(okExecuteResult());
-		const manager = { execute } as unknown as KernelClient;
+		const manager = { execute } as unknown as ReplKernelManager;
 		const ensure = vi.fn(async () => manager);
 		const kill = vi.fn(async () => {});
 		const provisioner = { ensure, kill } as unknown as IpythonKernelProvisioner;
@@ -377,11 +459,11 @@ describe("IpythonKernelProvisioner", () => {
 
 	it("lets the user kill and restart a busy interrupted kernel", async () => {
 		const busyManager = {
-			execute: vi.fn<KernelClient["execute"]>().mockRejectedValueOnce(new KernelBusyAfterInterruptError()),
-		} as unknown as KernelClient;
+			execute: vi.fn<ReplKernelManager["execute"]>().mockRejectedValueOnce(new KernelBusyAfterInterruptError()),
+		} as unknown as ReplKernelManager;
 		const freshManager = {
-			execute: vi.fn<KernelClient["execute"]>().mockResolvedValueOnce(okExecuteResult()),
-		} as unknown as KernelClient;
+			execute: vi.fn<ReplKernelManager["execute"]>().mockResolvedValueOnce(okExecuteResult()),
+		} as unknown as ReplKernelManager;
 		const ensure = vi.fn(async () => {
 			return ensure.mock.calls.length === 1 ? busyManager : freshManager;
 		});
@@ -437,7 +519,7 @@ describe("ReplKernelManager session cleanup during startup", () => {
 
 	it("disposes a kernel that is still booting when its session is cleaned up", async () => {
 		const python = join(tempDir, "python");
-		// Never emits the ready line - stays in the booting phase until killed.
+		// Never writes connection ports - stays in the booting phase until killed.
 		writeFileSync(python, ["#!/bin/sh", "sleep 30", ""].join("\n"));
 		chmodSync(python, 0o755);
 		const sessionId = `provisioner-test-${Date.now()}`;
@@ -449,7 +531,7 @@ describe("ReplKernelManager session cleanup during startup", () => {
 			await expect(startup).rejects.toThrow(/Kernel exited before ready|disposed during startup/);
 			expect(manager.isRunning).toBe(false);
 		} finally {
-			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+			await manager.shutdown({ snapshot: true });
 		}
 	});
 });

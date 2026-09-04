@@ -3,7 +3,7 @@ import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
-import { SettingsManager } from "../src/core/settings-manager.js";
+import { type Settings, SettingsManager } from "../src/core/settings-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionSavedSessionInfo } from "../src/modes/agent-connection/types.js";
 import {
@@ -28,7 +28,7 @@ const modeMocks = vi.hoisted(() => ({
 	teardownSessionUi: vi.fn(async () => undefined),
 	dispose: vi.fn(async () => undefined),
 	connectionPrompt: vi.fn(async () => undefined),
-	clientRequest: vi.fn<() => Promise<unknown>>(),
+	clientRequest: vi.fn<(command: unknown) => Promise<unknown>>(),
 }));
 
 vi.mock("../src/config.js", async (importOriginal) => {
@@ -97,7 +97,16 @@ const settingsManager = {
 
 describe("AgentsViewMode", () => {
 	beforeAll(() => setKeybindings(new KeybindingsManager()));
-	beforeEach(() => vi.clearAllMocks());
+	beforeEach(() => {
+		vi.clearAllMocks();
+		modeMocks.clientRequest.mockImplementation(async (command: unknown) => {
+			const request = command as { type?: string; sessionPath?: string };
+			if (request.type === "create") {
+				return { success: true, data: summary({ sessionFile: request.sessionPath }) };
+			}
+			return undefined;
+		});
+	});
 
 	it("keeps the selection chosen by row rebuilding when the query changes", () => {
 		const self = {
@@ -327,6 +336,41 @@ describe("AgentsViewMode", () => {
 			streamingBehavior: "steer",
 		});
 		expect(DaemonAgentConnection.attach).not.toHaveBeenCalled();
+	});
+
+	it("opens the selected file instead of a runtime id reused by /new", async () => {
+		const oldSession = summary({
+			id: "worker-one",
+			activeSessionId: "worker-one",
+			sessionId: "session-old",
+			sessionFile: "/tmp/old.jsonl",
+		});
+		const resumedOldSession = { ...oldSession, id: "worker-old", activeSessionId: "worker-old" };
+		const runView = vi
+			.spyOn(AgentsViewMode.prototype, "run")
+			.mockResolvedValueOnce({ type: "open", summary: oldSession })
+			.mockResolvedValueOnce({ type: "exit" });
+		modeMocks.clientRequest.mockResolvedValueOnce({ success: true, data: resumedOldSession });
+		modeMocks.interactiveRun.mockRejectedValueOnce(new Error("stop after open"));
+
+		await runAgentsViewMode({
+			socketPath: "/tmp/fake-daemon.sock",
+			config: { cwd: "/tmp" } as never,
+			uiServices: {
+				settingsManager: settingsManager as never,
+				modelRegistry: {} as never,
+				getInitialCwd: () => "/tmp",
+				getInitialSessionName: () => undefined,
+				getThemes: () => [],
+			},
+		});
+
+		expect(modeMocks.clientRequest).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "create", sessionPath: "/tmp/old.jsonl" }),
+		);
+		expect(DaemonAgentConnection.attach).toHaveBeenCalledWith(expect.anything(), "worker-old", expect.anything());
+		expect(DaemonAgentConnection.attach).not.toHaveBeenCalledWith(expect.anything(), "worker-one", expect.anything());
+		runView.mockRestore();
 	});
 
 	it("uses the opened session as the crash-path back target", async () => {
@@ -717,7 +761,7 @@ describe("AgentsViewMode", () => {
 		}
 	});
 
-	it("renders the unconditional usage cell and drops the message count", () => {
+	it("gates usage details and defaults to the earlier row layout", () => {
 		const parent = summary({
 			id: "spender",
 			activeSessionId: "spender",
@@ -741,23 +785,39 @@ describe("AgentsViewMode", () => {
 			rosterStatus: "inactive",
 			messageCount: 7,
 		});
-		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
+		const defaultView = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
+		const usageView = new AgentsViewMode(
+			{
+				config: {},
+				uiServices: createUiServices({ agentsViewUsage: { enabled: true } }),
+			},
+			{},
+		);
 
 		try {
 			const collapsed = buildAgentsViewRows([parent, child, inactive]);
 			const rows = buildAgentsViewRows([parent, child, inactive], new Set(collapsed.map((row) => row.identity)));
-			Reflect.set(view, "rows", rows);
-			const line = (row: AgentsViewRow | undefined) => stripAnsi(invoke("renderRow", view, row, 200) as string);
+			Reflect.set(defaultView, "rows", rows);
+			Reflect.set(usageView, "rows", rows);
+			const line = (view: AgentsViewMode, row: AgentsViewRow | undefined) =>
+				stripAnsi(invoke("renderRow", view, row, 200) as string);
 			const byId = (sessionId: string, kind?: string) =>
 				rows.find((row) => row.summary.sessionId === sessionId && (!kind || row.kind === kind));
 
-			expect(line(byId("spender-session"))).toContain("↑12k ↓1.2k · $0.42 ($1.10 w/ subagents)");
-			expect(line(byId("spender-child-session", "subagent"))).toContain("↑500 ↓50 · $0.68 ($0.68 w/ subagents)");
-			const inactiveLine = line(byId("saved-only-session"));
+			expect(line(defaultView, byId("spender-session"))).not.toContain("↑");
+			const defaultInactiveLine = line(defaultView, byId("saved-only-session"));
+			expect(defaultInactiveLine).toContain("7 ·");
+			expect(defaultInactiveLine).not.toContain("$");
+
+			expect(line(usageView, byId("spender-session"))).toContain("↑12k ↓1.2k · $0.42 ($1.10 w/ subagents)");
+			expect(line(usageView, byId("spender-child-session", "subagent"))).toContain(
+				"↑500 ↓50 · $0.68 ($0.68 w/ subagents)",
+			);
+			const inactiveLine = line(usageView, byId("saved-only-session"));
 			expect(inactiveLine).toContain("↑0 ↓0 · $0.00 ($0.00 w/ subagents)");
 			expect(inactiveLine).not.toContain("7 ·");
 			const bare = { ...byId("spender-session")!, summary: { ...parent, usage: undefined } };
-			expect(line(bare)).toContain("↑0 ↓0 · $0.00 ($1.10 w/ subagents)");
+			expect(line(usageView, bare)).toContain("↑0 ↓0 · $0.00 ($1.10 w/ subagents)");
 		} finally {
 			stopThemeWatcher();
 		}
@@ -850,9 +910,9 @@ describe("AgentsViewMode", () => {
 	});
 });
 
-function createUiServices(): InteractiveModeUiServices {
+function createUiServices(settings: Partial<Settings> = {}): InteractiveModeUiServices {
 	return {
-		settingsManager: SettingsManager.inMemory({ theme: "dark" }),
+		settingsManager: SettingsManager.inMemory({ theme: "dark", ...settings }),
 		modelRegistry: {} as ModelRegistry,
 		getInitialCwd: () => process.cwd(),
 		getInitialSessionName: () => undefined,

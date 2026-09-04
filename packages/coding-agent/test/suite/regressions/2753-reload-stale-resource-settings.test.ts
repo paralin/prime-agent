@@ -10,7 +10,7 @@ import {
 	createAgentSessionServices,
 } from "../../../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../../../src/core/auth-storage.js";
-import { SessionManager } from "../../../src/core/session-manager.js";
+import { createTestSessionManager } from "../../utilities.js";
 
 describe("issue #2753 reload stale resource settings", () => {
 	const cleanups: Array<() => void> = [];
@@ -77,7 +77,7 @@ describe("issue #2753 reload stale resource settings", () => {
 		const runtime = await createAgentSessionRuntime(createRuntime, {
 			cwd: tempDir,
 			agentDir,
-			sessionManager: SessionManager.create(tempDir),
+			sessionManager: createTestSessionManager(tempDir),
 		});
 
 		cleanups.push(() => {

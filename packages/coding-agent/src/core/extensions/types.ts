@@ -266,7 +266,9 @@ export interface ContextUsage {
 	/** Estimated context tokens, or null if unknown (e.g. right after compaction, before next LLM response). */
 	tokens: number | null;
 	contextWindow: number;
-	/** Context usage as percentage of context window, or null if tokens is unknown. */
+	/** Token count at which auto compaction triggers: min(triggerContextTokens, contextWindow - reserveTokens). */
+	compactionTrigger: number;
+	/** Context usage as percentage of the compaction trigger, or null if tokens is unknown. */
 	percent: number | null;
 }
 
@@ -719,7 +721,12 @@ export interface ToolExecutionEndEvent {
 	result: any;
 	isError: boolean;
 }
-export type ModelSelectSource = "set" | "cycle" | "restore";
+
+// ============================================================================
+// Model Events
+// ============================================================================
+
+export type ModelSelectSource = "set" | "cycle" | "restore" | "fallback";
 
 /** Fired when a new model is selected */
 export interface ModelSelectEvent {

@@ -5,8 +5,8 @@
  * Responses and events are emitted as JSON lines on stdout.
  */
 
-import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Model } from "@earendil-works/pi-ai";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ImageContent, Model, ServiceTier } from "@earendil-works/pi-ai";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
@@ -20,7 +20,11 @@ import type { GoalState } from "../../core/goals.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { SessionActionSnapshot } from "../../core/session-action-store.js";
 import type { SessionStats } from "../../core/session-stats.js";
-import type { AgentConnectionHeartbeat, AgentConnectionSourceInfo } from "../agent-connection/types.js";
+import type {
+	AgentConnectionHeartbeat,
+	AgentConnectionSessionEvent,
+	AgentConnectionSourceInfo,
+} from "../agent-connection/types.js";
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -36,6 +40,7 @@ export type RpcCommand =
 
 	// State
 	| { id?: string; type: "get_state" }
+	| { id?: string; type: "set_service_tier"; serviceTier: ServiceTier }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -136,6 +141,14 @@ export interface RpcSlashCommand {
 // ============================================================================
 
 export interface RpcSessionState {
+	rpcProtocolVersion: 1;
+	rpcSchemaRevision: 3;
+	cwd: string;
+	serviceTier: ServiceTier;
+	rlmMaxDepth: number;
+	actEnabled: boolean;
+	retryEnabled: boolean;
+	foregroundMode: "rpc_only" | "ordinary";
 	model?: Model<any>;
 	thinkingLevel: ThinkingLevel;
 	isStreaming: boolean;
@@ -166,6 +179,7 @@ export type RpcResponse =
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| { id?: string; type: "response"; command: "set_service_tier"; success: true }
 
 	// Model
 	| {
@@ -352,5 +366,5 @@ export type RpcExtensionUIResponse =
 export type RpcCommandType = RpcCommand["type"];
 
 export type RpcObservedSessionEvent =
-	| { type: "observed_session_event"; activeSessionId: string; event: AgentEvent }
+	| { type: "observed_session_event"; activeSessionId: string; event: AgentConnectionSessionEvent }
 	| { type: "observed_session_closed"; activeSessionId: string; error?: string };

@@ -10,14 +10,19 @@ import {
 	createDaemonReplayInfo,
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_COMMAND_PLANE,
+	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_OUTBOUND_COMPATIBILITY,
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
+	DAEMON_SESSION_EVENT_COMPATIBILITY,
+	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
+	type DaemonClientCapability,
 	type DaemonCommand,
 	type DaemonOutbound,
+	daemonClientSupportsSessionEvent,
 	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
@@ -25,6 +30,7 @@ import {
 	salvageDaemonCommandId,
 } from "../src/modes/daemon/daemon-protocol.js";
 import {
+	DAEMON_WORKER_COMMAND_COMPATIBILITY,
 	type DaemonWorkerDescriptor,
 	durableDaemonWorkerDescriptor,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
@@ -79,6 +85,12 @@ describe("daemon protocol helpers", () => {
 		expect(JSON.stringify(durable)).not.toContain("secret-");
 	});
 
+	it("gates active-only worker summaries for new-supervisor/old-worker compatibility", () => {
+		expect(DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_list_active_sessions).toEqual({ minSchemaRevision: 23 });
+		// Old supervisors continue using the unchanged public list command against new workers.
+		expect(DAEMON_COMMAND_COMPATIBILITY.list).toEqual({ minProtocol: 7 });
+	});
+
 	it("keeps the advertised schema identity synchronized with wire type shapes", () => {
 		const source = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
 		const commandSource = source.slice(
@@ -122,6 +134,49 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toEqual(
 			expect.arrayContaining(["heartbeat_catalog", "heartbeat_management"]),
 		);
+	});
+
+	it("capability-gates mailbox commands for both compatibility directions", () => {
+		expect(DAEMON_SCHEMA_REVISION).toBe(26);
+		expect(DAEMON_COMMAND_COMPATIBILITY.agent_message_inbox).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 17,
+			capability: "family_mailbox",
+		});
+		expect(DAEMON_COMMAND_COMPATIBILITY.agent_message_wait).toEqual(DAEMON_COMMAND_COMPATIBILITY.agent_message_inbox);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("family_mailbox");
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("session_model_selection");
+		expect(DAEMON_COMMAND_COMPATIBILITY.send_message).toEqual({ minProtocol: 7 });
+	});
+
+	it("capability-gates the additive Act stream without changing legacy defaults", () => {
+		expect(DAEMON_SESSION_EVENT_COMPATIBILITY.act_event).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 19,
+			capability: "rlm_act_stream",
+		});
+		expect(DAEMON_DEFAULT_CLIENT_CAPABILITIES).not.toContain("rlm_act_stream");
+		expect(DAEMON_SUPPORTED_CLIENT_CAPABILITIES).toContain("rlm_act_stream");
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("rlm_act_stream");
+		const event = {
+			type: "act_event" as const,
+			actId: "act-1",
+			outerToolCallId: "tool-1",
+			sequence: 1,
+			event: "start" as const,
+			prompt: "inspect",
+			promptTruncated: false,
+			model: { provider: "test", id: "test-model" },
+			cancellationCapability: "posix-managed" as const,
+		};
+		expect(daemonClientSupportsSessionEvent(new Set<DaemonClientCapability>(), event)).toBe(false);
+		expect(daemonClientSupportsSessionEvent(new Set<DaemonClientCapability>(["rlm_act_stream"]), event)).toBe(true);
+		expect(
+			daemonClientSupportsSessionEvent(new Set<DaemonClientCapability>(), {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [], followUps: [] },
+			}),
+		).toBe(true);
 	});
 
 	it("capability-gates explicit subagent deletion instead of schema-gating it", () => {

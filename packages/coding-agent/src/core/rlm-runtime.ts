@@ -3,7 +3,6 @@ import type { Api, Model, ServiceTier } from "@earendil-works/pi-ai";
 import type { AgentSession } from "./agent-session.js";
 import type { ToolDefinition } from "./extensions/index.js";
 import type { HostRequestHandler } from "./kernel/index.js";
-import { THINKING_LEVELS } from "./thinking-levels.js";
 
 /** Request emitted by `rlm.run`; cellSourceCode preserves the spawning cell for display. */
 export interface RlmRunRequest {
@@ -44,6 +43,11 @@ export interface RlmModelMatch {
 	id: string;
 	name: string;
 	selector: string;
+	role?: string;
+	concreteSelector?: string;
+	runtime?: "native" | "claude-code";
+	available?: boolean;
+	effort?: ThinkingLevel;
 }
 
 export interface RlmFindModelsResult {
@@ -59,6 +63,19 @@ const RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH = 64;
 export const DEFAULT_RLM_MODEL_SEARCH_LIMIT = 8;
 export const MAX_RLM_MODEL_SEARCH_LIMIT = 20;
 
+const RLM_SERVICE_TIERS = ["auto", "default", "flex", "scale", "priority"] as const;
+
+/** Validate and normalize an orchestrator-supplied child service tier. */
+export function normalizeRequestedRlmSubagentServiceTier(value: unknown): ServiceTier | undefined {
+	if (value === undefined) return undefined;
+	if (value === null) return null;
+	if (typeof value !== "string" || !(RLM_SERVICE_TIERS as readonly string[]).includes(value)) {
+		throw new Error(`rlm.run service_tier must be one of ${RLM_SERVICE_TIERS.join(", ")} or null`);
+	}
+	return value as ServiceTier;
+}
+
+/** Validate and normalize an orchestrator-supplied subagent session name. */
 export function normalizeRequestedRlmSubagentSessionName(value: unknown): string | undefined {
 	if (value === undefined) {
 		return undefined;
@@ -76,30 +93,17 @@ export function normalizeRequestedRlmSubagentSessionName(value: unknown): string
 	return name;
 }
 
-export function normalizeRequestedRlmSubagentThinkingLevel(value: unknown): ThinkingLevel | undefined {
+/** Validate and normalize an orchestrator-supplied subagent model reference. */
+export function normalizeRequestedRlmSubagentModel(value: unknown, operation = "rlm.run"): string | undefined {
 	if (value === undefined) {
 		return undefined;
 	}
 	if (typeof value !== "string") {
-		throw new Error("rlm.run thinking must be a string");
-	}
-	const level = value.trim().toLowerCase();
-	if (!THINKING_LEVELS.includes(level as ThinkingLevel)) {
-		throw new Error(`rlm.run thinking must be one of: ${THINKING_LEVELS.join(", ")}`);
-	}
-	return level as ThinkingLevel;
-}
-
-export function normalizeRequestedRlmSubagentModel(value: unknown): string | undefined {
-	if (value === undefined) {
-		return undefined;
-	}
-	if (typeof value !== "string") {
-		throw new Error("rlm.run model must be a string");
+		throw new Error(`${operation} model must be a string`);
 	}
 	const model = value.trim();
 	if (!model) {
-		throw new Error("rlm.run model must not be empty");
+		throw new Error(`${operation} model must not be empty`);
 	}
 	return model;
 }
@@ -211,8 +215,41 @@ export function createRlmDeleteSubagentHostHandler(handler: RlmDeleteSubagentHan
 	};
 }
 
+/** Minimal lifecycle boundary shared by native and external RLM children. */
+export interface RlmChildRuntime {
+	readonly runtimeKind: "native" | "claude-code";
+	readonly modelSelector: string;
+	readonly sessionName: string;
+	readonly sessionId?: string;
+	abort(reason: string): void;
+	dispose(): void | Promise<void>;
+	deliver?(message: string): "queued" | "woken" | Promise<"queued" | "woken">;
+}
+
+export function adaptNativeRlmChildRuntime(session: AgentSession): RlmChildRuntime {
+	const model = session.model;
+	return {
+		runtimeKind: "native",
+		modelSelector: model ? `${model.provider}/${model.id}` : "native/unknown",
+		get sessionName() {
+			return session.sessionName ?? session.sessionId;
+		},
+		get sessionId() {
+			return session.sessionId;
+		},
+		abort: () => void session.abort(),
+		dispose: () => session.disposeAsync(),
+	};
+}
+
 export interface RlmSubagentRuntime {
 	session: AgentSession;
+}
+
+/** Ordered native model candidate retained by an RLM child for provider fallback. */
+export interface RlmNativeModelCandidate {
+	model: Model<Api>;
+	thinkingLevel?: ThinkingLevel;
 }
 
 export interface CreateRlmSubagentRuntimeOptions {
@@ -223,6 +260,7 @@ export interface CreateRlmSubagentRuntimeOptions {
 	sessionDir: string;
 	model: Model<any>;
 	thinkingLevel: ThinkingLevel;
+	modelCandidates?: RlmNativeModelCandidate[];
 	serviceTier: ServiceTier;
 	scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	activeToolNames: string[];
@@ -252,6 +290,35 @@ export interface SubagentRuntimeHost {
 		status: "done" | "error" | "cancelled",
 	) => Promise<void>;
 	/** Close or remove the host-owned child; session is absent when a persisted child is still passive. */
+	/**
+	 * Durable artifacts for a child that runs outside the daemon session
+	 * runtime (claude-code): ledger edge, display file, and an appendable
+	 * session transcript so listing, selection, and reopen work unchanged.
+	 */
+	createExternalRlmSubagentTranscript?(
+		options: ExternalRlmSubagentTranscriptOptions,
+	): Promise<ExternalRlmSubagentTranscript>;
 	deleteRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<void>;
 	disposeRlmSubagentRuntimes?(): Promise<void>;
+}
+
+export interface ExternalRlmSubagentTranscriptOptions {
+	parentSession: AgentSession;
+	childId: string;
+	sessionName: string;
+	sessionDir: string;
+	rlmDepth: number;
+	rlmParentNodeId?: string;
+	prompt: string;
+	spawnCode?: string;
+	/** Display model reference, e.g. "claude-code/opus". */
+	modelLabel: string;
+}
+
+export interface ExternalRlmSubagentTranscript {
+	sessionFile: string;
+	appendUserMessage(text: string): void;
+	appendAssistantMessage(text: string): void;
+	/** Mark the child completed in the display file after its final message. */
+	complete(): void;
 }

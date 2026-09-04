@@ -68,12 +68,14 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 19 adds daemon-held session input pauses.
 // Revision 20 lets cancellation target a prompt the session owns but has not started.
 // Revision 21 adds capability-gated, session-scoped ACP MCP server replacement.
-// Revision 23 lets workers query the supervisor agent roster on demand.
+// Revision 22 scopes ACP MCP replacement and cleanup to a connection owner.
+// Revision 23 adds active-only worker summaries and supervisor agent-roster queries.
 // Revision 24 adds the capability-gated agent-roster subscription and push.
-// Revision 25 adds capability-gated direct worker peer transport discovery.
-// Revision 26 publishes own-session usage totals on session summary and saved-session rows.
+// Revision 25 adds stable mailbox identity fields to cross-worker agent-message delivery.
+// Revision 26 adds capability-gated direct worker peer transport discovery and
+// publishes own-session usage totals on session summary and saved-session rows.
 export const DAEMON_SCHEMA_REVISION = 26;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-962b8b4c5e35";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-c23b4ec8493c";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -91,7 +93,8 @@ export type DaemonClientCapability =
 	| "extension_ui"
 	| "slim_attach"
 	| "chunked_snapshot"
-	| "client_owned_sessions";
+	| "client_owned_sessions"
+	| "rlm_act_stream";
 export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
 export interface DaemonPromptAdmissionCancellationResult {
 	status: DaemonPromptAdmissionCancellationStatus;
@@ -114,12 +117,14 @@ export type DaemonServerCapability =
 	| "session_input_admission"
 	| "prompt_admission_cancellation"
 	| "queue_message_mutation"
+	| "family_mailbox"
 	| "authoritative_child_roster"
 	| "owned_session_recovery_context"
 	| "rlm_quiescence_barrier"
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
+	| "session_model_selection"
 	| "direct_peer_transport";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
@@ -146,6 +151,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"slim_attach",
 	"chunked_snapshot",
 	"client_owned_sessions",
+	"rlm_act_stream",
 ];
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
@@ -160,6 +166,8 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"prompt_admission_cancellation",
 	"owned_prompt_cancellation",
 	"queue_message_mutation",
+	"family_mailbox",
+	"session_model_selection",
 	"authoritative_child_roster",
 	"owned_session_recovery_context",
 	"rlm_quiescence_barrier",
@@ -451,6 +459,7 @@ export type DaemonCommand =
 			source?: InputSource;
 			agentMessageId?: string;
 			customMessage?: CustomMessage;
+			internalPrompt?: boolean;
 			/** Unique only when the caller needs cancellable pre-ownership admission. */
 			admissionId?: string;
 	  }
@@ -473,6 +482,8 @@ export type DaemonCommand =
 			queueIfBusy?: boolean;
 			expandPromptTemplates?: boolean;
 			source?: InputSource;
+			customMessage?: CustomMessage;
+			internalPrompt?: boolean;
 			/** Unique only when the caller needs cancellable pre-ownership admission. */
 			admissionId?: string;
 	  }
@@ -520,6 +531,25 @@ export type DaemonCommand =
 			/** Internal worker-origin marker; public clients remain unrestricted. */
 			agentOrigin?: boolean;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
+			messageId?: string;
+			replyTo?: string;
+	  }
+	| {
+			id?: string;
+			type: "agent_message_inbox";
+			activeSessionId: string;
+			limit?: number;
+			consume?: boolean;
+			sender?: string;
+			replyTo?: string;
+	  }
+	| {
+			id?: string;
+			type: "agent_message_wait";
+			activeSessionId: string;
+			timeoutMs?: number;
+			sender?: string;
+			replyTo?: string;
 	  }
 	| { id?: string; type: "agent_messages_status"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_pause"; activeSessionId?: string }
@@ -615,7 +645,14 @@ export type DaemonCommand =
 			promoteOwnedSession?: boolean;
 	  }
 	| { id?: string; type: "heartbeat_update"; activeSessionId: string; action: AgentHeartbeatUpdateAction }
-	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
+	| {
+			id?: string;
+			type: "set_model";
+			activeSessionId: string;
+			provider: string;
+			modelId: string;
+			persistDefault?: boolean;
+	  }
 	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }
 	| { id?: string; type: "set_scoped_models"; activeSessionId: string; scopedModels: AgentConnectionScopedModel[] }
 	| { id?: string; type: "set_thinking_level"; activeSessionId: string; level: ThinkingLevel }
@@ -640,7 +677,8 @@ export type DaemonCommand =
 	| { id?: string; type: "abort_retry"; activeSessionId: string }
 	| { id?: string; type: "execute_bash_and_wait"; activeSessionId: string; command: string }
 	| { id?: string; type: "reload"; activeSessionId: string }
-	| { id?: string; type: "new_session"; activeSessionId: string; parentSession?: string }
+	| { id?: string; type: "new_session"; activeSessionId: string; parentSession?: string; cwd?: string }
+	| { id?: string; type: "list_watches"; activeSessionId: string }
 	| { id?: string; type: "switch_session"; activeSessionId: string; sessionPath: string; cwdOverride?: string }
 	| { id?: string; type: "fork"; activeSessionId: string; entryId: string; position?: "before" | "at" }
 	| {
@@ -710,6 +748,11 @@ const CLIENT_OWNED_DAEMON_COMMAND = {
 	minProtocol: 7,
 	capability: "client_owned_sessions",
 } as const;
+const FAMILY_MAILBOX_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 17,
+	capability: "family_mailbox",
+} as const;
 const DELETE_RLM_SUBAGENT_COMMAND = {
 	minProtocol: 7,
 	capability: "delete_rlm_subagent",
@@ -767,6 +810,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	append_custom_message: LEGACY_DAEMON_COMMAND,
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
 	send_message: LEGACY_DAEMON_COMMAND,
+	agent_message_inbox: FAMILY_MAILBOX_COMMAND,
+	agent_message_wait: FAMILY_MAILBOX_COMMAND,
 	agent_messages_status: LEGACY_DAEMON_COMMAND,
 	agent_messages_pause: LEGACY_DAEMON_COMMAND,
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
@@ -827,6 +872,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	execute_bash_and_wait: CURRENT_DAEMON_COMMAND,
 	reload: LEGACY_DAEMON_COMMAND,
 	new_session: LEGACY_DAEMON_COMMAND,
+	list_watches: CURRENT_DAEMON_COMMAND,
 	switch_session: LEGACY_DAEMON_COMMAND,
 	fork: LEGACY_DAEMON_COMMAND,
 	navigate_tree: LEGACY_DAEMON_COMMAND,
@@ -914,6 +960,9 @@ export const DAEMON_COMMAND_PLANE = {
 	mutate_queued_message: "session",
 	clear_queue: "session",
 	abort_and_clear_queue: "session",
+	agent_message_inbox: "session",
+	agent_message_wait: "session",
+	list_watches: "session",
 	acquire_session_input_pause: "session",
 	release_session_input_pause: "session",
 	cron_list: "control",
@@ -1218,6 +1267,23 @@ export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	extension_ui_request: LEGACY_DAEMON_COMMAND,
 	extension_error: LEGACY_DAEMON_COMMAND,
 } as const satisfies Record<DaemonOutbound["type"], DaemonCommandCompatibility>;
+
+export const DAEMON_SESSION_EVENT_COMPATIBILITY = {
+	act_event: {
+		minProtocol: 7,
+		minSchemaRevision: 19,
+		capability: "rlm_act_stream",
+	},
+} as const satisfies Partial<Record<AgentConnectionSessionEvent["type"], DaemonCommandCompatibility>>;
+
+export function daemonClientSupportsSessionEvent(
+	capabilities: ReadonlySet<DaemonClientCapability>,
+	event: AgentConnectionSessionEvent,
+): boolean {
+	const compatibility =
+		DAEMON_SESSION_EVENT_COMPATIBILITY[event.type as keyof typeof DAEMON_SESSION_EVENT_COMPATIBILITY];
+	return compatibility?.capability === undefined || capabilities.has(compatibility.capability);
+}
 
 export function createDaemonCommandEnvelope<TCommand extends DaemonCommand>(
 	command: TCommand,

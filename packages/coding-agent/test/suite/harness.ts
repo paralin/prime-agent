@@ -7,13 +7,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { Agent } from "@earendil-works/pi-agent-core";
-import type { FauxModelDefinition, FauxProviderRegistration, FauxResponseStep, Model } from "@earendil-works/pi-ai";
+import type {
+	FauxModelDefinition,
+	FauxProviderRegistration,
+	FauxResponseStep,
+	Model,
+	ProviderNativeCompactionFunction,
+} from "@earendil-works/pi-ai";
 import { registerFauxProvider } from "@earendil-works/pi-ai";
 import type { AgentSessionMessageController } from "../../src/core/agent-messages.js";
 import type { AgentObserveController } from "../../src/core/agent-observe.js";
 import { AgentSession, type AgentSessionEvent, type AutoRefineReviewer } from "../../src/core/agent-session.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
 import type { AgentAutonomousConfig } from "../../src/core/autonomous.js";
+import type { StartClaudeCodeQuery } from "../../src/core/claude-code-sdk.js";
 import type { ExtensionRunner } from "../../src/core/extensions/index.js";
 import { convertToLlm } from "../../src/core/messages.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
@@ -63,6 +70,7 @@ export interface HarnessOptions {
 	api?: string;
 	provider?: string;
 	models?: FauxModelDefinition[];
+	nativeCompact?: ProviderNativeCompactionFunction<string>;
 	settings?: Partial<Settings>;
 	systemPrompt?: string;
 	tools?: AgentTool[];
@@ -72,12 +80,17 @@ export interface HarnessOptions {
 	agentObserveController?: AgentObserveController;
 	agentMessageController?: AgentSessionMessageController;
 	subagentRuntimeHost?: SubagentRuntimeHost;
+	startClaudeCodeQuery?: StartClaudeCodeQuery;
 	persistSession?: boolean;
+	tempDir?: string;
+	sessionFile?: string;
+	preserveTempDir?: boolean;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
 	autonomous?: AgentAutonomousConfig;
 	autoRefineReviewer?: AutoRefineReviewer;
 	serializedRefine?: boolean;
+	harnessMode?: "rpc-only";
 	initialGoal?: { objective: string; tokenBudget?: number };
 }
 
@@ -106,11 +119,13 @@ function createTempDir(): string {
 }
 
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
-	const tempDir = createTempDir();
+	const tempDir = options.tempDir ?? createTempDir();
+	mkdirSync(tempDir, { recursive: true });
 	const fauxProvider: FauxProviderRegistration = registerFauxProvider({
 		api: options.api,
 		provider: options.provider,
 		models: options.models,
+		compact: options.nativeCompact,
 	});
 	fauxProvider.setResponses([]);
 	const model = fauxProvider.getModel();
@@ -118,9 +133,11 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	const sessionManager = options.persistSession
-		? SessionManager.create(tempDir, join(tempDir, "sessions"))
-		: SessionManager.inMemory();
+	const sessionManager = options.sessionFile
+		? SessionManager.open(options.sessionFile, join(tempDir, "sessions"), tempDir)
+		: options.persistSession
+			? SessionManager.create(tempDir, join(tempDir, "sessions"))
+			: SessionManager.inMemory();
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();
@@ -138,6 +155,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 				name: registeredModel.name,
 				api: registeredModel.api,
 				reasoning: registeredModel.reasoning,
+				thinkingLevelMap: registeredModel.thinkingLevelMap,
 				input: registeredModel.input,
 				cost: registeredModel.cost,
 				contextWindow: registeredModel.contextWindow,
@@ -153,6 +171,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			model,
 			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
 			tools: [],
+			messages: sessionManager.buildSessionContext().messages,
 		},
 		convertToLlm,
 		onPayload: async (payload) => {
@@ -195,13 +214,15 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		agentObserveController: options.agentObserveController,
 		agentMessageController: options.agentMessageController,
 		subagentRuntimeHost: options.subagentRuntimeHost,
+		startClaudeCodeQuery: options.startClaudeCodeQuery,
 		baseToolsOverride: toolMap,
 		extensionRunnerRef,
-		rlmDepth: options.rlmDepth,
+		rlmDepth: options.rlmDepth ?? 0,
 		rlmMaxDepth: options.rlmMaxDepth,
 		autonomous: options.autonomous,
 		autoRefineReviewer: options.autoRefineReviewer,
 		serializedRefine: options.serializedRefine,
+		harnessMode: options.harnessMode,
 		initialGoal: options.initialGoal,
 	});
 
@@ -229,7 +250,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		cleanup() {
 			session.dispose();
 			fauxProvider.unregister();
-			if (existsSync(tempDir)) {
+			if (!options.preserveTempDir && existsSync(tempDir)) {
 				// Spawned fixture processes may still be flushing their final registry
 				// writes; retry briefly instead of failing the suite on ENOTEMPTY.
 				rmSync(tempDir, { recursive: true, force: true, maxRetries: 40, retryDelay: 50 });

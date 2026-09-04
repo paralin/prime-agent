@@ -76,7 +76,28 @@ describe("AgentSession retry and event characterization", () => {
 
 		expect(retryEvents).toEqual(["start:1", "end:true"]);
 		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.session.autoRetryEnabled).toBe(true);
 		expect(harness.session.isRetrying).toBe(false);
+	});
+
+	it("does not retry rpc-only harness failures when persisted retry is enabled", async () => {
+		const harness = await createHarness({
+			harnessMode: "rpc-only",
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("must not retry"),
+		]);
+
+		await harness.session.prompt("test");
+
+		expect(harness.settingsManager.getRetryEnabled()).toBe(true);
+		expect(harness.session.autoRetryEnabled).toBe(false);
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+		expect(harness.eventsOfType("agent_end")).toHaveLength(1);
 	});
 
 	it("retries multiple transient failures and succeeds on the final attempt", async () => {
@@ -188,6 +209,32 @@ describe("AgentSession retry and event characterization", () => {
 	it("does not retry faux provider queue exhaustion", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 		harnesses.push(harness);
+
+		await harness.session.prompt("test");
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+		expect(harness.session.isRetrying).toBe(false);
+	});
+
+	it("does not retry a reasoning-exhausted response with unchanged settings", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
+		harnesses.push(harness);
+		const exhausted = fauxAssistantMessage("", {
+			stopReason: "error",
+			errorMessage: "Provider exhausted the output budget on reasoning",
+		});
+		exhausted.diagnostics = [
+			{
+				type: "provider_warning",
+				timestamp: 0,
+				error: {
+					code: "reasoning_exhausted",
+					message: "the model spent its whole thinking budget and returned no answer",
+				},
+			},
+		];
+		harness.setResponses([exhausted, fauxAssistantMessage("retry should not happen")]);
 
 		await harness.session.prompt("test");
 

@@ -4,6 +4,24 @@ RPC mode enables headless operation of the coding agent via a JSON protocol over
 
 **Note for Node.js/TypeScript users**: If you're building a Node.js application, consider using `AgentSession` directly from `@earendil-works/pi-coding-agent` instead of spawning a subprocess. See [`src/core/agent-session.ts`](../src/core/agent-session.ts) for the API. For a subprocess-based TypeScript client, see [`src/modes/rpc/rpc-client.ts`](../src/modes/rpc/rpc-client.ts).
 
+
+## Supported harness boundary
+
+Prime Agent exposes protocol version `1` and schema revision `3`. Every
+`get_state` response includes these versions together with `cwd`, `serviceTier`,
+effective `rlmMaxDepth`, `actEnabled`, `retryEnabled`, and `foregroundMode`.
+In `rpc-only` harness mode, `retryEnabled` is always `false`, regardless of
+persisted retry settings. Schema revision 3 makes `abort` an
+active-operation/event fence: its response follows the aborted operation's
+terminal events and drained event queue while preserving queued work.
+
+Launch `--mode rpc --harness-mode rpc-only` for an externally supervised
+foreground session. This mode accepts model work only from literal `prompt`
+frames. It permits `get_state`, `set_service_tier`, `prompt`, `abort`, and
+`compact`; other RPC commands are rejected. Launch ceilings
+`--rlm-max-depth-ceiling <n>` and `--disable-rlm-act` override persisted and
+configured session behavior, including resumed sessions.
+
 ## Starting RPC Mode
 
 ```bash
@@ -122,7 +140,10 @@ See [set_follow_up_mode](#set_follow_up_mode) for controlling how follow-up mess
 
 #### abort
 
-Abort the current agent operation.
+Abort the current agent operation. In schema revision 3, the success response
+is emitted only after that operation is idle and its pending events are
+emitted. Queued work remains suspended; `abort` does not wait for the whole
+queue to become idle.
 
 ```json
 {"type": "abort"}
@@ -177,6 +198,7 @@ Response:
     "thinkingLevel": "medium",
     "isStreaming": false,
     "isCompacting": false,
+    "retryEnabled": true,
     "steeringMode": "all",
     "followUpMode": "one-at-a-time",
     "sessionFile": "/path/to/session.jsonl",
@@ -882,7 +904,7 @@ The `assistantMessageEvent` field contains one of these delta types:
 | `toolcall_start` | Tool call started |
 | `toolcall_delta` | Tool call arguments chunk |
 | `toolcall_end` | Tool call ended (includes full `toolCall` object) |
-| `done` | Message complete (reason: `"stop"`, `"length"`, `"toolUse"`) |
+| `done` | Message complete (reason: `"stop"`, `"length"`, `"toolUse"`, `"unknown"`) |
 | `error` | Error occurred (reason: `"aborted"`, `"error"`) |
 
 Example streaming a text response:
@@ -937,6 +959,16 @@ When complete:
 ```
 
 Use `toolCallId` to correlate events. The `partialResult` in `tool_execution_update` contains the accumulated output so far (not just the delta), allowing clients to simply replace their display on each update.
+
+### act_event
+
+A nested Act is an additive event stream correlated to its outer IPython tool call:
+
+```json
+{"type":"act_event","actId":"act-2","depth":2,"parentActId":"act-1","outerToolCallId":"call-ipython","sequence":1,"event":"start","prompt":"inspect state","promptTruncated":false,"model":{"provider":"prime","id":"model"},"cancellationCapability":"posix-managed"}
+```
+
+Every new event carries explicit `depth`; nested events carry the immediate `parentActId`, and readers normalize missing historical depth to 1. Sequences are monotonic within one Act. Progress contains only assistant thinking/text deltas and `shared_ipython` cell start/terminal facts. One self-contained terminal repeats the bounded prompt, resolved model, and exact cancellation capability and adds `done`, `error`, or `cancelled` status plus usage. Main-session events are emitted directly. An observed session wraps the unchanged event in `observed_session_event`. The union never contains the Python object returned by `rlm.done()` or private lane message identities.
 
 ### session_action_update
 
@@ -1314,7 +1346,7 @@ The `content` field can be a string or an array of `TextContent`/`ImageContent` 
 }
 ```
 
-Stop reasons: `"stop"`, `"length"`, `"toolUse"`, `"error"`, `"aborted"`
+Stop reasons: `"stop"`, `"length"`, `"toolUse"`, `"unknown"`, `"error"`, `"aborted"`
 
 ### ToolResultMessage
 

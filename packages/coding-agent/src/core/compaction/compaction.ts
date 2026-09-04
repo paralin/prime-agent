@@ -6,24 +6,32 @@
  */
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model, ProviderNativeCompactionResult, Usage } from "@earendil-works/pi-ai";
+import { compact as compactProvider, completeSimple } from "@earendil-works/pi-ai";
 import {
+	COMPACTION_SUMMARY_PREFIX,
+	COMPACTION_SUMMARY_SUFFIX,
 	convertToLlm,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "../messages.js";
-import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
+import {
+	buildSessionContext,
+	type CompactionEntry,
+	canReplayCompactionWithProvider,
+	type SessionEntry,
+} from "../session-manager.js";
 import { addAssistantUsage, emptyUsage } from "../usage.js";
 import {
 	computeFileLists,
 	createFileOps,
-	extractFileOpsFromMessage,
+	extractFileOpsFromMessages,
 	type FileOperations,
 	formatFileOperations,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
+	serializePromptData,
 } from "./utils.js";
 /** Details stored in CompactionEntry.details for file tracking */
 export interface CompactionDetails {
@@ -59,9 +67,9 @@ function extractFileOperations(
 			}
 		}
 	}
-	for (const msg of messages) {
-		extractFileOpsFromMessage(msg, fileOps);
-	}
+
+	// Record only direct edit calls with successful matching results.
+	extractFileOpsFromMessages(messages, fileOps);
 
 	return fileOps;
 }
@@ -102,6 +110,8 @@ export interface CompactionResult<T = unknown> {
 	summary: string;
 	firstKeptEntryId: string;
 	tokensBefore: number;
+	/** Opaque history returned by a provider-native compaction operation. */
+	providerNativeCompaction?: ProviderNativeCompactionResult;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
 	/** What the summarization call(s) billed; persisted on the compaction entry. */
@@ -113,13 +123,36 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	/** Absolute context-token threshold that overrides the window-reserve heuristic when set. */
+	triggerContextTokens?: number;
+	native: boolean;
+	strategy?: "default" | "scratch-handoff" | "native-or-scratch";
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
+	native: true,
 };
+
+/**
+ * Token count at which compaction triggers for a given window: the configured
+ * absolute threshold when it is stricter than the window reserve, otherwise the
+ * window minus its reserve. Callers that present context usage as a percentage
+ * should divide by this value, not the window.
+ */
+export function resolveCompactionTrigger(
+	contextWindow: number,
+	settings: Pick<CompactionSettings, "triggerContextTokens" | "reserveTokens"> = DEFAULT_COMPACTION_SETTINGS,
+): number {
+	const defaultTrigger = contextWindow > 0 ? contextWindow - settings.reserveTokens : 0;
+	const manual = settings.triggerContextTokens;
+	if (manual !== undefined && manual > 0) {
+		return defaultTrigger > 0 ? Math.min(manual, defaultTrigger) : manual;
+	}
+	return defaultTrigger;
+}
 /**
  * Calculate total context tokens from usage.
  * Uses the native totalTokens field when available, falls back to computing from components.
@@ -166,10 +199,13 @@ export interface ContextUsageEstimate {
 	lastUsageIndex: number | null;
 }
 
-function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; index: number } | undefined {
+function getLastAssistantUsageInfo(
+	messages: AgentMessage[],
+): { usage: Usage; index: number; provider: string } | undefined {
 	for (let i = messages.length - 1; i >= 0; i--) {
-		const usage = getAssistantUsage(messages[i]);
-		if (usage) return { usage, index: i };
+		const message = messages[i];
+		const usage = getAssistantUsage(message);
+		if (usage && message.role === "assistant") return { usage, index: i, provider: message.provider };
 	}
 	return undefined;
 }
@@ -181,7 +217,9 @@ function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; in
 export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
 	const usageInfo = getLastAssistantUsageInfo(messages);
 
-	if (!usageInfo) {
+	// Merge usage measures the request after Gateway context compression. It
+	// cannot serve as a checkpoint for the larger local transcript.
+	if (!usageInfo || usageInfo.provider === "merge-gateway") {
 		let estimated = 0;
 		for (const message of messages) {
 			estimated += estimateTokens(message);
@@ -213,8 +251,9 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
  */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
-	if (contextWindow <= 0) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	const trigger = resolveCompactionTrigger(contextWindow, settings);
+	if (trigger <= 0) return false;
+	return contextTokens > trigger;
 }
 /**
  * Estimate token count for a message using chars/4 heuristic.
@@ -422,91 +461,129 @@ export function findCutPoint(
 		isSplitTurn: !isUserMessage && turnStartIndex !== -1,
 	};
 }
-const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+
+// ============================================================================
+// Summarization
+// ============================================================================
+
+const SUMMARIZATION_PROMPT = `Create a structured context checkpoint that another agent can use to continue the work.
 
 Use this EXACT format:
 
 ## Goal
-[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+[Still-active objectives, newest unresolved user request first. Include multiple objectives when the session contains multiple unfinished requests. Move a request to Done once its requested result exists; do not keep a completed request under Goal or Next Steps.]
 
 ## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned by user]
-- [Or "(none)" if none were mentioned]
+- [User constraints, requested formats, authority limits, and durable preferences]
+- [Or "(none)" if none were stated]
 
 ## Progress
 ### Done
-- [x] [Completed tasks/changes]
+- [x] [Work whose requested result exists and whose material completion claim is supported by the conversation]
 
 ### In Progress
-- [ ] [Current work]
+- [ ] [Started or still-active work]
 
 ### Blocked
-- [Issues preventing progress, if any]
+- [Specific condition that prevents concrete progress, if any]
+- [Or "(none)" if no blocker remains]
 
 ## Key Decisions
-- **[Decision]**: [Brief rationale]
+- **[Decision]**: [Reason and evidence boundary]
 
 ## Next Steps
-1. [Ordered list of what should happen next]
+1. [Ordered next action needed to complete the active work]
 
 ## Critical Context
-- [Any data, examples, or references needed to continue]
+- [Exact data, source references, paths, symbols, variables, results, failures, or assumptions needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep each section concise. Preserve exact file paths, function names, commands, error messages, API identifiers, and unresolved questions. Mark an item done only when the source data contains the requested result or a completed behavior check.`;
 
 const KERNEL_PERSIST_SUMMARY_NOTE =
-	"Note: the Python kernel keeps running after this summary — every Python variable, import, and helper you defined stays available. The cells that defined them won't appear above, so record in the summary any names worth remembering so you reuse them instead of redefining them.";
+	"The IPython kernel keeps running after compaction. Python variables, imports, helpers, and live objects remain available even though the cells that created them may leave the visible history. Record the names and meanings of state that later work should reuse.";
 
-const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+const UPDATE_SUMMARIZATION_PROMPT = `Merge the new conversation data into the previous context checkpoint.
 
-Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
-- UPDATE "Next Steps" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it
+Carry forward every still-active objective, constraint, preference, authority boundary, unresolved question, material decision, failed check, and item of critical context. Add new progress and evidence. Move an item from In Progress to Done only when the new data establishes completion. Remove or rewrite an item only when later source data explicitly cancels or supersedes it, resolves it, or shows that it was wrong. A later message that adds work does not cancel earlier unfinished work.
 
 Use this EXACT format:
 
 ## Goal
-[Preserve existing goals, add new ones if the task expanded]
+[All still-active goals, including goals added by the new data; newest unresolved user request first. Move a request to Done once its requested result exists; do not keep a completed request under Goal or Next Steps.]
 
 ## Constraints & Preferences
-- [Preserve existing, add new ones discovered]
+- [All still-applicable constraints and preferences]
+- [Or "(none)" if none remain]
 
 ## Progress
 ### Done
-- [x] [Include previously done items AND newly completed items]
+- [x] [Previously and newly completed work]
 
 ### In Progress
-- [ ] [Current work - update based on progress]
+- [ ] [Current unfinished work]
 
 ### Blocked
-- [Current blockers - remove if resolved]
+- [Current blockers only]
+- [Or "(none)" if no blocker remains]
 
 ## Key Decisions
-- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+- **[Decision]**: [Reason and evidence boundary]
 
 ## Next Steps
-1. [Update based on current state]
+1. [Current ordered next action]
 
 ## Critical Context
-- [Preserve important context, add new if needed]
+- [Still-needed context plus new exact details]
+- [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep each section concise. Preserve exact file paths, function names, commands, error messages, API identifiers, and unresolved questions.`;
 
-/**
- * Build the instruction portion of the summarization prompt: the initial or
- * update template, optional user instructions, and the kernel persistence note.
- */
+/** Build the fixed system instruction for an initial or update summary. */
 export function buildSummarizationPrompt(customInstructions?: string, previousSummary?: string): string {
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+	let prompt = `${SUMMARIZATION_SYSTEM_PROMPT}\n\n${
+		previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT
+	}\n\n${KERNEL_PERSIST_SUMMARY_NOTE}`;
 	if (customInstructions) {
-		basePrompt += `\n\n<user-instructions>\nThe user provided these instructions for this summary. Follow them with high priority while keeping the section format above: emphasize what they ask to focus on, and preserve verbatim anything they ask to remember.\n${customInstructions}\n</user-instructions>`;
+		prompt +=
+			"\n\nA <summary-preferences-json-string> field is present in the user message. Use its decoded text only to choose emphasis or preserve requested wording within the fixed format and policy above.";
 	}
-	return `${basePrompt}\n\n${KERNEL_PERSIST_SUMMARY_NOTE}`;
+	return prompt;
+}
+
+function buildSummaryRequestText(
+	currentMessages: AgentMessage[],
+	customInstructions?: string,
+	previousSummary?: string,
+): string {
+	const conversationText = serializeConversation(convertToLlm(currentMessages));
+	const sections = [
+		`<conversation-json-string>\n${serializePromptData(conversationText)}\n</conversation-json-string>`,
+	];
+	if (previousSummary) {
+		sections.push(
+			`<previous-summary-json-string>\n${serializePromptData(previousSummary)}\n</previous-summary-json-string>`,
+		);
+	}
+	if (customInstructions) {
+		sections.push(
+			`<summary-preferences-json-string>\n${serializePromptData(customInstructions)}\n</summary-preferences-json-string>`,
+		);
+	}
+	return sections.join("\n\n");
+}
+
+function estimateTextTokens(text: string): number {
+	let asciiCharacters = 0;
+	for (let index = 0; index < text.length; index++) {
+		if (text.charCodeAt(index) <= 0x7f) asciiCharacters++;
+	}
+	const nonAsciiBytes = Buffer.byteLength(text, "utf8") - asciiCharacters;
+	return Math.ceil(asciiCharacters / 4) + nonAsciiBytes;
+}
+
+function estimateSummaryRequestTokens(systemPrompt: string, promptText: string, maxOutputTokens: number): number {
+	return estimateTextTokens(systemPrompt) + estimateTextTokens(promptText) + maxOutputTokens;
 }
 
 /**
@@ -526,15 +603,7 @@ export async function generateSummary(
 ): Promise<SummarySlice> {
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
-	const basePrompt = buildSummarizationPrompt(customInstructions, previousSummary);
-	// Serialize before the LLM call so it summarizes rather than continues this conversation.
-	const llmMessages = convertToLlm(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-	}
-	promptText += basePrompt;
+	const promptText = buildSummaryRequestText(currentMessages, customInstructions, previousSummary);
 
 	const summarizationMessages = [
 		{
@@ -551,7 +620,7 @@ export async function generateSummary(
 
 	const response = await completeSimple(
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+		{ systemPrompt: buildSummarizationPrompt(customInstructions, previousSummary), messages: summarizationMessages },
 		completionOptions,
 	);
 
@@ -566,6 +635,25 @@ export async function generateSummary(
 
 	return { summary: textContent, usage: response.usage };
 }
+
+// ============================================================================
+// Compaction Preparation (for extensions)
+// ============================================================================
+
+export class CompactionContextLimitError extends Error {
+	readonly estimatedTokens: number;
+	readonly contextWindow: number;
+
+	constructor(estimatedTokens: number, contextWindow: number, model: Model<any>) {
+		super(
+			`Local compaction requires approximately ${estimatedTokens} tokens, exceeding the ${contextWindow}-token context window for ${model.provider}/${model.id}`,
+		);
+		this.name = "CompactionContextLimitError";
+		this.estimatedTokens = estimatedTokens;
+		this.contextWindow = contextWindow;
+	}
+}
+
 export interface CompactionPreparation {
 	/** UUID of first entry to keep */
 	firstKeptEntryId: string;
@@ -578,6 +666,8 @@ export interface CompactionPreparation {
 	tokensBefore: number;
 	/** Summary from previous compaction, for iterative update */
 	previousSummary?: string;
+	/** Provider-native history from the previous compatible compaction. */
+	previousNativeCompaction?: ProviderNativeCompactionResult;
 	/** File operations extracted from messagesToSummarize */
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
@@ -587,30 +677,42 @@ export interface CompactionPreparation {
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
+	nativeProvider?: string,
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
 	}
 
+	// The latest compaction always bounds the summarization window. Re-summarizing
+	// past an incompatible provider-native boundary would replay the full
+	// pre-compaction history and exceed the context window; its opaque payload
+	// rides along only when it belongs to the compacting provider.
 	let prevCompactionIndex = -1;
 	for (let i = pathEntries.length - 1; i >= 0; i--) {
-		if (pathEntries[i].type === "compaction") {
+		const entry = pathEntries[i];
+		if (entry.type === "compaction") {
 			prevCompactionIndex = i;
 			break;
 		}
 	}
 
 	let previousSummary: string | undefined;
+	let previousNativeCompaction: ProviderNativeCompactionResult | undefined;
 	let boundaryStart = 0;
 	if (prevCompactionIndex >= 0) {
 		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
 		previousSummary = prevCompaction.summary;
+		if (canReplayCompactionWithProvider(prevCompaction, nativeProvider)) {
+			previousNativeCompaction = prevCompaction.providerNativeCompaction;
+		}
 		const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
 		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
 	}
 	const boundaryEnd = pathEntries.length;
 
-	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
+	const tokensBefore = estimateContextTokens(
+		buildSessionContext(pathEntries, undefined, undefined, nativeProvider ?? null).messages,
+	).tokens;
 
 	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
@@ -638,11 +740,10 @@ export function prepareCompaction(
 		return undefined;
 	}
 	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
-	// Split turns retain their suffix, but their prefix file operations still belong in the summary.
+
+	// Include successful direct edits from a removed turn prefix.
 	if (cutPoint.isSplitTurn) {
-		for (const msg of turnPrefixMessages) {
-			extractFileOpsFromMessage(msg, fileOps);
-		}
+		extractFileOpsFromMessages(turnPrefixMessages, fileOps);
 	}
 
 	return {
@@ -652,24 +753,153 @@ export function prepareCompaction(
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary,
+		previousNativeCompaction,
 		fileOps,
 		settings,
 	};
 }
-const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
 
-Summarize the prefix to provide context for the retained suffix:
+// ============================================================================
+// Main compaction function
+// ============================================================================
+
+const TURN_PREFIX_SUMMARIZATION_PROMPT = `Summarize the removed prefix of one oversized turn. The recent suffix of that same turn remains visible to the continuing agent.
+
+Use this EXACT format:
 
 ## Original Request
-[What did the user ask for in this turn?]
+[The user request that began this turn]
 
 ## Early Progress
-- [Key decisions and work done in the prefix]
+- [Actions, observations, decisions, results, and failed checks from the removed prefix]
 
 ## Context for Suffix
-- [Information needed to understand the retained recent work]
+- [Facts, variables, paths, assumptions, and unresolved work needed to understand the retained suffix]
 
-Be concise. Focus on what's needed to understand the kept suffix.`;
+Preserve exact file paths, function names, commands, error messages, and the distinction between completed work and intended work. Include only context needed to understand and continue the retained suffix.`;
+
+function buildTurnPrefixRequestText(messages: AgentMessage[]): string {
+	const conversationText = serializeConversation(convertToLlm(messages));
+	return `<conversation-json-string>\n${serializePromptData(conversationText)}\n</conversation-json-string>`;
+}
+
+function assertLocalCompactionFits(
+	preparation: CompactionPreparation,
+	model: Model<any>,
+	customInstructions?: string,
+): void {
+	if (model.contextWindow <= 0) return;
+
+	const historyMaxTokens = Math.floor(0.8 * preparation.settings.reserveTokens);
+	const turnPrefixMaxTokens = Math.floor(0.5 * preparation.settings.reserveTokens);
+	let largestRequestTokens = 0;
+	if (preparation.isSplitTurn && preparation.turnPrefixMessages.length > 0) {
+		if (preparation.messagesToSummarize.length > 0) {
+			const historyPrompt = buildSummaryRequestText(
+				preparation.messagesToSummarize,
+				customInstructions,
+				preparation.previousSummary,
+			);
+			largestRequestTokens = estimateSummaryRequestTokens(
+				buildSummarizationPrompt(customInstructions, preparation.previousSummary),
+				historyPrompt,
+				historyMaxTokens,
+			);
+		}
+		const turnPrefixPrompt = buildTurnPrefixRequestText(preparation.turnPrefixMessages);
+		largestRequestTokens = Math.max(
+			largestRequestTokens,
+			estimateSummaryRequestTokens(
+				`${SUMMARIZATION_SYSTEM_PROMPT}\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`,
+				turnPrefixPrompt,
+				turnPrefixMaxTokens,
+			),
+		);
+	} else {
+		const historyPrompt = buildSummaryRequestText(
+			preparation.messagesToSummarize,
+			customInstructions,
+			preparation.previousSummary,
+		);
+		largestRequestTokens = estimateSummaryRequestTokens(
+			buildSummarizationPrompt(customInstructions, preparation.previousSummary),
+			historyPrompt,
+			historyMaxTokens,
+		);
+	}
+
+	if (largestRequestTokens > model.contextWindow) {
+		throw new CompactionContextLimitError(largestRequestTokens, model.contextWindow, model);
+	}
+}
+
+export const PROVIDER_NATIVE_COMPACTION_SUMMARY =
+	"Provider-native compaction preserved opaque history for this session.";
+
+function buildProviderNativeCompactionInstructions(): string {
+	return `${SUMMARIZATION_SYSTEM_PROMPT}\n\n${SUMMARIZATION_PROMPT}\n\n${KERNEL_PERSIST_SUMMARY_NOTE}`;
+}
+
+/**
+ * Replace the prepared prefix with provider-native history. The caller decides
+ * whether the active API supports this operation and owns local fallback policy.
+ */
+export async function compactNative(
+	preparation: CompactionPreparation,
+	model: Model<any>,
+	apiKey: string,
+	headers?: Record<string, string>,
+	signal?: AbortSignal,
+	sessionId?: string,
+): Promise<CompactionResult> {
+	const nativeMessages: AgentMessage[] = [];
+	if (preparation.previousNativeCompaction) {
+		nativeMessages.push({
+			role: "user",
+			content: PROVIDER_NATIVE_COMPACTION_SUMMARY,
+			providerPayload: {
+				type: "openaiResponsesHistory",
+				provider: preparation.previousNativeCompaction.provider,
+				items: preparation.previousNativeCompaction.replacementHistory,
+			},
+			timestamp: Date.now(),
+		});
+	} else if (preparation.previousSummary) {
+		nativeMessages.push({
+			role: "user",
+			content: [
+				{
+					type: "text",
+					text: COMPACTION_SUMMARY_PREFIX + preparation.previousSummary + COMPACTION_SUMMARY_SUFFIX,
+				},
+			],
+			timestamp: Date.now(),
+		});
+	}
+	nativeMessages.push(...preparation.messagesToSummarize, ...preparation.turnPrefixMessages);
+
+	const providerNativeCompaction = await compactProvider(
+		model,
+		{ messages: convertToLlm(nativeMessages) },
+		{
+			apiKey,
+			headers,
+			signal,
+			sessionId,
+			instructions: buildProviderNativeCompactionInstructions(),
+		},
+	);
+	const { readFiles, modifiedFiles } = computeFileLists(preparation.fileOps);
+	const summary = PROVIDER_NATIVE_COMPACTION_SUMMARY + formatFileOperations(readFiles, modifiedFiles);
+
+	return {
+		summary,
+		firstKeptEntryId: preparation.firstKeptEntryId,
+		tokensBefore: preparation.tokensBefore,
+		providerNativeCompaction,
+		details: { readFiles, modifiedFiles } as CompactionDetails,
+	};
+}
 
 /**
  * Generate summaries for compaction using prepared data.
@@ -703,6 +933,10 @@ export async function compact(
 		fileOps,
 		settings,
 	} = preparation;
+
+	assertLocalCompactionFits(preparation, model, customInstructions);
+
+	// Generate summaries (can be parallel if both needed) and merge into one
 	let summary: string;
 	const slices: SummarySlice[] = [];
 
@@ -790,9 +1024,7 @@ async function generateTurnPrefixSummary(
 	thinkingLevel?: ThinkingLevel,
 ): Promise<SummarySlice> {
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
+	const promptText = buildTurnPrefixRequestText(messages);
 	const summarizationMessages = [
 		{
 			role: "user" as const,
@@ -803,7 +1035,12 @@ async function generateTurnPrefixSummary(
 
 	const response = await completeSimple(
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+		{
+			systemPrompt: `${SUMMARIZATION_SYSTEM_PROMPT}
+
+${TURN_PREFIX_SUMMARIZATION_PROMPT}`,
+			messages: summarizationMessages,
+		},
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
 			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
 			: { maxTokens, signal, apiKey, headers },

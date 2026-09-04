@@ -6,9 +6,10 @@ import { getSessionsDir } from "../src/config.js";
 import { type AgentCronJob, AgentCronJobStore, SESSION_SCHEDULED_JOBS_FILENAME } from "../src/core/cron-jobs.js";
 import { getSessionArtifactPathForFile, type SessionInfo } from "../src/core/session-manager.js";
 import { workerRosterEntryFromSummary } from "../src/modes/daemon/agent-roster.js";
-import { success } from "../src/modes/daemon/daemon-protocol.js";
+import { DAEMON_SCHEMA_REVISION, success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor, idleEvictionSweepIntervalMs } from "../src/modes/daemon/daemon-supervisor.js";
+import { DAEMON_WORKER_COMMAND_COMPATIBILITY } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
 
 interface WorkerFixture {
@@ -40,6 +41,7 @@ interface WorkerFixture {
 		requestWorker: ReturnType<typeof vi.fn>;
 		close: ReturnType<typeof vi.fn>;
 	};
+	schemaRevision?: number;
 	summaries: Map<string, SessionSummary>;
 	intentionalStop: boolean;
 	updateRestartPrepareClient?: object;
@@ -232,7 +234,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 				type: "worker_passivate_idle_children",
 				idleEvictionMinutes: 90,
 				now,
-				limit: 2,
+				limit: 8,
 			},
 			30_000,
 		);
@@ -265,6 +267,74 @@ describe("daemon supervisor whole-tree eviction", () => {
 		expect(supervisor.idleEvictionFence).toBeUndefined();
 		releasePassivation();
 		await sweep;
+	});
+
+	it("returns promptly without stopping or warning while a daemon mutation is in flight", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const idle = makeWorker("idle", [makeSummary("idle-root", now)]);
+		supervisor.workers.set("idle", idle);
+		supervisor.mutationDrain.begin();
+
+		await supervisor.runIdleEvictionSweep(now);
+
+		expect(supervisor.stopWorker).not.toHaveBeenCalled();
+		expect(supervisor.log).not.toHaveBeenCalled();
+		expect(supervisor.idleEvictionFence).toBeUndefined();
+	});
+
+	it("evicts on the next sweep after an in-flight mutation ends", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const idle = makeWorker("idle", [makeSummary("idle-root", now)]);
+		supervisor.workers.set("idle", idle);
+		supervisor.mutationDrain.begin();
+
+		await supervisor.runIdleEvictionSweep(now);
+		expect(supervisor.stopWorker).not.toHaveBeenCalled();
+
+		supervisor.mutationDrain.end();
+		await supervisor.runIdleEvictionSweep(now);
+
+		expect(supervisor.stopWorker).toHaveBeenCalledTimes(1);
+		expect(supervisor.stopWorker).toHaveBeenCalledWith(idle, true);
+	});
+
+	it("holds a mutation arriving after the fence until eviction releases it", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const idle = makeWorker("idle", [makeSummary("idle-root", now)]);
+		let releaseStop!: () => void;
+		supervisor.stopWorker = vi.fn(
+			(worker: WorkerFixture) =>
+				new Promise<void>((resolve) => {
+					releaseStop = () => {
+						supervisor.workers.delete(worker.descriptor.workerId);
+						resolve();
+					};
+				}),
+		);
+		supervisor.workers.set("idle", idle);
+
+		const sweep = supervisor.runIdleEvictionSweep(now);
+		await vi.waitFor(() => expect(supervisor.stopWorker).toHaveBeenCalledOnce());
+		expect(supervisor.idleEvictionFence).toBeDefined();
+
+		// Mirrors the supervisor command gate: read the fence, await it, then
+		// admit the mutation.
+		let admitted = false;
+		const arrive = (async () => {
+			const fence = supervisor.idleEvictionFence;
+			if (fence) await fence;
+			supervisor.mutationDrain.begin();
+			admitted = true;
+		})();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(admitted).toBe(false);
+
+		releaseStop();
+		await Promise.all([sweep, arrive]);
+		expect(admitted).toBe(true);
 	});
 
 	it("uses canonical busy state so a stale parent with a running child is not evicted", async () => {
@@ -460,6 +530,74 @@ describe("daemon supervisor whole-tree eviction", () => {
 		});
 	});
 
+	it("forwards stable message id and replyTo through cross-worker delivery", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const sourceSummary = makeSummary("source-active", now, { sessionId: "source-session" });
+		const targetSummary = makeSummary("target-active", now, { sessionId: "target-session" });
+		const source = makeWorker("source", [sourceSummary]);
+		const target = makeWorker("target", [targetSummary]);
+		target.schemaRevision = DAEMON_SCHEMA_REVISION;
+		target.client!.requestWorker.mockResolvedValue({
+			type: "response",
+			command: "worker_deliver_message",
+			success: true,
+			data: { deliveryStatus: "delivered" },
+		});
+		supervisor.workers.set("source", source);
+		supervisor.workers.set("target", target);
+		const client = { id: "sender", attachedActiveSessionIds: new Set<string>() };
+
+		const response = await supervisor.handleCommand(client, {
+			id: "message-stable",
+			type: "send_message",
+			targetActiveSessionId: "target-active",
+			fromActiveSessionId: "source-active",
+			message: "hello across workers",
+			messageId: "agentmsg-stable-9",
+			replyTo: "agentmsg-parent-q",
+		});
+
+		expect(target.client?.requestWorker).toHaveBeenCalledWith(
+			expect.objectContaining({
+				type: "worker_deliver_message",
+				targetActiveSessionId: "target-active",
+				message: "hello across workers",
+				messageId: "agentmsg-stable-9",
+				replyTo: "agentmsg-parent-q",
+			}),
+			24 * 60 * 60 * 1000,
+		);
+		expect(response).toMatchObject({ success: true, id: "message-stable", command: "send_message" });
+	});
+
+	it("fails cross-worker delivery carrying stable identity to a pre-revision worker", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const sourceSummary = makeSummary("source-active", now, { sessionId: "source-session" });
+		const targetSummary = makeSummary("target-active", now, { sessionId: "target-session" });
+		const source = makeWorker("source", [sourceSummary]);
+		const target = makeWorker("target", [targetSummary]);
+		target.schemaRevision = DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_deliver_message.minSchemaRevision - 1;
+		target.client!.requestWorker = vi.fn();
+		supervisor.workers.set("source", source);
+		supervisor.workers.set("target", target);
+		const client = { id: "sender", attachedActiveSessionIds: new Set<string>() };
+
+		await expect(
+			supervisor.handleCommand(client, {
+				id: "message-old-worker",
+				type: "send_message",
+				targetActiveSessionId: "target-active",
+				fromActiveSessionId: "source-active",
+				message: "hello across workers",
+				messageId: "agentmsg-stable-10",
+				replyTo: "agentmsg-parent-q",
+			}),
+		).rejects.toThrow("stable mailbox identity");
+		expect(target.client?.requestWorker).not.toHaveBeenCalled();
+	});
+
 	it("fails an unknown agent-message selector without forwarding it back to the worker", async () => {
 		const now = Date.parse("2026-08-01T12:00:00.000Z");
 		const supervisor = makeSupervisor();
@@ -577,46 +715,6 @@ describe("daemon supervisor empty-session eviction on detach", () => {
 		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("Evicted empty session worker empty"));
 	});
 
-	it("evicts an empty draft when the worker reports its last direct viewer gone", async () => {
-		const now = Date.parse("2026-08-01T12:00:00.000Z");
-		const supervisor = makeSupervisor();
-		const liveSummaries = [makeSummary("draft-root", now, { messageCount: 0, directAttachedClients: 1 })];
-		const worker = makeWorker("draft", liveSummaries);
-		supervisor.workers.set("draft", worker);
-		seedSupervisorRoster(supervisor, worker);
-
-		// Clean detach and socket drop both surface as the same worker roster truth.
-		const detached = makeSummary("draft-root", now, { messageCount: 0 });
-		liveSummaries[0] = detached;
-		worker.summaries.set("draft-root", detached);
-		supervisor.writeRosterEntry(workerRosterEntryFromSummary(detached), worker);
-
-		await vi.waitFor(() => expect(supervisor.stopWorker).toHaveBeenCalledWith(worker, true));
-		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("Evicted empty session worker draft"));
-	});
-
-	it("evicts a mixed-client empty draft only when the last of both client kinds is gone", async () => {
-		const now = Date.parse("2026-08-01T12:00:00.000Z");
-		const supervisor = makeSupervisor();
-		const liveSummaries = [makeSummary("mixed-root", now, { messageCount: 0, directAttachedClients: 1 })];
-		const worker = makeWorker("mixed", liveSummaries);
-		supervisor.workers.set("mixed", worker);
-		seedSupervisorRoster(supervisor, worker);
-		const routed = makeDetachClient("routed", ["mixed-root"]);
-		supervisor.clients.add(routed);
-
-		await supervisor.handleCommand(routed, { id: "detach-1", type: "detach", activeSessionId: "mixed-root" });
-		await settle();
-		expect(supervisor.stopWorker).not.toHaveBeenCalled();
-
-		const detached = makeSummary("mixed-root", now, { messageCount: 0 });
-		liveSummaries[0] = detached;
-		worker.summaries.set("mixed-root", detached);
-		supervisor.writeRosterEntry(workerRosterEntryFromSummary(detached), worker);
-
-		await vi.waitFor(() => expect(supervisor.stopWorker).toHaveBeenCalledWith(worker, true));
-	});
-
 	it("does not stop a worker that was replaced while its summary refresh was in flight", async () => {
 		const now = Date.parse("2026-08-01T12:00:00.000Z");
 		const supervisor = makeSupervisor();
@@ -730,9 +828,15 @@ describe("daemon supervisor empty-session eviction on detach", () => {
 		const sweep = supervisor.runIdleEvictionSweep(now);
 		await vi.waitFor(() => expect(worker.client!.request).toHaveBeenCalledTimes(1));
 		await supervisor.handleCommand(client, { id: "detach", type: "detach", activeSessionId: "gap-root" });
-		await vi.waitFor(() => expect(worker.client!.request).toHaveBeenCalledTimes(3));
-		releaseSweepList();
 		await settle();
+
+		// The detach-path refresh coalesces behind the pending sweep refresh
+		// instead of racing it with a second in-flight list.
+		expect(worker.client!.request).toHaveBeenCalledTimes(1);
+		releaseSweepList();
+		// The sweep's trailing candidate refresh and the detach hook's decision
+		// refresh run next; the hook's list is gated.
+		await vi.waitFor(() => expect(worker.client!.request).toHaveBeenCalledTimes(3));
 
 		// The hook is still mid-decision, so its fence must still be in the slot.
 		expect(supervisor.idleEvictionFence).toBeDefined();

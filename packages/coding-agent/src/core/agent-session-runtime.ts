@@ -331,6 +331,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				sessionOptions: {
 					model: options.model,
 					thinkingLevel: options.thinkingLevel,
+					rlmModelCandidates: options.modelCandidates,
 					serviceTier: options.serviceTier,
 					scopedModels: options.scopedModels,
 					initialActiveToolNames: options.activeToolNames,
@@ -420,15 +421,32 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 		const previousSessionFile = this.session.sessionFile;
 		const lease = this.acquireReplacementLease(sessionPath);
+		const openSessionManager = () => {
+			const manager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
+			assertSessionCwdExists(manager, this.cwd);
+			return manager;
+		};
 		let sessionManager: SessionManager;
 		try {
-			sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
-			assertSessionCwdExists(sessionManager, this.cwd);
+			sessionManager = openSessionManager();
 		} catch (error) {
 			this.releaseUncommittedLease(lease);
 			throw error;
 		}
+		const reloadAfterTeardown =
+			previousSessionFile !== undefined &&
+			canonicalSessionPath(previousSessionFile) === canonicalSessionPath(sessionPath);
 		await this.teardownForReplacement("resume", sessionManager.getSessionFile(), lease);
+		if (reloadAfterTeardown) {
+			try {
+				// Teardown can append terminal lifecycle facts to the same file. Reopen
+				// only after it finishes so recovery never reconstructs a stale branch.
+				sessionManager = openSessionManager();
+			} catch (error) {
+				this.releaseUncommittedLease(lease);
+				throw error;
+			}
+		}
 		await this.buildAndApplyReplacement(
 			() =>
 				this.scopedBuild(() =>
@@ -452,6 +470,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	async newSession(options?: {
 		parentSession?: string;
+		/** Working directory for the new session; defaults to the current session's cwd. */
+		cwd?: string;
 		setup?: (sessionManager: SessionManager) => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	}): Promise<{ cancelled: boolean }> {
@@ -461,8 +481,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 
 		const previousSessionFile = this.session.sessionFile;
+		const cwd = options?.cwd ?? this.cwd;
 		const sessionDir = this.session.sessionManager.getSessionDir();
-		const sessionManager = SessionManager.create(this.cwd, sessionDir);
+		const sessionManager = SessionManager.create(cwd, sessionDir);
 		if (options?.parentSession) {
 			sessionManager.newSession({
 				parentSession: options.parentSession,
@@ -476,7 +497,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			() =>
 				this.scopedBuild(() =>
 					this.createRuntime({
-						cwd: this.cwd,
+						cwd,
 						agentDir: this.services.agentDir,
 						sessionManager,
 						sessionStartEvent: {
@@ -495,6 +516,50 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 		await this.finishSessionReplacement(options?.withSession);
 		return { cancelled: false };
+	}
+
+	/**
+	 * Write the branched transcript for a fork without replacing this live
+	 * session. The daemon connection launches a fresh worker for the returned
+	 * file and rebinds there; the source session keeps serving its session.
+	 */
+	async writeForkTranscript(
+		entryId: string,
+		options?: { position?: "before" | "at" },
+	): Promise<{ sessionPath: string; selectedText?: string }> {
+		const position = options?.position ?? "before";
+		let targetLeafId: string | null;
+		let selectedText: string | undefined;
+
+		const selectedEntry = this.session.sessionManager.getEntry(entryId);
+		if (!selectedEntry) {
+			throw new Error("Invalid entry ID for forking");
+		}
+
+		if (position === "at") {
+			targetLeafId = selectedEntry.id;
+		} else {
+			if (selectedEntry.type !== "message" || selectedEntry.message.role !== "user") {
+				throw new Error("Invalid entry ID for forking");
+			}
+			targetLeafId = selectedEntry.parentId;
+			selectedText = extractUserMessageText(selectedEntry.message.content);
+		}
+
+		const currentSessionFile = this.session.sessionFile;
+		if (!this.session.sessionManager.isPersisted() || !currentSessionFile) {
+			throw new Error("Cannot fork an unpersisted session");
+		}
+		if (!targetLeafId) {
+			throw new Error("Fork target entry has no parent to branch from");
+		}
+		const sessionDir = this.session.sessionManager.getSessionDir();
+		const sourceManager = SessionManager.open(currentSessionFile, sessionDir);
+		const forkedSessionPath = sourceManager.createBranchedSession(targetLeafId);
+		if (!forkedSessionPath) {
+			throw new Error("Failed to create forked session");
+		}
+		return { sessionPath: forkedSessionPath, ...(selectedText ? { selectedText } : {}) };
 	}
 
 	async fork(

@@ -6,12 +6,14 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, Message, ProviderPayload, TextContent } from "@earendil-works/pi-ai";
 import type { AgentCronJob } from "./cron-jobs.js";
+import { ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE } from "./english-output-nudge.js";
 import type { AppliedRefinementEdit, HarnessScope, RefinementResult } from "./refinement/refinement.js";
 import { isSessionSlashCommandName, parseSessionSlashCommand, type SessionSlashCommand } from "./slash-commands.js";
+import { TOOL_ERROR_NUDGE_CUSTOM_TYPE } from "./tool-error-nudge.js";
 
-export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
+export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary. This summary is background; the newest user message in the conversation after it is the live instruction. Do not re-execute requests the summary records as Done:
 
 <summary>
 `;
@@ -28,6 +30,10 @@ export const BRANCH_SUMMARY_SUFFIX = `</summary>`;
 
 export const HEARTBEAT_PROMPT_CUSTOM_TYPE = "heartbeat_prompt";
 export const HEARTBEAT_PROMPT_PREVIEW_LABEL = "Heartbeat prompt";
+export const REPETITION_NOTICE_CUSTOM_TYPE = "repetition_notice";
+export const REPETITION_NOTICE_PREVIEW_LABEL = "Repetition notice";
+export const REPETITION_NOTICE_PROMPT =
+	"You are repeating yourself, take a step back, remember the bigger picture, collect more information if necessary, and continue.";
 export const IPYTHON_STATE_RESTORED_CUSTOM_TYPE = "ipython_state_restored";
 export const SESSION_SLASH_COMMAND_CUSTOM_TYPE = "session_slash_command";
 export const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE = "session_slash_command_result";
@@ -35,6 +41,16 @@ export const COMPACTION_OUTCOME_CUSTOM_TYPE = "compaction_outcome";
 export const REFINEMENT_OUTCOME_CUSTOM_TYPE = "refinement_outcome";
 export const RLM_CHILD_FAILURE_CUSTOM_TYPE = "rlm_child_failure";
 export const RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE = "rlm_child_terminal_notice";
+export const MANUAL_CONTINUE_CUSTOM_TYPE = "manual_continue";
+/** Hidden extension context that is intended for the model, not the transcript UI. */
+export const MODEL_CONTEXT_CUSTOM_TYPE = "model-context";
+export const MANUAL_CONTINUE_PROMPT = `<system-notice>
+Continue.
+
+- Resume the most recent intent and carry unfinished work to completion.
+- If interrupted mid-step, continue from that point.
+- Do not pause to summarize progress, reconfirm the plan, or ask whether to proceed.
+</system-notice>`;
 
 export interface SessionSlashCommandDetails {
 	command: SessionSlashCommand;
@@ -196,6 +212,8 @@ export interface CompactionSummaryMessage {
 	tokensBefore: number;
 	/** Number of retained messages that precede this summary in transcript presentation. */
 	retainedMessageCount?: number;
+	/** Provider-native history replayed instead of the display summary by a matching provider. */
+	providerPayload?: ProviderPayload;
 	/** User instructions that guided the summary (from `/compact <instructions>`) */
 	customInstructions?: string;
 	timestamp: number;
@@ -263,12 +281,14 @@ export function createCompactionSummaryMessage(
 	timestamp: string,
 	customInstructions?: string,
 	retainedMessageCount?: number,
+	providerPayload?: ProviderPayload,
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
 		summary,
 		tokensBefore,
 		retainedMessageCount,
+		providerPayload,
 		customInstructions,
 		timestamp: new Date(timestamp).getTime(),
 	};
@@ -289,6 +309,16 @@ export function createCustomMessage(
 		display,
 		details,
 		timestamp: new Date(timestamp).getTime(),
+	};
+}
+
+export function createManualContinueMessage(timestamp = Date.now()): CustomMessage {
+	return {
+		role: "custom",
+		customType: MANUAL_CONTINUE_CUSTOM_TYPE,
+		content: MANUAL_CONTINUE_PROMPT,
+		display: false,
+		timestamp,
 	};
 }
 
@@ -476,6 +506,57 @@ export function createHeartbeatPromptMessage(
 	};
 }
 
+export function createRepetitionNoticeMessage(timestamp = Date.now()): CustomMessage {
+	return {
+		role: "custom",
+		customType: REPETITION_NOTICE_CUSTOM_TYPE,
+		content: REPETITION_NOTICE_PROMPT,
+		display: true,
+		timestamp,
+	};
+}
+
+function customMessageText(message: CustomMessage): string {
+	return typeof message.content === "string"
+		? message.content
+		: message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+}
+
+function isRepetitionLoopAssistant(message: AgentMessage): boolean {
+	return (
+		message.role === "assistant" &&
+		(message.diagnostics?.some((diagnostic) => diagnostic.type === "agent_repetition_loop") ?? false)
+	);
+}
+
+const ELAPSED_TIME_INTERVAL_SECONDS = 30;
+
+/**
+ * addElapsedSystemPrompt exposes quantized session time only to the provider.
+ *
+ * Keeping the hint in the transient system prompt avoids transcript and TUI
+ * messages. Quantization also keeps the prompt stable between 30-second
+ * boundaries.
+ */
+export function addElapsedSystemPrompt(
+	systemPrompt: string | undefined,
+	conversationStartedAt: number,
+	now = Date.now(),
+): string | undefined {
+	if (!Number.isFinite(conversationStartedAt) || !Number.isFinite(now)) return systemPrompt;
+	const elapsedSeconds = Math.max(0, Math.floor((now - conversationStartedAt) / 1000));
+	const elapsedBucket = Math.floor(elapsedSeconds / ELAPSED_TIME_INTERVAL_SECONDS) * ELAPSED_TIME_INTERVAL_SECONDS;
+	if (elapsedBucket < ELAPSED_TIME_INTERVAL_SECONDS) return systemPrompt;
+	const hint = `<session-elapsed-time>
+T+${elapsedBucket}s since the first persisted session message.
+</session-elapsed-time>`;
+	return systemPrompt && systemPrompt.length > 0
+		? `${systemPrompt}
+
+${hint}`
+		: hint;
+}
+
 /**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
@@ -498,7 +579,31 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						timestamp: m.timestamp,
 					};
 				case "custom": {
+					if (m.customType === MANUAL_CONTINUE_CUSTOM_TYPE) {
+						return {
+							role: "user",
+							content: [{ type: "text", text: MANUAL_CONTINUE_PROMPT }],
+							timestamp: m.timestamp,
+						};
+					}
 					if (
+						m.customType === REPETITION_NOTICE_CUSTOM_TYPE ||
+						m.customType === TOOL_ERROR_NUDGE_CUSTOM_TYPE ||
+						m.customType === ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE
+					) {
+						return {
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: `<system-notice>\n${customMessageText(m)}\n</system-notice>`,
+								},
+							],
+							timestamp: m.timestamp,
+						};
+					}
+					if (
+						(!m.display && m.customType !== MODEL_CONTEXT_CUSTOM_TYPE) ||
 						m.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
 						m.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE ||
 						m.customType === COMPACTION_OUTCOME_CUSTOM_TYPE ||
@@ -525,10 +630,13 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						content: [
 							{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
 						],
+						providerPayload: m.providerPayload,
 						timestamp: m.timestamp,
 					};
-				case "user":
 				case "assistant":
+					if (isRepetitionLoopAssistant(m)) return undefined;
+					return m;
+				case "user":
 				case "toolResult":
 					return m;
 				default:

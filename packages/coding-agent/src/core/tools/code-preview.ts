@@ -14,6 +14,9 @@ const PYTHON_MAIN_PATTERN = /^\s*if\s+__name__\s*==\s*['"]__main__['"]\s*:/;
 const PYTHON_CONTROL_PATTERN = /^\s*(?:if|elif|else|for|while|with|try|except|finally)\b.*:\s*$/;
 const PYTHON_CALL_PATTERN = /^\s*(?:await\s+)?[A-Za-z_][A-Za-z0-9_.]*\s*\(/;
 const BASH_SKILL_CALL_PATTERN = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?(?:await\s+)?bash\s*\(\s*[rR]?("""|'''|"|')/;
+const BASH_SKILL_NAME_CALL_PATTERN =
+	/^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?(?:await\s+)?bash\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)/;
+const PYTHON_LITERAL_ASSIGN_PATTERN = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([rR])?("""|'''|"|')/;
 const PYTHON_LOW_SIGNAL_CALL_PATTERN = /^\s*(?:await\s+)?(?:print|len|str|repr|int|float|list|dict|set|tuple)\s*\(/;
 const PYTHON_ASSIGNMENT_CALL_PATTERN =
 	/^\s*[A-Za-z_][A-Za-z0-9_]*(?:\s*:\s*[^=]+)?\s*=\s*(?:await\s+)?[A-Za-z_][A-Za-z0-9_.]*\s*\(/;
@@ -484,7 +487,57 @@ function endsInsideMultilineString(lines: readonly string[]): boolean {
 	return false;
 }
 
-function extractBashSkillCommand(code: string): string | undefined {
+/** pythonLiteralAssignments maps statement-level `name = "literal"` so bash(name) previews as bash("literal"). */
+function pythonLiteralAssignments(code: string): Map<string, string> {
+	const vars = new Map<string, string>();
+	let i = 0;
+	let atStatementStart = true;
+	while (i < code.length) {
+		const char = code[i] ?? "";
+		if (char === "#") {
+			const newline = code.indexOf("\n", i);
+			if (newline < 0) break;
+			i = newline + 1;
+			atStatementStart = true;
+			continue;
+		}
+		if (char === "\n") {
+			atStatementStart = true;
+			i += 1;
+			continue;
+		}
+		if (/\s/.test(char)) {
+			i += 1;
+			continue;
+		}
+		if (atStatementStart) {
+			const assign = code.slice(i).match(PYTHON_LITERAL_ASSIGN_PATTERN);
+			if (assign?.[1] && assign[3]) {
+				const quote = assign[3];
+				const start = i + assign[0].length;
+				const scan = scanPythonStringLiteral(code, start, quote, assign[2] === "r" || assign[2] === "R");
+				if (scan.closed && !scan.unsupportedEscape) {
+					vars.set(assign[1], scan.value);
+				}
+				i = scan.end;
+				atStatementStart = false;
+				continue;
+			}
+		}
+		if (char === '"' || char === "'") {
+			const quote = code.startsWith(char.repeat(3), i) ? char.repeat(3) : char;
+			const scan = scanPythonStringLiteral(code, i + quote.length, quote, true);
+			i = scan.end;
+			atStatementStart = false;
+			continue;
+		}
+		atStatementStart = false;
+		i += 1;
+	}
+	return vars;
+}
+
+function extractBashSkillLiteral(code: string): string | undefined {
 	const match = code.match(BASH_SKILL_CALL_PATTERN);
 	const quote = match?.[1];
 	if (!match || !quote) return undefined;
@@ -496,6 +549,17 @@ function extractBashSkillCommand(code: string): string | undefined {
 	// Require a plain literal first argument; concatenation or other expressions fall back.
 	if (!rest.startsWith(",") && !rest.startsWith(")")) return undefined;
 	return scan.value;
+}
+
+function extractBashSkillCommand(callCode: string, cellCode: string): string | undefined {
+	const literal = extractBashSkillLiteral(callCode);
+	if (literal !== undefined) return literal;
+	const match = callCode.match(BASH_SKILL_NAME_CALL_PATTERN);
+	const name = match?.[1];
+	if (!match || !name) return undefined;
+	const rest = callCode.slice(match[0].length).trimStart();
+	if (!rest.startsWith(",") && !rest.startsWith(")")) return undefined;
+	return pythonLiteralAssignments(cellCode).get(name);
 }
 
 export function previewPythonCode(code: string): CodePreview {
@@ -517,9 +581,13 @@ export function previewPythonCode(code: string): CodePreview {
 		// Extract from the full tail (literals may span lines), unless the chosen line is string text.
 		const bashCommand = endsInsideMultilineString(lines.slice(0, previewIndex))
 			? undefined
-			: extractBashSkillCommand(lines.slice(previewIndex).join("\n"));
+			: extractBashSkillCommand(lines.slice(previewIndex).join("\n"), code);
 		if (bashCommand) {
 			return previewBashCommand(bashCommand);
+		}
+		const subprocessCommand = pythonSubprocessCommand(lines[previewIndex] ?? "");
+		if (subprocessCommand) {
+			return previewBashCommand(subprocessCommand);
 		}
 		return {
 			language: "python",

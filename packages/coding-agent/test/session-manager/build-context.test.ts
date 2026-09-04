@@ -3,6 +3,7 @@ import {
 	type BranchSummaryEntry,
 	buildSessionContext,
 	type CompactionEntry,
+	type CustomMessageEntry,
 	type ModelChangeEntry,
 	type ServiceTierChangeEntry,
 	type SessionEntry,
@@ -135,6 +136,46 @@ describe("buildSessionContext", () => {
 	});
 
 	describe("with compaction", () => {
+		it("uses a retained user continuation without synthesizing an empty summary", () => {
+			const continuation = msg("3", "2", "user", "image plus scratch continuation");
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "old work"),
+				msg("2", "1", "assistant", "old result"),
+				continuation,
+				compaction("4", "3", "", "3"),
+			];
+
+			const ctx = buildSessionContext(entries);
+			expect(ctx.messages).toEqual([continuation.message]);
+		});
+
+		it("continues to reconstruct legacy text-only scratch entries", () => {
+			const legacy: CustomMessageEntry = {
+				type: "custom_message",
+				id: "3",
+				parentId: "2",
+				timestamp: "2025-01-01T00:00:00Z",
+				customType: "scratch-handoff-read",
+				content: "legacy scratch continuation",
+				display: false,
+				details: { path: "agent/legacy.org" },
+			};
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "old work"),
+				msg("2", "1", "assistant", "old result"),
+				legacy,
+				compaction("4", "3", "legacy summary", "3"),
+			];
+
+			const ctx = buildSessionContext(entries);
+			expect(ctx.messages).toHaveLength(2);
+			expect(ctx.messages[1]).toMatchObject({
+				role: "custom",
+				customType: "scratch-handoff-read",
+				content: "legacy scratch continuation",
+			});
+		});
+
 		it("includes summary before kept messages", () => {
 			const entries: SessionEntry[] = [
 				msg("1", null, "user", "first"),

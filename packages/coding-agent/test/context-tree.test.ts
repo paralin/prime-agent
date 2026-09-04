@@ -7,6 +7,7 @@ import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import { DEFAULT_COMPACTION_SETTINGS } from "../src/core/compaction/compaction.js";
 import { type ContextTreeNode, loadContextTreeChildrenFromDisk } from "../src/core/context-tree.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
@@ -154,7 +155,9 @@ describe("loadContextTreeChildrenFromDisk", () => {
 		expect(nodes[0].contextUsage).toEqual({
 			tokens: 2000,
 			contextWindow: 200000,
-			percent: 1,
+			// Percent reads against the compaction trigger (window - reserve).
+			compactionTrigger: 200000 - DEFAULT_COMPACTION_SETTINGS.reserveTokens,
+			percent: (2000 / (200000 - DEFAULT_COMPACTION_SETTINGS.reserveTokens)) * 100,
 		});
 
 		// Unknown context window: no context usage at all.
@@ -168,7 +171,12 @@ describe("loadContextTreeChildrenFromDisk", () => {
 		child.sessionManager.appendCompaction("summary", child.assistantEntryId, 2000);
 
 		const nodes = loadContextTreeChildrenFromDisk(rlmDir, resolveContextWindow);
-		expect(nodes[0].contextUsage).toEqual({ tokens: null, contextWindow: 200000, percent: null });
+		expect(nodes[0].contextUsage).toEqual({
+			tokens: null,
+			contextWindow: 200000,
+			compactionTrigger: 200000 - DEFAULT_COMPACTION_SETTINGS.reserveTokens,
+			percent: null,
+		});
 	});
 
 	it("derives error and cancelled status from the last assistant stop reason", () => {
@@ -396,7 +404,7 @@ describe("formatContextTree", () => {
 			model: { provider: "anthropic", id: "claude-sonnet-4-5" },
 			ownUsage: createUsage(40000, 5200, 0.84),
 			totalUsage: createUsage(52100, 5950, 1.1),
-			contextUsage: { tokens: 62300, contextWindow: 200000, percent: 31.15 },
+			contextUsage: { tokens: 62300, contextWindow: 200000, compactionTrigger: 200000, percent: 31.15 },
 			children: [
 				node({
 					id: "sub-aaaa1111",
@@ -404,7 +412,7 @@ describe("formatContextTree", () => {
 					status: "done",
 					ownUsage: createUsage(12100, 750, 0.21),
 					totalUsage: createUsage(12100, 750, 0.21),
-					contextUsage: { tokens: 18000, contextWindow: 200000, percent: 9 },
+					contextUsage: { tokens: 18000, contextWindow: 200000, compactionTrigger: 200000, percent: 9 },
 				}),
 				node({
 					id: "sub-bbbb2222",
@@ -442,14 +450,17 @@ describe("formatContextTree", () => {
 		const root = node({
 			ownUsage: createUsage(900, 100, 0.01),
 			totalUsage: createUsage(900, 100, 0.01),
-			contextUsage: { tokens: null, contextWindow: 200000, percent: null },
+			contextUsage: { tokens: null, contextWindow: 200000, compactionTrigger: 200000, percent: null },
 		});
 		const output = stripAnsi(formatContextTree(root, 100));
 		expect(output).toContain("Current: unknown after compaction");
 	});
 
 	it("renders a lone root without tree glyphs or agent count", () => {
-		const root = node({ ownUsage: createUsage(900, 100, 0.01), totalUsage: createUsage(900, 100, 0.01) });
+		const root = node({
+			ownUsage: createUsage(900, 100, 0.01),
+			totalUsage: createUsage(900, 100, 0.01),
+		});
 		const output = stripAnsi(formatContextTree(root, 100));
 		expect(output).toContain("● main agent");
 		expect(output).not.toContain("├");

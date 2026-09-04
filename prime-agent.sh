@@ -21,6 +21,13 @@ for arg in "$@"; do
   fi
 done
 
+exec_with_args() {
+  if (( ${#ARGS[@]} )); then
+    exec "$@" "${ARGS[@]}"
+  fi
+  exec "$@"
+}
+
 if [[ "$NO_ENV" == "true" ]]; then
   # Unset API keys (see packages/ai/src/env-api-keys.ts)
   unset ANTHROPIC_API_KEY
@@ -69,7 +76,7 @@ if [[ "$USE_DIST" == "true" ]]; then
     echo "Bundle not found at $BUNDLE. Run npm run build first." >&2
     exit 1
   fi
-  exec node "$BUNDLE" ${ARGS[@]+"${ARGS[@]}"}
+  exec_with_args node "$BUNDLE"
 fi
 
 TSX_BIN="$SCRIPT_DIR/node_modules/.bin/tsx"
@@ -78,4 +85,4 @@ if [[ ! -x "$TSX_BIN" ]]; then
   exit 1
 fi
 
-"$TSX_BIN" "$SCRIPT_DIR/packages/coding-agent/src/cli.ts" ${ARGS[@]+"${ARGS[@]}"}
+exec_with_args "$TSX_BIN" "$SCRIPT_DIR/packages/coding-agent/src/cli.ts"

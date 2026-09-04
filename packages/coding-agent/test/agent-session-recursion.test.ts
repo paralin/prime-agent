@@ -8,6 +8,7 @@ import {
 	type Context,
 	createAssistantMessageEventStream,
 	getModel,
+	type ServiceTier,
 	type TextContent,
 	type Usage,
 } from "@earendil-works/pi-ai";
@@ -184,6 +185,7 @@ describe("AgentSession rlm recursion", () => {
 		options: {
 			depth?: number;
 			maxDepth?: number;
+			serviceTier?: ServiceTier;
 			streamFn?: StreamFn;
 			agentMessageController?: AgentSessionMessageController;
 			subagentRuntimeHost?: SubagentRuntimeHost;
@@ -207,6 +209,7 @@ describe("AgentSession rlm recursion", () => {
 				systemPrompt: "",
 				tools: [],
 				thinkingLevel: "off",
+				serviceTier: options.serviceTier,
 			},
 			streamFn: options.streamFn ?? ((_model, context) => streamAnswer(`child answer: ${userText(context)}`)),
 		});
@@ -1474,26 +1477,32 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
-	it("releases a hosted child when its initial task fails", async () => {
+	it("retains a hosted child when its initial task fails", async () => {
 		const child = createSession({ rlmSessionDir: join(tempDir, "host-error-child") });
+		const disposeChild = vi.spyOn(child, "disposeAsync");
 		vi.spyOn(child, "promptAndWait").mockRejectedValue(new Error("child prompt failed"));
 		const releaseRlmSubagentRuntime = vi.fn(async () => {});
+		const deleteRlmSubagentRuntime = vi.fn(async () => {});
 		const root = createSession({
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: child }),
 				releaseRlmSubagentRuntime,
-				deleteRlmSubagentRuntime: async () => {},
+				deleteRlmSubagentRuntime,
 			},
 		});
 
 		const spawned = await root.runRlmChild("fail hosted child");
-		await vi.waitFor(() => {
-			expect(releaseRlmSubagentRuntime).toHaveBeenCalledWith(
-				expect.objectContaining({ session: child }),
-				expect.objectContaining({ id: spawned.rlm_child_id }),
-				"error",
+		await vi.waitFor(async () => {
+			expect((await root.listRlmSubagents()).subagents).toContainEqual(
+				expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "error" }),
 			);
 		});
+		expect(releaseRlmSubagentRuntime).not.toHaveBeenCalled();
+		expect(disposeChild).not.toHaveBeenCalled();
+		expect(root.getRlmChildSession(spawned.rlm_child_id)).toBe(child);
+
+		await root.deleteRlmSubagent(spawned.rlm_child_id);
+		expect(deleteRlmSubagentRuntime).toHaveBeenCalledWith(spawned.rlm_child_id, child);
 	});
 
 	it("strong quiescence waits for a gated child bash activity change", async () => {
@@ -2806,12 +2815,84 @@ describe("AgentSession rlm recursion", () => {
 		await expect(root.runRlmChild("nested")).rejects.toThrow("RLM recursion depth limit reached");
 	});
 
+	it("sets an explicit per-spawn service tier and otherwise inherits the parent tier", async () => {
+		const settingsManager = SettingsManager.inMemory({ rlmAllowedServiceTiers: ["flex", null] });
+		const root = createSession({ serviceTier: "scale", settingsManager });
+		const explicit = await root.runRlmChild("flex tier child", { service_tier: "flex" });
+		const inherited = await root.runRlmChild("inherited tier child");
+		const automatic = await root.runRlmChild("automatic tier child", { service_tier: null });
+
+		await waitFor(
+			() =>
+				root.getRlmChildSession(explicit.rlm_child_id) !== undefined &&
+				root.getRlmChildSession(inherited.rlm_child_id) !== undefined &&
+				root.getRlmChildSession(automatic.rlm_child_id) !== undefined,
+		);
+		expect(root.getRlmChildSession(explicit.rlm_child_id)?.serviceTier).toBe("flex");
+		expect(root.getRlmChildSession(inherited.rlm_child_id)?.serviceTier).toBe("scale");
+		expect(root.getRlmChildSession(automatic.rlm_child_id)?.serviceTier).toBe("default");
+	});
+
+	it("clamps an explicit priority tier for an unsupported child model", async () => {
+		const settingsManager = SettingsManager.inMemory({ rlmAllowedServiceTiers: ["priority"] });
+		const root = createSession({ settingsManager });
+		const spawned = await root.runRlmChild("priority child", { service_tier: "priority" });
+
+		await waitFor(() => root.getRlmChildSession(spawned.rlm_child_id) !== undefined);
+		expect(root.getRlmChildSession(spawned.rlm_child_id)?.serviceTier).toBe("default");
+	});
+
+	it("defaults the RLM spawn allowlist to the configured default service tier", async () => {
+		expect(SettingsManager.inMemory().getRlmAllowedServiceTiers()).toEqual(["default"]);
+		const settingsManager = SettingsManager.inMemory({ defaultServiceTier: "scale" });
+		expect(settingsManager.getRlmAllowedServiceTiers()).toEqual(["scale"]);
+		const root = createSession({ serviceTier: "scale", settingsManager });
+
+		await expect(root.runRlmChild("disallowed default tier", { service_tier: "default" })).rejects.toThrow(
+			"rlm.run service_tier default is not allowed; allowed values are scale",
+		);
+	});
+
+	it("allows configured RLM spawn tiers including priority", async () => {
+		const settingsManager = SettingsManager.inMemory({ rlmAllowedServiceTiers: ["default", "priority"] });
+		const root = createSession({ settingsManager });
+		const spawned = await root.runRlmChild("priority child", { service_tier: "priority" });
+
+		await waitFor(() => root.getRlmChildSession(spawned.rlm_child_id) !== undefined);
+		expect(root.getRlmChildSession(spawned.rlm_child_id)?.serviceTier).toBe("default");
+	});
+
+	it("rejects an explicit RLM spawn tier excluded by the allowlist", async () => {
+		const settingsManager = SettingsManager.inMemory({ rlmAllowedServiceTiers: ["default", "priority"] });
+		const root = createSession({ settingsManager });
+
+		await expect(root.runRlmChild("flex tier child", { service_tier: "flex" })).rejects.toThrow(
+			"rlm.run service_tier flex is not allowed; allowed values are default, priority",
+		);
+	});
+
+	it.each(["fast", 1, {}, "PRIORITY"])("rejects invalid per-spawn service tier %j", async (serviceTier) => {
+		const root = createSession();
+
+		await expect(root.runRlmChild("invalid tier", { service_tier: serviceTier })).rejects.toThrow(
+			"rlm.run service_tier must be one of auto, default, flex, scale, priority or null",
+		);
+	});
+
 	it("rejects unsupported rlm.run kwargs loudly", async () => {
 		const root = createSession();
 
 		await expect(root.runRlmChild("nested", { temperature: 0 })).rejects.toThrow(
 			"Unsupported rlm.run kwargs: temperature",
 		);
+	});
+
+	it("applies an explicit thinking level to a native child", async () => {
+		const root = createSession();
+		const spawned = await root.runRlmChild("high thinking child", { thinking: "high" });
+
+		await waitFor(() => root.getRlmChildSession(spawned.rlm_child_id) !== undefined);
+		expect(root.getRlmChildSession(spawned.rlm_child_id)?.thinkingLevel).toBe("high");
 	});
 
 	it("rejects a non-string rlm.run thinking kwarg", async () => {

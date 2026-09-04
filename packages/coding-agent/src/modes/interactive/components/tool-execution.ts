@@ -1,5 +1,6 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { type Component, Container, Image, Text, type TUI } from "@earendil-works/pi-tui";
+import type { ActProjectionEvent } from "../../../core/act-events.js";
 import type { ToolDefinition, ToolRenderContext, ToolRenderResultOptions } from "../../../core/extensions/types.js";
 import type { KernelSentAgentMessage } from "../../../core/kernel/index.js";
 import { createBashToolDefinition } from "../../../core/tools/bash.js";
@@ -9,6 +10,7 @@ import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/rend
 import type { AgentConnectionToolDefinition } from "../../agent-connection/index.js";
 import { type Theme, theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
+import { ACT_COMPONENT_MAX_ACTS_PER_TOOL, ActExecutionComponent } from "./act-execution.js";
 import { getIpythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.js";
 import { ToolPanel } from "./tool-panel.js";
 
@@ -16,6 +18,8 @@ export interface ToolExecutionOptions {
 	showImages?: boolean;
 	/** Whether image metadata may parse dimensions from base64 data. */
 	includeImageDimensions?: boolean;
+	/** Muted session elapsed label (`T+<seconds>s`) shown on the status line. */
+	elapsedLabel?: string;
 }
 
 export interface ToolExecutionRendererDefinition {
@@ -91,12 +95,16 @@ export class ToolExecutionComponent extends Container {
 	private executionStarted = false;
 	private argsComplete = false;
 	private pendingSentAgentMessages: KernelSentAgentMessage[] = [];
+	private readonly actComponents = new Map<string, ActExecutionComponent>();
+	private readonly actParents = new Map<string, string>();
+	private actComponentsTruncated = false;
 	private result?: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 		isError: boolean;
 		details?: any;
 	};
 	private hideComponent = false;
+	private elapsedLabel: string | undefined;
 
 	constructor(
 		toolName: string,
@@ -115,6 +123,7 @@ export class ToolExecutionComponent extends Container {
 		this.builtInToolDefinition = createReplayBuiltInToolDefinition(toolName, cwd, toolDefinition);
 		this.showImages = options.showImages ?? true;
 		this.includeImageDimensions = options.includeImageDimensions ?? true;
+		this.elapsedLabel = options.elapsedLabel;
 		this.ui = ui;
 		this.cwd = cwd;
 
@@ -233,6 +242,15 @@ export class ToolExecutionComponent extends Container {
 		this.ui.requestRender();
 	}
 
+	setElapsedLabel(elapsedLabel: string | undefined): void {
+		if (this.elapsedLabel === elapsedLabel) {
+			return;
+		}
+		this.elapsedLabel = elapsedLabel;
+		this.updateDisplay();
+		this.ui.requestRender();
+	}
+
 	updateResult(
 		result: {
 			content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
@@ -270,8 +288,44 @@ export class ToolExecutionComponent extends Container {
 		}
 	}
 
+	appendActEvent(event: ActProjectionEvent): boolean {
+		if (this.toolName !== "ipython" || event.outerToolCallId !== this.toolCallId) return false;
+		let component = this.actComponents.get(event.actId);
+		if (!component) {
+			if (this.actComponents.size >= ACT_COMPONENT_MAX_ACTS_PER_TOOL) {
+				this.actComponentsTruncated = true;
+				this.updateDisplay();
+				return true;
+			}
+			component = new ActExecutionComponent(event);
+			component.setExpanded(this.expanded);
+			this.actComponents.set(event.actId, component);
+			if (event.parentActId) {
+				const parent = this.actComponents.get(event.parentActId);
+				if (parent) {
+					this.actParents.set(event.actId, event.parentActId);
+					parent.appendNested(component);
+				}
+			}
+		} else {
+			component.update(event);
+			let parentId = this.actParents.get(event.actId);
+			while (parentId) {
+				this.actComponents.get(parentId)?.invalidate();
+				parentId = this.actParents.get(parentId);
+			}
+		}
+		this.updateDisplay();
+		return true;
+	}
+
+	getActExecutionComponents(): readonly ActExecutionComponent[] {
+		return [...this.actComponents.values()];
+	}
+
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
+		for (const component of this.actComponents.values()) component.setExpanded(expanded);
 		this.updateDisplay();
 	}
 
@@ -361,6 +415,7 @@ export class ToolExecutionComponent extends Container {
 					argsComplete: this.argsComplete,
 					showExpandHint: this.showExpandHint,
 					showImages: this.showImages,
+					elapsedLabel: this.elapsedLabel,
 					cwd: this.cwd,
 				};
 				if (!this.ipythonCellComponent) {
@@ -369,6 +424,14 @@ export class ToolExecutionComponent extends Container {
 					this.ipythonCellComponent.update(state);
 				}
 				this.selfRenderContainer.addChild(this.ipythonCellComponent);
+				for (const component of this.actComponents.values()) {
+					if (!this.actParents.has(component.actId)) this.selfRenderContainer.addChild(component);
+				}
+				if (this.actComponentsTruncated) {
+					this.selfRenderContainer.addChild(
+						new Text(theme.fg("muted", "   … additional Act executions omitted"), 0, 0),
+					);
+				}
 				hasContent = true;
 			} else {
 				hasContent = this.mountRenderers(this.selfRenderContainer, true);
@@ -483,7 +546,8 @@ export class ToolExecutionComponent extends Container {
 
 	private panelHeader(): string {
 		const label = this.toolDefinition?.label ?? this.builtInToolDefinition?.label ?? this.toolName;
-		return `${theme.fg("muted", label)}${theme.fg("dim", " · ")}${this.panelStatus()}`;
+		const elapsed = this.elapsedLabel ? `${theme.fg("dim", " · ")}${theme.fg("muted", this.elapsedLabel)}` : "";
+		return `${theme.fg("muted", label)}${theme.fg("dim", " · ")}${this.panelStatus()}${elapsed}`;
 	}
 
 	private panelStatus(): string {

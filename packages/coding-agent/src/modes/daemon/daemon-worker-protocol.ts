@@ -1,5 +1,9 @@
 import { closeSync, readFileSync } from "node:fs";
-import type { AgentSessionMessageDeliveryMode, AgentSessionMessageSender } from "../../core/agent-messages.js";
+import type {
+	AgentSessionMessageAgentSummary,
+	AgentSessionMessageDeliveryMode,
+	AgentSessionMessageSender,
+} from "../../core/agent-messages.js";
 import type { IdleEvictionMinutes } from "../../core/session-action-store.js";
 
 export { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../core/session-lease.js";
@@ -17,6 +21,12 @@ export const DAEMON_WORKER_STARTUP_GATE_FD_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WO
 export const DAEMON_WORKER_STARTUP_GATE_COMMIT = "start\n";
 export type DaemonWorkerLifecycle = "starting" | "ready" | "recovering" | "stopping" | "failed";
 
+export const DAEMON_WORKER_COMMAND_COMPATIBILITY = {
+	worker_list_active_sessions: { minSchemaRevision: 23 },
+	// Schema revision at which worker_deliver_message carries stable mailbox identity
+	// fields; older workers drop unknown fields, so senders must gate on this revision.
+	worker_deliver_message: { minSchemaRevision: 25 },
+} as const;
 // Worker->supervisor roster frames live outside the client-facing DaemonOutbound schema.
 export type DaemonWorkerRosterOutbound =
 	| {
@@ -35,7 +45,6 @@ export const DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY = "peer_transport";
 
 /** Idle keepalive cadence for worker->supervisor roster frames; the supervisor staleness threshold derives from it. */
 export const ROSTER_HEARTBEAT_INTERVAL_MS = 15_000;
-
 export type DaemonWorkerFrameHeader =
 	| {
 			kind: "command";
@@ -116,6 +125,8 @@ export type DaemonWorkerCommand =
 			supportsExtensionUi?: boolean;
 	  }
 	| { id?: string; type: "worker_unsubscribe"; activeSessionId: string }
+	| { id?: string; type: "worker_list_active_sessions" }
+	| { id?: string; type: "worker_sync_agent_peers"; peers: AgentSessionMessageAgentSummary[] }
 	| { id?: string; type: "worker_register_peer_transport"; grant: DaemonWorkerPeerGrant }
 	| { id?: string; type: "worker_archive_and_shutdown" }
 	| {
@@ -132,6 +143,9 @@ export type DaemonWorkerCommand =
 			message: string;
 			sender: AgentSessionMessageSender;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
+			/** Stable mailbox identity carried across cross-worker forwarding. */
+			messageId?: string;
+			replyTo?: string;
 	  }
 	| { id?: string; type: "worker_prepare_update" }
 	| { id?: string; type: "worker_commit_update" }

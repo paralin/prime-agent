@@ -1,13 +1,13 @@
 # Settings
 
-Prime Agent uses JSON settings files with project settings overriding global settings.
+Prime Agent accepts JSON or YAML settings files, with project settings overriding global settings.
 
 | Location | Scope |
 |----------|-------|
-| `~/.prime/agent/settings.json` | Global (all projects) |
-| `.prime/agent/settings.json` | Project (current directory) |
+| `~/.prime/agent/settings.json`, `~/.prime/agent/settings.yml`, or `~/.prime/agent/settings.yaml` | Global (all projects) |
+| `.prime/agent/settings.json`, `.prime/agent/settings.yml`, or `.prime/agent/settings.yaml` | Project (current directory) |
 
-Edit directly or use `/settings` for common options.
+Use exactly one settings file per scope. Prime Agent preserves the selected format when it saves changes and creates `settings.json` when no file exists. Edit the file directly or use `/settings` for common options. Prime Agent watches both settings directories and reloads changed documents. Settings read for each operation, including `modelRoles`, take effect on the next operation. Settings used to construct runtime resources still require `/reload` or a new session.
 
 ## All Settings
 
@@ -18,8 +18,24 @@ Edit directly or use `/settings` for common options.
 | `defaultProvider` | string | - | Default provider (e.g., `"anthropic"`, `"openai"`) |
 | `defaultModel` | string | - | Default model ID |
 | `defaultThinkingLevel` | string | `"xhigh"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
+| `defaultServiceTier` | string | `"default"` | Default provider service tier: `"auto"`, `"default"`, `"flex"`, `"scale"`, or `"priority"` |
+| `rlmAllowedServiceTiers` | array | `[defaultServiceTier]` | Service tiers allowed as explicit `rlm(..., service_tier=...)` overrides; use JSON `null` for Python `None` |
+| `rlmActMaxDepth` | non-negative integer | `1` | Maximum synchronous Act depth; `0` disables Act and Sol is depth 0 |
+| `rlmActDefaultModel` | string or string array | - | Default native selector for Act depth 1, or ordered defaults indexed by Act depth |
+| `codexHomes` | string array | `[]` | Global-only ordered Codex CLI homes whose `auth.json` credentials rotate daemon-wide when usage is exhausted |
 | `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
+
+An RLM child inherits the parent service tier when `service_tier` is omitted. Explicit overrides require an entry in `rlmAllowedServiceTiers`. For example, opt in to `priority` with:
+
+```json
+{
+  "defaultServiceTier": "default",
+  "rlmAllowedServiceTiers": ["default", "flex", "priority"]
+}
+```
+
+When `rlmAllowedServiceTiers` is absent, its effective value contains only `defaultServiceTier`.
 
 #### thinkingBudgets
 
@@ -29,10 +45,87 @@ Edit directly or use `/settings` for common options.
     "minimal": 1024,
     "low": 4096,
     "medium": 10240,
-    "high": 32768
+    "high": 32768,
+    "xhigh": 49152,
+    "max": 65536
   }
 }
 ```
+
+### Recursive child routes
+
+`modelRoles` names reusable RLM model routes. A role accepts one selector or an ordered selector list. Prime Agent selects the first authenticated native candidate. An omitted `model` argument uses `task` when that role exists; otherwise it inherits the parent model. Exact `provider/model` selectors keep their existing behavior.
+
+```yaml
+modelRoles:
+  task: openai-codex/gpt-5.6-luna:high
+  copilot-grok: github-copilot/grok-4.5:high
+  luna: openai-codex/gpt-5.6-luna:high
+  deepseek: openrouter/deepseek/deepseek-v4-flash-0731:max
+  claude: claude-code/claude-opus-4-7:high
+claudeCode:
+  executable: /absolute/path/to/claude
+```
+
+Append `:<effort>` to a model string to bind the role's exact provider effort, even when the model catalog marks that effort unsupported, as in `github-copilot/grok-4.5:high`. Call `await rlm("task", model="@luna")` or use the result's `concrete_selector` from `await rlm.find_models("luna")`. Project roles merge over global roles by name.
+
+Act defaults to one synchronous depth, so the root Sol actor may call one retained Act actor. Set `rlmActMaxDepth: 0` to disable Act. Configure a scalar depth-1 default when that call should omit `model`:
+
+```yaml
+rlmActDefaultModel: "@luna"
+modelRoles:
+  luna: openai-codex/gpt-5.6-luna:high
+```
+
+A scalar applies only at Act depth 1. To permit and default a second depth, configure both settings:
+
+```yaml
+rlmActMaxDepth: 2
+rlmActDefaultModel:
+  - "@luna"     # Sol -> Luna, Act depth 1
+  - "@deepseek" # Luna -> DeepSeek, Act depth 2
+modelRoles:
+  luna: openai-codex/gpt-5.6-luna:high
+  deepseek: openrouter/deepseek/deepseek-v4-flash-0731:max
+```
+
+Array index zero supplies depth 1, index one supplies depth 2, and so on. A missing entry requires an explicit `model=` at that depth. An explicit selector overrides the configured entry. Prime Agent rejects calls beyond `rlmActMaxDepth` and calls without a selector before provider or shared-cell work. Each admitted depth retains a private transcript per resolved model while every selector and depth shares the root IPython namespace. Reusing a selector that resolves to the same model resumes its transcript; changing the resolved model never carries one model's conversation into another model's session.
+
+A native child retains its admitted role order for its resident lifetime. A retryable provider failure that occurs before the response produces text, thinking, or tool calls advances immediately to the next available and authenticated candidate. The new candidate uses its configured effort and a fresh same-model retry budget without changing global model or thinking defaults. Prime Agent checks candidate availability and authentication again at the switch. Exact selectors and `claude-code/<model>` children do not use role fallback.
+
+`claude-code/<model>` selects an external Claude Agent SDK child rather than a `pi-ai` provider. The configured executable supplies Claude authentication. Prime Agent denies Claude's native `Agent`, `Task`, and `SendMessage` tools and provides an in-process family adapter for listing, correlated send, retained inbox, and wait operations. Claude queries and follow-up input remain live only while the parent worker lives; daemon passivation or replacement closes them, and cold revival does not reconstruct them.
+
+### OpenRouter Transport
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `openRouter.responses` | boolean | `false` | Prefer OpenRouter's stateless Responses API and fall back to Chat Completions only when the Responses transport is unavailable before streaming starts |
+
+Prime Agent sends its opaque local session UUID as `session_id` on both OpenRouter transports. OpenRouter uses it for dashboard grouping and sticky upstream routing. When prompt caching is enabled, Responses also sends the same value as `prompt_cache_key`. Both transports send the complete conversation context on every request.
+
+```yaml
+openRouter:
+  responses: true
+```
+
+Prime Agent reads this setting for every provider request, so an external JSON or YAML edit applies to the next request without `/reload`. Chat Completions remains the default. When Responses is enabled, cancellation, context overflow, authentication, rate limiting, invalid input, and failures after streaming starts do not cross transports.
+
+### Session elapsed time
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `sessionElapsedTime.enabled` | boolean | `false` | Add session time, quantized to 30-second intervals, to the transient provider system prompt |
+
+```yaml
+sessionElapsedTime:
+  enabled: true
+```
+
+The elapsed-time hint is disabled by default. When enabled, Prime Agent reads
+the setting for every provider request, so an external settings edit applies to
+the next request without `/reload`. The hint is measured from the first
+persisted message on the current conversation branch and is never stored in the
+transcript or rendered in the TUI.
 
 ### UI & Display
 
@@ -45,6 +138,16 @@ Edit directly or use `/settings` for common options.
 | `editorPaddingX` | number | `0` | Horizontal padding for input editor (0-3) |
 | `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown (3-20) |
 | `showHardwareCursor` | boolean | `false` | Show terminal cursor |
+| `agentsViewUsage.enabled` | boolean | `false` | Show token totals and estimated own/recursive costs in agents-list rows |
+
+```yaml
+agentsViewUsage:
+  enabled: false
+```
+
+Set `enabled: true` to show `↑input ↓output · $own ($recursive w/ subagents)`
+on each agents-list row. When disabled, active rows show age only and inactive
+rows show message count and age.
 
 ### Update Checks
 
@@ -115,13 +218,58 @@ prime-agent --offline
 | `compaction.enabled` | boolean | `true` | Enable auto-compaction |
 | `compaction.reserveTokens` | number | `16384` | Tokens reserved for LLM response |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens to keep (not summarized) |
+| `compaction.triggerContextTokens` | number | unset | Absolute context-token count that starts auto compaction; compaction fires at whichever is smaller of this threshold and `contextWindow - reserveTokens` (for example `256000` on a 1M-token model) |
+| `compaction.native` | boolean | `true` | Prefer provider-native compaction when the active API supports it |
+| `compaction.strategy` | string | `"default"` | Select `"default"`, `"scratch-handoff"`, or `"native-or-scratch"` compaction |
+| `scratchHandoff.enabled` | boolean | `false` | Allow scratch-handoff compaction for vision-capable models |
+| `scratchHandoff.rootDir` | string | `"agent"` | Directory, relative to the working directory unless absolute, that contains the session's scratch Org file |
+
+Supported OpenAI Codex models use the native `/responses/compact` operation by default. Prime Agent stores the returned opaque history in the session and replays it only to the same provider. A provider switch re-expands the original append-only entries. Unsupported providers, an explicit `false`, and native failures before a valid result use the existing local summary path.
+
+`"scratch-handoff"` selects scratch handoff whenever it is enabled and the
+active model accepts images. `"native-or-scratch"` keeps provider-native
+compaction when available and otherwise selects scratch handoff. If scratch
+handoff is disabled or the model cannot accept images, Prime Agent visibly
+warns and uses ordinary compaction. Emergency overflow recovery always uses
+ordinary compaction.
+
+A scratch-handoff session starts without a scratch file or scratch-specific
+system prompt. At its first manual, threshold, or requested compaction boundary,
+Prime Agent asks the agent:
+
+> Stop working for now; please create a .org file brain-dump of your ongoing work to {path}, use org-todo structure including TODO subheadings, subheadings of subheadings, TODOs on nested subheadings, and so on. It should be detailed enough to hand off this work to a colleague.
+
+At later boundaries it asks:
+
+> Stop working for now and make any final edits to {path} such that you can hand it to a colleague to continue this work.
+
+The closeout must create a readable, non-empty file. Otherwise compaction fails
+and preserves the old context. After a successful closeout, Prime Agent renders
+the session through the point immediately before the closeout into snapshot
+images, clears the active context, and supplies one replacement user message:
+the images, the complete Org file labelled with its resolved source path, and
+this final instruction:
+
+> Keep this org file up to date as you continue the tasks within. When you finish a task or subtask, update it from TODO to DONE and move any notes to the daily log leaving behind a short org-link to the relevant daily log entry in the scratch file. If you are confused on what this means, read the daily-log skill. After marking a task as DONE, check if there are any parent headings to mark DONE, or any peer or child TODO headings to action next, and loop.
+
+The replacement contains no generated summary or text delta. At the next
+boundary Prime Agent rerenders a new snapshot generation from the prior
+generation's stored source plus subsequent session entries, reads the same Org
+file in full, and installs the replacement message again.
 
 ```json
 {
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
-    "keepRecentTokens": 20000
+    "keepRecentTokens": 20000,
+    "triggerContextTokens": 256000,
+    "native": true,
+    "strategy": "scratch-handoff"
+  },
+  "scratchHandoff": {
+    "enabled": true,
+    "rootDir": "agent"
   }
 }
 ```
@@ -202,7 +350,7 @@ Normally the package manager's global modules location is queried using `root -g
 |---------|------|---------|-------------|
 | `idleEvictionMinutes` | number or `"off"` | `90` | Idle threshold in minutes for whole-tree worker eviction and individual idle-child passivation; `"off"` disables both. |
 
-`idleEvictionMinutes` is a global daemon policy and is read only from `~/.prime/agent/settings.json`. Set it to a positive number to configure the idle threshold.
+`idleEvictionMinutes` is a global daemon policy and is read only from the global settings file. Set it to a positive number to configure the idle threshold.
 
 ### Sessions
 
@@ -214,7 +362,7 @@ Normally the package manager's global modules location is queried using `root -g
 { "sessionDir": ".prime/agent/sessions" }
 ```
 
-When multiple sources specify a session directory, precedence is `--session-dir`, `PRIME_AGENT_SESSION_DIR`, the legacy `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, then `sessionDir` in `settings.json`.
+When multiple sources specify a session directory, precedence is `--session-dir`, `PRIME_AGENT_SESSION_DIR`, the legacy `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, then `sessionDir` in the settings file.
 
 ### Model Cycling
 
@@ -238,7 +386,7 @@ When multiple sources specify a session directory, precedence is `--session-dir`
 
 These settings define where to load extensions, skills, prompts, and themes from.
 
-Paths in `~/.prime/agent/settings.json` resolve relative to `~/.prime/agent`. Paths in `.prime/agent/settings.json` resolve relative to `.prime/agent`. Absolute paths and `~` are supported.
+Paths in the global settings file resolve relative to `~/.prime/agent`. Paths in the project settings file resolve relative to `.prime/agent`. Absolute paths and `~` are supported.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
@@ -316,7 +464,7 @@ See [packages.md](packages.md) for package management details.
 
 ## Project Overrides
 
-Project settings (`.prime/agent/settings.json`) override global settings. Nested objects are merged:
+Project settings override global settings. Nested objects are merged; this JSON example has the same meaning in YAML:
 
 ```json
 // ~/.prime/agent/settings.json (global)

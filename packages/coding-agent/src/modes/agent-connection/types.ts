@@ -1,5 +1,6 @@
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, ServiceTier, TextContent, Transport, Usage } from "@earendil-works/pi-ai";
+import type { ActProjectionEvent } from "../../core/act-events.js";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AuthSourceToken } from "../../core/auth-storage.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
@@ -14,9 +15,11 @@ import type {
 } from "../../core/cron-jobs.js";
 import type { ReplayBuiltInToolName } from "../../core/extensions/index.js";
 import type { InputSource } from "../../core/extensions/types.js";
+import type { ExternalEventWatch } from "../../core/external-events.js";
 import type { GoalState } from "../../core/goals.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
+import type { CustomMessage } from "../../core/messages.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { RlmMaxDepthStatus, SetRlmMaxDepthResult } from "../../core/rlm-max-depth.js";
 import type {
@@ -204,6 +207,27 @@ export interface AgentConnectionChildUsageAttributionEntry extends AgentConnecti
 	origin?: "spawn_task" | "agent_message" | "direct_user";
 }
 
+export interface AgentConnectionActStartEntry extends AgentConnectionSessionEntryBase {
+	type: "act_start";
+	actId: string;
+	depth?: number;
+	parentActId?: string;
+	sessionKey?: string;
+	usageBaseline: Usage;
+}
+
+export interface AgentConnectionActTerminalEntry extends AgentConnectionSessionEntryBase {
+	type: "act_terminal";
+	actId: string;
+	depth?: number;
+	parentActId?: string;
+	sessionKey?: string;
+	status: "done" | "cancelled" | "error" | "interrupted";
+	usage: Usage;
+	model?: { provider: string; id: string };
+	error?: string;
+}
+
 export interface AgentConnectionCustomMessageEntry extends AgentConnectionSessionEntryBase {
 	type: "custom_message";
 	customType: string;
@@ -251,6 +275,8 @@ export type AgentConnectionSessionEntry =
 	| AgentConnectionBranchSummaryEntry
 	| AgentConnectionCustomEntry
 	| AgentConnectionChildUsageAttributionEntry
+	| AgentConnectionActStartEntry
+	| AgentConnectionActTerminalEntry
 	| AgentConnectionCustomMessageEntry
 	| AgentConnectionLabelEntry
 	| AgentConnectionSessionInfoEntry
@@ -331,6 +357,9 @@ export interface AgentConnectionState {
 	model?: AgentConnectionModel;
 	thinkingLevel: ThinkingLevel;
 	serviceTier: ServiceTier;
+	rlmMaxDepth?: number;
+	actEnabled?: boolean;
+	retryEnabled?: boolean;
 	availableThinkingLevels: ThinkingLevel[];
 	isStreaming: boolean;
 	isCompacting: boolean;
@@ -458,7 +487,11 @@ export interface AgentConnectionPromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	queueIfBusy?: boolean;
 	source?: InputSource;
-	/** Cancels only while admission waits; accepted prompts remain session-owned. */
+	/** Host-authored message to persist instead of a visible user message. */
+	customMessage?: CustomMessage;
+	/** Bypass user input expansion and handlers for a host-authored prompt. */
+	internalPrompt?: boolean;
+	/** Cancel admission while it is still waiting; accepted prompts remain session-owned. */
 	signal?: AbortSignal;
 }
 
@@ -489,6 +522,8 @@ export interface AgentConnectionExecuteBashOptions {
 
 export interface AgentConnectionNewSessionOptions {
 	parentSession?: string;
+	/** Working directory for the new session; defaults to the current session's cwd. */
+	cwd?: string;
 }
 
 export interface AgentConnectionForkOptions {
@@ -572,6 +607,7 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 
 export type AgentConnectionSessionEvent =
 	| AgentEvent
+	| ActProjectionEvent
 	| { type: "ipython_sent_agent_message"; toolCallId: string; message: KernelSentAgentMessage }
 	| { type: "session_action_update"; actions: SessionActionSnapshot }
 	| {
@@ -611,7 +647,8 @@ export type AgentConnectionSessionEvent =
 			runId?: string;
 	  }
 	| { type: "refine_complete"; result: RefinementResult }
-	| { type: "refine_failed"; error: string };
+	| { type: "refine_failed"; error: string }
+	| { type: "external_event_watches_changed"; watches: ExternalEventWatch[] };
 
 export type AgentConnectionEvent =
 	| { type: "session_event"; event: AgentConnectionSessionEvent }
@@ -670,6 +707,7 @@ export interface AgentConnection {
 	acquireSessionInputPause(leaseKey: string): Promise<AgentConnectionSessionInputPause>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;
 	listHeartbeats(): Promise<AgentConnectionHeartbeat[]>;
+	listExternalEventWatches(): Promise<ExternalEventWatch[]>;
 	manageHeartbeat(
 		activeSessionId: string,
 		jobId: string,
@@ -706,6 +744,7 @@ export interface AgentConnection {
 	abortSideQuestion(id: string): Promise<boolean>;
 	steer(message: string, images?: ImageContent[]): Promise<void>;
 	followUp(message: string, images?: ImageContent[]): Promise<void>;
+	/** Abort the active operation and drain its events without consuming queued work. */
 	abort(): Promise<void>;
 	cancelRlmChild(childId: string): Promise<boolean>;
 	waitForIdle(): Promise<void>;
@@ -720,7 +759,7 @@ export interface AgentConnection {
 	executeBashAndWait(command: string): Promise<BashResult>;
 	abortBash(): Promise<void>;
 
-	setModel(provider: string, modelId: string): Promise<AgentConnectionModel>;
+	setModel(provider: string, modelId: string, options?: { persistDefault?: boolean }): Promise<AgentConnectionModel>;
 	cycleModel(direction?: "forward" | "backward"): Promise<AgentConnectionModelCycleResult | undefined>;
 	setScopedModels(scopedModels: AgentConnectionScopedModel[]): Promise<void>;
 	setThinkingLevel(level: ThinkingLevel): Promise<void>;

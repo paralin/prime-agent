@@ -4,8 +4,17 @@ import { Container, type MarkdownTheme } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { type AgentCronJob, shouldDeferHeartbeatCronJob } from "../../../src/core/cron-jobs.js";
+import {
+	createEnglishOutputNudgeMessage,
+	ENGLISH_OUTPUT_NUDGE_PROMPT,
+} from "../../../src/core/english-output-nudge.js";
 import { createGoalContextMessage, type GoalState } from "../../../src/core/goals.js";
-import { createHeartbeatPromptMessage, HEARTBEAT_PROMPT_CUSTOM_TYPE } from "../../../src/core/messages.js";
+import {
+	createHeartbeatPromptMessage,
+	createRepetitionNoticeMessage,
+	HEARTBEAT_PROMPT_CUSTOM_TYPE,
+} from "../../../src/core/messages.js";
+import { BASH_ERROR_NUDGE_PROMPT, createToolErrorNudgeMessage } from "../../../src/core/tool-error-nudge.js";
 import {
 	InjectedPromptMessageComponent,
 	isInjectedPromptMessage,
@@ -622,5 +631,47 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 
 		component.setExpanded(true);
 		expect(render(component)).toContain("<goal_context>");
+	});
+
+	it("renders repetition notices as injected prompt panels", () => {
+		const message = createRepetitionNoticeMessage();
+		const component = new InjectedPromptMessageComponent(message);
+
+		expect(message.display).toBe(true);
+		expect(isInjectedPromptMessage(message)).toBe(true);
+		expect(render(component)).toContain("Repetition notice");
+		expect(render(component)).toContain("You are repeating yourself");
+
+		component.setExpanded(true);
+		expect(render(component)).toContain("collect more information if necessary");
+	});
+
+	it("renders tool error notices as injected prompt panels", () => {
+		const message = createToolErrorNudgeMessage({
+			kind: "bash",
+			prompt: BASH_ERROR_NUDGE_PROMPT,
+		});
+		const component = new InjectedPromptMessageComponent(message);
+
+		expect(message.display).toBe(true);
+		expect(isInjectedPromptMessage(message)).toBe(true);
+		expect(render(component)).toContain("Tool error notice");
+		expect(render(component)).toContain("bash calls are malformed");
+
+		component.setExpanded(true);
+		expect(render(component)).toContain("think through the syntax");
+	});
+
+	it("renders english reminders as injected prompt panels", () => {
+		const message = createEnglishOutputNudgeMessage();
+		const component = new InjectedPromptMessageComponent(message);
+
+		expect(message.display).toBe(true);
+		expect(isInjectedPromptMessage(message)).toBe(true);
+		expect(render(component)).toContain("English reminder");
+		expect(render(component)).toContain("use English language");
+
+		component.setExpanded(true);
+		expect(render(component)).toContain(ENGLISH_OUTPUT_NUDGE_PROMPT);
 	});
 });

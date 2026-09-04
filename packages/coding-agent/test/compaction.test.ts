@@ -11,11 +11,13 @@ import {
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
+	estimateTokens,
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
 	shouldCompact,
 } from "../src/core/compaction/index.js";
+import { convertToLlm } from "../src/core/messages.js";
 import {
 	buildSessionContext,
 	type CompactionEntry,
@@ -176,29 +178,33 @@ function extractText(messages: AgentMessage[]): string {
 // ============================================================================
 
 describe("buildSummarizationPrompt", () => {
-	it("omits user instructions block when no instructions given", () => {
+	it("keeps fixed summary policy and the kernel note in the system prompt", () => {
 		const prompt = buildSummarizationPrompt();
-		expect(prompt).not.toContain("<user-instructions>");
 		expect(prompt).toContain("## Goal");
-		// The kernel keeps running across compaction — the note must not claim a wipe.
-		expect(prompt).toContain("Python kernel keeps running");
+		expect(prompt).toContain("IPython kernel keeps running");
+		expect(prompt).toContain("Preserve how each material statement is known");
+		expect(prompt).toContain("expectation that existed before the check and the observed result");
+		expect(prompt).toContain(
+			"Do not turn a plan, hypothesis, assistant claim, or requested action into a completed fact",
+		);
 		expect(prompt).not.toMatch(/wiped|restarted/);
 	});
 
-	it("includes user instructions in a delimited block before the kernel note", () => {
-		const prompt = buildSummarizationPrompt("focus on the auth refactor, remember the migration command");
-		expect(prompt).toContain("<user-instructions>");
-		expect(prompt).toContain("focus on the auth refactor, remember the migration command");
-		expect(prompt).toContain("</user-instructions>");
-		expect(prompt.indexOf("</user-instructions>")).toBeLessThan(prompt.indexOf("Python kernel"));
+	it("keeps custom summary text out of the system prompt", () => {
+		const preference = "focus on the auth refactor, remember the migration command";
+		const prompt = buildSummarizationPrompt(preference);
+		expect(prompt).toContain("<summary-preferences-json-string>");
+		expect(prompt).not.toContain(preference);
+		expect(prompt).not.toContain("<user-instructions>");
 	});
 
 	it("uses the update template when a previous summary exists", () => {
 		const initial = buildSummarizationPrompt("focus on xyz");
 		const update = buildSummarizationPrompt("focus on xyz", "## Goal\nprevious summary");
-		expect(initial).not.toContain("existing summary provided in <previous-summary> tags");
-		expect(update).toContain("existing summary provided in <previous-summary> tags");
-		expect(update).toContain("<user-instructions>");
+		expect(initial).toContain("Create a structured context checkpoint");
+		expect(initial).not.toContain("Merge the new conversation data");
+		expect(update).toContain("Merge the new conversation data");
+		expect(update).toContain("A later message that adds work does not cancel earlier unfinished work");
 	});
 });
 
@@ -211,6 +217,29 @@ describe("Token calculation", () => {
 	it("should handle zero values", () => {
 		const usage = createMockUsage(0, 0, 0, 0);
 		expect(calculateContextTokens(usage)).toBe(0);
+	});
+
+	it("estimates the full local transcript after a Merge Gateway response", () => {
+		const messages: AgentMessage[] = [
+			createUserMessage("earlier context ".repeat(400)),
+			{
+				...createAssistantMessage("compressed answer", createMockUsage(20, 5)),
+				api: "merge-gateway-responses",
+				provider: "merge-gateway",
+				model: "example/model",
+			},
+			createUserMessage("current instruction ".repeat(40)),
+		];
+
+		const estimate = estimateContextTokens(messages);
+
+		expect(estimate).toEqual({
+			tokens: messages.reduce((total, message) => total + estimateTokens(message), 0),
+			usageTokens: 0,
+			trailingTokens: messages.reduce((total, message) => total + estimateTokens(message), 0),
+			lastUsageIndex: null,
+		});
+		expect(estimate.tokens).toBeGreaterThan(25);
 	});
 });
 
@@ -256,6 +285,7 @@ describe("shouldCompact", () => {
 	it("should return true when context exceeds threshold", () => {
 		const settings: CompactionSettings = {
 			enabled: true,
+			native: true,
 			reserveTokens: 10000,
 			keepRecentTokens: 20000,
 		};
@@ -267,6 +297,7 @@ describe("shouldCompact", () => {
 	it("should return false when disabled", () => {
 		const settings: CompactionSettings = {
 			enabled: false,
+			native: true,
 			reserveTokens: 10000,
 			keepRecentTokens: 20000,
 		};
@@ -277,11 +308,48 @@ describe("shouldCompact", () => {
 	it("should return false when context window is unknown", () => {
 		const settings: CompactionSettings = {
 			enabled: true,
+			native: true,
 			reserveTokens: 10000,
 			keepRecentTokens: 20000,
 		};
 
 		expect(shouldCompact(95000, 0, settings)).toBe(false);
+	});
+
+	it("should honor an absolute trigger threshold over the window reserve", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			native: true,
+			reserveTokens: 16384,
+			keepRecentTokens: 20000,
+			triggerContextTokens: 256000,
+		};
+
+		// A 1M-token window with the default reserve would not compact yet.
+		expect(shouldCompact(256001, 1_000_000, settings)).toBe(true);
+		expect(shouldCompact(256000, 1_000_000, settings)).toBe(false);
+		// The absolute threshold applies even when the window is unknown.
+		expect(shouldCompact(256001, 0, settings)).toBe(true);
+	});
+
+	it("should compact at whichever trigger is smaller: the manual threshold or the window reserve", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			native: true,
+			reserveTokens: 16384,
+			keepRecentTokens: 20000,
+			triggerContextTokens: 900_000,
+		};
+
+		// The manual 900k fires before the window reserve (1000000 - 16384).
+		expect(shouldCompact(900_001, 1_000_000, settings)).toBe(true);
+		expect(shouldCompact(900_000, 1_000_000, settings)).toBe(false);
+
+		// A manual threshold above the window reserve never delays compaction:
+		// the reserve boundary still fires.
+		const late: CompactionSettings = { ...settings, triggerContextTokens: 999_000 };
+		expect(shouldCompact(983_617, 1_000_000, late)).toBe(true);
+		expect(shouldCompact(983_616, 1_000_000, late)).toBe(false);
 	});
 });
 
@@ -434,6 +502,91 @@ describe("buildSessionContext", () => {
 		expect(loaded.model).toEqual({ provider: "anthropic", modelId: "claude-sonnet-4-5" });
 		expect(loaded.thinkingLevel).toBe("high");
 	});
+
+	it("replays compatible provider-native history through the compaction summary", () => {
+		const u1 = createMessageEntry(createUserMessage("original prefix"));
+		const a1 = createMessageEntry(createAssistantMessage("original answer"));
+		const u2 = createMessageEntry(createUserMessage("retained suffix"));
+		const compaction = createCompactionEntry("Native compaction", u2.id);
+		compaction.providerNativeCompaction = {
+			provider: "anthropic",
+			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+			compactionItem: { type: "compaction", encrypted_content: "opaque" },
+		};
+
+		const loaded = buildSessionContext([u1, a1, u2, compaction]);
+		const summary = loaded.messages[0];
+		expect(summary).toMatchObject({
+			role: "compactionSummary",
+			providerPayload: {
+				type: "openaiResponsesHistory",
+				provider: "anthropic",
+				items: [{ type: "compaction", encrypted_content: "opaque" }],
+			},
+		});
+		const llmSummary = convertToLlm([summary]);
+		expect(llmSummary[0]).toMatchObject({
+			role: "user",
+			providerPayload: { type: "openaiResponsesHistory", provider: "anthropic" },
+		});
+	});
+
+	it("re-expands original entries when provider-native history is incompatible", () => {
+		const u1 = createMessageEntry(createUserMessage("original prefix"));
+		const a1 = createMessageEntry(createAssistantMessage("original answer"));
+		const u2 = createMessageEntry(createUserMessage("retained suffix"));
+		const compaction = createCompactionEntry("Native compaction", u2.id);
+		compaction.providerNativeCompaction = {
+			provider: "openai-codex",
+			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+			compactionItem: { type: "compaction", encrypted_content: "opaque" },
+		};
+
+		const loaded = buildSessionContext([u1, a1, u2, compaction]);
+		// The latest compaction boundary still applies; only the opaque payload is
+		// dropped, so the summary text stands in for the pre-compaction history.
+		expect(loaded.messages[0]).toMatchObject({ role: "compactionSummary", summary: "Native compaction" });
+		expect((loaded.messages[0] as { providerPayload?: unknown }).providerPayload).toBeUndefined();
+		expect(extractText(loaded.messages)).toContain("retained suffix");
+	});
+
+	it("uses the newest portable boundary when later native history is incompatible", () => {
+		const oldUser = createMessageEntry(createUserMessage("old raw prefix"));
+		const oldAssistant = createMessageEntry(createAssistantMessage("old raw answer"));
+		const portableUser = createMessageEntry(createUserMessage("portable retained user"));
+		const portableAssistant = createMessageEntry(createAssistantMessage("portable retained answer"));
+		const portableCompaction = createCompactionEntry("Portable summary", portableUser.id);
+		const nativeUser = createMessageEntry(createUserMessage("native retained user"));
+		const nativeAssistant = createMessageEntry(createAssistantMessage("native retained answer"));
+		const nativeCompaction = createCompactionEntry("Native summary", nativeUser.id);
+		nativeCompaction.providerNativeCompaction = {
+			provider: "openai-codex",
+			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+			compactionItem: { type: "compaction", encrypted_content: "opaque" },
+		};
+		const recentUser = createMessageEntry(createUserMessage("recent user"));
+		const recentAssistant = createMessageEntry(createAssistantMessage("recent answer"));
+		const entries = [
+			oldUser,
+			oldAssistant,
+			portableUser,
+			portableAssistant,
+			portableCompaction,
+			nativeUser,
+			nativeAssistant,
+			nativeCompaction,
+			recentUser,
+			recentAssistant,
+		];
+
+		const loaded = buildSessionContext(entries, undefined, undefined, "anthropic");
+		// The newest boundary (native) applies; its opaque payload is dropped on
+		// the mismatching provider, so the summary text is used instead.
+		expect(loaded.messages[0]).toMatchObject({ role: "compactionSummary", summary: "Native summary" });
+		expect((loaded.messages[0] as { providerPayload?: unknown }).providerPayload).toBeUndefined();
+		expect(extractText(loaded.messages)).not.toContain("old raw prefix");
+		expect(extractText(loaded.messages)).toContain("native retained user");
+	});
 });
 
 describe("prepareCompaction with small sessions", () => {
@@ -488,6 +641,75 @@ describe("prepareCompaction with previous compaction", () => {
 
 		expect(contextAfterText).toContain("user msg 2 - kept by compaction1");
 		expect(contextAfterText).toContain("user msg 3 - kept by compaction1");
+	});
+
+	it("carries compatible native history and re-expands it for local fallback", () => {
+		const u1 = createMessageEntry(createUserMessage("old original prefix ".repeat(20)));
+		const a1 = createMessageEntry(createAssistantMessage("old original answer ".repeat(20)));
+		const u2 = createMessageEntry(createUserMessage("previously retained suffix ".repeat(20)));
+		const compaction = createCompactionEntry("Native compaction", u2.id);
+		compaction.providerNativeCompaction = {
+			provider: "anthropic",
+			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+			compactionItem: { type: "compaction", encrypted_content: "opaque" },
+		};
+		const u3 = createMessageEntry(createUserMessage("new turn ".repeat(20)));
+		const a3 = createMessageEntry(createAssistantMessage("new answer ".repeat(20), createMockUsage(1000, 100)));
+		const entries = [u1, a1, u2, compaction, u3, a3];
+		const settings = { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 1 };
+
+		const nativePreparation = prepareCompaction(entries, settings, "anthropic");
+		expect(nativePreparation?.previousNativeCompaction).toEqual(compaction.providerNativeCompaction);
+		expect(extractText(nativePreparation?.messagesToSummarize ?? [])).not.toContain("old original prefix");
+
+		const localPreparation = prepareCompaction(entries, settings);
+		// The opaque payload is dropped for a different provider, but the latest
+		// boundary still applies: the summary text carries the compacted prefix.
+		expect(localPreparation?.previousNativeCompaction).toBeUndefined();
+		expect(localPreparation?.previousSummary).toBe("Native compaction");
+		expect(extractText(localPreparation?.messagesToSummarize ?? [])).not.toContain("old original prefix");
+	});
+
+	it("uses an older portable boundary when local fallback cannot replay the latest native boundary", () => {
+		const oldUser = createMessageEntry(createUserMessage("old raw prefix ".repeat(20)));
+		const oldAssistant = createMessageEntry(createAssistantMessage("old raw answer ".repeat(20)));
+		const portableUser = createMessageEntry(createUserMessage("portable retained user ".repeat(20)));
+		const portableAssistant = createMessageEntry(createAssistantMessage("portable retained answer ".repeat(20)));
+		const portableCompaction = createCompactionEntry("Portable summary", portableUser.id);
+		const nativeUser = createMessageEntry(createUserMessage("native retained user ".repeat(20)));
+		const nativeAssistant = createMessageEntry(createAssistantMessage("native retained answer ".repeat(20)));
+		const nativeCompaction = createCompactionEntry("Native summary", nativeUser.id);
+		nativeCompaction.providerNativeCompaction = {
+			provider: "openai-codex",
+			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+			compactionItem: { type: "compaction", encrypted_content: "opaque" },
+		};
+		const recentUser = createMessageEntry(createUserMessage("recent user ".repeat(20)));
+		const recentAssistant = createMessageEntry(
+			createAssistantMessage("recent answer ".repeat(20), createMockUsage(1000, 100)),
+		);
+		const entries = [
+			oldUser,
+			oldAssistant,
+			portableUser,
+			portableAssistant,
+			portableCompaction,
+			nativeUser,
+			nativeAssistant,
+			nativeCompaction,
+			recentUser,
+			recentAssistant,
+		];
+		const settings = { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 1 };
+
+		const preparation = prepareCompaction(entries, settings);
+
+		// The newest native boundary still applies even though its opaque payload
+		// cannot be replayed locally: the portable summary is not resurrected.
+		expect(preparation?.previousSummary).toBe("Native summary");
+		expect(preparation?.previousNativeCompaction).toBeUndefined();
+		expect(extractText(preparation?.messagesToSummarize ?? [])).not.toContain("old raw prefix");
+		expect(extractText(preparation?.messagesToSummarize ?? [])).toContain("native retained user");
 	});
 
 	it("should re-summarize previously kept messages when the recent window moves past them", () => {

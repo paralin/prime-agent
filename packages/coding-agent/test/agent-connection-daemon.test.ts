@@ -1,6 +1,8 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { getModel } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
+import type { ActStartEvent } from "../src/core/act-events.js";
+import { createManualContinueMessage, MANUAL_CONTINUE_PROMPT } from "../src/core/messages.js";
 import { MissingSessionCwdError } from "../src/core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../src/core/session-import-errors.js";
 import {
@@ -421,6 +423,8 @@ class FakeDaemonClient {
 					};
 				}
 				return { type: "response", command: command.type, success: true };
+			case "abort":
+				return { type: "response", command: command.type, success: true };
 			case "abort_bash":
 				if (this.abortBashUnknownCommand) {
 					return {
@@ -477,21 +481,24 @@ class FakeDaemonClient {
 						},
 					},
 				};
-			case "switch_session":
-				return {
-					type: "response",
-					command: command.type,
-					success: false,
-					error: "Stored session working directory does not exist: /tmp/missing\nSession file: /tmp/session.jsonl\nCurrent working directory: /tmp/current",
-					errorInfo: {
-						code: "missing_session_cwd",
-						issue: {
-							sessionFile: "/tmp/session.jsonl",
-							sessionCwd: "/tmp/missing",
-							fallbackCwd: "/tmp/current",
+			case "create":
+				if ((command as { sessionPath?: string }).sessionPath === "/tmp/session.jsonl") {
+					return {
+						type: "response",
+						command: command.type,
+						success: false,
+						error: "Stored session working directory does not exist: /tmp/missing\nSession file: /tmp/session.jsonl\nCurrent working directory: /tmp/current",
+						errorInfo: {
+							code: "missing_session_cwd",
+							issue: {
+								sessionFile: "/tmp/session.jsonl",
+								sessionCwd: "/tmp/missing",
+								fallbackCwd: "/tmp/current",
+							},
 						},
-					},
-				};
+					};
+				}
+				throw new Error(`Unexpected create target: ${(command as { sessionPath?: string }).sessionPath}`);
 			case "import_jsonl":
 				return {
 					type: "response",
@@ -635,6 +642,22 @@ function createConnectionState(activeSessionId: string, sessionId: string): Agen
 		scopedModels: [],
 		activeToolNames: ["ipython"],
 		contextUsage: undefined,
+	};
+}
+
+function actStartEvent(): ActStartEvent {
+	return {
+		type: "act_event",
+		actId: "act-1",
+		depth: 2,
+		parentActId: "act-parent",
+		outerToolCallId: "outer-tool-1",
+		sequence: 1,
+		event: "start",
+		prompt: "inspect",
+		promptTruncated: false,
+		model: { provider: "test", id: "test-model" },
+		cancellationCapability: "posix-managed",
 	};
 }
 
@@ -1492,6 +1515,22 @@ describe("DaemonAgentConnection", () => {
 			message: "queued input",
 			streamingBehavior: "followUp",
 			queueIfBusy: true,
+		});
+	});
+
+	it("forwards hidden internal continuation prompts", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const customMessage = createManualContinueMessage(123);
+
+		await connection.prompt(MANUAL_CONTINUE_PROMPT, { customMessage, internalPrompt: true });
+
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "prompt",
+			activeSessionId: "active-1",
+			message: MANUAL_CONTINUE_PROMPT,
+			customMessage,
+			internalPrompt: true,
 		});
 	});
 
@@ -2399,7 +2438,6 @@ describe("DaemonAgentConnection", () => {
 			"attach",
 			"get_connection_state",
 			"get_messages",
-			"get_session_context",
 		]);
 	});
 
@@ -2715,11 +2753,7 @@ describe("DaemonAgentConnection", () => {
 					},
 				});
 			}
-			expect(fakeClient.requests.map((request) => request.type)).toEqual([
-				"get_connection_state",
-				"get_messages",
-				"get_session_context",
-			]);
+			expect(fakeClient.requests.map((request) => request.type)).toEqual(["get_connection_state", "get_messages"]);
 			emitSequencedQueueUpdate(fakeClient, "active-2", 13);
 			await vi.waitFor(() => expect(siblingEvents).toHaveLength(1));
 			expect(siblingEvents[0]).toMatchObject({ type: "session_event", event: { type: "session_action_update" } });
@@ -3008,10 +3042,8 @@ describe("DaemonAgentConnection", () => {
 				sessionId: "session-current",
 			},
 			messages: [{ role: "user", content: "current prompt", timestamp: 4 }],
-			sessionContext: {
-				messages: [{ role: "user", content: "context prompt", timestamp: 3 }],
-			},
 		});
+		expect(snapshot.sessionContext).toBeUndefined();
 		// The session tree is fetched lazily (only when the tree/branch selector is
 		// opened), so refreshing the initial snapshot must not request it.
 		expect(snapshot.sessionTree).toBeUndefined();
@@ -3019,7 +3051,6 @@ describe("DaemonAgentConnection", () => {
 			"attach",
 			"get_connection_state",
 			"get_messages",
-			"get_session_context",
 		]);
 	});
 
@@ -3042,6 +3073,7 @@ describe("DaemonAgentConnection", () => {
 				protocol: DAEMON_PROTOCOL_INFO,
 				activeSessionId: "active-1",
 				sequence: 10,
+				cursor: { generation: "generation-active-1", sequence: 10 },
 				emittedAt: "2026-01-01T00:00:00.000Z",
 			},
 		});
@@ -3055,6 +3087,7 @@ describe("DaemonAgentConnection", () => {
 				protocol: DAEMON_PROTOCOL_INFO,
 				activeSessionId: "active-1",
 				sequence: 13,
+				cursor: { generation: "generation-active-1", sequence: 13 },
 				emittedAt: "2026-01-01T00:00:00.000Z",
 			},
 		});
@@ -3071,6 +3104,62 @@ describe("DaemonAgentConnection", () => {
 		await expect(connection.getState()).resolves.toMatchObject({
 			sessionId: "session-new",
 		});
+	});
+
+	it("does not let a legacy cursor-less sequence drop newer generation-scoped events", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.attachResultFactory = (command) =>
+			createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 10);
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		await connection.attach();
+		// A legacy daemon emits sequenced frames without a generation cursor.
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: ["legacy"], followUps: [] },
+			},
+			meta: {
+				id: "active-1:99",
+				protocol: DAEMON_PROTOCOL_INFO,
+				activeSessionId: "active-1",
+				sequence: 99,
+				emittedAt: "2026-01-01T00:00:00.000Z",
+			},
+		});
+		emitSequencedQueueUpdate(fakeClient, "active-1", 11);
+
+		expect(events).toEqual([
+			{
+				type: "session_event",
+				event: {
+					type: "session_action_update",
+					actions: { queuedCount: 0, steering: ["legacy"], followUps: [] },
+				},
+			},
+			{
+				type: "session_event",
+				event: {
+					type: "session_action_update",
+					actions: { queuedCount: 0, steering: [], followUps: [] },
+				},
+			},
+		]);
+	});
+
+	it("uses the long-running request timeout for abort", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.abort();
+
+		expect(fakeClient.requests).toEqual([expect.objectContaining({ type: "abort", activeSessionId: "active-1" })]);
+		expect(fakeClient.requestTimeouts).toEqual([24 * 60 * 60 * 1000]);
 	});
 
 	it("sends queue commands through the daemon protocol", async () => {
@@ -3476,10 +3565,12 @@ describe("DaemonAgentConnection", () => {
 			activeSessionId: "active-1",
 			clientId: expect.any(String),
 			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"],
+			// A legacy sequenced frame without a cursor never advances the
+			// generation-scoped resume cursor.
 			resumeCursor: {
 				activeSessionId: "active-1",
 				generation: "generation-active-1",
-				sequence: 14,
+				sequence: 12,
 			},
 		});
 
@@ -3491,7 +3582,7 @@ describe("DaemonAgentConnection", () => {
 			resumeCursor: {
 				activeSessionId: "active-1",
 				generation: "generation-active-1",
-				sequence: 14,
+				sequence: 12,
 			},
 		});
 	});
@@ -3530,6 +3621,138 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests.at(-1)).toMatchObject({
 			type: "attach",
 			resumeCursor: { generation: "generation-new", sequence: 1 },
+		});
+	});
+
+	it("negotiates the Act stream in both version directions without disturbing ordinary sequence", async () => {
+		const oldDaemon = new FakeDaemonClient();
+		const oldConnection = new DaemonAgentConnection(asDaemonClient(oldDaemon), "active-1");
+		const oldEvents: AgentConnectionEvent[] = [];
+		oldConnection.subscribe((event) => {
+			oldEvents.push(event);
+		});
+		await oldConnection.attach();
+		expect(oldDaemon.requests[0]).toMatchObject({ type: "attach" });
+		expect((oldDaemon.requests[0] as Extract<DaemonCommand, { type: "attach" }>).capabilities).not.toContain(
+			"rlm_act_stream",
+		);
+
+		oldDaemon.emitMessage({ type: "session_event", activeSessionId: "active-1", event: actStartEvent() });
+		oldDaemon.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: {
+				type: "tool_execution_start",
+				toolCallId: "outer-tool-1",
+				toolName: "ipython",
+				args: { code: "await rlm.act('inspect')" },
+			},
+			meta: {
+				id: "generation-active-1:13",
+				protocol: DAEMON_PROTOCOL_INFO,
+				activeSessionId: "active-1",
+				sequence: 13,
+				cursor: { generation: "generation-active-1", sequence: 13 },
+				emittedAt: "2026-01-01T00:00:00.000Z",
+			},
+		});
+		expect(oldEvents).toEqual([
+			{
+				type: "session_event",
+				event: expect.objectContaining({ type: "tool_execution_start", toolCallId: "outer-tool-1" }),
+			},
+		]);
+
+		const newDaemon = new FakeDaemonClient();
+		newDaemon.serverCapabilities.add("rlm_act_stream");
+		const newConnection = new DaemonAgentConnection(asDaemonClient(newDaemon), "active-1");
+		const newEvents: AgentConnectionEvent[] = [];
+		newConnection.subscribe((event) => {
+			newEvents.push(event);
+		});
+		await newConnection.attach();
+		expect((newDaemon.requests[0] as Extract<DaemonCommand, { type: "attach" }>).capabilities).toContain(
+			"rlm_act_stream",
+		);
+		newDaemon.emitMessage({ type: "session_event", activeSessionId: "active-1", event: actStartEvent() });
+		newDaemon.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: {
+				type: "tool_execution_start",
+				toolCallId: "outer-tool-1",
+				toolName: "ipython",
+				args: { code: "await rlm.act('inspect')" },
+			},
+			meta: {
+				id: "generation-active-1:13",
+				protocol: DAEMON_PROTOCOL_INFO,
+				activeSessionId: "active-1",
+				sequence: 13,
+				cursor: { generation: "generation-active-1", sequence: 13 },
+				emittedAt: "2026-01-01T00:00:00.000Z",
+			},
+		});
+		expect(newEvents).toEqual([
+			{ type: "session_event", event: actStartEvent() },
+			{
+				type: "session_event",
+				event: expect.objectContaining({ type: "tool_execution_start", toolCallId: "outer-tool-1" }),
+			},
+		]);
+		expect(newDaemon.requests).toHaveLength(1);
+		newDaemon.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-1",
+			state: createConnectionState("active-1", "session-replaced"),
+			messages: [],
+			meta: {
+				id: "generation-active-1:14",
+				protocol: DAEMON_PROTOCOL_INFO,
+				activeSessionId: "active-1",
+				sequence: 14,
+				cursor: { generation: "generation-active-1", sequence: 14 },
+				emittedAt: "2026-01-01T00:00:00.000Z",
+			},
+		});
+		newDaemon.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: { ...actStartEvent(), actId: "act-after-replacement" },
+		});
+		expect(newEvents.slice(-2)).toEqual([
+			{
+				type: "session_replaced",
+				state: createConnectionState("active-1", "session-replaced"),
+				messages: [],
+			},
+			{
+				type: "session_event",
+				event: { ...actStartEvent(), actId: "act-after-replacement" },
+			},
+		]);
+
+		newDaemon.serverCapabilities.delete("rlm_act_stream");
+		await newConnection.attach();
+		expect((newDaemon.requests.at(-1) as Extract<DaemonCommand, { type: "attach" }>).capabilities).not.toContain(
+			"rlm_act_stream",
+		);
+		newDaemon.emitMessage({ type: "session_event", activeSessionId: "active-1", event: actStartEvent() });
+		expect(newEvents).toHaveLength(4);
+
+		oldDaemon.serverCapabilities.add("rlm_act_stream");
+		await oldConnection.attach();
+		expect((oldDaemon.requests.at(-1) as Extract<DaemonCommand, { type: "attach" }>).capabilities).toContain(
+			"rlm_act_stream",
+		);
+		oldDaemon.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: { ...actStartEvent(), actId: "act-after-reconnect" },
+		});
+		expect(oldEvents.at(-1)).toEqual({
+			type: "session_event",
+			event: { ...actStartEvent(), actId: "act-after-reconnect" },
 		});
 	});
 

@@ -1475,22 +1475,22 @@ describe("agents view state", () => {
 			);
 		});
 
-		test("prefers the current runtime over a stale saved-file identity", () => {
-			const switched = {
+		test("keeps the old session selected after /new reuses its runtime id", () => {
+			const newSession = {
 				...opened,
-				sessionId: "session-switched",
-				sessionFile: "/tmp/project/switched.jsonl",
+				sessionId: "session-new",
+				sessionFile: "/tmp/project/new.jsonl",
 			};
-			const staleSaved = makeSummary({
+			const oldSession = makeSummary({
 				id: "session-open",
 				activeSessionId: undefined,
 				sessionId: "session-open",
 				sessionFile: opened.sessionFile,
 				lifecycle: "archived",
 			});
-			const rows = buildAgentsViewRows([staleSaved, switched]);
+			const rows = buildAgentsViewRows([oldSession, newSession]);
 			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(
-				rows.findIndex((row) => row.summary.sessionId === "session-switched"),
+				rows.findIndex((row) => row.summary.sessionId === "session-open"),
 			);
 		});
 

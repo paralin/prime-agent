@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -28,6 +28,7 @@ import type {
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
+	getApiProvider,
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	modelsAreEqual,
@@ -37,6 +38,16 @@ import {
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
+import { actCancellationCapability, actContextLabel } from "./act-cancellation.js";
+import {
+	ACT_EVENT_CELL_TEXT_MAX_CHARS,
+	ACT_EVENT_ERROR_MAX_CHARS,
+	ACT_EVENT_PROMPT_MAX_CHARS,
+	type ActProjectionEvent,
+	truncateActEventText,
+} from "./act-events.js";
+import { buildActCallerHistory } from "./act-history-snapshot.js";
+import { ActLane, type ActLaneProgress, createActResourceLoader } from "./act-lane.js";
 import {
 	AGENT_MESSAGE_CUSTOM_TYPE,
 	AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL,
@@ -52,12 +63,14 @@ import {
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
 	createAgentMessageHostHandlers,
+	createAgentSessionMessage,
 	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 	isAgentSessionMessagePrompt,
 	normalizeAgentSessionMessage,
 	parseAgentSessionMessagePromptId,
+	SYSTEM_SIBLING_AGENT_NAME,
 	startsAgentRun,
 } from "./agent-messages.js";
 import {
@@ -93,14 +106,42 @@ import {
 } from "./autonomous.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
+	CLAUDE_CODE_FAMILY_TOOL_NAMES,
+	CLAUDE_CODE_MCP_SERVER_NAME,
+	ClaudeCodeFamilyMailbox,
+	type ClaudeCodeFamilySendInput,
+	createClaudeCodeFamilyMcpServer,
+} from "./claude-code-coordination.js";
+import {
+	CLAUDE_CODE_COORDINATION_PROMPT,
+	ClaudeCodeRuntime,
+	type ClaudeCodeRuntimeSnapshot,
+	claudeCodeNativeTools,
+} from "./claude-code-runtime.js";
+import type { ClaudeCodeEvent, StartClaudeCodeQuery } from "./claude-code-sdk.js";
+import {
+	buildScratchHandoffContinuation,
+	buildScratchHandoffHistory,
 	COMPACT_SKILL_NAME,
 	type CompactionResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	compactNative,
+	createScratchHandoffCloseoutMessage,
 	estimateContextTokens,
 	generateBranchSummary,
+	hasCommittedScratchHandoff,
+	latestPersistedScratchHandoffPath,
 	prepareCompaction,
+	readScratchHandoffText,
+	resolveCompactionTrigger,
+	resolveScratchHandoffBoundary,
+	resolveScratchHandoffPath,
+	resolveScratchHandoffRoute,
+	SCRATCH_HANDOFF_PATH_CUSTOM_TYPE,
+	SCRATCH_HANDOFF_WARNING_CUSTOM_TYPE,
+	scratchHandoffCompactionDetails,
 	serializeConversation,
 	shouldCompact,
 } from "./compaction/index.js";
@@ -114,6 +155,13 @@ import {
 import type { AgentCronJob, AgentRlmHeartbeatController, AgentRlmHeartbeatStatusUpdate } from "./cron-jobs.js";
 import { normalizeHeartbeatDeliveryMode } from "./cron-jobs.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+import {
+	createEnglishOutputNudgeMessage,
+	ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE,
+	ENGLISH_OUTPUT_NUDGE_PREVIEW_LABEL,
+	ENGLISH_OUTPUT_NUDGE_PROMPT,
+	stripChineseOutputBlocks,
+} from "./english-output-nudge.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
 import {
@@ -144,6 +192,20 @@ import {
 } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
 import {
+	createExternalEventHostHandler,
+	EXTERNAL_EVENT_CUSTOM_TYPE,
+	EXTERNAL_EVENT_MAX_PENDING,
+	EXTERNAL_EVENT_PREVIEW_LABEL,
+	type ExternalEventDeliveryStatus,
+	type ExternalEventInput,
+	type ExternalEventReceipt,
+	ExternalEventRegistry,
+	type ExternalEventWatch,
+	externalEventQueueKey,
+	isExternalEventQueueKey,
+	normalizeExternalEventWatchList,
+} from "./external-events.js";
+import {
 	createGoalContextMessage,
 	emptyGoalState,
 	GOAL_CONTEXT_CUSTOM_TYPE,
@@ -159,8 +221,10 @@ import {
 	normalizeGoalState,
 	validateGoalBudget,
 	validateGoalObjective,
+	validateGoalPauseReason,
 } from "./goals.js";
-import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
+import type { HistorySnapshot } from "./history-snapshot.js";
+import type { HostRequestChannel, HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
@@ -172,7 +236,9 @@ import {
 	convertToLlm,
 	createCompactionOutcomeMessage,
 	createHeartbeatPromptMessage,
+	createManualContinueMessage,
 	createRefinementOutcomeMessage,
+	createRepetitionNoticeMessage,
 	createRlmChildFailureMessage,
 	createRlmChildTerminalNoticeMessage,
 	createSessionSlashCommandMessage,
@@ -181,12 +247,24 @@ import {
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	MANUAL_CONTINUE_CUSTOM_TYPE,
+	MANUAL_CONTINUE_PROMPT,
+	REPETITION_NOTICE_CUSTOM_TYPE,
+	REPETITION_NOTICE_PREVIEW_LABEL,
+	REPETITION_NOTICE_PROMPT,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
+import {
+	findExactModelReferenceMatch,
+	parseRlmRuntimeCandidate,
+	type RlmRuntimeCandidate,
+	resolveRlmRoleCandidates,
+} from "./model-resolver.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
+import { renderScratchHandoffCloseoutMessage } from "./prompts/scratch-handoff.js";
 import {
 	type AutoRefineReason,
 	type AutoRefineReview,
@@ -213,6 +291,7 @@ import {
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import {
+	adaptNativeRlmChildRuntime,
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
 	createRlmDeleteSubagentHostHandler,
@@ -221,16 +300,19 @@ import {
 	createRlmRunHostHandler,
 	findRlmModelMatches,
 	normalizeRequestedRlmSubagentModel,
+	normalizeRequestedRlmSubagentServiceTier,
 	normalizeRequestedRlmSubagentSessionName,
-	normalizeRequestedRlmSubagentThinkingLevel,
+	type RlmChildRuntime,
 	type RlmDeleteSubagentResult,
 	type RlmFindModelsResult,
 	type RlmListSubagentsResult,
+	type RlmNativeModelCandidate,
 	type RlmSpawnHandle,
 	type RlmSubagentRegistryEntry,
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
+import { RootForegroundLease } from "./root-foreground-lease.js";
 import {
 	modelRequestHeaders,
 	SemanticEdgeRecorder,
@@ -240,6 +322,7 @@ import {
 import {
 	ActionStore,
 	type ActionTicket,
+	type AdmissionDisposition,
 	canSelectSessionAction,
 	type DeliveryPolicy,
 	type DeliveryRecord,
@@ -255,7 +338,15 @@ import {
 	transitionSessionAction,
 	type WakePolicy,
 } from "./session-action-store.js";
-import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
+import type {
+	ActStartEntry,
+	ActTerminalEntry,
+	ActTerminalStatus,
+	BranchSummaryEntry,
+	CompactionEntry,
+	SessionContext,
+	SessionMessageEntry,
+} from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
@@ -275,12 +366,26 @@ import {
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
+import {
+	consecutiveToolErrorNudge,
+	createToolErrorNudgeMessage,
+	TOOL_ERROR_NUDGE_CUSTOM_TYPE,
+	TOOL_ERROR_NUDGE_PREVIEW_LABEL,
+} from "./tool-error-nudge.js";
 import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
+import { resolveToCwd } from "./tools/path-utils.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
-import { addAssistantUsage, emptyUsage, type SessionUsageSummary, sessionUsageSummaryFrom } from "./usage.js";
+import {
+	addAssistantUsage,
+	cloneUsage,
+	emptyUsage,
+	type SessionUsageSummary,
+	sessionUsageSummaryFrom,
+	subtractAssistantUsage,
+} from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
 export type { GoalState, GoalStatus } from "./goals.js";
@@ -317,6 +422,7 @@ export type CompactionReason = "manual" | "threshold" | "overflow" | "requested"
 
 export type AgentSessionEvent =
 	| AgentEvent
+	| ActProjectionEvent
 	| {
 			type: "ipython_sent_agent_message";
 			toolCallId: string;
@@ -381,7 +487,8 @@ export type AgentSessionEvent =
 			runId?: string;
 	  }
 	| { type: "refine_complete"; result: RefinementResult }
-	| { type: "refine_failed"; error: string };
+	| { type: "refine_failed"; error: string }
+	| { type: "external_event_watches_changed"; watches: ExternalEventWatch[] };
 
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 
@@ -397,6 +504,21 @@ export class CompactionSkippedError extends Error {}
 
 /** Thrown when a session_before_refine extension skips the refinement round. */
 export class RefineSkippedError extends Error {}
+
+function describeCompactionFailure(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function combineCompactionFailures(nativeError: unknown, localError: unknown): AggregateError {
+	return new AggregateError(
+		[nativeError, localError],
+		`Provider-native compaction failed: ${describeCompactionFailure(nativeError)}. Local fallback failed: ${describeCompactionFailure(localError)}`,
+	);
+}
+
+// ============================================================================
+// Types
+// ============================================================================
 
 export interface AgentSessionConfig {
 	agent: Agent;
@@ -445,12 +567,22 @@ export interface AgentSessionConfig {
 	sessionStartEvent?: SessionStartEvent;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
+	rlmMaxDepthCeiling?: number;
+	actEnabled?: boolean;
+	harnessMode?: "rpc-only";
+	/** Directory exposed to the kernel as RLM_SESSION_DIR. */
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
 	rlmParentAgent?: string;
 	semanticParentSessionId?: string;
 	semanticSpawnedByRequestId?: string;
+	/** Ordered native candidates retained by a named-role child for provider fallback. */
+	rlmModelCandidates?: RlmNativeModelCandidate[];
+	/** Host responsible for creating native RLM subagent runtimes. */
 	subagentRuntimeHost?: SubagentRuntimeHost;
+	/** Test/embedding seam for the external Claude Code SDK query. */
+	startClaudeCodeQuery?: StartClaudeCodeQuery;
+	/** Host-side autonomous continuation policy. */
 	autonomous?: AgentAutonomousConfig;
 	prewarmIpythonKernel?: boolean;
 	autoRefineReviewer?: AutoRefineReviewer;
@@ -811,8 +943,16 @@ function injectedMessagePreviewLabel(message: CustomMessage): string | undefined
 	switch (message.customType) {
 		case HEARTBEAT_PROMPT_CUSTOM_TYPE:
 			return HEARTBEAT_PROMPT_PREVIEW_LABEL;
+		case REPETITION_NOTICE_CUSTOM_TYPE:
+			return REPETITION_NOTICE_PREVIEW_LABEL;
+		case TOOL_ERROR_NUDGE_CUSTOM_TYPE:
+			return TOOL_ERROR_NUDGE_PREVIEW_LABEL;
+		case ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE:
+			return ENGLISH_OUTPUT_NUDGE_PREVIEW_LABEL;
 		case GOAL_CONTEXT_CUSTOM_TYPE:
 			return GOAL_CONTEXT_PREVIEW_LABEL;
+		case EXTERNAL_EVENT_CUSTOM_TYPE:
+			return EXTERNAL_EVENT_PREVIEW_LABEL;
 		default:
 			return undefined;
 	}
@@ -846,7 +986,11 @@ interface PostCompactionContinuationSettlement extends AgentMessageDeferred {
 }
 
 function createPostCompactionContinuationSettlement(): PostCompactionContinuationSettlement {
-	return { ...createAgentMessageDeferred(), continueAfterSessionInput: false, settled: false };
+	return {
+		...createAgentMessageDeferred(),
+		continueAfterSessionInput: false,
+		settled: false,
+	};
 }
 
 export interface ModelCycleResult {
@@ -858,6 +1002,7 @@ export interface ModelCycleResult {
 
 interface ModelSelectOptions {
 	waitForExtensions?: boolean;
+	persistDefault?: boolean;
 }
 
 interface ToolDefinitionEntry {
@@ -876,7 +1021,11 @@ type AutonomousSlashCommand = { kind: "status" } | { kind: "on" } | { kind: "off
 
 import type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
 
-export type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
+export type {
+	RlmMaxDepthSource,
+	RlmMaxDepthStatus,
+	SetRlmMaxDepthResult,
+} from "./rlm-max-depth.js";
 
 interface PersistedRlmMaxDepthState {
 	maxDepth: number;
@@ -901,15 +1050,25 @@ interface RlmChildRun {
 	error?: string;
 	abort: () => void;
 	publication: AgentMessageDeferred;
+	/** Runtime-neutral lifecycle handle, once either child runtime exists. */
+	runtime?: RlmChildRuntime;
+	/** Live-worker family coordination for an external Claude child. */
+	familyMailbox?: ClaudeCodeFamilyMailbox;
+	/** Native child session, once its runtime exists. Used to cancel nested child runs. */
 	/** Resolves after terminal result publication and detached-run cleanup finish. */
 	settlement: AgentMessageDeferred;
 	/** Child session, once its runtime exists. Used to cancel nested child runs. */
 	session?: AgentSession;
+	/** True when an external child has replied to its parent since its latest parent input. */
+	externalRepliedToParent?: boolean;
+	/** True once the detached run task has finished its catch and cleanup paths. */
 	settled: boolean;
 	/** Do not inject a late terminal notice after the parent session is aborted. */
 	suppressTerminalNotice?: boolean;
 	/** Excluded from future strong barriers after an authoritative cancellation cut. */
 	abandonedForQuiescence?: boolean;
+	/** Display model reference for external runtimes that have no Model object. */
+	modelOverride?: string;
 	/** Selector snapshot for an admitted explicit delete. */
 	detachedDeletion?: RlmSubagentRegistryEntry;
 	/** Shared physical runtime cleanup owned by the explicit-delete path. */
@@ -933,22 +1092,72 @@ interface RetainedRlmChild {
 	run?: RlmChildRun;
 }
 
-interface RlmSubagentModelSelection {
-	model: Model<Api>;
+type RlmSubagentModelSelection =
+	| {
+			runtime: "native";
+			model: Model<Api>;
+			thinkingLevel?: ThinkingLevel;
+			modelCandidates?: RlmNativeModelCandidate[];
+	  }
+	| {
+			runtime: "claude-code";
+			model: string;
+			selector: string;
+			thinkingLevel?: ThinkingLevel;
+	  };
+
+type NativeRlmSubagentModelSelection = Extract<RlmSubagentModelSelection, { runtime: "native" }>;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
+const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+const KERNEL_STATE_NOTICE_NAME_LIMIT = 12;
+
+function formatKernelStateNames(names: readonly string[]): string {
+	const sorted = [...new Set(names)].sort();
+	const shown = sorted.slice(0, KERNEL_STATE_NOTICE_NAME_LIMIT);
+	const hiddenCount = sorted.length - shown.length;
+	return `${shown.join(", ")}${hiddenCount > 0 ? ` (+${hiddenCount} more)` : ""}`;
 }
 
-const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
+const ACT_SESSION_DIRNAME = "act";
+const ACT_SESSION_FILENAME = "session.jsonl";
+const ACT_SESSION_MODEL_KEY_FILENAME = "model-key";
+
+function actUsageDelta(after: Usage, before: Usage): Usage {
+	const delta = cloneUsage(after);
+	subtractAssistantUsage(delta, before);
+	return delta;
+}
+
+function actErrorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
 
 function noopRlmChildAbort(): void {}
 function noopRlmChildEventUnsubscribe(): void {}
+
+function withExplicitRlmThinkingLevel(model: Model<Api>, thinkingLevel: ThinkingLevel | undefined): Model<Api> {
+	if (thinkingLevel === undefined) return model;
+	return {
+		...model,
+		thinkingLevelMap: {
+			...model.thinkingLevelMap,
+			[thinkingLevel]: thinkingLevel,
+		},
+	};
+}
 
 function autoRefineInstructions(reason: AutoRefineReason, review: AutoRefineReview): string {
 	const detail = review.instructions
 		? `
 Reviewer instructions: ${review.instructions}`
 		: "";
-	return `Automatic refine review triggered by ${reason}. Only create/update/delete local harness entries if there is clear evidence that should help this session continue. Prefer an empty edits array over speculative or one-off memories. Do not promote anything global unless explicitly requested. Reviewer rationale: ${review.rationale}${detail}`;
+	return `Automatic refinement review triggered by ${reason}. Review local harness entries and create, update, or delete one only when the trajectory contains concrete evidence that it should affect a later action in this session. Leave the edits array empty for speculative or one-off material. Do not promote anything global without an explicit request. Reviewer rationale: ${review.rationale}${detail}`;
 }
 
 function isNonNegativeInteger(value: unknown): value is number {
@@ -1067,9 +1276,17 @@ export class AgentSession {
 		followUps: [],
 	};
 	private _agentEventQueue: Promise<void> = Promise.resolve();
+	private _pendingAgentEventCount = 0;
+	private _processingAgentEnd = false;
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
 	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
+	private readonly _externalEventRegistry = new ExternalEventRegistry();
+	private readonly _externalEventHostHandler = createExternalEventHostHandler(this._externalEventRegistry, (event) =>
+		this._admitExternalEvent(event),
+	);
+	/** Mirror of the kernel watch registry; the kernel publishes the full list on every mutation. */
+	private _externalEventWatches: ExternalEventWatch[] = [];
 	private _sessionInputPump: Promise<void> = Promise.resolve();
 	private _sessionInputPumpRequested = false;
 	// Invalidates preparation when a branch pause starts and finishes before its next await resumes.
@@ -1102,6 +1319,17 @@ export class AgentSession {
 
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+	/** State owned by the active scratch compaction while its closeout episode runs. */
+	private _scratchCloseout:
+		| {
+				displayPath: string;
+				history: HistorySnapshot;
+				status: "pending" | "complete" | "failed";
+				reminderSent: boolean;
+				finalAssistant?: AssistantMessage;
+		  }
+		| undefined = undefined;
+	private _scratchCloseoutRunActive = false;
 	private _compactionOperation: Promise<void> | undefined = undefined;
 	/** One recovery attempt per overflow; "reported" dedups the failure notice. */
 	private _overflowRecovery: "idle" | "attempted" | "reported" = "idle";
@@ -1114,6 +1342,7 @@ export class AgentSession {
 
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	private _retryAttemptOnCurrentModel = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
 	private _retryAuthFailureSources: AuthSourceToken[] = [];
@@ -1134,6 +1363,7 @@ export class AgentSession {
 	private _modelSelectEmitQueue: Promise<void> = Promise.resolve();
 	private _modelSelectEmitQueueIdle = true;
 	private _modelSelectEmitContext = new AsyncLocalStorage<boolean>();
+	private _pendingModelContextRebuild = false;
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -1163,7 +1393,9 @@ export class AgentSession {
 	// Set at the start of async teardown so a child finishing mid-disposeAsync doesn't
 	// re-populate the retained map after it's been cleared.
 	private _disposing = false;
+	private _disposalAdmissionClosed = false;
 	private _disposeAsyncPromise?: Promise<void>;
+	private _kernelDisposePromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
 	private _ipythonKernelSnapshotDir?: string;
@@ -1173,14 +1405,32 @@ export class AgentSession {
 	private _rlmDepth: number;
 	private readonly _configuredRlmMaxDepth: number | undefined;
 	private _rlmMaxDepth: number;
+	private readonly _rlmMaxDepthCeiling?: number;
+	private readonly _actEnabled: boolean;
+	private readonly _harnessMode?: "rpc-only";
 	private _rlmMaxDepthSource: RlmMaxDepthSource;
 	private _rlmSessionDir?: string;
 	private readonly _semanticEdges: SemanticEdgeRecorder;
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
+	private readonly _rlmModelCandidates: RlmNativeModelCandidate[];
+	private _rlmModelCandidateIndex = 0;
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
+	private readonly _rootForeground = new RootForegroundLease(() => {
+		this._notifySessionInputCheckpointChange();
+		this._scheduleSessionInputPump();
+	});
+	private readonly _actLanes = new Map<number, ActLane>();
+	private readonly _activeActStack: Array<{
+		actId: string;
+		depth: number;
+		lane: ActLane;
+	}> = [];
+	private _activeActCompletion?: Promise<void>;
+	private _actTeardownPromise?: Promise<void>;
+	private readonly _startClaudeCodeQuery?: StartClaudeCodeQuery;
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
 	private _unsettledRlmChildRuns = new Set<RlmChildRun>();
 	private _abandonedRlmQuiescenceChildIds = new Set<string>();
@@ -1261,17 +1511,23 @@ export class AgentSession {
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
 		this._includeGoals = config.includeGoals ?? true;
 		this._includeCompactSkill = config.includeCompactSkill ?? this.settingsManager.getCompactionAgentCallable();
-		this._rlmHeartbeatController = config.rlmHeartbeatController;
-		this._agentMessageController = config.agentMessageController;
+		this._rlmHeartbeatController = config.harnessMode === "rpc-only" ? undefined : config.rlmHeartbeatController;
+		this._agentMessageController = config.harnessMode === "rpc-only" ? undefined : config.agentMessageController;
 		this._agentObserveController = config.agentObserveController;
 		this._mcpManager = config.mcpManager;
 		this._baseToolsOverride = config.baseToolsOverride;
-		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._sessionStartEvent = config.sessionStartEvent ?? {
+			type: "session_start",
+			reason: "startup",
+		};
 		const headerRlmDepth = this.sessionManager.getHeader()?.rlmDepth;
 		this._rlmDepth =
 			config.rlmDepth ??
 			(isNonNegativeInteger(headerRlmDepth) ? headerRlmDepth : parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH"));
 		this._configuredRlmMaxDepth = config.rlmMaxDepth;
+		this._rlmMaxDepthCeiling = config.rlmMaxDepthCeiling;
+		this._actEnabled = config.actEnabled ?? true;
+		this._harnessMode = config.harnessMode;
 		if (this._configuredRlmMaxDepth !== undefined && !isNonNegativeInteger(this._configuredRlmMaxDepth)) {
 			throw new Error("rlmMaxDepth must be a non-negative integer");
 		}
@@ -1280,7 +1536,7 @@ export class AgentSession {
 		this._rlmMaxDepthSource = resolvedRlmMaxDepth.source;
 		this._prewarmIpythonKernel = (config.prewarmIpythonKernel ?? false) && this._rlmDepth === 0;
 		this._autoRefineReviewer = config.autoRefineReviewer;
-		this._serializedRefine = config.serializedRefine ?? false;
+		this._serializedRefine = this._harnessMode === "rpc-only" ? false : (config.serializedRefine ?? false);
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
@@ -1294,6 +1550,9 @@ export class AgentSession {
 			spawnedByRequestId: config.semanticSpawnedByRequestId,
 		});
 		this.agent.streamFn = wrapStreamFnWithSemanticEdges(this.agent.streamFn, this._semanticEdges);
+		this._rlmModelCandidates = [...(config.rlmModelCandidates ?? [])];
+		if (this._rlmDepth === 0 && this._actEnabled) this._recoverInterruptedActs();
+		this._startClaudeCodeQuery = config.startClaudeCodeQuery;
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
 		this._repliedToParentSinceTask =
@@ -1304,7 +1563,7 @@ export class AgentSession {
 		this._autonomousState = createAutonomousRuntimeState(config.autonomous, {
 			cwd: this._cwd,
 		});
-		this._goalState = this._loadPersistedGoalState();
+		this._goalState = this._harnessMode === "rpc-only" ? emptyGoalState() : this._loadPersistedGoalState();
 		// Seed initial goal from CLI --goal flag, but only for top-level sessions
 		// and only when the branch contains only bootstrap entry types (model_change,
 		// thinking_level_change, service_tier_change) and no persisted
@@ -1316,7 +1575,7 @@ export class AgentSession {
 			// admission is unavailable mid-construction, so ride the next turn.
 			this._pendingNextTurnMessages.push(createGoalContextMessage(this._goalState, "continuation"));
 		}
-		this._restoreLateIpythonSentAgentMessages();
+		if (this._harnessMode !== "rpc-only") this._restoreLateIpythonSentAgentMessages();
 		if (this._goalState.status === "active") {
 			this._goalAccountingStartedAt = Date.now();
 		}
@@ -1343,6 +1602,7 @@ export class AgentSession {
 	 * when the session is created outside the daemon.
 	 */
 	setRlmHeartbeatController(controller: AgentRlmHeartbeatController): void {
+		if (this._harnessMode === "rpc-only") return;
 		if (this._rlmHeartbeatController === controller) {
 			return;
 		}
@@ -1630,22 +1890,29 @@ export class AgentSession {
 		maxDepth: number;
 		source: RlmMaxDepthSource;
 	} {
+		const cap = (value: number) => Math.min(value, this._rlmMaxDepthCeiling ?? value);
 		const persisted = this._loadPersistedRlmMaxDepthState();
 		if (persisted) {
-			return { maxDepth: persisted.maxDepth, source: "chat" };
+			return { maxDepth: cap(persisted.maxDepth), source: "chat" };
 		}
 		if (this._configuredRlmMaxDepth !== undefined) {
-			return { maxDepth: this._configuredRlmMaxDepth, source: "inherited" };
+			return {
+				maxDepth: cap(this._configuredRlmMaxDepth),
+				source: "inherited",
+			};
 		}
 		const global = this.settingsManager.getRlmMaxDepth();
 		if (global !== undefined && isNonNegativeInteger(global)) {
-			return { maxDepth: global, source: "global" };
+			return { maxDepth: cap(global), source: "global" };
 		}
 		const env = process.env.RLM_MAX_DEPTH;
 		if (env !== undefined && env !== "") {
-			return { maxDepth: parseDepth(env, 1, "RLM_MAX_DEPTH"), source: "env" };
+			return {
+				maxDepth: cap(parseDepth(env, 1, "RLM_MAX_DEPTH")),
+				source: "env",
+			};
 		}
-		return { maxDepth: 2, source: "default" };
+		return { maxDepth: cap(2), source: "default" };
 	}
 
 	private _loadPersistedGoalState(): GoalState {
@@ -1878,14 +2145,14 @@ export class AgentSession {
 		});
 	}
 
-	private async _resumeGoal(): Promise<void> {
+	private _resumeGoalState(): boolean {
 		if (!this._goalState.objective) {
 			this._emitGoalUpdate();
-			return;
+			return false;
 		}
 		if (this._goalState.status !== "paused" && this._goalState.status !== "budget_limited") {
 			this._emitGoalUpdate();
-			return;
+			return false;
 		}
 		const exhausted =
 			this._goalState.tokenBudget !== undefined && this._goalState.tokensUsed >= this._goalState.tokenBudget;
@@ -1897,7 +2164,11 @@ export class AgentSession {
 			lastReason: exhausted ? "Goal token budget already reached" : undefined,
 			lastError: undefined,
 		});
-		if (nextStatus === "active") {
+		return nextStatus === "active";
+	}
+
+	private async _resumeGoal(): Promise<void> {
+		if (this._resumeGoalState()) {
 			await this._runOrQueueGoalContext("continuation");
 		}
 	}
@@ -2251,10 +2522,12 @@ export class AgentSession {
 	}
 
 	private _shouldStopBeforeTurn(): boolean {
+		if (this._scratchCloseoutRunActive) return false;
 		return this._steeringStopPending;
 	}
 
 	private async _shouldStopAfterTurn(context: ShouldStopAfterTurnContext): Promise<boolean> {
+		if (this._scratchCloseoutRunActive) return false;
 		if (this._stopGoalContinuationForTerminalMessage(context.message)) {
 			return true;
 		}
@@ -2285,9 +2558,77 @@ export class AgentSession {
 		if (await this._shouldStopForThresholdCompaction(context)) {
 			return true;
 		}
+		try {
+			await this._maybeQueueToolErrorNudge();
+		} catch {
+			// Tool-error nudge must not interrupt the core agent loop.
+		}
 		// Steering stops continuation only after mandatory serialized checkpoints.
 		// Returning true here still prevents the agent loop from starting another turn.
 		return this._steeringStopPending;
+	}
+
+	private _hasQueuedToolErrorNudge(): boolean {
+		return this._actionStore
+			.unfinishedActions()
+			.some(
+				(action) =>
+					action.payload.kind === "turn" &&
+					action.payload.customMessage?.customType === TOOL_ERROR_NUDGE_CUSTOM_TYPE,
+			);
+	}
+
+	private async _maybeQueueToolErrorNudge(): Promise<void> {
+		if (this._hasQueuedToolErrorNudge()) return;
+		const nudge = consecutiveToolErrorNudge(this.agent.state.messages);
+		if (!nudge) return;
+		const message = createToolErrorNudgeMessage(nudge);
+		await this._queuePreparedPrompt("steer", nudge.prompt, undefined, {
+			message,
+			previewLabel: TOOL_ERROR_NUDGE_PREVIEW_LABEL,
+			resumeIfIdle: true,
+		});
+	}
+
+	private _hasQueuedEnglishOutputNudge(): boolean {
+		return this._actionStore
+			.unfinishedActions()
+			.some(
+				(action) =>
+					action.payload.kind === "turn" &&
+					action.payload.customMessage?.customType === ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE,
+			);
+	}
+
+	private async _queueEnglishOutputNudge(): Promise<void> {
+		if (this._hasQueuedEnglishOutputNudge()) return;
+		const message = createEnglishOutputNudgeMessage();
+		await this._queuePreparedPrompt("steer", ENGLISH_OUTPUT_NUDGE_PROMPT, undefined, {
+			message,
+			previewLabel: ENGLISH_OUTPUT_NUDGE_PREVIEW_LABEL,
+			resumeIfIdle: true,
+		});
+	}
+
+	/** _guardEnglishAssistantOutput strips Chinese text blocks from live context. Returns true when the message was dropped and must not be persisted. */
+	private async _guardEnglishAssistantOutput(message: AgentMessage): Promise<boolean> {
+		if (message.role !== "assistant") return false;
+		const stripped = stripChineseOutputBlocks(message);
+		if (!stripped) return false;
+		this._replaceMessageInPlace(message, stripped);
+		try {
+			await this._queueEnglishOutputNudge();
+		} catch {
+			// English-output nudge must not interrupt the core agent loop.
+		}
+		if (stripped.content.length === 0) {
+			const messages = this.agent.state.messages;
+			if (messages.at(-1) === message) {
+				this.agent.state.messages = messages.slice(0, -1);
+			}
+			return true;
+		}
+		return false;
 	}
 
 	private async _shouldStopForThresholdCompaction(context: ShouldStopAfterTurnContext): Promise<boolean> {
@@ -2794,6 +3135,7 @@ export class AgentSession {
 		if (contextTokens === undefined || !shouldCompact(contextTokens, contextWindow, settings)) {
 			return false;
 		}
+		if (this._hasQueuedCompactCommand()) return true;
 
 		// Goal continuation takes exclusive priority over autonomous continuation, matching _getContinuationMessages.
 		if (this._queueGoalContinuationForThresholdCompaction(context.message)) {
@@ -2923,7 +3265,10 @@ export class AgentSession {
 		// A stale marker (continuation already consumed) matches no action; only an
 		// actual cancellation may roll back its queue-time continuationsUsed increment.
 		if (cancelled.length === 0) return;
-		this._setGoalState({ ...this._goalState, continuationsUsed: this._goalState.continuationsUsed - 1 });
+		this._setGoalState({
+			...this._goalState,
+			continuationsUsed: this._goalState.continuationsUsed - 1,
+		});
 		this._emitQueueUpdate();
 	}
 
@@ -3004,6 +3349,14 @@ export class AgentSession {
 				}
 				return goalHostResponse(this._createGoalFromHost(payload.objective, payload.token_budget), false);
 			}
+			case "goal.pause": {
+				if (typeof payload.reason !== "string") {
+					throw new Error("goal.pause reason must be a string");
+				}
+				return goalHostResponse(this._pauseGoalFromHost(payload.reason), false);
+			}
+			case "goal.resume":
+				return goalHostResponse(this._resumeGoalFromHost(), false);
 			case "goal.complete":
 				return goalHostResponse(this._completeGoalFromHost(), true);
 			default:
@@ -3224,6 +3577,27 @@ export class AgentSession {
 		}
 	}
 
+	private async _agentMessageRosterWithExternalChildren(): Promise<AgentFamilyRosterResult> {
+		const roster = (await this.handleAgentMessageHostRequest("agent_message.list_agents")) as AgentFamilyRosterResult;
+		const entries = [...roster.entries];
+		for (const run of this._activeRlmChildRuns.values()) {
+			if (!run.familyMailbox || run.detachedDeletion || entries.some((entry) => entry.id === run.id)) continue;
+			entries.push({
+				relationship: "child",
+				name: run.sessionName,
+				id: run.id,
+				depth: roster.current.depth + 1,
+				status:
+					run.status === "queued" || run.status === "running"
+						? "running"
+						: run.status === "error"
+							? "inactive"
+							: "idle",
+			});
+		}
+		return { ...roster, entries };
+	}
+
 	handleAgentMessageHostRequest(
 		type: string,
 		payload: Record<string, unknown> = {},
@@ -3249,6 +3623,8 @@ export class AgentSession {
 				return this._agentMessageController.sendAgentMessage({
 					target: assertDirectAgentMessageTarget(payload.target),
 					message: normalizeAgentSessionMessage(payload.message),
+					id: typeof payload.id === "string" ? payload.id : undefined,
+					replyTo: typeof payload.replyTo === "string" ? payload.replyTo : undefined,
 				});
 			}
 			default:
@@ -3312,6 +3688,22 @@ export class AgentSession {
 		}
 	}
 
+	private _pauseGoalFromHost(reasonText: string): GoalState {
+		if (this._goalState.status !== "active") {
+			throw new Error("cannot pause goal because this thread has no active goal");
+		}
+		this._pauseGoal(validateGoalPauseReason(reasonText));
+		return this._goalState;
+	}
+
+	private _resumeGoalFromHost(): GoalState {
+		if (this._goalState.status !== "paused") {
+			throw new Error("cannot resume goal because this thread has no paused goal");
+		}
+		this._resumeGoalState();
+		return this._goalState;
+	}
+
 	private _completeGoalFromHost(): GoalState {
 		if (!this._goalState.objective || this._goalState.status === "idle") {
 			throw new Error("cannot complete goal because this thread has no goal");
@@ -3373,6 +3765,22 @@ export class AgentSession {
 		context: GetContinuationMessagesContext,
 		signal?: AbortSignal,
 	): Promise<AgentMessage[]> {
+		const closeout = this._scratchCloseout;
+		if (this._scratchCloseoutRunActive && closeout) {
+			if (signal?.aborted || context.message.stopReason === "error" || context.message.stopReason === "aborted") {
+				return [];
+			}
+			const scratchText = await readScratchHandoffText(resolveToCwd(closeout.displayPath, this._cwd));
+			if (scratchText || closeout.reminderSent) return [];
+			closeout.reminderSent = true;
+			return [
+				createScratchHandoffCloseoutMessage({
+					displayPath: closeout.displayPath,
+					phase: "repair",
+					content: `The scratch handoff checkpoint at ${closeout.displayPath} is still missing or empty. Finish the requested Org handoff now; do not stop until the file exists and is non-empty.`,
+				}),
+			];
+		}
 		if (this.queuedActionCount > 0) {
 			return [];
 		}
@@ -3537,24 +3945,42 @@ export class AgentSession {
 				}
 			}
 		}
-		this._agentEventQueue = this._agentEventQueue.then(
-			() => this._processAgentEvent(event),
-			() => this._processAgentEvent(event),
-		);
+		this._pendingAgentEventCount++;
+		const processEvent = async () => {
+			if (event.type === "agent_end") this._processingAgentEnd = true;
+			try {
+				await this._processAgentEvent(event);
+			} finally {
+				this._processingAgentEnd = false;
+				this._pendingAgentEventCount--;
+				if (
+					this._pendingAgentEventCount === 0 &&
+					this._pendingModelContextRebuild &&
+					(!this.agent.state.isStreaming || event.type === "agent_end")
+				) {
+					this._restoreMessagesAfterModelChange();
+				}
+			}
+		};
+		this._agentEventQueue = this._agentEventQueue.then(processEvent, processEvent);
 		this._agentEventQueue.catch(() => {});
 	};
 
 	private _createRetryPromiseForAgentEnd(event: AgentEvent): void {
-		if (event.type !== "agent_end" || this._retryPromise) {
-			return;
-		}
-
-		const settings = this.settingsManager.getRetrySettings();
-		if (!settings.enabled) {
+		if (event.type !== "agent_end" || this._retryPromise || this._scratchCloseoutRunActive) {
 			return;
 		}
 
 		const lastAssistant = this._findLastAssistantInMessages(event.messages);
+		if (lastAssistant && this._isOpenAICodexUsageExhaustion(lastAssistant)) {
+			this._rotateExhaustedCodexHome(lastAssistant);
+		}
+
+		const settings = this.retrySettings;
+		if (!settings.enabled) {
+			return;
+		}
+
 		const concreteAuthFailure = lastAssistant ? this._isConcreteProviderAuthFailure(lastAssistant) : false;
 		if (!lastAssistant || (!this._isRetryableError(lastAssistant) && !concreteAuthFailure)) {
 			return;
@@ -3648,9 +4074,17 @@ export class AgentSession {
 
 		this._addLoginGuidanceToAuthError(event);
 
+		let skipPersist = false;
+		if (event.type === "message_end" && event.message.role === "assistant" && !this._scratchCloseoutRunActive) {
+			skipPersist = await this._guardEnglishAssistantOutput(event.message);
+		}
+
 		this._emit(event);
 
 		if (event.type === "message_end") {
+			if (skipPersist) {
+				return;
+			}
 			if (event.message.role === "custom") {
 				this.sessionManager.appendCustomMessageEntry(
 					event.message.customType,
@@ -3668,6 +4102,10 @@ export class AgentSession {
 
 			if (event.message.role === "assistant") {
 				this._lastAssistantMessage = event.message;
+				if (this._scratchCloseoutRunActive && this._scratchCloseout) {
+					this._scratchCloseout.finalAssistant = event.message;
+					return;
+				}
 
 				const assistantMsg = event.message as AssistantMessage;
 				if (assistantMsg.stopReason !== "error") {
@@ -3698,6 +4136,7 @@ export class AgentSession {
 						attempt: this._retryAttempt,
 					});
 					this._retryAttempt = 0;
+					this._retryAttemptOnCurrentModel = 0;
 					this._retryAuthFailureSources = [];
 				}
 				if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
@@ -3716,6 +4155,10 @@ export class AgentSession {
 		}
 
 		if (event.type === "agent_end") {
+			if (this._scratchCloseoutRunActive) {
+				this._lastAssistantMessage = undefined;
+				return;
+			}
 			const msg =
 				this._lastAssistantMessage ??
 				(this._retryPromise ? this._findLastAssistantInMessages(event.messages) : undefined);
@@ -3728,6 +4171,28 @@ export class AgentSession {
 			const concreteAuthFailure = this._isConcreteProviderAuthFailure(msg);
 			const retryConcreteAuthFailure =
 				concreteAuthFailure && !this._isStructuredPermanentProviderRetryExhausted(msg);
+			if (this._isAgentRepetitionLoop(msg)) {
+				// Retrying would replay the same prompt into the same loop. Drop the
+				// cancelled output from live context (it stays in session history),
+				// queue a visible system notice, and continue the task.
+				const messages = this.agent.state.messages;
+				if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+					this.agent.state.messages = messages.slice(0, -1);
+				}
+				const notice = createRepetitionNoticeMessage();
+				// Steer at the front: the loop interrupted the provider request, so the
+				// notice must reach the model before any queued notifications (child
+				// terminal notices, heartbeats) and the run resumes from there.
+				await this._queuePreparedPrompt("steer", REPETITION_NOTICE_PROMPT, undefined, {
+					message: notice,
+					previewLabel: REPETITION_NOTICE_PREVIEW_LABEL,
+					resumeIfIdle: true,
+					front: true,
+				});
+				this._finishActiveRetryWithFailure(msg);
+				this._resolveRetry();
+				return;
+			}
 			if (this._isRetryableError(msg) || retryConcreteAuthFailure) {
 				if (retryConcreteAuthFailure) {
 					this._captureRetryAuthFailureSource(msg);
@@ -3923,27 +4388,37 @@ export class AgentSession {
 	 * the latest state reaches disk instead of racing process exit.
 	 */
 	async disposeAsync(options?: { kernelSnapshot?: boolean }): Promise<void> {
-		if (this._disposed) {
-			return this._disposeCallbacksPromise;
-		}
-		// Concurrent callers await the same in-flight teardown so none resolves before
-		// the kernel snapshot flush finishes.
-		if (this._disposeAsyncPromise) {
-			return this._disposeAsyncPromise;
-		}
+		// Concurrent synchronous or asynchronous callers share one bounded cleanup.
+		if (this._disposeAsyncPromise) return this._disposeAsyncPromise;
+		if (this._disposed) return this._kernelDisposePromise;
 		const kernelSnapshot = options?.kernelSnapshot ?? true;
+		const actTeardown = this._beginActTeardown();
+		this._closeDisposalAdmission();
 		this._disposeAsyncPromise = (async () => {
-			// Drain before marking _disposing so a refine triggered at the final
-			// agent_end completes instead of being aborted by dispose().
-			await this._drainPendingRefinementForDisposal();
-			if (this._disposed) {
-				return this._disposeCallbacksPromise;
+			let drainError: unknown;
+			try {
+				// Preserve the established final-refinement drain after closing new admission.
+				await this._drainPendingRefinementForDisposal();
+			} catch (error) {
+				drainError = error;
 			}
-			this._disposing = true;
-			this._sessionActionCommitDisposeAbortController.abort();
-			await this._disposeAsyncOnce(kernelSnapshot);
+			if (this._disposed) {
+				if (actTeardown) await actTeardown;
+				await this._disposeKernelOnce();
+				await this._startDisposeCallbacks();
+			} else {
+				this._disposing = true;
+				this._sessionActionCommitDisposeAbortController.abort();
+				await this._disposeAsyncOnce(kernelSnapshot, actTeardown);
+			}
+			if (drainError) throw drainError;
 		})();
 		return this._disposeAsyncPromise;
+	}
+
+	/** Persist and release an idle IPython process; the next tool call restores it lazily. */
+	hibernateIpythonKernel(): Promise<void> {
+		return this._ipythonKernelProvisioner?.hibernate() ?? Promise.resolve();
 	}
 
 	/**
@@ -4078,7 +4553,8 @@ export class AgentSession {
 		}
 	}
 
-	private async _disposeAsyncOnce(kernelSnapshot: boolean): Promise<void> {
+	private async _disposeAsyncOnce(kernelSnapshot: boolean, actTeardown: Promise<void> | undefined): Promise<void> {
+		if (actTeardown) await actTeardown;
 		// Flush kernels/traces for both still-running and retained children; the sync
 		// dispose() below only tears them down synchronously.
 		for (const run of [...this._activeRlmChildRuns.values()]) {
@@ -4110,7 +4586,9 @@ export class AgentSession {
 		this._rlmChildCleanupFailures.clear();
 		this._deletedRlmChildIds.clear();
 		try {
-			await this._ipythonKernelProvisioner?.dispose({ snapshot: kernelSnapshot });
+			await this._ipythonKernelProvisioner?.dispose({
+				snapshot: kernelSnapshot,
+			});
 		} catch {
 			// a failed kernel startup already cleaned up after itself
 		}
@@ -4139,8 +4617,20 @@ export class AgentSession {
 	}
 
 	dispose(): void {
-		if (this._disposed) {
-			return;
+		if (this._disposed) return;
+		const actTeardown = this._beginActTeardown();
+		this._closeDisposalAdmission();
+		if (!this._disposeAsyncPromise) {
+			const childSessions = new Set([
+				...[...this._activeRlmChildRuns.values()].flatMap((run) => (run.session ? [run.session] : [])),
+				...[...this._rlmChildSessions.values()].map(({ session }) => session),
+			]);
+			this._disposeAsyncPromise = (async () => {
+				if (actTeardown) await actTeardown;
+				await Promise.allSettled([...childSessions].map((session) => session.disposeAsync()));
+				await this._disposeKernelOnce();
+			})();
+			void this._disposeAsyncPromise.catch(() => undefined);
 		}
 		this._disposed = true;
 		for (const run of this._unsettledRlmChildRuns) run.suppressTerminalNotice = true;
@@ -4160,7 +4650,14 @@ export class AgentSession {
 			this._pendingRequestedRefine = undefined;
 			this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
 			this._autoRefineBranchVersion++;
+			for (const [, lane] of [...this._actLanes.entries()].sort(([left], [right]) => right - left)) {
+				lane.dispose();
+			}
+			this._actLanes.clear();
+			this._activeActStack.length = 0;
+			this._rootForeground.dispose(new Error("Session disposed before foreground admission."));
 			this._cancelActiveRlmChildRuns("Parent session disposed");
+			this._disposeExternalRlmChildRuntimes();
 			for (const unsubscribe of this._rlmChildUnsubscribes.values()) {
 				unsubscribe();
 			}
@@ -4284,7 +4781,7 @@ export class AgentSession {
 	}
 
 	buildSessionContext(): SessionContext {
-		const context = this.sessionManager.buildSessionContext();
+		const context = this.sessionManager.buildSessionContext(this.model?.provider);
 		for (const message of context.messages) {
 			this._applyLateIpythonSentAgentMessages(message);
 		}
@@ -4326,6 +4823,17 @@ export class AgentSession {
 		return this._semanticEdges;
 	}
 
+	/** actEnabled reports whether this session exposes rlm.act. */
+	get actEnabled(): boolean {
+		return this._actEnabled;
+	}
+
+	/** foregroundMode identifies whether this session is the rpc-only harness. */
+	get foregroundMode(): "rpc_only" | "ordinary" {
+		return this._harnessMode === "rpc-only" ? "rpc_only" : "ordinary";
+	}
+
+	/** rlmMaxDepth is the current absolute RLM spawn-depth cap. */
 	get rlmMaxDepth(): number {
 		return this._rlmMaxDepth;
 	}
@@ -4438,8 +4946,16 @@ export class AgentSession {
 			toolSnippets,
 			promptGuidelines,
 			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
+			actEnabled: this._actEnabled && this.settingsManager.getRlmActMaxDepth() > 0,
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
+			currentModel: this.model
+				? {
+						provider: this.model.provider,
+						id: this.model.id,
+						name: this.model.name,
+					}
+				: undefined,
 			harnessState: this._loadMergedHarnessState(),
 			genericMcpServers: this._mcpManager?.getEnabledPersistentGenericServers(),
 		};
@@ -4558,6 +5074,7 @@ export class AgentSession {
 
 	private _canStartSessionActionImmediately(): boolean {
 		return (
+			!this._rootForeground.blocksCurrentContext &&
 			!this.isStreaming &&
 			!this.isCompacting &&
 			!this.isRetrying &&
@@ -4579,11 +5096,39 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
-		return this._prompt(text, options);
+		const normalized = this._normalizeManualContinuation(text, options);
+		return this._prompt(normalized.text, normalized.options);
 	}
 
 	async promptUntilAccepted(text: string, options?: PromptOptions): Promise<void> {
-		return this._prompt(text, { ...options, returnAfterAccepted: true });
+		const normalized = this._normalizeManualContinuation(text, options);
+		return this._prompt(normalized.text, {
+			...normalized.options,
+			returnAfterAccepted: true,
+		});
+	}
+
+	private _normalizeManualContinuation(
+		text: string,
+		options?: PromptOptions,
+	): { text: string; options?: PromptOptions } {
+		if (
+			text.trim() !== "." ||
+			options?.internalPrompt ||
+			options?.customMessage ||
+			(options?.images?.length ?? 0) > 0 ||
+			(options?.content?.length ?? 0) > 0
+		) {
+			return { text, options };
+		}
+		return {
+			text: MANUAL_CONTINUE_PROMPT,
+			options: {
+				...options,
+				customMessage: createManualContinueMessage(),
+				internalPrompt: true,
+			},
+		};
 	}
 
 	async promptAndWait(text: string, options?: PromptOptions): Promise<void> {
@@ -4624,6 +5169,7 @@ export class AgentSession {
 	}
 
 	async acceptAgentMessagePrompt(text: string, options?: PromptOptions): Promise<void> {
+		if (this._harnessMode === "rpc-only") throw new Error("Agent messages are disabled in rpc-only harness mode");
 		const customMessage =
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
 		const clearEpoch = this._agentMessageClearEpoch;
@@ -4642,6 +5188,15 @@ export class AgentSession {
 			admissionCommitted();
 			const queued = await this.queueAgentMessagePrompt(text, options.streamingBehavior, customMessage);
 			options.preflightResult?.(queued, queued);
+			return;
+		}
+		if (this._sessionInputPumpSuspended && !this._isBusyForSessionInput("preflight") && customMessage) {
+			// An aborted parent keeps queued-input admission suspended so late
+			// results cannot start turns, but the child's message must still
+			// arrive: park it as next-turn context for the resumed session.
+			admissionCommitted();
+			this._pendingNextTurnMessages.push(cloneCustomMessage(customMessage));
+			options?.preflightResult?.(true, true);
 			return;
 		}
 		await this._prompt(text, {
@@ -4663,6 +5218,7 @@ export class AgentSession {
 		streamingBehavior: "steer" | "followUp",
 		customMessage?: AgentSessionMessage,
 	): Promise<boolean> {
+		if (this._harnessMode === "rpc-only") throw new Error("Agent messages are disabled in rpc-only harness mode");
 		const agentMessageId = customMessage?.details.id ?? parseAgentSessionMessagePromptId(text);
 		if (streamingBehavior === "steer") {
 			await this._queuePreparedPrompt("steer", text, undefined, {
@@ -4681,6 +5237,7 @@ export class AgentSession {
 	}
 
 	async promptHeartbeat(job: AgentCronJob, options?: PromptOptions): Promise<void> {
+		if (this._harnessMode === "rpc-only") throw new Error("Scheduled prompts are disabled in rpc-only harness mode");
 		const message = createHeartbeatPromptMessage(job);
 		await this._promptInjectedMessage(job.prompt, message, {
 			...options,
@@ -4822,7 +5379,7 @@ export class AgentSession {
 		text: string,
 		message: CustomMessage,
 		options?: InternalPromptOptions & { executionPolicy?: TurnExecutionPolicy },
-	): Promise<void> {
+	): Promise<AdmissionDisposition | undefined> {
 		if (!this.isStreaming && options?.resumeIfIdle) this._resumeSessionInputAdmission();
 		const admissionEpoch = this._sessionInputPumpEpoch;
 		const admissionFence = await this._acquireDirectTurnAdmissionFence(options?.signal).catch((error: unknown) => {
@@ -4847,8 +5404,13 @@ export class AgentSession {
 			}
 			const schedule = options?.streamingBehavior ?? "followUp";
 			const prefixMessages = visibleQueued ? this._takePendingNextTurnMessages() : undefined;
-			const action = this._createPreparedTurnAction(schedule, text, undefined, {
-				message,
+			// A manual continue ("." in the composer) that drains queued messages
+			// does not need its own continuation notice: the queued messages are the
+			// turn input, so injecting <system-notice> would be redundant.
+			const dropManualContinueNotice =
+				message.customType === MANUAL_CONTINUE_CUSTOM_TYPE && (prefixMessages?.length ?? 0) > 0;
+			const action = this._createPreparedTurnAction(schedule, dropManualContinueNotice ? "" : text, undefined, {
+				message: dropManualContinueNotice ? undefined : message,
 				prefixMessages,
 				queueKey: options?.followUpQueueKey,
 				previewLabel: injectedMessagePreviewLabel(message),
@@ -4870,7 +5432,7 @@ export class AgentSession {
 			if (!result.accepted || !result.ticket) {
 				if (prefixMessages) this._pendingNextTurnMessages.unshift(...prefixMessages);
 				reportPreflight(false, false);
-				return;
+				return undefined;
 			}
 			if (result.disposition === "queued") {
 				reportPreflight(true, true);
@@ -4882,10 +5444,11 @@ export class AgentSession {
 			}
 			if (options?.returnAfterAccepted) {
 				if (result.disposition === "starts_when_admitted") await result.ticket.delivered;
-				return;
+				return result.disposition;
 			}
-			if (visibleQueued) return;
+			if (visibleQueued) return result.disposition;
 			await result.ticket.completed;
+			return result.disposition;
 		} catch (error) {
 			reportPreflight(false);
 			throw error;
@@ -4978,10 +5541,11 @@ export class AgentSession {
 					return;
 				}
 
-				const queueForStreaming = this.isStreaming;
+				const queueForForegroundAct = this._rootForeground.actActive && this._rootForeground.blocksCurrentContext;
+				const queueForStreaming = this.isStreaming && !queueForForegroundAct;
 				const queueForBusy = options?.queueIfBusy === true && this._isBusyForSessionInput("preflight");
-				const visibleQueued = queueForStreaming || queueForBusy;
-				if (visibleQueued && !options?.streamingBehavior) {
+				const visibleQueued = queueForForegroundAct || queueForStreaming || queueForBusy;
+				if (visibleQueued && !options?.streamingBehavior && !queueForForegroundAct) {
 					const stateDescription = queueForStreaming ? "Agent is already processing" : "Agent has queued work";
 					throw new Error(
 						`${stateDescription}. Specify streamingBehavior ('steer' or 'followUp') to queue the message.`,
@@ -5011,6 +5575,7 @@ export class AgentSession {
 					prefixMessages,
 					suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
 					resumeIfIdle:
+						queueForForegroundAct ||
 						!visibleQueued ||
 						options?.resumeIfIdle ||
 						(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
@@ -5599,7 +6164,7 @@ export class AgentSession {
 	}
 
 	private _assertSessionActionAdmissionAvailable(): void {
-		if (this._disposed || this._disposing) {
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 		if (this._sessionInputAdmissionPauses.size > 0) {
@@ -5623,7 +6188,7 @@ export class AgentSession {
 		disposition: "starts_when_admitted" | "queued";
 		ticket?: ActionTicket;
 	} {
-		if (this._disposed || this._disposing) {
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 		if (this._sessionInputAdmissionPauses.size > 0) {
@@ -5632,6 +6197,10 @@ export class AgentSession {
 		if (
 			options.restore !== true &&
 			action.payload.kind === "turn" &&
+			// External events are agent messages from the kernel's "system"
+			// sibling, but they are bounded by EXTERNAL_EVENT_MAX_PENDING below;
+			// the peer-message capacity must not drop job-completion wake-ups.
+			!isExternalEventQueueKey(action.queueKey) &&
 			isAgentSessionMessage(primaryDeliveryRecord(action).message)
 		) {
 			assertAgentMessageQueueCapacity(
@@ -5648,6 +6217,13 @@ export class AgentSession {
 				);
 			}
 			return { accepted: false, disposition: "queued" };
+		}
+		if (
+			isExternalEventQueueKey(action.queueKey) &&
+			this._actionStore.unfinishedActions().filter((candidate) => isExternalEventQueueKey(candidate.queueKey))
+				.length >= EXTERNAL_EVENT_MAX_PENDING
+		) {
+			throw new Error(`session.external_event.emit queue is full: maximum is ${EXTERNAL_EVENT_MAX_PENDING} events`);
 		}
 		const canStartImmediately =
 			options.immediatelyEligible === true &&
@@ -5694,25 +6270,26 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			front?: boolean;
 		} = {},
 	): Promise<boolean> {
 		const action = this._createPreparedTurnAction(schedule, text, images, options);
 		if (action.suppressAutonomousContinuation) {
 			this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 		}
-		return this._admitSessionInput(action).accepted;
+		return this._admitSessionInput(action, { front: options.front === true }).accepted;
 	}
 
 	private _runtimeActivity(): RuntimeActivity {
 		return {
-			lowerAgentRun: this.isStreaming,
+			lowerAgentRun: this.isStreaming && !this._rootForeground.actActive,
 			compaction: this.isCompacting,
 			retry: this.isRetrying,
 			bash: this.isBashRunning,
 			refinementApply: this._refineInFlight !== undefined,
 			branchMutation: this._branchSummaryOperation !== undefined,
 			schedulerPauseCount: this._queuedWorkPauses.size + (this._sessionInputPumpSuspended ? 1 : 0),
-			disposing: this._disposed || this._disposing,
+			disposing: this._disposed || this._disposing || this._disposalAdmissionClosed,
 		};
 	}
 
@@ -5745,7 +6322,13 @@ export class AgentSession {
 
 	private _scheduleSessionInputPump(): void {
 		if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) return;
-		if (this._disposed || this._disposing || this._sessionInputPumpRequested || !this._hasSelectableSessionInput()) {
+		if (
+			this._disposed ||
+			this._disposing ||
+			this._disposalAdmissionClosed ||
+			this._sessionInputPumpRequested ||
+			!this._hasSelectableSessionInput()
+		) {
 			return;
 		}
 		this._sessionInputPumpRequested = true;
@@ -5761,8 +6344,13 @@ export class AgentSession {
 	private async _pumpSessionInputs(epoch: number): Promise<void> {
 		let blocked = false;
 		try {
-			while (!this._disposed && !this._disposing && this._hasSelectableSessionInput()) {
-				await this.agent.waitForIdle();
+			while (
+				!this._disposed &&
+				!this._disposing &&
+				!this._disposalAdmissionClosed &&
+				this._hasSelectableSessionInput()
+			) {
+				if (!this._rootForeground.actActive) await this.agent.waitForIdle();
 				const preselected = this._actionStore
 					.activeActions()
 					.find((action) => action.lifecycle.state === "selected");
@@ -5912,7 +6500,11 @@ export class AgentSession {
 		}
 	}
 
-	private async _executeSelectedSessionCommand(action: QueuedSessionAction, epoch: number): Promise<void> {
+	private _executeSelectedSessionCommand(action: QueuedSessionAction, epoch: number): Promise<void> {
+		return this._rootForeground.run("root-turn", () => this._executeSelectedSessionCommandWithLease(action, epoch));
+	}
+
+	private async _executeSelectedSessionCommandWithLease(action: QueuedSessionAction, epoch: number): Promise<void> {
 		if (action.payload.kind !== "session_command") throw new Error("Expected a selected session command");
 		const input = action.payload;
 		const commitFence = await this._acquireSessionActionCommitFence();
@@ -5975,7 +6567,9 @@ export class AgentSession {
 				this._branchSummaryOperation !== undefined
 			);
 		}
-		return externalBusy || this._actionStore.unfinishedActions().length > 0;
+		return (
+			this._rootForeground.blocksCurrentContext || externalBusy || this._actionStore.unfinishedActions().length > 0
+		);
 	}
 
 	private _isSessionInputHandoffDeferred(epoch: number): boolean {
@@ -6010,7 +6604,11 @@ export class AgentSession {
 		}
 	}
 
-	private async _startPreparedTurnActions(actions: QueuedSessionAction[], epoch: number): Promise<void> {
+	private _startPreparedTurnActions(actions: QueuedSessionAction[], epoch: number): Promise<void> {
+		return this._rootForeground.run("root-turn", () => this._startPreparedTurnActionsWithLease(actions, epoch));
+	}
+
+	private async _startPreparedTurnActionsWithLease(actions: QueuedSessionAction[], epoch: number): Promise<void> {
 		let nextTurnMessages: CustomMessage[] = [];
 		const activeTurns = () =>
 			actions.filter(
@@ -6092,20 +6690,21 @@ export class AgentSession {
 					);
 					const firstPrimaryIndex = turns[0].payload.records.indexOf(primaryDeliveryRecord(turns[0]));
 					turns[0].payload.records.splice(firstPrimaryIndex, 0, ...contextRecords);
-					const preparedMessages: AgentMessage[] = turns.flatMap((action) =>
-						action.payload.records.map((record) => record.message),
-					);
 					for (const action of turns) {
 						if (action.suppressAutonomousContinuation) {
 							this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 						}
 					}
 					if (executionPolicy.runBeforeAgentStart) {
-						this._appendBeforeAgentStartMessages(preparedMessages, prepared?.result);
 						this._applyPreparedSystemPrompt(prepared, executionPolicy.preserveEmptyExtensionPrompt);
 					} else if (executionPolicy.nextTurnContextTiming !== "skip") {
 						this.agent.state.systemPrompt = this._baseSystemPrompt;
 					}
+					const preparedMessages: AgentMessage[] = turns.flatMap((action) =>
+						action.payload.records.map((record) => record.message),
+					);
+					if (executionPolicy.runBeforeAgentStart)
+						this._appendBeforeAgentStartMessages(preparedMessages, prepared?.result);
 					for (const action of turns) transitionSessionAction(action, { state: "committing" });
 					this._notifySessionInputCheckpointChange();
 					this._emitQueueUpdate();
@@ -6403,7 +7002,10 @@ export class AgentSession {
 		return this.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt);
 	}
 
-	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): { steering: string[]; followUp: string[] } {
+	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): {
+		steering: string[];
+		followUp: string[];
+	} {
 		const ownedActions = this._actionStore.ownedActions();
 		const dispatchedTurnCount = ownedActions.filter(
 			(action) =>
@@ -6944,11 +7546,15 @@ export class AgentSession {
 			await this.agent.waitForIdle();
 			const agentEventQueue = this._agentEventQueue;
 			await agentEventQueue;
+			const compactionOperation = this._compactionOperation;
+			if (compactionOperation) await compactionOperation;
 			if (
 				pump === this._sessionInputPump &&
 				agentEventQueue === this._agentEventQueue &&
+				compactionOperation === this._compactionOperation &&
 				!this._sessionInputPumpRequested &&
 				!this.agent.state.isStreaming &&
+				!this.isCompacting &&
 				this.unfinishedActionCount === 0
 			) {
 				return;
@@ -7012,7 +7618,49 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
+	private _beginActTeardown(): Promise<void> | undefined {
+		if (this._actTeardownPromise) return this._actTeardownPromise;
+		const runningLanes = [...this._actLanes.entries()]
+			.filter(([, lane]) => lane.running)
+			.sort(([left], [right]) => right - left);
+		const completion = this._activeActCompletion;
+		if (runningLanes.length === 0 && !completion) return undefined;
+		const foregroundRelease = this._rootForeground.waitForCurrentActorRelease();
+		const cleanup = (async () => {
+			for (const [, lane] of runningLanes) {
+				if (!lane.running) continue;
+				lane.cancel();
+				await Promise.allSettled([lane.waitForIdle()]);
+			}
+			await Promise.allSettled([...(completion ? [completion] : []), foregroundRelease]);
+		})();
+		this._actTeardownPromise = cleanup;
+		void cleanup.finally(() => {
+			if (this._actTeardownPromise === cleanup) this._actTeardownPromise = undefined;
+		});
+		return cleanup;
+	}
+
+	private _closeDisposalAdmission(): void {
+		if (this._disposalAdmissionClosed) return;
+		this._disposalAdmissionClosed = true;
+		this._externalEventRegistry.dispose();
+		this._sessionInputPumpRequested = false;
+		this._sessionInputPumpEpoch++;
+		this._sessionInputPumpSuspended = true;
+		this._sessionActionCommitDisposeAbortController.abort();
+		this._rootForeground.dispose(new Error("Session disposed before foreground admission"));
+		this._notifySessionInputCheckpointChange();
+	}
+
+	private _disposeKernelOnce(): Promise<void> {
+		if (this._kernelDisposePromise) return this._kernelDisposePromise;
+		this._kernelDisposePromise = this._ipythonKernelProvisioner?.dispose() ?? Promise.resolve();
+		return this._kernelDisposePromise;
+	}
+
 	requestAbort(): void {
+		void this._beginActTeardown()?.catch(() => undefined);
 		for (const run of [...this._unsettledRlmChildRuns]) {
 			if (run.status === "cancelled") this._abandonRlmRunForQuiescence(run);
 		}
@@ -7044,6 +7692,7 @@ export class AgentSession {
 	async abort(): Promise<void> {
 		const compactionOperation = this._compactionOperation;
 		const branchSummaryOperation = this._branchSummaryOperation;
+		const actTeardown = this._beginActTeardown();
 		this.requestAbort();
 		this._cancelActiveRlmChildRuns("Parent session aborted");
 		this._goalAbortInProgress = this._goalState.status === "active";
@@ -7053,6 +7702,7 @@ export class AgentSession {
 				this._agentEventQueue,
 				...(compactionOperation ? [compactionOperation] : []),
 				...(branchSummaryOperation ? [branchSummaryOperation] : []),
+				...(actTeardown ? [actTeardown] : []),
 			]);
 		} finally {
 			this._goalAbortInProgress = false;
@@ -7060,6 +7710,7 @@ export class AgentSession {
 	}
 
 	abortForUpdateRestart(): void {
+		void this._beginActTeardown()?.catch(() => undefined);
 		// Cancel scheduled pumps and suspend new ones: queued inputs must survive
 		// into the restart manifest instead of starting a turn during teardown.
 		this._sessionInputPumpRequested = false;
@@ -7070,6 +7721,7 @@ export class AgentSession {
 		this.abortRetry();
 		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
 		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
+		this._disposeExternalRlmChildRuntimes();
 		this._goalAbortInProgress = this._goalState.status === "active";
 		this.agent.abort();
 		if (this._goalAbortInProgress) {
@@ -7086,7 +7738,7 @@ export class AgentSession {
 	private async _emitModelSelect(
 		nextModel: Model<any>,
 		previousModel: Model<any> | undefined,
-		source: "set" | "cycle" | "restore",
+		source: "set" | "cycle" | "restore" | "fallback",
 	): Promise<void> {
 		if (modelsAreEqual(previousModel, nextModel)) return;
 		await this._extensionRunner.emit({
@@ -7100,7 +7752,7 @@ export class AgentSession {
 	private _queueModelSelectEmit(
 		nextModel: Model<any>,
 		previousModel: Model<any> | undefined,
-		source: "set" | "cycle" | "restore",
+		source: "set" | "cycle" | "restore" | "fallback",
 	): Promise<void> {
 		const emit = () =>
 			this._modelSelectEmitContext.run(true, () => this._emitModelSelect(nextModel, previousModel, source));
@@ -7116,6 +7768,35 @@ export class AgentSession {
 		return promise;
 	}
 
+	private _applySessionModelChange(model: Model<any>): void {
+		const oldBaseSystemPrompt = this._baseSystemPrompt;
+		this.agent.state.model = model;
+		this.sessionManager.appendModelChange(model.provider, model.id);
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._refreshExtensionSystemPrompt(
+			this.agent.state.systemPrompt,
+			oldBaseSystemPrompt,
+		);
+		if ((this.agent.state.isStreaming || this._pendingAgentEventCount > 0) && !this._processingAgentEnd) {
+			this._pendingModelContextRebuild = true;
+			return;
+		}
+		this._restoreMessagesAfterModelChange();
+	}
+
+	private _restoreMessagesAfterModelChange(): void {
+		// Rebuild against the new provider so provider-bound compaction history is
+		// either replayed intact or replaced with its original append-only entries.
+		this.agent.state.messages = this.buildSessionContext().messages;
+		this._pendingModelContextRebuild = false;
+	}
+
+	/**
+	 * Set model directly.
+	 * Validates that the model is available and saves it to the session. The
+	 * configured default is updated unless persistDefault is false.
+	 * @throws Error if the model is not available
+	 */
 	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
 		if (!this._modelRegistry.hasConfiguredAuth(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
@@ -7127,9 +7808,10 @@ export class AgentSession {
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
-		this.agent.state.model = model;
-		this.sessionManager.appendModelChange(model.provider, model.id);
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		this._applySessionModelChange(model);
+		if (options.persistDefault !== false) {
+			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		}
 
 		this.setThinkingLevel(thinkingLevel);
 		this._clampServiceTierForModel(serviceTier);
@@ -7140,6 +7822,16 @@ export class AgentSession {
 		} else {
 			this._trackModelSelectEmitError(emitPromise);
 		}
+	}
+
+	private async _setRlmFallbackModel(candidate: RlmNativeModelCandidate): Promise<void> {
+		const previousModel = this.model;
+		const thinkingLevel = this._getThinkingLevelForModelSwitch(candidate.thinkingLevel);
+		const serviceTier = this._getServiceTierForModelSwitch();
+		this._applySessionModelChange(candidate.model);
+		this._applyThinkingLevel(thinkingLevel, false);
+		this._clampServiceTierForModel(serviceTier);
+		await this._queueModelSelectEmit(candidate.model, previousModel, "fallback");
 	}
 
 	private _trackModelSelectEmitError(emitPromise: Promise<void>): void {
@@ -7194,8 +7886,8 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.thinkingLevel);
 		const serviceTier = this._getServiceTierForModelSwitch();
 
-		this.agent.state.model = next.model;
-		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+		// Apply model
+		this._applySessionModelChange(next.model);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -7233,8 +7925,7 @@ export class AgentSession {
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
-		this.agent.state.model = nextModel;
-		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+		this._applySessionModelChange(nextModel);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -7256,26 +7947,26 @@ export class AgentSession {
 	}
 
 	setThinkingLevel(level: ThinkingLevel): void {
+		this._applyThinkingLevel(level, true);
+	}
+
+	private _applyThinkingLevel(level: ThinkingLevel, persistDefault: boolean): void {
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
-
 		const previousLevel = this.agent.state.thinkingLevel;
-		const isChanging = effectiveLevel !== previousLevel;
+		if (effectiveLevel === previousLevel) return;
 
 		this.agent.state.thinkingLevel = effectiveLevel;
-
-		if (isChanging) {
-			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (this.supportsThinking() || effectiveLevel !== "off") {
-				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
-			}
-			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
-			void this._extensionRunner.emit({
-				type: "thinking_level_select",
-				level: effectiveLevel,
-				previousLevel,
-			});
+		this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+		if (persistDefault && (this.supportsThinking() || effectiveLevel !== "off")) {
+			this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
 		}
+		this._emit({ type: "thinking_level_changed", level: effectiveLevel });
+		void this._extensionRunner.emit({
+			type: "thinking_level_select",
+			level: effectiveLevel,
+			previousLevel,
+		});
 	}
 
 	setServiceTier(serviceTier: ServiceTier): void {
@@ -7356,10 +8047,13 @@ export class AgentSession {
 		return this.model ? (clampThinkingLevel(this.model, level) as ThinkingLevel) : "off";
 	}
 
-	private async _syncKernelStateAfterCompaction(): Promise<void> {
+	private async _notifyKernelStateAfterCompaction(): Promise<void> {
 		const provisioner = this._ipythonKernelProvisioner;
 		if (!provisioner?.hasRunningKernel) return;
-		const pruned = await provisioner.pruneOversizedVariables().catch(() => null);
+		const pruned =
+			typeof provisioner.pruneOversizedVariables === "function"
+				? await provisioner.pruneOversizedVariables().catch(() => null)
+				: null;
 		const abort = new AbortController();
 		const timer = setTimeout(() => abort.abort(), KERNEL_STATE_LISTING_TIMEOUT_MS);
 		if (typeof timer === "object" && "unref" in timer) timer.unref();
@@ -7374,7 +8068,7 @@ export class AgentSession {
 			names === null
 				? ""
 				: names.length > 0
-					? ` These names are still defined: ${names.join(", ")}.`
+					? ` These names are still defined: ${formatKernelStateNames(names)}.`
 					: " You have not defined any names yet.";
 		const prunedDetail =
 			pruned && pruned.length > 0
@@ -7409,7 +8103,7 @@ export class AgentSession {
 		const lines = ["<ipython_state_restored>"];
 		if (result.restored.length > 0) {
 			lines.push(
-				`Your Python kernel state was revived from your previous session. These names are available again: ${result.restored.join(", ")}.`,
+				`Your IPython kernel state was revived from your previous session. These names are available again: ${formatKernelStateNames(result.restored)}.`,
 			);
 		} else {
 			lines.push(
@@ -7418,7 +8112,7 @@ export class AgentSession {
 		}
 		if (result.failed.length > 0) {
 			lines.push(
-				`These could not be restored and must be recreated if needed: ${result.failed.map((f) => f.name).join(", ")}.`,
+				`These could not be restored and must be recreated if needed: ${formatKernelStateNames(result.failed.map((entry) => entry.name))}.`,
 			);
 		}
 		lines.push("</ipython_state_restored>");
@@ -7444,14 +8138,29 @@ export class AgentSession {
 	}
 
 	async compact(customInstructions?: string, options: { skipAbort?: boolean } = {}): Promise<CompactionResult> {
-		if (options.skipAbort && this.isStreaming) {
+		const queuesBehindForegroundAct = this._rootForeground.blocksCurrentContext && this._rootForeground.actActive;
+		if (options.skipAbort && this.isStreaming && !queuesBehindForegroundAct) {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
 		const continueAfterSessionInput = this._postCompactionContinuationSettlement?.continueAfterSessionInput ?? false;
-		this._disconnectFromAgent();
-		if (!options.skipAbort) await this.abort();
+		if (!options.skipAbort && !queuesBehindForegroundAct) await this.abort();
+		return this._rootForeground.run("compaction", () =>
+			this._compactWithLease(customInstructions, hadPostCompactionContinue, continueAfterSessionInput),
+		);
+	}
+
+	/** Runs the compaction core under the root foreground lease so queued prompts, compaction, and cells execute in foreground order. */
+	private async _compactWithLease(
+		customInstructions: string | undefined,
+		hadPostCompactionContinue: boolean,
+		continueAfterSessionInput: boolean,
+	): Promise<CompactionResult> {
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
+			throw new Error("Cannot compact a disposing or disposed session.");
+		}
 		let didCompact = false;
+		let disconnected = false;
 		this._compactionAbortController = new AbortController();
 		let resolveCompactionOperation: () => void = () => {};
 		const compactionOperation = new Promise<void>((resolve) => {
@@ -7470,12 +8179,16 @@ export class AgentSession {
 			}
 
 			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
+			await this._runScratchHandoffCloseoutEpisode(this._compactionAbortController.signal);
+			this._disconnectFromAgent();
+			disconnected = true;
 			const result = await this._performCompaction({
 				model: this.model,
 				apiKey,
 				headers,
 				customInstructions,
 				signal: this._compactionAbortController.signal,
+				reason: "manual",
 			});
 
 			this._emit({
@@ -7508,7 +8221,7 @@ export class AgentSession {
 			throw error;
 		} finally {
 			this._compactionAbortController = undefined;
-			this._reconnectToAgent();
+			if (disconnected) this._reconnectToAgent();
 			if (this._compactionOperation === compactionOperation) {
 				this._compactionOperation = undefined;
 			}
@@ -7540,13 +8253,38 @@ export class AgentSession {
 		headers?: Record<string, string>;
 		customInstructions?: string;
 		signal: AbortSignal;
+		reason?: "manual" | "overflow" | "threshold" | "requested";
 	}): Promise<CompactionResult> {
 		const { model, apiKey, headers, customInstructions, signal } = options;
-		const pathEntries = this.sessionManager.getBranch();
 		const settings = this.settingsManager.getCompactionSettings();
+		const supportsNativeCompaction = settings.native && getApiProvider(model.api)?.compact !== undefined;
+		const scratchRoute = resolveScratchHandoffBoundary({
+			strategy: settings.strategy,
+			scratchEnabled: this.settingsManager.getScratchHandoffSettings().enabled,
+			supportsNativeCompaction,
+			supportsImages: model.input.includes("image"),
+			reason: options.reason ?? "manual",
+		});
+		if (scratchRoute.mode === "scratch") {
+			return this._performScratchHandoffCompaction(signal);
+		}
+		if (scratchRoute.warning) {
+			await this.sendCustomMessage({
+				customType: SCRATCH_HANDOFF_WARNING_CUSTOM_TYPE,
+				content: scratchRoute.warning,
+				display: true,
+				details: { reason: options.reason ?? "manual" },
+			});
+		}
+		const pathEntries = this.sessionManager.getBranch();
+		const portablePreparation = prepareCompaction(pathEntries, settings);
+		const nativePreparation =
+			supportsNativeCompaction && !customInstructions
+				? prepareCompaction(pathEntries, settings, model.provider)
+				: undefined;
+		const hookPreparation = portablePreparation ?? nativePreparation;
 
-		const preparation = prepareCompaction(pathEntries, settings);
-		if (!preparation) {
+		if (!hookPreparation) {
 			const lastEntry = pathEntries[pathEntries.length - 1];
 			if (lastEntry?.type === "compaction") {
 				throw new CompactionSkippedError("Already compacted");
@@ -7556,7 +8294,6 @@ export class AgentSession {
 
 		let extensionCompaction: CompactionResult | undefined;
 		let fromExtension = false;
-
 		const semanticCompaction = this._semanticEdges.beginCompaction();
 		let compactionRecorded = false;
 		const uncommittedSlices: string[] = [];
@@ -7566,11 +8303,13 @@ export class AgentSession {
 		let tokensBefore: number;
 		let details: CompactionResult["details"];
 		let usage: CompactionResult["usage"];
+		let providerNativeCompaction: CompactionResult["providerNativeCompaction"];
+		let savedCompactionEntryId: string;
 		try {
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
 				const result = (await this._extensionRunner.emit({
 					type: "session_before_compact",
-					preparation,
+					preparation: hookPreparation,
 					branchEntries: pathEntries,
 					customInstructions,
 					signal,
@@ -7586,47 +8325,77 @@ export class AgentSession {
 				}
 			}
 
-			if (extensionCompaction) {
-				({ summary, firstKeptEntryId, tokensBefore, details, usage } = extensionCompaction);
-			} else {
-				// Each summary wire call gets its own request ID: split turns send two
-				// different bodies, and one Idempotency-Key must never cover both. A slice
-				// that succeeds on the wire stays uncommitted until the compaction itself
-				// commits: a racing sibling's failure (or an abort) must leave no committed
-				// summary request for the next turn's continuation edge to attach to.
-				const summaryCall = async <T>(
-					call: (callHeaders: Record<string, string> | undefined) => Promise<T>,
-				): Promise<T> => {
-					const requestId = this._semanticEdges.startCompactionRequest(semanticCompaction.compactionId);
-					if (requestId === undefined) {
-						return call(headers);
-					}
-					try {
-						const result = await call({ ...headers, ...modelRequestHeaders(requestId) });
-						// A slice resolving after a sibling's rejection already settled the
-						// compaction would push into a drained list and stay in-flight forever.
-						if (compactionSettled) {
-							this._semanticEdges.failRequest(requestId);
-						} else {
-							uncommittedSlices.push(requestId);
-						}
-						return result;
-					} catch (error) {
+			// Each summary wire call gets its own request ID: split turns send two
+			// different bodies, and one Idempotency-Key must never cover both. A slice
+			// that succeeds on the wire stays uncommitted until the compaction itself
+			// commits: a racing sibling's failure (or an abort) must leave no committed
+			// summary request for the next turn's continuation edge to attach to.
+			const summaryCall = async <T>(
+				call: (callHeaders: Record<string, string> | undefined) => Promise<T>,
+			): Promise<T> => {
+				const requestId = this._semanticEdges.startCompactionRequest(semanticCompaction.compactionId);
+				if (requestId === undefined) {
+					return call(headers);
+				}
+				try {
+					const result = await call({ ...headers, ...modelRequestHeaders(requestId) });
+					// A slice resolving after a sibling's rejection already settled the
+					// compaction would push into a drained list and stay in-flight forever.
+					if (compactionSettled) {
 						this._semanticEdges.failRequest(requestId);
-						throw error;
+					} else {
+						uncommittedSlices.push(requestId);
 					}
-				};
-				({ summary, firstKeptEntryId, tokensBefore, details, usage } = await compact(
-					preparation,
-					model,
-					apiKey,
-					headers,
-					customInstructions,
-					signal,
-					this.thinkingLevel,
-					summaryCall,
-				));
+					return result;
+				} catch (error) {
+					this._semanticEdges.failRequest(requestId);
+					throw error;
+				}
+			};
+
+			let coreCompaction: CompactionResult | undefined;
+			let nativeCompactionError: unknown;
+			if (!extensionCompaction && nativePreparation) {
+				try {
+					coreCompaction = await summaryCall((callHeaders) =>
+						compactNative(nativePreparation, model, apiKey, callHeaders, signal, this.sessionId),
+					);
+				} catch (error) {
+					if (signal.aborted) throw error;
+					nativeCompactionError = error;
+				}
 			}
+			if (!extensionCompaction && !coreCompaction) {
+				if (!portablePreparation) {
+					const localError = new CompactionSkippedError(
+						"Session is too short to compact — try again once it grows",
+					);
+					if (nativeCompactionError !== undefined) {
+						throw combineCompactionFailures(nativeCompactionError, localError);
+					}
+					throw localError;
+				}
+				try {
+					coreCompaction = await compact(
+						portablePreparation,
+						model,
+						apiKey,
+						headers,
+						customInstructions,
+						signal,
+						this.thinkingLevel,
+						summaryCall,
+					);
+				} catch (error) {
+					if (signal.aborted || nativeCompactionError === undefined) throw error;
+					throw combineCompactionFailures(nativeCompactionError, error);
+				}
+			}
+			const selectedCompaction = extensionCompaction ?? coreCompaction;
+			if (!selectedCompaction) {
+				throw new Error("Compaction produced no result");
+			}
+			({ summary, firstKeptEntryId, tokensBefore, details, usage, providerNativeCompaction } = selectedCompaction);
 
 			if (signal.aborted) {
 				throw new Error("Compaction cancelled");
@@ -7641,7 +8410,7 @@ export class AgentSession {
 				this._semanticEdges.finishRequest(requestId);
 			}
 			this._semanticEdges.finishCompaction(semanticCompaction.compactionId, "completed");
-			this.sessionManager.appendCompaction(
+			savedCompactionEntryId = this.sessionManager.appendCompaction(
 				summary,
 				firstKeptEntryId,
 				tokensBefore,
@@ -7649,6 +8418,7 @@ export class AgentSession {
 				fromExtension,
 				customInstructions,
 				usage,
+				providerNativeCompaction,
 			);
 		} catch (error) {
 			compactionSettled = true;
@@ -7663,13 +8433,14 @@ export class AgentSession {
 			throw error;
 		}
 		const newEntries = this.sessionManager.getEntries();
-		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
+		this.agent.state.messages = this.buildSessionContext().messages;
 		this._mergeUnpersistedOutcomes(this.agent.state.messages);
 		this._restoreLateIpythonSentAgentMessages();
 
-		const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
-			| CompactionEntry
-			| undefined;
+		// Get the saved compaction entry for the extension event
+		const savedCompactionEntry = newEntries.find(
+			(entry): entry is CompactionEntry => entry.type === "compaction" && entry.id === savedCompactionEntryId,
+		);
 		if (savedCompactionEntry) {
 			await this._extensionRunner.emit({
 				type: "session_compact",
@@ -7677,10 +8448,162 @@ export class AgentSession {
 				fromExtension,
 			});
 		}
-		await this._syncKernelStateAfterCompaction();
+		await this._notifyKernelStateAfterCompaction();
 		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
 
-		return { summary, firstKeptEntryId, tokensBefore, details };
+		return {
+			summary,
+			firstKeptEntryId,
+			tokensBefore,
+			details,
+			providerNativeCompaction,
+		};
+	}
+
+	/**
+	 * True when compaction should rebuild from a scratch checkpoint for the
+	 * active model and configured strategy.
+	 */
+	private _scratchHandoffRoute(): boolean {
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!this.model) return false;
+		return (
+			resolveScratchHandoffRoute({
+				strategy: settings.strategy,
+				scratchEnabled: this.settingsManager.getScratchHandoffSettings().enabled,
+				supportsNativeCompaction: settings.native && getApiProvider(this.model.api)?.compact !== undefined,
+				supportsImages: this.model.input.includes("image"),
+			}).mode === "scratch"
+		);
+	}
+
+	/** Scratch checkpoint path for this session; persisted read markers pin it. */
+	private _scratchHandoffDisplayPath(): string | undefined {
+		if (!this.settingsManager.getScratchHandoffSettings().enabled) return undefined;
+		const persisted = latestPersistedScratchHandoffPath(this.sessionManager.getBranch());
+		if (persisted) return persisted;
+		return resolveScratchHandoffPath({
+			cwd: this._cwd,
+			rootDir: this.settingsManager.getScratchHandoffSettings().rootDir,
+			sessionId: this.sessionId,
+		}).displayPath;
+	}
+
+	/**
+	 * Run the pencils-down checkpoint as an internal phase of compaction. The
+	 * visible custom message still converts to a user-role LLM message, but it
+	 * never enters the user-input scheduler or displaces the selected command.
+	 */
+	private async _runScratchHandoffCloseoutEpisode(signal: AbortSignal): Promise<void> {
+		if (!this._scratchHandoffRoute()) return;
+		const displayPath = this._scratchHandoffDisplayPath();
+		if (!displayPath) return;
+		if (signal.aborted) throw new Error("Compaction cancelled");
+
+		const branch = this.sessionManager.getBranch();
+		const create = !hasCommittedScratchHandoff(branch, displayPath);
+		this._scratchCloseout = {
+			displayPath,
+			history: buildScratchHandoffHistory(branch),
+			status: "pending",
+			reminderSent: false,
+		};
+		const closeout = this._scratchCloseout;
+		if (latestPersistedScratchHandoffPath(branch) !== displayPath) {
+			this.sessionManager.appendCustomEntry(SCRATCH_HANDOFF_PATH_CUSTOM_TYPE, { path: displayPath });
+		}
+
+		const prompt = renderScratchHandoffCloseoutMessage(displayPath, create);
+		const message = createScratchHandoffCloseoutMessage({
+			displayPath,
+			phase: create ? "create" : "update",
+			content: prompt,
+		});
+		try {
+			await this.agent.waitForIdle();
+			if (signal.aborted) throw new Error("Compaction cancelled");
+			const basePromptSnapshot = this._baseSystemPrompt;
+			const extensionResult = await this._extensionRunner.emitBeforeAgentStart(
+				prompt,
+				undefined,
+				basePromptSnapshot,
+				this._baseSystemPromptOptions,
+			);
+			if (signal.aborted) throw new Error("Compaction cancelled");
+			this._applyPreparedSystemPrompt({ result: extensionResult, basePromptSnapshot }, true);
+			const messages: AgentMessage[] = [message];
+			this._appendBeforeAgentStartMessages(messages, extensionResult);
+			this._scratchCloseoutRunActive = true;
+			await this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(messages));
+			await this._agentEventQueue;
+			if (signal.aborted) throw new Error("Compaction cancelled");
+			const finalAssistant = closeout.finalAssistant;
+			closeout.status =
+				!finalAssistant || finalAssistant.stopReason === "error" || finalAssistant.stopReason === "aborted"
+					? "failed"
+					: "complete";
+		} finally {
+			this._scratchCloseoutRunActive = false;
+		}
+	}
+
+	/**
+	 * Rebuild context around the pre-closeout history image and the complete
+	 * checkpoint instead of running an LLM-authored summary.
+	 */
+	private async _performScratchHandoffCompaction(signal: AbortSignal): Promise<CompactionResult> {
+		const displayPath = this._scratchHandoffDisplayPath();
+		if (!displayPath) throw new Error("Scratch handoff is not active");
+		const closeout = this._scratchCloseout?.displayPath === displayPath ? this._scratchCloseout : undefined;
+		if (closeout?.status !== "complete") {
+			this._scratchCloseout = undefined;
+			throw new Error("Scratch handoff closeout did not run before compaction");
+		}
+		let scratchText: string | undefined;
+		try {
+			scratchText = await readScratchHandoffText(resolveToCwd(displayPath, this._cwd));
+		} catch (error) {
+			this._scratchCloseout = undefined;
+			throw error;
+		}
+		if (!scratchText) {
+			this._scratchCloseout = undefined;
+			throw new Error(`Scratch handoff closeout did not produce a non-empty Org checkpoint at ${displayPath}`);
+		}
+		if (signal.aborted) {
+			this._scratchCloseout = undefined;
+			throw new Error("Compaction cancelled");
+		}
+		const tokensBefore = estimateContextTokens(this.agent.state.messages).tokens;
+		const continuation = buildScratchHandoffContinuation({
+			displayPath,
+			scratchText,
+			history: closeout.history,
+		});
+		if (signal.aborted) {
+			this._scratchCloseout = undefined;
+			throw new Error("Compaction cancelled");
+		}
+		let scratchEntryId: string;
+		try {
+			({ messageEntryId: scratchEntryId } = this.sessionManager.appendMessageCompaction(continuation, {
+				summary: "",
+				tokensBefore,
+				details: scratchHandoffCompactionDetails(displayPath, closeout.history),
+			}));
+		} finally {
+			this._scratchCloseout = undefined;
+		}
+		this.agent.state.messages = this.buildSessionContext().messages;
+
+		await this._notifyKernelStateAfterCompaction();
+		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
+
+		return {
+			summary: `Scratch handoff: rebuilt context around ${displayPath}.`,
+			firstKeptEntryId: scratchEntryId,
+			tokensBefore,
+		};
 	}
 
 	private async _reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void> {
@@ -7693,6 +8616,7 @@ export class AgentSession {
 	abortCompaction(): void {
 		this._compactionAbortController?.abort();
 		this._autoCompactionAbortController?.abort();
+		if (this._scratchCloseoutRunActive) this.agent.abort();
 	}
 
 	private _localHarnessStateDir(): string | undefined {
@@ -7703,7 +8627,7 @@ export class AgentSession {
 	}
 
 	private _autoRefineAllowedForSession(): boolean {
-		return this._rlmDepth === 0 && this._localHarnessStateDir() !== undefined;
+		return this._harnessMode !== "rpc-only" && this._rlmDepth === 0 && this._localHarnessStateDir() !== undefined;
 	}
 
 	private _settlePostCompactionContinue(error?: Error): void {
@@ -7892,7 +8816,14 @@ export class AgentSession {
 					waitForSessionInput = true;
 				} else {
 					this._postCompactionContinuationScheduled = false;
-					continuation = this.agent.continue();
+					// The continuation starts as foreground work: it queues
+					// behind any active Act. The lease releases before the run
+					// itself, so a cancelled stale continue can never block its
+					// replacement.
+					continuation = (async () => {
+						await this._rootForeground.run("root-turn", async () => {});
+						return this.agent.continue();
+					})();
 				}
 			} finally {
 				commitFence.release();
@@ -8562,6 +9493,12 @@ export class AgentSession {
 		return calculateContextTokens(assistantMessage.usage);
 	}
 
+	private _hasQueuedCompactCommand(): boolean {
+		return this._actionStore
+			.unfinishedActions()
+			.some((action) => action.payload.kind === "session_command" && action.payload.command.name === "compact");
+	}
+
 	private async _checkCompaction(
 		assistantMessage: AssistantMessage,
 		skipAbortedCheck = true,
@@ -8589,7 +9526,6 @@ export class AgentSession {
 			}
 			if (skipAbortedCheck) return false;
 		}
-
 		const settings = this.settingsManager.getCompactionSettings();
 		const contextWindow = this.model?.contextWindow ?? 0;
 
@@ -8637,7 +9573,13 @@ export class AgentSession {
 			}
 			return await this._runAutoCompaction("overflow", true);
 		}
-
+		// An explicit /compact already waiting at this boundary owns the
+		// maintenance episode. Let the scheduler run that selected command once
+		// the current agent turn ends instead of starting a duplicate auto pass.
+		if (this._hasQueuedCompactCommand()) {
+			this._continueAfterThresholdCompaction = false;
+			return false;
+		}
 		if (this._pendingRequestedCompaction !== undefined) {
 			return await this._runAutoCompaction("requested", false);
 		}
@@ -8724,7 +9666,43 @@ export class AgentSession {
 	private async _runAutoCompaction(
 		reason: "overflow" | "threshold" | "requested",
 		willRetry: boolean,
+		scheduled?: {
+			controller: AbortController;
+			operation: Promise<void>;
+			resolveOperation: () => void;
+		},
 	): Promise<boolean> {
+		// agent_end is processed on the session event queue. Start ownership now,
+		// but defer the model-backed closeout until that event has drained so its
+		// own events can be processed by the same queue without deadlocking.
+		if (this._processingAgentEnd && !scheduled) {
+			const controller = new AbortController();
+			let resolveOperation: () => void = () => {};
+			const operation = new Promise<void>((resolve) => {
+				resolveOperation = resolve;
+			});
+			this._autoCompactionAbortController = controller;
+			this._compactionOperation = operation;
+			const startAfter = this._agentEventQueue;
+			void startAfter.then(
+				() => this._runAutoCompaction(reason, willRetry, { controller, operation, resolveOperation }),
+				() => this._runAutoCompaction(reason, willRetry, { controller, operation, resolveOperation }),
+			);
+			return true;
+		}
+
+		const controller = scheduled?.controller ?? new AbortController();
+		let resolveCompactionOperation = scheduled?.resolveOperation ?? (() => {});
+		const compactionOperation =
+			scheduled?.operation ??
+			new Promise<void>((resolve) => {
+				resolveCompactionOperation = resolve;
+			});
+		if (!scheduled) {
+			this._autoCompactionAbortController = controller;
+			this._compactionOperation = compactionOperation;
+		}
+
 		// Any compaction consumes a pending model request and honors its instructions
 		// (overflow recovery can fire first and take the request with it).
 		const pending = this._pendingRequestedCompaction;
@@ -8752,12 +9730,6 @@ export class AgentSession {
 		};
 
 		this._emit({ type: "compaction_start", reason, customInstructions });
-		this._autoCompactionAbortController = new AbortController();
-		let resolveCompactionOperation: () => void = () => {};
-		const compactionOperation = new Promise<void>((resolve) => {
-			resolveCompactionOperation = resolve;
-		});
-		this._compactionOperation = compactionOperation;
 
 		try {
 			const authResult = this.model ? await this._modelRegistry.getApiKeyAndHeaders(this.model) : undefined;
@@ -8776,13 +9748,19 @@ export class AgentSession {
 				resumeAfterFailure();
 				return false;
 			}
+			// Overflow recovery cannot spare a turn; every other reason gives the
+			// model its pencils-down checkpoint inside this compaction operation.
+			if (reason !== "overflow") {
+				await this._runScratchHandoffCloseoutEpisode(controller.signal);
+			}
 
 			const result = await this._performCompaction({
 				model: this.model,
 				apiKey: authResult.apiKey,
 				headers: authResult.headers,
 				customInstructions,
-				signal: this._autoCompactionAbortController.signal,
+				signal: controller.signal,
+				reason,
 			});
 
 			this._emit({
@@ -8859,7 +9837,9 @@ export class AgentSession {
 			resumeAfterFailure();
 			return false;
 		} finally {
-			this._autoCompactionAbortController = undefined;
+			if (this._autoCompactionAbortController === controller) {
+				this._autoCompactionAbortController = undefined;
+			}
 			if (this._compactionOperation === compactionOperation) {
 				this._compactionOperation = undefined;
 			}
@@ -8986,7 +9966,13 @@ export class AgentSession {
 			return;
 		}
 
+		const oldBaseSystemPrompt = this._baseSystemPrompt;
 		this.agent.state.model = refreshedModel;
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._refreshExtensionSystemPrompt(
+			this.agent.state.systemPrompt,
+			oldBaseSystemPrompt,
+		);
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
@@ -9220,6 +10206,11 @@ export class AgentSession {
 			// reload can't restore from a snapshot the old kernel is still writing.
 			const previousDispose = this._ipythonKernelProvisioner?.dispose();
 			this._ipythonKernelSnapshotDir = this.sessionManager.getSessionArtifactDir();
+			// A fresh kernel starts with an empty watch registry; drop the stale mirror.
+			if (this._externalEventWatches.length > 0) {
+				this._externalEventWatches = [];
+				this._emit({ type: "external_event_watches_changed", watches: [] });
+			}
 			// Only surface the "revived from your previous session" notice on the first
 			// build (a genuine resume). A later rebuild (/reload) restores state silently
 			// for continuity — the conversation is unchanged, so there's nothing to flag.
@@ -9230,6 +10221,7 @@ export class AgentSession {
 				shellPath: this.settingsManager.getShellPath(),
 				sessionId: this.sessionId,
 				hostHandlers: this._createKernelHostHandlers(),
+				foregroundLease: this._rootForeground,
 				pythonSkills,
 				snapshotDir: this._ipythonKernelSnapshotDir,
 				readyGate: previousDispose,
@@ -9341,6 +10333,584 @@ export class AgentSession {
 		return skills;
 	}
 
+	private _emitActProgress(
+		actId: string,
+		depth: number,
+		parentActId: string | undefined,
+		outerToolCallId: string,
+		sequence: number,
+		progress: ActLaneProgress,
+	): void {
+		if (progress.type === "assistant_delta") {
+			const text = truncateActEventText(progress.text, ACT_EVENT_CELL_TEXT_MAX_CHARS);
+			this._emit({
+				type: "act_event",
+				actId,
+				depth,
+				...(parentActId ? { parentActId } : {}),
+				outerToolCallId,
+				sequence,
+				event: "assistant_delta",
+				stream: progress.stream,
+				text: text.text,
+				textTruncated: text.truncated,
+			});
+			return;
+		}
+		if (progress.type === "cell_start") {
+			const code = truncateActEventText(progress.code, ACT_EVENT_CELL_TEXT_MAX_CHARS);
+			this._emit({
+				type: "act_event",
+				actId,
+				depth,
+				...(parentActId ? { parentActId } : {}),
+				outerToolCallId,
+				sequence,
+				event: "cell_start",
+				cellId: progress.cellId,
+				code: code.text,
+				codeTruncated: code.truncated,
+			});
+			return;
+		}
+		const stdout = truncateActEventText(progress.stdout, ACT_EVENT_CELL_TEXT_MAX_CHARS);
+		const stderr = truncateActEventText(progress.stderr, ACT_EVENT_CELL_TEXT_MAX_CHARS);
+		const result =
+			progress.result === undefined
+				? undefined
+				: truncateActEventText(progress.result, ACT_EVENT_CELL_TEXT_MAX_CHARS);
+		const error =
+			progress.error === undefined ? undefined : truncateActEventText(progress.error, ACT_EVENT_ERROR_MAX_CHARS);
+		this._emit({
+			type: "act_event",
+			actId,
+			depth,
+			...(parentActId ? { parentActId } : {}),
+			outerToolCallId,
+			sequence,
+			event: "cell_terminal",
+			cellId: progress.cellId,
+			...(progress.durationMs !== undefined ? { durationMs: progress.durationMs } : {}),
+			status: progress.status,
+			stdout: stdout.text,
+			stdoutTruncated: stdout.truncated,
+			stderr: stderr.text,
+			stderrTruncated: stderr.truncated,
+			...(result ? { result: result.text } : {}),
+			resultTruncated: result?.truncated ?? false,
+			...(error ? { error: error.text } : {}),
+			errorTruncated: error?.truncated ?? false,
+		});
+	}
+
+	private async _runAct(
+		payload: Record<string, unknown>,
+		_signal: AbortSignal | undefined,
+		channel: HostRequestChannel | undefined,
+	): Promise<Record<string, unknown>> {
+		if (typeof payload.prompt !== "string" || payload.prompt.trim().length === 0) {
+			throw new Error("rlm.act requires a non-empty prompt");
+		}
+		if (!channel) throw new Error("rlm.act requires a duplex kernel channel");
+		if (!channel.outerToolCallId) throw new Error("rlm.act requires outer tool-call correlation");
+		const requestedModel = normalizeRequestedRlmSubagentModel(payload.model, "rlm.act");
+		const depth = this._activeActStack.length + 1;
+		const maxDepth = this.settingsManager.getRlmActMaxDepth();
+		if (depth > maxDepth) {
+			throw new Error(`rlm.act depth ${depth} exceeds rlmActMaxDepth ${maxDepth}`);
+		}
+		const parent = this._activeActStack.at(-1);
+		const parentActId = parent?.actId;
+		if (parent && !parent.lane.cellRunning) {
+			throw new Error("Nested rlm.act requires the calling Act's active shared-IPython cell");
+		}
+		const model = requestedModel ?? this.settingsManager.getRlmActDefaultModel(depth);
+		if (!model) {
+			if (depth === 1) {
+				throw new Error("rlm.act requires an explicit model when rlmActDefaultModel is not configured");
+			}
+			throw new Error(
+				`rlm.act requires an explicit model at Act depth ${depth} because rlmActDefaultModel has no entry`,
+			);
+		}
+		const selection = await this._resolveActModel(model);
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed || channel.signal.aborted) {
+			return { outcome: "cancelled" };
+		}
+		const rootBranch = this.sessionManager.getBranch();
+		const previousAct = rootBranch
+			.slice()
+			.reverse()
+			.find((entry) => entry.type === "act_start" && (entry.depth ?? 1) === depth);
+		const callerEntries = parent?.lane.callerHistoryEntries ?? rootBranch;
+		const callerHistory = buildActCallerHistory(
+			callerEntries,
+			channel.outerToolCallId,
+			previousAct?.type === "act_start" ? previousAct.outerToolCallId : undefined,
+		);
+		if (callerHistory.images.length > 0 && !selection.model.input.includes("image")) {
+			throw new Error(
+				"rlm.act caller-history transfer requires an image-capable model after the first call at a depth",
+			);
+		}
+		const historyImages = callerHistory.images;
+		const sessionKey = `${selection.model.provider}/${selection.model.id}`;
+		let lane = this._actLanes.get(depth);
+		if (!lane) {
+			lane = new ActLane();
+			this._actLanes.set(depth, lane);
+		}
+		const actId = randomUUID();
+		const frame = { actId, depth, lane };
+		this._activeActStack.push(frame);
+		const outerToolCallId = channel.outerToolCallId;
+		const prompt = truncateActEventText(payload.prompt, ACT_EVENT_PROMPT_MAX_CHARS);
+		const cancellationCapability = actCancellationCapability();
+		let sequence = 0;
+		const pendingProgress: ActLaneProgress[] = [];
+		let started:
+			| {
+					sessionKey: string;
+					baseline: Usage;
+					model: { provider: string; id: string; name?: string };
+					thinkingLevel: string;
+					directingModel?: { provider: string; id: string; name?: string };
+					directingThinkingLevel: string;
+			  }
+			| undefined;
+		let status: Exclude<ActTerminalStatus, "interrupted"> = "error";
+		let terminalError: string | undefined;
+		let admitted = false;
+		let resolveTerminalCompletion: () => void = () => {};
+		const terminalCompletion = new Promise<void>((resolve) => {
+			resolveTerminalCompletion = resolve;
+		});
+		try {
+			const result = await lane.run(
+				payload.prompt,
+				channel,
+				{
+					sessionKey,
+					createSession: (tool) => this._createActLaneSession(tool, selection, depth, sessionKey),
+				},
+				(state) => {
+					if (!state.model) throw new Error("Act model selection did not resolve a model");
+					this.sessionManager.appendActStart(actId, state.usage, {
+						depth,
+						parentActId,
+						sessionKey: state.sessionKey,
+						outerToolCallId,
+					});
+					started = {
+						sessionKey: state.sessionKey,
+						baseline: state.usage,
+						model: state.model,
+						thinkingLevel: state.thinkingLevel,
+						directingModel:
+							parent?.lane.model ??
+							(this.model
+								? {
+										provider: this.model.provider,
+										id: this.model.id,
+										name: this.model.name,
+									}
+								: undefined),
+						directingThinkingLevel: parent?.lane.thinkingLevel ?? this.thinkingLevel,
+					};
+					this._emit({
+						type: "act_event",
+						actId,
+						depth,
+						...(parentActId ? { parentActId } : {}),
+						outerToolCallId,
+						sequence: ++sequence,
+						event: "start",
+						prompt: prompt.text,
+						promptTruncated: prompt.truncated,
+						model: { ...state.model },
+						thinkingLevel: state.thinkingLevel,
+						...(started.directingModel ? { directingModel: { ...started.directingModel } } : {}),
+						directingThinkingLevel: started.directingThinkingLevel,
+						cancellationCapability,
+					});
+					for (const progress of pendingProgress.splice(0)) {
+						this._emitActProgress(actId, depth, parentActId, outerToolCallId, ++sequence, progress);
+					}
+				},
+				() => {
+					admitted = true;
+					if (depth === 1) {
+						const foregroundRelease = this._rootForeground.waitForCurrentActorRelease();
+						const completion = Promise.allSettled([terminalCompletion, foregroundRelease]).then(() => undefined);
+						this._activeActCompletion = completion;
+						void completion.finally(() => {
+							if (this._activeActCompletion === completion) this._activeActCompletion = undefined;
+						});
+					}
+				},
+				(progress) => {
+					if (!started) pendingProgress.push(progress);
+					else this._emitActProgress(actId, depth, parentActId, outerToolCallId, ++sequence, progress);
+				},
+				historyImages,
+			);
+			status = result.outcome === "done" ? "done" : result.outcome === "cancelled" ? "cancelled" : "error";
+			if (result.outcome === "text") terminalError = "Act ended without calling rlm.done()";
+			return { ...result };
+		} catch (error) {
+			status = channel.signal.aborted ? "cancelled" : "error";
+			terminalError = actErrorText(error);
+			throw error;
+		} finally {
+			try {
+				if (started) {
+					const terminalUsage = actUsageDelta(lane.usage, started.baseline);
+					const error = terminalError
+						? truncateActEventText(terminalError, ACT_EVENT_ERROR_MAX_CHARS)
+						: { text: "", truncated: false };
+					this.sessionManager.appendActTerminal(actId, status, terminalUsage, {
+						depth,
+						parentActId,
+						sessionKey: started.sessionKey,
+						model: started.model,
+						...(terminalError ? { error: error.text } : {}),
+					});
+					this._emit({
+						type: "act_event",
+						actId,
+						depth,
+						...(parentActId ? { parentActId } : {}),
+						outerToolCallId,
+						sequence: ++sequence,
+						event: "terminal",
+						status,
+						prompt: prompt.text,
+						promptTruncated: prompt.truncated,
+						model: { ...started.model },
+						thinkingLevel: started.thinkingLevel,
+						...(started.directingModel ? { directingModel: { ...started.directingModel } } : {}),
+						directingThinkingLevel: started.directingThinkingLevel,
+						cancellationCapability,
+						usage: cloneUsage(terminalUsage),
+						...(terminalError ? { error: error.text } : {}),
+						errorTruncated: error.truncated,
+					});
+				}
+			} finally {
+				if (admitted) resolveTerminalCompletion();
+				const frameIndex = this._activeActStack.lastIndexOf(frame);
+				if (frameIndex >= 0) this._activeActStack.splice(frameIndex, 1);
+			}
+		}
+	}
+
+	private _baseActSessionLocation(depth = 1): { dir: string; file: string } | undefined {
+		const artifactDir = this.sessionManager.getSessionArtifactDir();
+		if (!artifactDir) return undefined;
+		const dir = join(artifactDir, depth === 1 ? ACT_SESSION_DIRNAME : `${ACT_SESSION_DIRNAME}-depth-${depth}`);
+		return { dir, file: join(dir, ACT_SESSION_FILENAME) };
+	}
+
+	private _actSessionLocation(
+		depth = 1,
+		sessionKey?: string,
+		claimModel?: { provider: string; id: string },
+	): { dir: string; file: string } | undefined {
+		const base = this._baseActSessionLocation(depth);
+		if (!base || !sessionKey) return base;
+		const marker = join(base.dir, ACT_SESSION_MODEL_KEY_FILENAME);
+		if (existsSync(marker)) {
+			if (readFileSync(marker, "utf8").trim() === sessionKey) return base;
+			return this._qualifiedActSessionLocation(base, sessionKey, claimModel);
+		}
+		if (existsSync(base.file)) {
+			if (!claimModel) return this._qualifiedActSessionLocation(base, sessionKey);
+			const manager = SessionManager.open(base.file, base.dir, this._cwd);
+			const persistedModel = manager
+				.getBranch()
+				.slice()
+				.reverse()
+				.find((entry) => entry.type === "model_change");
+			if (
+				persistedModel?.type === "model_change" &&
+				persistedModel.provider === claimModel.provider &&
+				persistedModel.modelId === claimModel.id
+			) {
+				writeFileSync(marker, `${sessionKey}\n`, {
+					encoding: "utf8",
+					mode: 0o600,
+				});
+				return base;
+			}
+			return this._qualifiedActSessionLocation(base, sessionKey, claimModel);
+		}
+		if (!claimModel) return this._qualifiedActSessionLocation(base, sessionKey);
+		mkdirSync(base.dir, { recursive: true });
+		writeFileSync(marker, `${sessionKey}\n`, { encoding: "utf8", mode: 0o600 });
+		return base;
+	}
+
+	private _qualifiedActSessionLocation(
+		base: { dir: string; file: string },
+		sessionKey: string,
+		claimModel?: { provider: string; id: string },
+	): { dir: string; file: string } {
+		const suffix = createHash("sha256").update(sessionKey).digest("hex").slice(0, 16);
+		const dir = `${base.dir}-model-${suffix}`;
+		const file = join(dir, ACT_SESSION_FILENAME);
+		const marker = join(dir, ACT_SESSION_MODEL_KEY_FILENAME);
+		if (existsSync(marker) && readFileSync(marker, "utf8").trim() !== sessionKey) {
+			throw new Error("Act model session key collision");
+		}
+		if (claimModel && !existsSync(marker)) {
+			if (existsSync(file)) {
+				const manager = SessionManager.open(file, dir, this._cwd);
+				const persistedModel = manager
+					.getBranch()
+					.slice()
+					.reverse()
+					.find((entry) => entry.type === "model_change");
+				if (
+					persistedModel?.type !== "model_change" ||
+					persistedModel.provider !== claimModel.provider ||
+					persistedModel.modelId !== claimModel.id
+				) {
+					throw new Error("Act model session key collision");
+				}
+			}
+			mkdirSync(dir, { recursive: true });
+			writeFileSync(marker, `${sessionKey}\n`, {
+				encoding: "utf8",
+				mode: 0o600,
+			});
+		}
+		return { dir, file };
+	}
+
+	private _openActSessionManager(
+		depth: number,
+		sessionKey: string,
+		model: { provider: string; id: string },
+	): SessionManager {
+		const location = this._actSessionLocation(depth, sessionKey, model);
+		if (!location) return SessionManager.inMemory(this._cwd);
+		return SessionManager.open(location.file, location.dir, this._cwd);
+	}
+
+	private _persistedActState(
+		depth = 1,
+		sessionKey?: string,
+	): {
+		usage: Usage;
+		model?: { provider: string; id: string };
+	} {
+		const location = this._actSessionLocation(depth, sessionKey);
+		if (!location || !existsSync(location.file)) return { usage: emptyUsage() };
+		const manager = SessionManager.open(location.file, location.dir, this._cwd);
+		const branch = manager.getBranch();
+		const modelEntry = branch
+			.slice()
+			.reverse()
+			.find((entry) => entry.type === "model_change");
+		const { totalUsage } = computeOwnAndTotalUsage(branch, manager.getEntries());
+		return {
+			usage: totalUsage,
+			...(modelEntry?.type === "model_change"
+				? { model: { provider: modelEntry.provider, id: modelEntry.modelId } }
+				: {}),
+		};
+	}
+
+	private _recoverInterruptedActs(): void {
+		const branch = this.sessionManager.getBranch();
+		const terminalIds = new Set(branch.filter((entry) => entry.type === "act_terminal").map((entry) => entry.actId));
+		const interrupted = branch.filter(
+			(entry): entry is ActStartEntry => entry.type === "act_start" && !terminalIds.has(entry.actId),
+		);
+		if (interrupted.length === 0) return;
+		for (const start of interrupted) {
+			const depth = start.depth ?? 1;
+			const persisted = this._persistedActState(depth, start.sessionKey);
+			this.sessionManager.appendActTerminal(
+				start.actId,
+				"interrupted",
+				actUsageDelta(persisted.usage, start.usageBaseline),
+				{
+					depth,
+					parentActId: start.parentActId,
+					sessionKey: start.sessionKey,
+					...(persisted.model ? { model: persisted.model } : {}),
+					error: "Act was interrupted before the root session restarted",
+				},
+			);
+		}
+	}
+
+	private async _resolveActModel(model: string | undefined): Promise<NativeRlmSubagentModelSelection> {
+		if (!model) throw new Error("Act model selection requires a model");
+		const selection = await this._resolveRlmSubagentModel(model);
+		if (selection.runtime !== "native") {
+			throw new Error(`Act model selector "${model}" must resolve to a native model`);
+		}
+		return selection;
+	}
+
+	private async _applyActModelSelection(
+		selection: NativeRlmSubagentModelSelection,
+		forceModelChange = false,
+	): Promise<void> {
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
+			throw new Error("Cannot select an Act model after lane disposal");
+		}
+		const previousModel = this.model;
+		const thinkingLevel = this._getThinkingLevelForModelSwitch(selection.thinkingLevel);
+		const serviceTier = this._getServiceTierForModelSwitch();
+		const modelChanged = !previousModel || !modelsAreEqual(previousModel, selection.model);
+		if (modelChanged || forceModelChange) this._applySessionModelChange(selection.model);
+		this._applyThinkingLevel(thinkingLevel, false);
+		this._clampServiceTierForModel(serviceTier);
+		this._rlmModelCandidates.splice(
+			0,
+			this._rlmModelCandidates.length,
+			...(selection.modelCandidates ?? [{ model: selection.model, thinkingLevel: selection.thinkingLevel }]),
+		);
+		this._rlmModelCandidateIndex = 0;
+		if (modelChanged) await this._queueModelSelectEmit(selection.model, previousModel, "set");
+	}
+
+	private async _createActLaneSession(
+		tool: AgentTool,
+		selection: NativeRlmSubagentModelSelection,
+		depth: number,
+		sessionKey: string,
+	): Promise<AgentSession> {
+		const sessionManager = this._openActSessionManager(depth, sessionKey, selection.model);
+		const restored = sessionManager.buildSessionContext();
+		const persistedModel = sessionManager
+			.getBranch()
+			.slice()
+			.reverse()
+			.find((entry) => entry.type === "model_change");
+		const restoredModel =
+			persistedModel?.type === "model_change"
+				? this._modelRegistry.find(persistedModel.provider, persistedModel.modelId)
+				: undefined;
+		const hasPersistedModel = persistedModel?.type === "model_change";
+		const model = restoredModel ?? selection.model;
+		const thinkingLevel = clampThinkingLevel(
+			model,
+			hasPersistedModel && restoredModel
+				? (restored.thinkingLevel as ThinkingLevel)
+				: (selection.thinkingLevel ?? this.thinkingLevel),
+		) as ThinkingLevel;
+		const inheritedServiceTier = hasPersistedModel ? restored.serviceTier : this.serviceTier;
+		const serviceTier =
+			inheritedServiceTier === "priority" && !supportsFastMode(model) ? "default" : inheritedServiceTier;
+		if (!hasPersistedModel) {
+			sessionManager.appendModelChange(model.provider, model.id);
+			sessionManager.appendThinkingLevelChange(thinkingLevel);
+			sessionManager.appendServiceTierChange(serviceTier);
+		}
+		const agent = new Agent({
+			initialState: {
+				systemPrompt: "",
+				model,
+				thinkingLevel,
+				serviceTier,
+				tools: [],
+				messages: restored.messages,
+			},
+			convertToLlm: this.agent.convertToLlm,
+			transformContext: this.agent.transformContext,
+			streamFn: this.agent.streamFn,
+			getApiKey: this.agent.getApiKey,
+			onPayload: this.agent.onPayload,
+			onResponse: this.agent.onResponse,
+			steeringMode: this.settingsManager.getSteeringMode(),
+			followUpMode: this.settingsManager.getFollowUpMode(),
+			sessionId: sessionManager.getSessionId(),
+			thinkingBudgets: this.settingsManager.getThinkingBudgets(),
+			transport: this.settingsManager.getTransport(),
+			maxRetryDelayMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+			toolExecution: this.agent.toolExecution,
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager: this.settingsManager,
+			cwd: this._cwd,
+			agentDir: this._agentDir,
+			resourceLoader: createActResourceLoader({
+				depth,
+				maxDepth: this.settingsManager.getRlmActMaxDepth(),
+			}),
+			modelRegistry: this._modelRegistry,
+			baseToolsOverride: { [tool.name]: tool },
+			allowedToolNames: [tool.name],
+			includeGoals: false,
+			includeCompactSkill: false,
+			rlmDepth: this._rlmDepth,
+			rlmMaxDepth: this._rlmMaxDepth,
+			rlmModelCandidates: selection.modelCandidates,
+			autonomous: { enabled: false },
+		});
+		if (hasPersistedModel) {
+			await session._applyActModelSelection(selection, restoredModel === undefined);
+		}
+		return session;
+	}
+
+	/** handleExternalEventHostRequest admits one authenticated session-local external event. */
+	async handleExternalEventHostRequest(payload: Record<string, unknown>): Promise<ExternalEventReceipt> {
+		return this._externalEventHostHandler(payload);
+	}
+
+	/** listExternalEventWatches returns the mirrored kernel watch registry. */
+	listExternalEventWatches(): readonly ExternalEventWatch[] {
+		return this._externalEventWatches;
+	}
+
+	/** handleExternalEventWatchUpdate replaces the mirrored watch list from the kernel. */
+	async handleExternalEventWatchUpdate(payload: Record<string, unknown>): Promise<{ accepted: true; count: number }> {
+		const watches = normalizeExternalEventWatchList(payload);
+		this._externalEventWatches = watches;
+		this._emit({ type: "external_event_watches_changed", watches });
+		return { accepted: true, count: watches.length };
+	}
+
+	/**
+	 * _admitExternalEvent delivers one validated event through the existing session input owner.
+	 *
+	 * External events are steers from the kernel's "system" sibling agent: they
+	 * arrive with the same disposition as received agent messages and render
+	 * through the agent-message component.
+	 */
+	private async _admitExternalEvent(event: ExternalEventInput): Promise<ExternalEventDeliveryStatus> {
+		const message = createAgentSessionMessage({
+			id: `agentmsg_external_${event.name}_${event.eventId}`,
+			source: "agent_message",
+			message: event.text,
+			from: { sessionName: SYSTEM_SIBLING_AGENT_NAME },
+			fromRelationship: "sibling",
+			target: {
+				activeSessionId: this.sessionId,
+				sessionId: this.sessionId,
+				sessionName: this.sessionName,
+			},
+		});
+		const disposition = await this._promptInjectedMessage(event.text, message, {
+			streamingBehavior: "steer",
+			followUpQueueKey: externalEventQueueKey(event.name, event.eventId),
+			resumeIfIdle: true,
+			returnAfterAccepted: true,
+			queueIfBusy: true,
+			suppressAutonomousContinuation: true,
+		});
+		if (disposition === undefined) throw new Error("External event was not admitted into the session action store.");
+		return disposition === "starts_when_admitted" ? "delivered" : "queued";
+	}
+
+	/** Typed handlers for host requests arriving from the IPython kernel comm bridge. */
 	private _createKernelHostHandlers(): HostRequestHandlers {
 		const handlers: HostRequestHandlers = {
 			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }) => ({
@@ -9354,9 +10924,20 @@ export class AgentSession {
 				provider: this.model?.provider ?? null,
 				input: this.model?.input ?? [],
 			}),
+			...(this._harnessMode === "rpc-only"
+				? {}
+				: {
+						"session.external_event.emit": async (payload: Record<string, unknown>) =>
+							this.handleExternalEventHostRequest(payload),
+						"session.external_event.watch_update": async (payload: Record<string, unknown>) =>
+							this.handleExternalEventWatchUpdate(payload),
+					}),
 		};
+		if (this._rlmDepth === 0 && this._actEnabled && this.settingsManager.getRlmActMaxDepth() > 0) {
+			handlers["rlm.act"] = async (payload, signal, channel) => this._runAct(payload, signal, channel);
+		}
 		if (this._includeGoals) {
-			for (const type of ["goal.get", "goal.create", "goal.complete"]) {
+			for (const type of ["goal.get", "goal.create", "goal.pause", "goal.resume", "goal.complete"]) {
 				handlers[type] = async (payload) => this.handleGoalHostRequest(type, payload);
 			}
 		}
@@ -9365,7 +10946,7 @@ export class AgentSession {
 				handlers[type] = async (payload) => this.handleCompactHostRequest(type, payload);
 			}
 		}
-		if (this._autoRefineAllowedForSession()) {
+		if (this._harnessMode !== "rpc-only" && this._autoRefineAllowedForSession()) {
 			for (const type of ["refine.run", "refine.status"]) {
 				handlers[type] = async (payload) => this.handleRefineHostRequest(type, payload);
 			}
@@ -9389,14 +10970,24 @@ export class AgentSession {
 			Object.assign(
 				handlers,
 				createAgentMessageHostHandlers({
-					roster: async () =>
-						(await this.handleAgentMessageHostRequest("agent_message.list_agents")) as AgentFamilyRosterResult,
+					roster: () => this._agentMessageRosterWithExternalChildren(),
 					awaitPendingChildPublication: (selector) => this._awaitPendingRlmChildPublication(selector),
 					sendAgentMessage: async (input) => {
-						const receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
-							target: input.target,
-							message: input.message,
-						})) as AgentSessionMessageReceipt;
+						const external = [...this._activeRlmChildRuns.values()].some(
+							(run) => run.familyMailbox && (run.id === input.target || run.sessionName === input.target),
+						);
+						const receipt = external
+							? await this._receiveExternalRlmChildMessage(input.target, {
+									message: input.message,
+									id: input.id,
+									replyTo: input.replyTo,
+								})
+							: ((await this.handleAgentMessageHostRequest("agent_message.send", {
+									target: input.target,
+									message: input.message,
+									id: input.id,
+									replyTo: input.replyTo,
+								})) as AgentSessionMessageReceipt);
 						if (this._rlmDepth > 0) {
 							let addressedParent = input.receiverRole === "parent";
 							if (input.receiverRole === undefined && this._agentMessageController?.roster) {
@@ -9596,7 +11187,10 @@ export class AgentSession {
 		model: Model<any>;
 		thinkingLevel?: ThinkingLevel;
 		spawnedByRequestId?: string;
+		modelCandidates?: RlmNativeModelCandidate[];
+		serviceTier?: ServiceTier;
 	}): CreateRlmSubagentRuntimeOptions {
+		const serviceTier = options.serviceTier === undefined ? this.serviceTier : options.serviceTier;
 		return {
 			parentSession: this,
 			id: options.id,
@@ -9605,10 +11199,9 @@ export class AgentSession {
 			spawnCode: options.spawnCode,
 			sessionDir: options.sessionDir,
 			model: options.model,
-			thinkingLevel:
-				options.thinkingLevel ?? (clampThinkingLevel(options.model, this.thinkingLevel) as ThinkingLevel),
-			serviceTier:
-				this.serviceTier === "priority" && !supportsFastMode(options.model) ? "default" : this.serviceTier,
+			thinkingLevel: clampThinkingLevel(options.model, options.thinkingLevel ?? this.thinkingLevel) as ThinkingLevel,
+			modelCandidates: options.modelCandidates,
+			serviceTier: serviceTier === "priority" && !supportsFastMode(options.model) ? "default" : serviceTier,
 			scopedModels: [...this._scopedModels],
 			activeToolNames: this.getActiveToolNames(),
 			allowedToolNames: this._allowedToolNames ? [...this._allowedToolNames] : undefined,
@@ -9686,6 +11279,7 @@ export class AgentSession {
 			rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
 			semanticParentSessionId: options.parentSession.sessionId,
 			semanticSpawnedByRequestId: options.spawnedByRequestId,
+			rlmModelCandidates: options.modelCandidates,
 			sessionStartEvent: { type: "session_start", reason: "startup" },
 		});
 		if (child.sessionName !== options.sessionName) {
@@ -9716,6 +11310,14 @@ export class AgentSession {
 		}
 	}
 
+	private _disposeExternalRlmChildRuntimes(): void {
+		for (const run of [...this._activeRlmChildRuns.values()]) {
+			if (run.runtime?.runtimeKind !== "claude-code") continue;
+			void run.runtime.dispose();
+			this._removeRlmSubagentTracking(run.id, run);
+		}
+	}
+
 	private _cancelRlmChildRun(run: RlmChildRun, reason: string): boolean {
 		if (run.status !== "running" && run.status !== "queued") {
 			return false;
@@ -9724,7 +11326,8 @@ export class AgentSession {
 		if (this._sessionInputPumpSuspended) this._abandonRlmRunForQuiescence(run);
 		run.error = reason;
 		run.publication.reject(new Error(reason));
-		run.abort();
+		if (run.runtime) run.runtime.abort(reason);
+		else run.abort();
 		// Surface the cancellation immediately; the run's own terminal update is
 		// delayed indefinitely when the child is stuck mid-stream, which is
 		// exactly when users reach for the kill.
@@ -9732,6 +11335,52 @@ export class AgentSession {
 		return true;
 	}
 
+	/** Deliver ordered follow-up input to a retained external direct child. */
+	private _resolveExternalRlmChild(target: string): RlmChildRun {
+		const matches = [...this._activeRlmChildRuns.values()].filter(
+			(run) =>
+				!run.detachedDeletion &&
+				run.familyMailbox &&
+				(run.id === target || run.sessionName === target || run.runtime?.sessionId === target),
+		);
+		if (matches.length === 0) throw new Error(`No retained external RLM child matches "${target}"`);
+		if (matches.length > 1) throw new Error(`RLM child selector "${target}" is ambiguous`);
+		return matches[0]!;
+	}
+
+	private async _receiveExternalRlmChildMessage(
+		target: string,
+		input: { message: string; id?: string; replyTo?: string },
+	): Promise<AgentSessionMessageReceipt> {
+		const run = this._resolveExternalRlmChild(target);
+		const familyMailbox = run.familyMailbox!;
+		const receipt = await familyMailbox.receive({
+			message: input.message,
+			id: input.id,
+			replyTo: input.replyTo,
+			from: {
+				activeSessionId: await this._currentActiveSessionId(),
+				sessionId: this.sessionId,
+				sessionName: this.sessionName,
+			},
+			fromRelationship: "parent",
+		});
+		if (receipt.handoff !== "retry") {
+			run.externalRepliedToParent = false;
+			run.emitUpdate?.();
+		}
+		return receipt;
+	}
+
+	/** Deliver and durably retain ordered follow-up input for an external direct child. */
+	async deliverRlmChildInput(target: string, message: string): Promise<"queued" | "woken"> {
+		const receipt = await this._receiveExternalRlmChildMessage(target, {
+			message,
+		});
+		return receipt.deliveryStatus === "delivered" ? "woken" : "queued";
+	}
+
+	/** Status of a direct RLM child run, while the run is still tracked. */
 	getRlmChildRunStatus(childId: string): RlmChildAgentStatus | undefined {
 		return this._activeRlmChildRuns.get(childId)?.status;
 	}
@@ -9753,7 +11402,7 @@ export class AgentSession {
 		);
 		if (!run) return undefined;
 		await run.publication.promise;
-		return run.session?.sessionId;
+		return run.session?.sessionId ?? run.runtime?.sessionId;
 	}
 
 	async listRlmSubagents(): Promise<RlmListSubagentsResult> {
@@ -9785,7 +11434,7 @@ export class AgentSession {
 			subagents.push({
 				rlm_child_id: run.id,
 				active_session_id: daemonChild?.activeSessionId ?? null,
-				session_id: daemonChild?.sessionId ?? run.session?.sessionId ?? null,
+				session_id: daemonChild?.sessionId ?? run.session?.sessionId ?? run.runtime?.sessionId ?? null,
 				session_name: daemonChild?.sessionName ?? run.session?.sessionName ?? run.sessionName,
 				session_dir: run.sessionDir,
 				status: run.status === "done" ? "completed" : run.status === "error" ? "error" : "running",
@@ -10074,6 +11723,7 @@ export class AgentSession {
 	}
 
 	private _removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void {
+		run?.familyMailbox?.close();
 		run?.unsubscribe?.();
 		this._rlmChildUnsubscribes.get(childId)?.();
 		this._rlmChildUnsubscribes.delete(childId);
@@ -10087,6 +11737,8 @@ export class AgentSession {
 			run.abort = noopRlmChildAbort;
 			run.unsubscribe = undefined;
 			run.session = undefined;
+			run.runtime = undefined;
+			run.familyMailbox = undefined;
 		}
 	}
 
@@ -10127,6 +11779,12 @@ export class AgentSession {
 				this._emitRlmSubagentRemoval(subagent);
 			}
 			const liveSession = run.session;
+			if (!liveSession && run.runtime?.runtimeKind === "claude-code") {
+				await run.runtime.dispose();
+				this._deletedRlmChildIds.add(childId);
+				this._removeRlmSubagentTracking(childId, run);
+				return { subagent };
+			}
 			if (run.status === "error" && !liveSession && run.settled) {
 				this._deletedRlmChildIds.add(childId);
 				this._removeRlmSubagentTracking(childId, run);
@@ -10183,7 +11841,10 @@ export class AgentSession {
 			void session.disposeAsync().catch(() => undefined);
 			return false;
 		}
-		this._rlmChildSessions.set(childId, { session, run: this._activeRlmChildRuns.get(childId) });
+		this._rlmChildSessions.set(childId, {
+			session,
+			run: this._activeRlmChildRuns.get(childId),
+		});
 		if (unsubscribe) {
 			this._rlmChildUnsubscribes.set(childId, unsubscribe);
 		}
@@ -10218,7 +11879,7 @@ export class AgentSession {
 			id: run.id,
 			parentId: this._rlmParentNodeId,
 			sessionName: child?.sessionName ?? run.sessionName,
-			model: `${model.provider}/${model.id}`,
+			model: run.modelOverride ?? `${model.provider}/${model.id}`,
 			label: rlmChildLabel(run.prompt),
 			status: run.status,
 			durationMs: run.durationMs,
@@ -10350,7 +12011,10 @@ export class AgentSession {
 		const cancellation = new AbortController();
 		const cancelFromParent = () => cancellation.abort();
 		if (externalSignal?.aborted) cancellation.abort();
-		else externalSignal?.addEventListener("abort", cancelFromParent, { once: true });
+		else
+			externalSignal?.addEventListener("abort", cancelFromParent, {
+				once: true,
+			});
 		this._rlmQuiescenceWaitAborts.add(cancellation);
 		let rejectCancelled = (_error: Error) => {};
 		const cancelled = new Promise<never>((_resolve, reject) => {
@@ -10515,36 +12179,523 @@ export class AgentSession {
 	}
 
 	async findRlmModels(query: string, limit: number): Promise<RlmFindModelsResult> {
-		return {
-			models: findRlmModelMatches(query, await this._authenticatedRlmModels(), limit),
-		};
+		const executableModels = await this._authenticatedRlmModels();
+		const parentModel = this.model;
+		const normalizedQuery = query.toLowerCase().replace(/[^a-z0-9]+/g, "");
+		const roleMatches = Object.keys(this.settingsManager.getModelRoles())
+			.sort()
+			.flatMap((role) => {
+				let candidates: RlmRuntimeCandidate[];
+				try {
+					candidates = resolveRlmRoleCandidates(role, this.settingsManager.getModelRoles());
+				} catch {
+					return [];
+				}
+				return candidates.map((candidate) => {
+					const nativeModel =
+						candidate.runtime === "native"
+							? findExactModelReferenceMatch(candidate.modelReference, this._modelRegistry.getAll())
+							: undefined;
+					const executableModel =
+						candidate.runtime === "native"
+							? ((parentModel
+									? findExactModelReferenceMatch(candidate.modelReference, [parentModel])
+									: undefined) ?? findExactModelReferenceMatch(candidate.modelReference, executableModels))
+							: undefined;
+					const slash = candidate.modelReference.indexOf("/");
+					const provider =
+						nativeModel?.provider ??
+						(candidate.runtime === "claude-code" ? "claude-code" : candidate.modelReference.slice(0, slash));
+					const id =
+						nativeModel?.id ??
+						(candidate.runtime === "claude-code"
+							? candidate.modelReference
+							: candidate.modelReference.slice(slash + 1));
+					return {
+						provider,
+						id,
+						name: `@${role} → ${candidate.selector}`,
+						selector: `@${role}`,
+						role,
+						concreteSelector: candidate.selector,
+						runtime: candidate.runtime,
+						available:
+							candidate.runtime === "claude-code"
+								? this.settingsManager.getClaudeCodeExecutable() !== undefined
+								: executableModel !== undefined,
+						...(candidate.thinkingLevel ? { effort: candidate.thinkingLevel } : {}),
+					};
+				});
+			})
+			.filter((match) => {
+				if (!normalizedQuery) return true;
+				return [match.selector, match.concreteSelector, match.name]
+					.map((value) => value.toLowerCase().replace(/[^a-z0-9]+/g, ""))
+					.some((value) => value.includes(normalizedQuery));
+			});
+		const nativeMatches = findRlmModelMatches(query, executableModels, limit);
+		return { models: [...roleMatches, ...nativeMatches].slice(0, limit) };
 	}
 
 	private async _resolveRlmSubagentModel(reference: string | undefined): Promise<RlmSubagentModelSelection> {
 		const parentModel = this.model;
-		if (!parentModel) {
-			throw new Error(formatNoModelSelectedMessage());
-		}
-		if (!reference) {
-			return { model: parentModel };
+		if (!parentModel) throw new Error(formatNoModelSelectedMessage());
+
+		const taskRole = this.settingsManager.getModelRole("task");
+		const effectiveReference = reference ?? (taskRole === undefined ? undefined : "@task");
+		if (!effectiveReference) return { runtime: "native", model: parentModel };
+
+		if (effectiveReference.startsWith("@")) {
+			const role = effectiveReference.slice(1);
+			if (!role) throw new Error("RLM model role name must not be empty");
+			const candidates = resolveRlmRoleCandidates(role, this.settingsManager.getModelRoles());
+			if (candidates[0]?.runtime === "claude-code") {
+				if (!this.settingsManager.getClaudeCodeExecutable()) {
+					throw new Error(`RLM model role "@${role}" has no available Claude Code executable`);
+				}
+				const candidate = candidates[0];
+				return {
+					runtime: "claude-code",
+					model: candidate.modelReference,
+					selector: candidate.selector,
+					thinkingLevel: candidate.thinkingLevel,
+				};
+			}
+			const executableModels = await this._authenticatedRlmModels();
+			for (const [index, candidate] of candidates.entries()) {
+				const registeredModel =
+					findExactModelReferenceMatch(candidate.modelReference, [parentModel]) ??
+					findExactModelReferenceMatch(candidate.modelReference, executableModels);
+				if (!registeredModel) continue;
+				const auth = await this._modelRegistry.getApiKeyAndHeaders(registeredModel);
+				if (!auth.ok) continue;
+				const model = withExplicitRlmThinkingLevel(registeredModel, candidate.thinkingLevel);
+				const modelCandidates: RlmNativeModelCandidate[] = [
+					{ model, thinkingLevel: candidate.thinkingLevel },
+					...candidates.slice(index + 1).flatMap((fallback) => {
+						const fallbackModel = findExactModelReferenceMatch(
+							fallback.modelReference,
+							this._modelRegistry.getAll(),
+						);
+						return fallbackModel
+							? [
+									{
+										model: withExplicitRlmThinkingLevel(fallbackModel, fallback.thinkingLevel),
+										thinkingLevel: fallback.thinkingLevel,
+									},
+								]
+							: [];
+					}),
+				];
+				return {
+					runtime: "native",
+					model,
+					thinkingLevel: candidate.thinkingLevel,
+					modelCandidates,
+				};
+			}
+			throw new Error(`RLM model role "@${role}" has no executable candidates`);
 		}
 
-		const normalizedReference = reference.toLowerCase();
+		if (effectiveReference.startsWith("claude-code/")) {
+			const candidate = parseRlmRuntimeCandidate(effectiveReference);
+			if (!this.settingsManager.getClaudeCodeExecutable()) {
+				throw new Error(
+					`Requested subagent runtime "${candidate.selector}" has no configured Claude Code executable`,
+				);
+			}
+			return {
+				runtime: "claude-code",
+				model: candidate.modelReference,
+				selector: candidate.selector,
+				thinkingLevel: candidate.thinkingLevel,
+			};
+		}
+
+		const normalizedReference = effectiveReference.toLowerCase();
 		if (`${parentModel.provider}/${parentModel.id}`.toLowerCase() === normalizedReference) {
-			return { model: parentModel };
+			return { runtime: "native", model: parentModel };
 		}
 		const model = (await this._authenticatedRlmModels()).find(
 			(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalizedReference,
 		);
 		if (!model) {
-			throw new Error(`Requested subagent model "${reference}" is unavailable, unauthenticated, or expired`);
+			throw new Error(
+				`Requested subagent model "${effectiveReference}" is unavailable, unauthenticated, or expired`,
+			);
 		}
 
 		const auth = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!auth.ok) {
-			throw new Error(`Requested subagent model "${reference}" failed authentication preflight`);
+			throw new Error(`Requested subagent model "${effectiveReference}" failed authentication preflight`);
 		}
-		return { model };
+		return { runtime: "native", model };
+	}
+
+	private async _claudeCodeFamilyRoster(run: RlmChildRun): Promise<AgentFamilyRosterResult> {
+		const parentRoster = this._agentMessageController?.roster
+			? await this._agentMessageController.roster()
+			: {
+					current: {
+						name: this.sessionName ?? this.sessionId,
+						id: this.sessionId,
+						depth: this._rlmDepth,
+					},
+					entries: [],
+				};
+		const siblings = parentRoster.entries
+			.filter((entry) => entry.relationship === "child" && entry.id !== run.id)
+			.map((entry) => ({ ...entry, relationship: "sibling" as const }));
+		for (const candidate of this._activeRlmChildRuns.values()) {
+			if (
+				candidate.id === run.id ||
+				siblings.some(
+					(entry) =>
+						entry.id === candidate.id ||
+						entry.id === candidate.session?.sessionId ||
+						entry.name === candidate.sessionName,
+				)
+			) {
+				continue;
+			}
+			siblings.push({
+				relationship: "sibling",
+				name: candidate.sessionName,
+				id: candidate.id,
+				depth: parentRoster.current.depth + 1,
+				status:
+					candidate.status === "queued" || candidate.status === "running"
+						? "running"
+						: candidate.status === "error"
+							? "inactive"
+							: "idle",
+			});
+		}
+		return {
+			current: {
+				name: run.sessionName,
+				id: run.id,
+				depth: parentRoster.current.depth + 1,
+			},
+			entries: [
+				{
+					relationship: "parent",
+					name: parentRoster.current.name,
+					id: parentRoster.current.id,
+					depth: parentRoster.current.depth,
+					status: "running",
+				},
+				...siblings.sort((a, b) => a.name.localeCompare(b.name)),
+			],
+		};
+	}
+
+	private async _sendClaudeCodeFamilyMessage(
+		run: RlmChildRun,
+		input: ClaudeCodeFamilySendInput,
+	): Promise<AgentSessionMessageReceipt> {
+		const roster = await this._claudeCodeFamilyRoster(run);
+		const matches = roster.entries.filter(
+			(entry) =>
+				entry.relationship === input.receiverRole &&
+				(input.receiverRole === "parent" || entry.id === input.receiverName || entry.name === input.receiverName),
+		);
+		if (matches.length !== 1) {
+			throw new Error(
+				matches.length === 0
+					? `No ${input.receiverRole} matches ${input.receiverName ?? "this parent"}`
+					: `${input.receiverRole} selector is ambiguous`,
+			);
+		}
+		const target = matches[0]!;
+		if (input.receiverRole === "sibling") {
+			const externalSibling = this._activeRlmChildRuns.get(target.id);
+			if (externalSibling?.familyMailbox) {
+				return externalSibling.familyMailbox.receive({
+					message: input.message,
+					id: input.id,
+					replyTo: input.replyTo,
+					from: {
+						activeSessionId: run.id,
+						sessionId: run.runtime?.sessionId ?? run.id,
+						sessionName: run.sessionName,
+					},
+					fromRelationship: "sibling",
+				});
+			}
+		}
+		const controller = this._agentMessageController;
+		if (!controller?.sendExternalChildAgentMessage) {
+			throw new Error("Claude Code family sending requires a daemon-backed parent session");
+		}
+		const receipt = await controller.sendExternalChildAgentMessage({
+			childId: run.id,
+			childSessionId: run.runtime?.sessionId,
+			childName: run.sessionName,
+			target: target.id,
+			message: input.message,
+			receiverRole: input.receiverRole,
+			id: input.id,
+			replyTo: input.replyTo,
+		});
+		if (input.receiverRole === "parent") {
+			run.externalRepliedToParent = true;
+			run.emitUpdate?.();
+		}
+		return receipt;
+	}
+
+	private async _startClaudeCodeRlmChildRun(options: {
+		prompt: string;
+		selection: Extract<RlmSubagentModelSelection, { runtime: "claude-code" }>;
+		childNodeId: string;
+		sessionName: string;
+		sessionDir: string;
+		startedAt: number;
+		spawnCode?: string;
+	}): Promise<RlmSpawnHandle> {
+		const { prompt, selection, childNodeId, sessionName, sessionDir, startedAt } = options;
+		const executable = this.settingsManager.getClaudeCodeExecutable();
+		if (!executable)
+			throw new Error(`Requested subagent runtime "${selection.selector}" has no configured executable`);
+		const parentAssistantForUsage = this._findLastAssistantMessage();
+		let runtime: ClaudeCodeRuntime;
+		// External children have no hosted session file; the host writes the
+		// ledger edge, display file, and transcript the agents view needs.
+		// Admission fails when the spawn record cannot be made durable, the
+		// same gate hosted runtimes apply.
+		const transcriptHost = this._subagentRuntimeHost?.createExternalRlmSubagentTranscript;
+		const transcript = transcriptHost
+			? await transcriptHost.call(this._subagentRuntimeHost, {
+					parentSession: this,
+					childId: childNodeId,
+					sessionName,
+					sessionDir,
+					rlmDepth: this._rlmDepth,
+					rlmParentNodeId: this._rlmParentNodeId,
+					prompt,
+					spawnCode: options.spawnCode,
+					modelLabel: `claude-code/${selection.model}`,
+				})
+			: undefined;
+		let lastAppendedMessage: string | undefined;
+		const onRuntimeEvent = (event: ClaudeCodeEvent): void => {
+			if (!transcript) return;
+			const text =
+				(event.kind === "assistant" && event.text) ||
+				(event.kind === "result" && !event.isError && event.text) ||
+				undefined;
+			if (!text || text === lastAppendedMessage) return;
+			lastAppendedMessage = text;
+			transcript.appendAssistantMessage(text);
+		};
+		const run: RlmChildRun = {
+			id: childNodeId,
+			prompt,
+			sessionName,
+			sessionDir,
+			model: this.model!,
+			modelOverride: `claude-code/${selection.model}`,
+			status: "queued",
+			settled: false,
+			toolUseCount: 0,
+			abort: () => runtime.abort("RLM child cancelled"),
+			publication: createAgentMessageDeferred(),
+			settlement: createAgentMessageDeferred(),
+			deletionReservation: createAgentMessageDeferred(),
+		};
+		const familyMailbox = new ClaudeCodeFamilyMailbox({
+			target: {
+				activeSessionId: childNodeId,
+				sessionId: childNodeId,
+				sessionName,
+				runtimeKind: "subagent",
+			},
+			storage: {
+				read: () => this.sessionManager.getEntries(),
+				append: (customType, details) => {
+					this.sessionManager.appendCustomMessageEntryWithRollback(customType, "", false, details);
+				},
+			},
+			list: () => this._claudeCodeFamilyRoster(run),
+			send: (input) => this._sendClaudeCodeFamilyMessage(run, input),
+			deliver: (message) => runtime.deliver(message),
+		});
+		const mcpServer = createClaudeCodeFamilyMcpServer(familyMailbox);
+		runtime = new ClaudeCodeRuntime({
+			prompt: `[task from parent]\n\n${prompt}`,
+			model: selection.model,
+			effort: selection.thinkingLevel,
+			executable,
+			cwd: this._cwd,
+			appendSystemPrompt: CLAUDE_CODE_COORDINATION_PROMPT,
+			tools: claudeCodeNativeTools(this.getActiveToolNames()),
+			mcpServers: { [CLAUDE_CODE_MCP_SERVER_NAME]: mcpServer },
+			requiredTools: CLAUDE_CODE_FAMILY_TOOL_NAMES,
+			startQuery: this._startClaudeCodeQuery,
+			onEvent: onRuntimeEvent,
+		});
+		let latest = runtime.snapshot;
+		let durationMs: number | undefined;
+		let attributedUsage = { ...latest.usage };
+		const attributeCompletedUsage = (snapshot: ClaudeCodeRuntimeSnapshot) => {
+			const delta: Usage = {
+				input: snapshot.usage.input - attributedUsage.input,
+				output: snapshot.usage.output - attributedUsage.output,
+				cacheRead: snapshot.usage.cacheRead - attributedUsage.cacheRead,
+				cacheWrite: snapshot.usage.cacheWrite - attributedUsage.cacheWrite,
+				totalTokens: snapshot.usage.totalTokens - attributedUsage.totalTokens,
+				cost: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					total: snapshot.usage.cost - attributedUsage.cost,
+				},
+			};
+			const origin = attributedUsage.requests === 0 ? "spawn_task" : "agent_message";
+			attributedUsage = { ...snapshot.usage };
+			if (delta.totalTokens <= 0 && delta.cost.total <= 0) return;
+			const parentAssistant = this._findLastAssistantMessage() ?? parentAssistantForUsage;
+			if (!parentAssistant) return;
+			attributeChildUsage(parentAssistant.usage, delta);
+			const parentEntry = this._findAssistantEntryForMessage(parentAssistant);
+			if (parentEntry) {
+				this.sessionManager.appendChildUsageAttribution(parentEntry.id, delta, parentAssistant.usage, origin);
+			}
+		};
+		const runtimeHandle: RlmChildRuntime = {
+			runtimeKind: "claude-code",
+			modelSelector: selection.selector,
+			sessionName,
+			get sessionId() {
+				return latest.sessionId;
+			},
+			abort: (reason) => {
+				familyMailbox.close(reason);
+				runtime.abort(reason);
+			},
+			dispose: () => {
+				familyMailbox.close();
+				runtime.dispose();
+			},
+			deliver: (message) => runtime.deliver(message),
+		};
+		run.runtime = runtimeHandle;
+		run.familyMailbox = familyMailbox;
+
+		const emitChildUpdate = () => {
+			const activity: RlmChildAgentActivity | undefined = latest.runningTool
+				? { kind: "executing", toolName: latest.runningTool }
+				: latest.status === "running"
+					? { kind: latest.answerPreview ? "writing" : "waiting" }
+					: undefined;
+			this._emit({
+				type: "rlm_child_update",
+				child: {
+					id: childNodeId,
+					parentId: this._rlmParentNodeId,
+					sessionName,
+					model: selection.selector,
+					label: rlmChildLabel(prompt),
+					status: run.status,
+					durationMs,
+					answerPreview: latest.answerPreview,
+					toolUseCount: latest.toolUseCount > 0 ? latest.toolUseCount : undefined,
+					tokenCount: latest.usage.totalTokens || undefined,
+					sessionDir,
+					activity,
+					repliedSinceTask: run.externalRepliedToParent,
+					error: run.error,
+				},
+			});
+		};
+		run.emitUpdate = emitChildUpdate;
+		run.unsubscribe = runtime.subscribe((snapshot) => {
+			latest = snapshot;
+			run.status = snapshot.status === "starting" || snapshot.status === "queued" ? "queued" : snapshot.status;
+			run.error = snapshot.error;
+			if (snapshot.status === "done" || snapshot.status === "error" || snapshot.status === "cancelled") {
+				durationMs = Date.now() - startedAt;
+				transcript?.complete();
+			}
+			if (snapshot.status === "error" || snapshot.status === "cancelled") {
+				familyMailbox.close(snapshot.error);
+			}
+			if (snapshot.status === "done") attributeCompletedUsage(snapshot);
+			emitChildUpdate();
+		});
+		this._activeRlmChildRuns.set(run.id, run);
+		this._unsettledRlmChildRuns.add(run);
+		emitChildUpdate();
+		try {
+			await runtime.start();
+			const admission = await runtime.admission;
+			if (admission.status !== "running") {
+				throw new Error(admission.error ?? "Claude Code runtime failed before admission");
+			}
+		} catch (error) {
+			runtime.dispose();
+			this._removeRlmSubagentTracking(run.id, run);
+			this._unsettledRlmChildRuns.delete(run);
+			run.settlement.resolve();
+			throw error;
+		}
+		run.publication.resolve();
+
+		void (async () => {
+			const terminal = await runtime.initialCompletion;
+			if (terminal.status === "done") {
+				if (!run.detachedDeletion && !run.externalRepliedToParent) {
+					const notice = createRlmChildTerminalNoticeMessage({
+						kind: "completed_without_reply",
+						childId: run.id,
+						sessionName,
+						lastAssistantTextPreview: terminal.answerPreview,
+					});
+					await this._promptInjectedMessage(notice.content as string, notice, {
+						streamingBehavior: "followUp",
+						queueIfBusy: true,
+						returnAfterAccepted: true,
+						suppressAutonomousContinuation: true,
+					}).catch(() => undefined);
+				}
+			} else if (terminal.status === "error" && !run.detachedDeletion) {
+				const failure = createRlmChildFailureMessage({
+					childId: run.id,
+					sessionName,
+					error: terminal.error ?? "unknown Claude Code runtime error",
+				});
+				await this._promptInjectedMessage(failure.content as string, failure, {
+					streamingBehavior: "followUp",
+					queueIfBusy: true,
+					returnAfterAccepted: true,
+					suppressAutonomousContinuation: true,
+				}).catch(() => undefined);
+			}
+		})()
+			.catch((error: unknown) => {
+				run.status = "error";
+				run.error = error instanceof Error ? error.message : String(error);
+				emitChildUpdate();
+				runtime.dispose();
+			})
+			.finally(() => {
+				run.settled = true;
+				run.settlement.resolve();
+				this._unsettledRlmChildRuns.delete(run);
+				if (run.detachedDeletion || this._disposed || this._disposing) {
+					runtime.dispose();
+					this._removeRlmSubagentTracking(run.id, run);
+				}
+			});
+
+		return {
+			rlm_child_id: childNodeId,
+			name: sessionName,
+			session_dir: sessionDir,
+			model: selection.selector,
+		};
 	}
 
 	private async _startRlmChildRun(
@@ -10556,14 +12707,37 @@ export class AgentSession {
 		// executing now. A spawn arriving outside an active run (a detached kernel task
 		// firing while the parent is idle) has no such turn; an absent edge beats a wrong one.
 		const spawnedByRequestId = this.isStreaming ? this._semanticEdges.lastTurnRequestId : undefined;
-		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
+		const {
+			name: rawName,
+			model: rawModel,
+			service_tier: rawServiceTier,
+			thinking: rawThinking,
+			...unsupported
+		} = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
 			throw new Error(`Unsupported rlm.run kwargs: ${unsupportedKwargs.sort().join(", ")}`);
 		}
 		const requestedSessionName = normalizeRequestedRlmSubagentSessionName(rawName);
 		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
-		const requestedThinkingLevel = normalizeRequestedRlmSubagentThinkingLevel(rawThinking);
+		if (rawThinking !== undefined && typeof rawThinking !== "string") {
+			throw new Error("rlm.run thinking must be a string");
+		}
+		if (rawThinking !== undefined && !THINKING_LEVELS.includes(rawThinking as ThinkingLevel)) {
+			throw new Error(`rlm.run thinking must be one of: ${THINKING_LEVELS.join(", ")}`);
+		}
+		const requestedThinking = rawThinking as ThinkingLevel | undefined;
+		const requestedServiceTier = normalizeRequestedRlmSubagentServiceTier(rawServiceTier);
+		if (requestedServiceTier !== undefined) {
+			const allowedServiceTiers = this.settingsManager.getRlmAllowedServiceTiers();
+			if (!allowedServiceTiers.includes(requestedServiceTier)) {
+				const allowedValues =
+					allowedServiceTiers.map((tier) => (tier === null ? "null" : tier)).join(", ") || "none";
+				throw new Error(
+					`rlm.run service_tier ${String(rawServiceTier)} is not allowed; allowed values are ${allowedValues}`,
+				);
+			}
+		}
 		if (requestedSessionName) assertDirectAgentMessageTarget(requestedSessionName);
 		if (this._rlmDepth >= this._rlmMaxDepth) {
 			throw new Error(
@@ -10583,21 +12757,44 @@ export class AgentSession {
 		} finally {
 			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
 		}
-		if (requestedThinkingLevel !== undefined) {
-			const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
-			if (!supported.includes(requestedThinkingLevel)) {
+		if (this._disposed || this._disposing || this._disposalAdmissionClosed) {
+			throw new Error("Cannot spawn a subagent after its parent was disposed");
+		}
+		if (requestedThinking && modelSelection.runtime === "native") {
+			const supportedLevels = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
+			if (!supportedLevels.includes(requestedThinking)) {
 				throw new Error(
-					`Requested thinking level "${requestedThinkingLevel}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supported.join(", ")}`,
+					`Requested thinking level "${requestedThinking}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supportedLevels.join(", ")}`,
 				);
 			}
 		}
-		if (this._disposed || this._disposing) throw new Error("Cannot spawn a subagent after its parent was disposed");
+		if (requestedThinking) {
+			modelSelection =
+				modelSelection.runtime === "native"
+					? {
+							...modelSelection,
+							model: withExplicitRlmThinkingLevel(modelSelection.model, requestedThinking),
+							thinkingLevel: requestedThinking,
+						}
+					: { ...modelSelection, thinkingLevel: requestedThinking };
+		}
 
 		const childSessionDir = this._createChildRlmSessionDir();
 		const childNodeId = basename(childSessionDir);
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
 		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
 		const startedAt = Date.now();
+		if (modelSelection.runtime === "claude-code") {
+			return this._startClaudeCodeRlmChildRun({
+				prompt,
+				selection: modelSelection,
+				childNodeId,
+				sessionName,
+				sessionDir: childSessionDir,
+				startedAt,
+				spawnCode,
+			});
+		}
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		let runningToolCount = 0;
 		let childSession: AgentSession | undefined;
@@ -10634,7 +12831,8 @@ export class AgentSession {
 			childSession = child;
 			if (this._activeRlmChildRuns.get(run.id) !== run) return;
 			run.session = child;
-			run.abort = () => void child.abort();
+			run.runtime = adaptNativeRlmChildRuntime(child);
+			run.abort = () => run.runtime?.abort("RLM child cancelled");
 			run.publication.resolve();
 			// Cancellation may have been admitted while runtime construction was
 			// blocked and run.abort was still a no-op.
@@ -10648,8 +12846,10 @@ export class AgentSession {
 				spawnCode,
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
-				thinkingLevel: requestedThinkingLevel,
+				thinkingLevel: requestedThinking ?? modelSelection.thinkingLevel,
 				spawnedByRequestId,
+				modelCandidates: modelSelection.modelCandidates,
+				serviceTier: requestedServiceTier,
 			}),
 			onSessionPublished: publishChildSession,
 		};
@@ -10694,6 +12894,7 @@ export class AgentSession {
 		// retention, cancellation, and late-startup cleanup.
 		void (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
+			let initialTaskCompleted = false;
 			try {
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
 				const child = childRuntime.session;
@@ -10793,7 +12994,12 @@ export class AgentSession {
 				});
 				await child.waitForRlmQuiescence();
 				if (run.error) throw new Error(run.error);
+				const terminalAssistant = child._findLastAssistantMessage();
+				if (terminalAssistant?.stopReason === "error") {
+					throw new Error(terminalAssistant.errorMessage ?? "RLM child provider request failed");
+				}
 				run.status = "done";
+				initialTaskCompleted = true;
 				// Only successful completions return; the edge lands on the parent's next commit.
 				const childLastCommitted = child.semanticEdges.lastCommittedRequestId;
 				if (childLastCommitted !== undefined) {
@@ -10846,7 +13052,10 @@ export class AgentSession {
 					// A pre-bind failure leaves no row: "cancelled" is the wire's removal signal.
 					this._emit({
 						type: "rlm_child_update",
-						child: { ...this._rlmChildSnapshotForRun(run), status: "cancelled" },
+						child: {
+							...this._rlmChildSnapshotForRun(run),
+							status: "cancelled",
+						},
 					});
 				} else {
 					emitChildUpdate();
@@ -10871,7 +13080,15 @@ export class AgentSession {
 						);
 					}
 				}
-				if (!run.detachedDeletion && childSession && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
+				// A failed model turn is not a child-session lifetime boundary. Keep the
+				// published session and its descendants until the parent explicitly deletes it.
+				const retainFailedTask = run.status === "error" && childSession !== undefined && !initialTaskCompleted;
+				if (
+					!retainFailedTask &&
+					!run.detachedDeletion &&
+					childSession &&
+					this._subagentRuntimeHost?.releaseRlmSubagentRuntime
+				) {
 					try {
 						await this._subagentRuntimeHost.releaseRlmSubagentRuntime(
 							childRuntime ?? { session: childSession },
@@ -10885,7 +13102,7 @@ export class AgentSession {
 					} catch {
 						await childSession?.disposeAsync().catch(() => undefined);
 					}
-				} else if (!run.detachedDeletion) {
+				} else if (!retainFailedTask && !run.detachedDeletion) {
 					try {
 						if (childRuntime && this._subagentRuntimeHost) {
 							await this._subagentRuntimeHost.deleteRlmSubagentRuntime(run.id, childRuntime.session);
@@ -10927,10 +13144,6 @@ export class AgentSession {
 							run.session = undefined;
 						} else if (run.status !== "error") {
 							this._removeRlmSubagentTracking(run.id, run);
-						} else {
-							run.unsubscribe?.();
-							run.abort = noopRlmChildAbort;
-							run.unsubscribe = undefined;
 						}
 					}
 					run.settled = true;
@@ -10971,6 +13184,16 @@ export class AgentSession {
 			return false;
 		}
 
+		// Repetition loops are recovered by a system notice, not by retrying
+		// into the same degenerate output.
+		if (this._isAgentRepetitionLoop(message)) {
+			return false;
+		}
+
+		if (this._isProviderReasoningExhausted(message)) {
+			return false;
+		}
+
 		if (this._isStructuredPermanentProviderRetryExhausted(message)) {
 			return false;
 		}
@@ -10984,6 +13207,18 @@ export class AgentSession {
 
 	private _isAgentLifecycleFailure(message: AssistantMessage): boolean {
 		return message.diagnostics?.some((diagnostic) => diagnostic.type === "agent_lifecycle_failure") ?? false;
+	}
+
+	private _isAgentRepetitionLoop(message: AssistantMessage): boolean {
+		return message.diagnostics?.some((diagnostic) => diagnostic.type === "agent_repetition_loop") ?? false;
+	}
+
+	private _isProviderReasoningExhausted(message: AssistantMessage): boolean {
+		return (
+			message.diagnostics?.some(
+				(diagnostic) => diagnostic.type === "provider_warning" && diagnostic.error?.code === "reasoning_exhausted",
+			) ?? false
+		);
 	}
 
 	private _getProviderStreamFailureDetails(message: AssistantMessage): Record<string, unknown> | undefined {
@@ -11005,8 +13240,48 @@ export class AgentSession {
 		return kind === "auth" || kind === "invalid_request" || kind === "refusal";
 	}
 
+	private _hasReplayUnsafeProviderFailureOutput(message: AssistantMessage): boolean {
+		return message.content.some(
+			(content) =>
+				content.type === "toolCall" ||
+				(content.type === "text" && content.text.trim().length > 0) ||
+				(content.type === "thinking" && content.thinking.trim().length > 0),
+		);
+	}
+
+	private async _tryRlmProviderFallback(message: AssistantMessage): Promise<boolean> {
+		if (this._rlmModelCandidates.length <= 1 || this._hasReplayUnsafeProviderFailureOutput(message)) {
+			return false;
+		}
+		const currentModel = this.model;
+		if (!currentModel || message.provider !== currentModel.provider || message.model !== currentModel.id) {
+			return false;
+		}
+		const kind = this._getProviderStreamFailureKind(message);
+		if (kind === "refusal" || kind === "safety" || kind === "invalid_request") {
+			return false;
+		}
+		const concreteAuthFailure = this._isConcreteProviderAuthFailure(message);
+		if (concreteAuthFailure) {
+			this._markProviderAuthStale(message, this._retryAuthFailureSources);
+		}
+
+		for (let index = this._rlmModelCandidateIndex + 1; index < this._rlmModelCandidates.length; index++) {
+			const candidate = this._rlmModelCandidates[index]!;
+			if (modelsAreEqual(candidate.model, currentModel)) continue;
+			if (!(await this._modelRegistry.canUseModel(candidate.model))) continue;
+			const auth = await this._modelRegistry.getApiKeyAndHeaders(candidate.model);
+			if (!auth.ok) continue;
+			this._rlmModelCandidateIndex = index;
+			await this._setRlmFallbackModel(candidate);
+			if (concreteAuthFailure) this._retryAuthFailureSources = [];
+			return true;
+		}
+		return false;
+	}
+
 	private _isStructuredPermanentProviderRetryExhausted(message: AssistantMessage): boolean {
-		return this._retryAttempt > 0 && this._isStructuredPermanentProviderFailure(message);
+		return this._retryAttemptOnCurrentModel > 0 && this._isStructuredPermanentProviderFailure(message);
 	}
 
 	private _getProviderStreamFailureAuthStatus(message: AssistantMessage): number | undefined {
@@ -11029,6 +13304,24 @@ export class AgentSession {
 			return Number.isInteger(parsed) ? parsed : undefined;
 		}
 		return undefined;
+	}
+
+	private _isOpenAICodexUsageExhaustion(message: AssistantMessage): boolean {
+		if (message.provider !== "openai-codex" || message.stopReason !== "error") return false;
+		const details = this._getProviderStreamFailureDetails(message);
+		const providerErrorType = details?.providerErrorType;
+		if (typeof providerErrorType === "string" && /usage_limit_reached|usage_not_included/i.test(providerErrorType)) {
+			return true;
+		}
+		return /(?:chatgpt\s+)?usage[ _-]?limit(?:[ _-]?reached)?|usage[ _-]?not[ _-]?included/i.test(
+			message.errorMessage ?? "",
+		);
+	}
+
+	private _rotateExhaustedCodexHome(message: AssistantMessage): boolean {
+		const token = this._modelRegistry.getCurrentProviderAuthSourceToken(message.provider);
+		if (token?.source !== "runtime_chain") return false;
+		return this._markProviderAuthStale(message, [token]);
 	}
 
 	private _isConcreteProviderAuthFailure(message: AssistantMessage): boolean {
@@ -11121,6 +13414,7 @@ export class AgentSession {
 			finalError: message.errorMessage,
 		});
 		this._retryAttempt = 0;
+		this._retryAttemptOnCurrentModel = 0;
 		this._retryAuthFailureSources = [];
 	}
 
@@ -11131,7 +13425,7 @@ export class AgentSession {
 			authSourceTokens?: readonly AuthSourceToken[];
 		},
 	): Promise<boolean> {
-		const settings = this.settingsManager.getRetrySettings();
+		const settings = this.retrySettings;
 		if (!settings.enabled) {
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			this._retryAuthFailureSources = [];
@@ -11146,8 +13440,13 @@ export class AgentSession {
 		}
 
 		this._retryAttempt++;
+		this._retryAttemptOnCurrentModel++;
+		const switchedModel = await this._tryRlmProviderFallback(message);
+		if (switchedModel) {
+			this._retryAttemptOnCurrentModel = 0;
+		}
 
-		if (this._retryAttempt > settings.maxRetries) {
+		if (!switchedModel && this._retryAttemptOnCurrentModel > settings.maxRetries) {
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			this._emit({
 				type: "auto_retry_end",
@@ -11156,12 +13455,13 @@ export class AgentSession {
 				finalError: message.errorMessage,
 			});
 			this._retryAttempt = 0;
+			this._retryAttemptOnCurrentModel = 0;
 			this._retryAuthFailureSources = [];
 			this._resolveRetry(); // Resolve so waitForRetry() completes
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		const delayMs = switchedModel ? 0 : settings.baseDelayMs * 2 ** (this._retryAttemptOnCurrentModel - 1);
 		// Park now: the retry re-issues the failed call and must reuse its Idempotency-Key.
 		// Payload hooks mutate the wire body after the hash point, so reuse is forfeited.
 		if (!this._extensionRunner.hasHandlers("before_provider_request")) {
@@ -11171,7 +13471,7 @@ export class AgentSession {
 		this._emit({
 			type: "auto_retry_start",
 			attempt: this._retryAttempt,
-			maxAttempts: settings.maxRetries,
+			maxAttempts: settings.maxRetries + Math.max(0, this._rlmModelCandidates.length - 1),
 			delayMs,
 			errorMessage: message.errorMessage || "Unknown error",
 		});
@@ -11188,6 +13488,7 @@ export class AgentSession {
 			const attempt = this._retryAttempt;
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			this._retryAttempt = 0;
+			this._retryAttemptOnCurrentModel = 0;
 			this._retryAbortController = undefined;
 			this._emit({
 				type: "auto_retry_end",
@@ -11202,7 +13503,14 @@ export class AgentSession {
 		this._retryAbortController = undefined;
 
 		setTimeout(() => {
-			this.agent.continue().catch(() => {});
+			this._rootForeground
+				.run("root-turn", () => {
+					if (this._disposed || this._disposing) return Promise.resolve();
+					return this.agent.continue();
+				})
+				.catch(() => {
+					// Retry failed - will be caught by next agent_end
+				});
 		}, 0);
 
 		return true;
@@ -11223,6 +13531,7 @@ export class AgentSession {
 				finalError: "Retry cancelled",
 			});
 			this._retryAttempt = 0;
+			this._retryAttemptOnCurrentModel = 0;
 		}
 		this._retryAuthFailureSources = [];
 		this._resolveRetry();
@@ -11252,8 +13561,20 @@ export class AgentSession {
 			);
 	}
 
+	/** autoRetryEnabled reports whether this session can retry model failures automatically. */
 	get autoRetryEnabled(): boolean {
-		return this.settingsManager.getRetryEnabled();
+		return this._harnessMode !== "rpc-only" && this.settingsManager.getRetryEnabled();
+	}
+
+	private get retrySettings(): {
+		enabled: boolean;
+		maxRetries: number;
+		baseDelayMs: number;
+	} {
+		return {
+			...this.settingsManager.getRetrySettings(),
+			enabled: this.autoRetryEnabled,
+		};
 	}
 
 	setAutoRetryEnabled(enabled: boolean): void {
@@ -11790,7 +14111,8 @@ export class AgentSession {
 				this.sessionManager.appendLabelChange(targetId, label);
 			}
 
-			const sessionContext = this.sessionManager.buildSessionContext();
+			// Update agent state
+			const sessionContext = this.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 			this._mergeUnpersistedOutcomes(this.agent.state.messages);
 			this._restoreLateIpythonSentAgentMessages();
@@ -11897,6 +14219,10 @@ export class AgentSession {
 		const contextWindow = model.contextWindow ?? 0;
 		if (contextWindow <= 0) return undefined;
 
+		// The compaction trigger is the smaller of the configured threshold and
+		// the window reserve; percentages are reported against this, not the window.
+		const compactionTrigger = resolveCompactionTrigger(contextWindow, this.settingsManager.getCompactionSettings());
+
 		// After compaction, the last assistant usage reflects pre-compaction context size.
 		// We can only trust usage from an assistant that responded after the latest compaction.
 		// If no such assistant exists, context token count is unknown until the next LLM response.
@@ -11922,16 +14248,22 @@ export class AgentSession {
 			}
 
 			if (!hasPostCompactionUsage) {
-				return { tokens: null, contextWindow, percent: null };
+				return {
+					tokens: null,
+					contextWindow,
+					compactionTrigger,
+					percent: null,
+				};
 			}
 		}
 
 		const estimate = estimateContextTokens(this.messages);
-		const percent = (estimate.tokens / contextWindow) * 100;
+		const percent = (estimate.tokens / compactionTrigger) * 100;
 
 		return {
 			tokens: estimate.tokens,
 			contextWindow,
+			compactionTrigger,
 			percent,
 		};
 	}
@@ -11968,12 +14300,62 @@ export class AgentSession {
 	 */
 	getContextTree(): ContextTreeNode {
 		const resolveContextWindow = this._contextWindowResolver();
-		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(
-			this.sessionManager.getBranch(),
-			this.sessionManager.getEntries(),
-		);
+		const branch = this.sessionManager.getBranch();
+		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(branch, this.sessionManager.getEntries());
 
 		const children: ContextTreeNode[] = [];
+		const actDepths = new Set<number>(this._actLanes.keys());
+		for (const entry of branch) {
+			if (entry.type === "act_start" || entry.type === "act_terminal") actDepths.add(entry.depth ?? 1);
+		}
+		const actNodes = new Map<number, ContextTreeNode>();
+		for (const depth of [...actDepths].sort((left, right) => left - right)) {
+			const lane = this._actLanes.get(depth);
+			const terminal = branch
+				.slice()
+				.reverse()
+				.find((entry): entry is ActTerminalEntry => entry.type === "act_terminal" && (entry.depth ?? 1) === depth);
+			const location = this._actSessionLocation(depth, terminal?.sessionKey);
+			const liveNode = lane?.contextTree;
+			const diskNode =
+				!liveNode && location && existsSync(location.file)
+					? loadContextTreeChildFromDisk(location.dir, resolveContextWindow)
+					: undefined;
+			const sourceNode = liveNode ?? diskNode;
+			if (!sourceNode) continue;
+			if (!lane?.running && terminal?.type !== "act_terminal") continue;
+			const usage = emptyUsage();
+			for (const entry of branch) {
+				if (entry.type === "act_terminal" && (entry.depth ?? 1) === depth) addAssistantUsage(usage, entry.usage);
+			}
+			const status = lane?.running
+				? "running"
+				: terminal?.type === "act_terminal" && terminal.status === "error"
+					? "error"
+					: terminal?.type === "act_terminal" &&
+							(terminal.status === "cancelled" || terminal.status === "interrupted")
+						? "cancelled"
+						: "done";
+			const selectedModel = lane?.running ? sourceNode.model : (terminal?.model ?? sourceNode.model);
+			actNodes.set(depth, {
+				...sourceNode,
+				id: depth === 1 ? "act" : `act-depth-${depth}`,
+				label: depth === 1 ? actContextLabel() : `${actContextLabel()} depth ${depth}`,
+				depth,
+				status,
+				...(selectedModel ? { model: selectedModel } : {}),
+				cancellationCapability: actCancellationCapability(),
+				ownUsage: usage,
+				totalUsage: cloneUsage(usage),
+				children: [],
+			});
+		}
+		for (const [depth, node] of actNodes) {
+			const parent = actNodes.get(depth - 1);
+			if (parent) parent.children.push(node);
+			else children.push(node);
+		}
+
 		const liveIds = new Set<string>();
 		for (const run of this._activeRlmChildRuns.values()) {
 			liveIds.add(run.id);

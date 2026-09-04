@@ -38,6 +38,7 @@ type FakeInteractiveMode = {
 	subagentSummaryLine: { invalidate: Mock };
 	ui: { requestRender: Mock; onDebug?: () => void };
 	updatePendingMessagesDisplay: Mock;
+	restoreQueuedMessagesToEditor: Mock;
 	showError: Mock;
 	showTreeSelector: Mock;
 	shutdown: Mock;
@@ -110,6 +111,7 @@ function createInteractiveFake(options: {
 		ui: { requestRender: vi.fn() },
 		queueSelection: { isBrowsing: false, reset: () => "" },
 		updatePendingMessagesDisplay: vi.fn(),
+		restoreQueuedMessagesToEditor: vi.fn(),
 		showError: vi.fn(),
 		showTreeSelector: vi.fn(),
 		shutdown: vi.fn().mockResolvedValue(undefined),
@@ -197,10 +199,10 @@ describe("InteractiveMode interrupt shortcuts", () => {
 	});
 
 	it("clears the exit hint after two seconds", async () => {
-		const mode = createInteractiveFake({ editorText: "draft" });
+		const mode = createInteractiveFake({});
 
 		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
-		expect(mode.editor.getText()).toBe("draft");
+		expect(mode.editor.getText()).toBe("");
 		expect(Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode)).toBe(
 			"Press Ctrl+C again to exit",
 		);
@@ -212,14 +214,16 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.ui.requestRender).toHaveBeenCalled();
 	});
 
-	it("preserves idle draft input on first Ctrl+C", () => {
-		const mode = createInteractiveFake({ editorText: "draft" });
+	it("clears draft input before applying the existing Ctrl+C behavior", () => {
+		const mode = createInteractiveFake({ editorText: "draft", streaming: true });
 
 		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
 
-		expect(mode.editor.getText()).toBe("draft");
-		expect(mode.agentConnection.abort).not.toHaveBeenCalled();
+		expect(mode.editor.getText()).toBe("");
+		expect(mode.restoreQueuedMessagesToEditor).not.toHaveBeenCalled();
 		expect(mode.shutdown).not.toHaveBeenCalled();
+		expect(Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode)).toBeUndefined();
+		expect(mode.ui.requestRender).toHaveBeenCalled();
 	});
 
 	it("cancels the tree repeat when typing after interrupting streaming", () => {

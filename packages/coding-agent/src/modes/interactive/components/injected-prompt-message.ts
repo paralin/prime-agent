@@ -8,6 +8,11 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+import {
+	SCRATCH_HANDOFF_CLOSEOUT_CUSTOM_TYPE,
+	type ScratchHandoffCloseoutDetails,
+} from "../../../core/compaction/scratch-handoff.js";
+import { ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE } from "../../../core/english-output-nudge.js";
 import { GOAL_CONTEXT_CUSTOM_TYPE, type GoalContextDetails } from "../../../core/goals.js";
 import {
 	type CustomMessage,
@@ -15,11 +20,13 @@ import {
 	type HeartbeatPromptDetails,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	type IpythonStateRestoredDetails,
+	REPETITION_NOTICE_CUSTOM_TYPE,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 	type RlmChildFailureDetails,
 	type RlmChildTerminalNoticeDetails,
 } from "../../../core/messages.js";
+import { TOOL_ERROR_NUDGE_CUSTOM_TYPE } from "../../../core/tool-error-nudge.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { expandCollapseHint } from "./keybinding-hints.js";
 
@@ -28,13 +35,18 @@ type InjectedPromptDetails =
 	| HeartbeatPromptDetails
 	| IpythonStateRestoredDetails
 	| RlmChildFailureDetails
-	| RlmChildTerminalNoticeDetails;
+	| RlmChildTerminalNoticeDetails
+	| ScratchHandoffCloseoutDetails;
 type InjectedPromptMessage = CustomMessage<InjectedPromptDetails>;
 
 export function isInjectedPromptMessage(message: AgentMessage): message is InjectedPromptMessage {
 	return (
 		message.role === "custom" &&
 		(message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE ||
+			message.customType === REPETITION_NOTICE_CUSTOM_TYPE ||
+			message.customType === TOOL_ERROR_NUDGE_CUSTOM_TYPE ||
+			message.customType === ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE ||
+			message.customType === SCRATCH_HANDOFF_CLOSEOUT_CUSTOM_TYPE ||
 			message.customType === GOAL_CONTEXT_CUSTOM_TYPE ||
 			message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE ||
 			message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE ||
@@ -85,7 +97,7 @@ export class InjectedPromptMessageComponent extends Container {
 	private expanded = false;
 
 	constructor(
-		private readonly message: InjectedPromptMessage,
+		private readonly message: CustomMessage,
 		private readonly markdownTheme: MarkdownTheme = getMarkdownTheme(),
 	) {
 		super();
@@ -112,8 +124,9 @@ export class InjectedPromptMessageComponent extends Container {
 		this.header.setText(this.headerText());
 		this.content.addChild(this.header);
 		if (this.expanded && this.message.customType !== IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
+			const text = readCustomText(this.message);
 			this.content.addChild(
-				new Markdown(readCustomText(this.message), 1, 0, this.markdownTheme, {
+				new Markdown(text, 1, 0, this.markdownTheme, {
 					color: (text: string) => theme.fg("customMessageText", text),
 				}),
 			);
@@ -124,6 +137,22 @@ export class InjectedPromptMessageComponent extends Container {
 	private headerText(): string {
 		if (this.message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE) {
 			return this.heartbeatHeaderText();
+		}
+		if (this.message.customType === REPETITION_NOTICE_CUSTOM_TYPE) {
+			return this.repetitionHeaderText();
+		}
+		if (this.message.customType === TOOL_ERROR_NUDGE_CUSTOM_TYPE) {
+			return this.toolErrorHeaderText();
+		}
+		if (this.message.customType === ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE) {
+			return this.noticeHeaderText("English reminder");
+		}
+		if (this.message.customType === SCRATCH_HANDOFF_CLOSEOUT_CUSTOM_TYPE) {
+			const details = this.message.details as ScratchHandoffCloseoutDetails | undefined;
+			const phase = details?.phase === "repair" ? "repair" : details?.phase === "update" ? "update" : "create";
+			const path = details?.path ? ` · ${details.path}` : "";
+			const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;
+			return `${theme.fg("accent", "◆")} ${theme.fg("muted", "Scratch handoff")}${theme.fg("dim", ` · ${phase}${path}${hint}`)}`;
 		}
 		if (this.message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
 			const details = this.message.details as IpythonStateRestoredDetails | undefined;
@@ -151,6 +180,28 @@ export class InjectedPromptMessageComponent extends Container {
 		const schedule = theme.fg("muted", heartbeatPromptSchedule(details?.schedule));
 		const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;
 		return `${pulse} ${theme.fg("muted", "Heartbeat prompt")}${theme.fg("dim", " · ")}${schedule}${theme.fg("dim", hint)}`;
+	}
+
+	private repetitionHeaderText(): string {
+		return this.noticeHeaderText("Repetition notice");
+	}
+
+	private toolErrorHeaderText(): string {
+		return this.noticeHeaderText("Tool error notice");
+	}
+
+	private noticeHeaderText(title: string): string {
+		const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;
+		const label = `${theme.fg("accent", "◆")} ${theme.fg("muted", title)}`;
+		if (this.expanded) {
+			return label;
+		}
+		const preview = collapseText(readCustomText(this.message));
+		const prefixWidth = visibleWidth(`◆ ${title} · `);
+		const previewText = preview
+			? theme.fg("dim", " · ") + theme.fg("muted", truncateToWidth(preview, Math.max(20, 90 - prefixWidth)))
+			: "";
+		return label + previewText + theme.fg("dim", hint);
 	}
 
 	private metaText(): string {

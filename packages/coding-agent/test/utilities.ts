@@ -182,6 +182,10 @@ export interface CreateTestExtensionsResultInput {
 	path?: string;
 }
 
+export function createTestSessionManager(cwd: string): SessionManager {
+	return SessionManager.create(cwd, join(cwd, "sessions"));
+}
+
 export async function createTestExtensionsResult(
 	inputs: Array<ExtensionFactory | CreateTestExtensionsResultInput>,
 	cwd = process.cwd(),
@@ -247,7 +251,7 @@ export function createTestSession(options: TestSessionOptions = {}): TestSession
 		},
 	});
 
-	const sessionManager = options.inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir);
+	const sessionManager = options.inMemory ? SessionManager.inMemory() : createTestSessionManager(tempDir);
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
 
 	if (options.settingsOverrides) {

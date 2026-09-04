@@ -105,6 +105,12 @@ pub type AfterToolCallFn = Arc<
         + Sync,
 >;
 
+#[derive(Debug, Clone, Default)]
+pub struct RepetitionLoopConfig {
+    pub enabled: Option<bool>,
+    pub threshold: Option<usize>,
+}
+
 /// Configuration for the agent loop (TS `AgentLoopConfig`).
 #[derive(Clone)]
 pub struct AgentLoopConfig {
@@ -112,6 +118,8 @@ pub struct AgentLoopConfig {
     pub api_key: Option<String>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
+    pub stream_stall_timeout_ms: Option<u64>,
+    pub repetition_loop: Option<RepetitionLoopConfig>,
     pub reasoning: ThinkingLevel,
     pub session_id: Option<String>,
     /// TS `AgentLoopConfig extends SimpleStreamOptions` — the requested
@@ -144,6 +152,8 @@ impl AgentLoopConfig {
             api_key: None,
             temperature: None,
             max_tokens: None,
+            stream_stall_timeout_ms: None,
+            repetition_loop: None,
             reasoning: ThinkingLevel::Off,
             session_id: None,
             service_tier: None,
@@ -188,6 +198,7 @@ impl AgentLoopConfig {
 
 mod abort;
 mod entry;
+mod progress;
 mod response;
 mod run;
 mod tool_call;

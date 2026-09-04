@@ -33,6 +33,7 @@ pub(crate) async fn run_loop(
     stream_fn: Option<&StreamFn>,
 ) -> anyhow::Result<()> {
     let mut first_turn = true;
+    let mut progress = super::progress::TurnProgress::default();
     let mut last_turn: Option<ShouldStopAfterTurnContext> = None;
     let mut pending_messages =
         poll_messages_unless_aborted(config.get_steering_messages.as_ref(), signal).await?;
@@ -61,6 +62,7 @@ pub(crate) async fn run_loop(
             }
 
             if !pending_messages.is_empty() {
+                progress.reset_tools();
                 for message in pending_messages.drain(..) {
                     emit(AgentEvent::MessageStart {
                         message: message.clone(),
@@ -75,8 +77,15 @@ pub(crate) async fn run_loop(
                 }
             }
 
-            let message =
-                stream_assistant_response(current_context, config, signal, emit, stream_fn).await?;
+            let message = stream_assistant_response(
+                current_context,
+                config,
+                signal,
+                emit,
+                stream_fn,
+                &mut progress,
+            )
+            .await?;
             new_messages.push(AgentMessage::from(message.clone()));
 
             if message.stop_reason == StopReason::Error
@@ -101,11 +110,12 @@ pub(crate) async fn run_loop(
                 .collect::<Vec<ToolCall>>();
 
             let mut tool_results: Vec<ToolResultMessage> = Vec::new();
-            has_more_tool_calls = false;
+            has_more_tool_calls = super::progress::incomplete(&message);
             if !tool_calls.is_empty() {
                 let executed_tool_batch =
                     execute_tool_calls(current_context, &message, config, signal, emit).await?;
                 tool_results.extend(executed_tool_batch.messages);
+                progress.observe_results(&tool_results);
                 has_more_tool_calls = !executed_tool_batch.terminate;
 
                 for result in &tool_results {

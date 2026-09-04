@@ -90,6 +90,8 @@ pub enum ProxyAssistantMessageEvent {
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
 pub enum ProxyDoneReason {
+    #[serde(rename = "unknown")]
+    Unknown,
     #[serde(rename = "stop")]
     Stop,
     #[serde(rename = "length")]
@@ -533,6 +535,7 @@ fn process_proxy_event(
         ProxyAssistantMessageEvent::Done { reason, usage } => {
             partial.stop_reason = match reason {
                 ProxyDoneReason::Stop => StopReason::Stop,
+                ProxyDoneReason::Unknown => StopReason::Unknown,
                 ProxyDoneReason::Length => StopReason::Length,
                 ProxyDoneReason::ToolUse => StopReason::ToolUse,
             };
@@ -1262,6 +1265,20 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+    #[tokio::test]
+    async fn unknown_finish_reason_survives_the_proxy() {
+        let url = serve_proxy_sse("data: {\"type\":\"start\"}\n\ndata: {\"type\":\"done\",\"reason\":\"unknown\",\"usage\":{}}\n\n".into(), false).await;
+        let (_handle, mut stream) = stream_proxy(
+            test_model(url.clone()),
+            context(),
+            request_options(),
+            proxy_options(url),
+        );
+        assert_eq!(
+            stream.result().await.unwrap().stop_reason,
+            StopReason::Unknown
         );
     }
 }

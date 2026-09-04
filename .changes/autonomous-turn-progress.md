@@ -1,0 +1,1 @@
+- Fixed stalled and incomplete provider turns, cancelled repeating text or thinking, and stopped identical tool batches without blocking advancing results.

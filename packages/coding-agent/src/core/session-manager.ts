@@ -1292,15 +1292,23 @@ async function listSessionsFromDir(
 		}
 
 		let loaded = 0;
-		for (const file of files) {
-			const info = await readSessionInfo(file);
-			loaded++;
-			callbacks?.onProgress?.(progressOffset + loaded, total);
-			if (info) {
-				sessions.push(info);
-				callbacks?.onSession?.(info);
-			}
-		}
+		let nextFile = 0;
+		// Bound simultaneous transcript buffers while avoiding head-of-line blocking
+		// behind a large session. Public list methods sort the completed catalog.
+		await Promise.allSettled(
+			Array.from({ length: Math.min(4, files.length) }, async () => {
+				while (nextFile < files.length) {
+					const file = files[nextFile++];
+					const info = await readSessionInfo(file);
+					loaded++;
+					callbacks?.onProgress?.(progressOffset + loaded, total);
+					if (info) {
+						sessions.push(info);
+						callbacks?.onSession?.(info);
+					}
+				}
+			}),
+		);
 	} catch {
 		// Return no sessions when the directory cannot be read.
 	}

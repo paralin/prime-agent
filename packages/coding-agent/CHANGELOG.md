@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Accelerated cold session listings with bounded concurrent transcript scans so large sessions do not block smaller ones.
 - Preserved original assistant output when issuing language reminders and replaced retrospective rewrite notices with task-preserving reminders, including on session replay.
 - Fixed Merge Gateway discovery for routes with native reasoning-effort controls but no thinking-budget support.
 - Streamlined agent instructions for implementation, proportionate checks, child reporting, runtime notices, and Python environment boundaries.

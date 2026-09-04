@@ -11,6 +11,49 @@ afterEach(() => {
 });
 
 describe("readSessionInfo", () => {
+	it("lists every session once with monotonic progress and a sorted final result", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-session-info-parallel-"));
+		tempDirs.push(directory);
+		for (let i = 0; i < 12; i++) {
+			writeFileSync(
+				join(directory, `${i}.jsonl`),
+				[
+					JSON.stringify({
+						type: "session",
+						version: 3,
+						id: String(i),
+						timestamp: new Date(i * 1000).toISOString(),
+						cwd: directory,
+					}),
+					JSON.stringify({
+						type: "message",
+						id: `m${i}`,
+						parentId: null,
+						timestamp: new Date(i * 1000).toISOString(),
+						message: { role: "user", content: `session ${i}`, timestamp: i * 1000 },
+					}),
+					"",
+				].join("\n"),
+			);
+		}
+		const seen: string[] = [];
+		const progress: number[] = [];
+		const sessions = await SessionManager.listAll(
+			{
+				onSession: (session) => seen.push(session.id),
+				onProgress: (loaded, total) => {
+					expect(total).toBe(12);
+					progress.push(loaded);
+				},
+			},
+			directory,
+		);
+		expect(seen).toHaveLength(12);
+		expect(new Set(seen).size).toBe(12);
+		expect(progress).toEqual(Array.from({ length: 12 }, (_, i) => i + 1));
+		expect(sessions.map((session) => session.id)).toEqual(Array.from({ length: 12 }, (_, i) => String(11 - i)));
+	});
+
 	it("shares an in-flight scan for concurrent readers of the same transcript", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-session-info-single-flight-"));
 		tempDirs.push(directory);

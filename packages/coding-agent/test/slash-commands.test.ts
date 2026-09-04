@@ -21,6 +21,15 @@ describe("built-in slash commands", () => {
 		expect(commandNames).not.toContain("cron");
 	});
 
+	test("does not expose an update slash command; updates run through the prime-agent CLI", () => {
+		const commandNames = BUILTIN_SLASH_COMMANDS.map((command) => command.name);
+
+		expect(commandNames).not.toContain("update");
+		expect(isBuiltinSlashCommandName("update")).toBe(false);
+		expect(isBuiltinSlashCommandName("/update")).toBe(false);
+		expect(parseSlashCommand("/update --self")).toEqual({ name: "update", args: "--self" });
+	});
+
 	test("describes the fine-grained /rlm-max-depth semantics", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "rlm-max-depth")).toMatchObject({
 			description:
@@ -75,6 +84,7 @@ describe("built-in slash commands", () => {
 	test("marks argument commands as taking a free-form argument", () => {
 		for (const [name, argumentHint] of [
 			["model", "[search]"],
+			["switch", "[search]"],
 			["export", "[path]"],
 			["import", "<path.jsonl>"],
 			["name", "[name]"],

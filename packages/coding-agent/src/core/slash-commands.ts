@@ -86,7 +86,18 @@ interface BuiltinSlashCommandAlias {
 
 const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "settings", description: "Open settings menu" },
-	{ name: "model", description: "Select model (opens selector UI)", argumentHint: "[search]", takesArgument: true },
+	{
+		name: "model",
+		description: "Select model and save it as the default",
+		argumentHint: "[search]",
+		takesArgument: true,
+	},
+	{
+		name: "switch",
+		description: "Switch model for this session without changing the default",
+		argumentHint: "[search]",
+		takesArgument: true,
+	},
 	{ name: "effort", description: "Select reasoning/thinking level (opens selector UI)", argumentHint: "[level]" },
 	{ name: "fast", description: "Toggle OpenAI Fast mode" },
 	{ name: "scoped-models", description: "Enable/disable models for Ctrl+P cycling" },
@@ -126,12 +137,6 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	},
 	{ name: "context", description: "Show token, cost, and context usage for agent and sub-agents" },
 	{ name: "changelog", description: "Show changelog entries" },
-	{
-		name: "update",
-		description: `Update ${APP_NAME} and installed packages`,
-		argumentHint: "[source|--self|--extensions]",
-		takesArgument: true,
-	},
 	{ name: "hotkeys", description: "Show all keyboard shortcuts" },
 	{ name: "fork", description: "Create a new fork from a previous user message" },
 	{ name: "clone", description: "Duplicate the current session at the current position" },
@@ -186,6 +191,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		takesArgument: true,
 	},
 	{ name: "heartbeats", description: "View and manage all user and agent heartbeats" },
+	{ name: "watches", description: "List active background event watches" },
 	{
 		name: "resume",
 		description: "Open the agents view, or resume a session by id or path",

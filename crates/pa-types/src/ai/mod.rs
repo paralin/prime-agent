@@ -84,6 +84,8 @@ pub enum KnownProvider {
     #[serde(rename = "kimi-coding")]
     KimiCoding,
     Runinfra,
+    #[serde(rename = "merge-gateway")]
+    MergeGateway,
     Venice,
     #[serde(rename = "cloudflare-workers-ai")]
     CloudflareWorkersAi,

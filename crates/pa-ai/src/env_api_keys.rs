@@ -33,6 +33,7 @@ pub fn get_api_key_env_vars(provider: &str) -> Option<Vec<&'static str>> {
                 "opencode" | "opencode-go" => "OPENCODE_API_KEY",
                 "kimi-coding" => "KIMI_API_KEY",
                 "runinfra" => "RUNINFRA_GATEWAY_KEY",
+                "merge-gateway" => "MERGE_GATEWAY_API_KEY",
                 "venice" => "VENICE_API_KEY",
                 "cloudflare-workers-ai" | "cloudflare-ai-gateway" => "CLOUDFLARE_API_KEY",
                 "xiaomi" => "XIAOMI_API_KEY",

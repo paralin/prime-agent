@@ -30,6 +30,7 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "fireworks" => "accounts/fireworks/models/kimi-k2p6",
         "kimi-coding" => "kimi-for-coding",
         "runinfra" => "deepseek-v4-flash",
+        "merge-gateway" => "anthropic/claude-sonnet-4-6",
         "venice" => "stealth-ox-alpha",
         "cloudflare-workers-ai" => "@cf/moonshotai/kimi-k2.6",
         "cloudflare-ai-gateway" => "claude-sonnet-4.5",

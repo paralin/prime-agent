@@ -1,0 +1,1 @@
+- Added Merge Gateway models, API-key login, signed thinking, and strict streaming validation.

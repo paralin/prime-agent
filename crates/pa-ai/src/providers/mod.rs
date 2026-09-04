@@ -27,3 +27,6 @@ mod test_http;
 pub mod transform_messages;
 #[cfg(test)]
 mod venice_tests;
+
+#[cfg(test)]
+mod merge_gateway_tests;

@@ -203,4 +203,79 @@ mod tests {
             None
         ));
     }
+    #[tokio::test]
+    async fn chat_is_default_and_responses_preserves_stateless_request_metadata() {
+        for enabled in [false, true] {
+            let body = if enabled {
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":1,\"total_tokens\":5}}}\n\n"
+            } else {
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+            };
+            let server = ScriptedServer::new(vec![(200, body.into(), 0)]).await;
+            let model: Model = serde_json::from_value(json!({
+                "id":"openai/gpt-5.6-luna", "name":"Luna", "api":"openai-completions", "provider":"openrouter",
+                "baseUrl":server.url, "reasoning":true,"thinkingLevelMap":{"high":"high"}, "input":["text"],
+                "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}, "contextWindow":1_050_000,"maxTokens":128_000,
+                "compat":{"thinkingFormat":"openrouter","openRouterRouting":{"order":["openai","azure"]}}
+            })).unwrap();
+            let context: Context = serde_json::from_value(json!({"systemPrompt":"Use tools.","messages":[{"role":"user","content":"Reply briefly.","timestamp":1}],"tools":[{"name":"read","description":"Read one file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]})).unwrap();
+            let mut options = SimpleStreamOptions::from_base(StreamOptions {
+                api_key: Some("test".into()),
+                session_id: Some("conversation".into()),
+                headers: Some(std::collections::HashMap::from([(
+                    "X-OpenRouter-Title".into(),
+                    "Local override".into(),
+                )])),
+                ..Default::default()
+            });
+            options.open_router_responses = Some(enabled);
+            options.reasoning = Some(crate::types::ModelThinkingLevel::High);
+            let result = super::super::openai_completions::stream_simple_openai_completions(
+                &model,
+                &context,
+                Some(&options),
+            )
+            .result()
+            .await;
+            assert_eq!(result.stop_reason, StopReason::Stop);
+            let requests = server.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let (header, body) = &requests[0];
+            let header = header.to_ascii_lowercase();
+            assert!(
+                header.contains("http-referer: https://github.com/primeintellect-ai/prime-agent")
+            );
+            assert!(header.contains("x-openrouter-title: local override"));
+            assert!(header.contains("x-openrouter-categories: cli-agent"));
+            assert_eq!(body["session_id"], "conversation");
+            if enabled {
+                assert!(header.starts_with("post /responses "));
+                assert_eq!(body["prompt_cache_key"], "conversation");
+                assert_eq!(body["provider"], json!({"order":["openai","azure"]}));
+                assert_eq!(body["store"], false);
+                assert_eq!(body["reasoning"], json!({"effort":"high","summary":"auto"}));
+                assert_eq!(body["tools"][0]["name"], "read");
+                assert_eq!(body["input"].as_array().unwrap().len(), 2);
+            } else {
+                assert!(header.starts_with("post /chat/completions "));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn context_overflow_and_rate_limits_do_not_fallback() {
+        for status in [400, 429] {
+            let (events, server) = run_attempts(vec![(
+                status,
+                "context_length_exceeded or rate limit".into(),
+                0,
+            )])
+            .await;
+            assert!(matches!(
+                events.last(),
+                Some(AssistantMessageEvent::Error { .. })
+            ));
+            assert_eq!(server.requests.lock().unwrap().len(), 1);
+        }
+    }
 }

@@ -1,0 +1,1 @@
+- Added OpenRouter Responses transport verification and app-attribution coverage.

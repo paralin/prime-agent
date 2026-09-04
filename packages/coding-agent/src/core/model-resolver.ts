@@ -51,6 +51,8 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"xiaomi-token-plan-ams": "mimo-v2.5-pro",
 	"xiaomi-token-plan-sgp": "mimo-v2.5-pro",
 	runinfra: "deepseek-v4-flash",
+	// Venice must stay last: findPreferredDefaultModel picks the first
+	venice: "stealth-ox-alpha",
 };
 
 export interface ScopedModel {

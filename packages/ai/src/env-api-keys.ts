@@ -125,6 +125,7 @@ function getApiKeyEnvVars(provider: string): readonly string[] | undefined {
 		runinfra: "RUNINFRA_GATEWAY_KEY",
 		"cloudflare-workers-ai": "CLOUDFLARE_API_KEY",
 		"cloudflare-ai-gateway": "CLOUDFLARE_API_KEY",
+		venice: "VENICE_API_KEY",
 		xiaomi: "XIAOMI_API_KEY",
 		"xiaomi-token-plan-cn": "XIAOMI_TOKEN_PLAN_CN_API_KEY",
 		"xiaomi-token-plan-ams": "XIAOMI_TOKEN_PLAN_AMS_API_KEY",

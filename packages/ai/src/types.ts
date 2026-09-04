@@ -46,6 +46,7 @@ export type KnownProvider =
 	| "runinfra"
 	| "cloudflare-workers-ai"
 	| "cloudflare-ai-gateway"
+	| "venice"
 	| "xiaomi"
 	| "xiaomi-token-plan-cn"
 	| "xiaomi-token-plan-ams"

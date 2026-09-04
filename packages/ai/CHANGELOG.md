@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased]
+
+- Fixed Merge Gateway Chat tool loops dropping signed reasoning before follow-up requests.
+- Fixed Merge Gateway reasoning requests to send both the selected effort and its configured thinking-token budget.
+- Added GLM 5.3 Flash to the RunInfra model list.
+- Mapped Merge Gateway GLM-5.3-Flash thinking levels so off/minimal send low and medium sends high. Other values were coerced to max and produced runaway thinking.
+- Corrected Merge Gateway GLM-5.3 Flash cache-read estimates to Particle AI's $0.003 per million tokens rate.
+- Switched Merge Gateway models to the native `POST /v1/responses` snapshot stream so thinking, tools, and `reasoning_effort` use Gateway's own contract instead of the OpenAI-compatible `/v1/openai` surface.
+- Pointed Merge Gateway Responses models at `/v1/openai` so the OpenAI SDK speaks OpenAI's Responses stream instead of Merge's native `/v1/responses` snapshots, and sent `X-Session-Id` for conversation cache affinity.
+- Changed Merge Gateway to use the OpenCode-compatible Chat Completions request and streaming protocol.
+- Fixed Merge Gateway cache affinity to send the same session headers as OpenCode.
+- Fixed Merge Gateway terminal warnings so they remain observable in assistant diagnostics.
+- Fixed redacted Merge Gateway reasoning being replayed as an ordinary signature.
+- Fixed Merge Gateway requests using capabilities that were not shared by every eligible vendor route.
+- Fixed truncated Merge Gateway streams being saved as successful turns.
+- Fixed Merge Gateway degradation warnings being discarded and reasoning exhaustion being saved as a successful turn.
+- Limited Merge Gateway GLM-5.3-Flash reasoning choices to its supported low, high, and max efforts.
+- Sent Merge Gateway GLM-5.3-Flash `thinking: { type: "enabled", clear_thinking: false }` with `stream: true`, and never `thinking.type: "disabled"`. Merge does not document `tool_stream` on its OpenAI Responses surface.
+- Sent the OpenCode `x-opencode-session` conversation header on OpenCode Zen and OpenCode Go requests so the provider can keep a stable per-conversation identity.
+- Added per-thinking-level `reasoning_budget_tokens` support for compatible OpenAI completion servers.
+- Fixed Claude Fable 5.x failing over Anthropic OAuth with "Claude Code 2.1.75 does not support this model" by bumping the impersonated Claude Code version to 2.1.257 ([#1962](https://github.com/PrimeIntellect-ai/prime-agent/issues/1962))
+- Fixed malformed nested OpenAI Responses stream elements bypassing malformed-response handling.
+- Fixed malformed Responses streams crashing the session with a raw error when null or non-string payloads arrive at eight Responses stream event boundaries.
+- Fixed RunInfra reasoning models sending the system prompt as the OpenAI-only "developer" role, which the gateway rejects.
+- Changed a missing OpenAI Responses terminal status to map to the `unknown` stop reason instead of `stop`, so consumers can distinguish incomplete turns from completed ones.
+- Changed a stream that ends without any truthy OpenAI Chat Completions finish reason (provider closed early or sent `[DONE]` with no terminal chunk) to map to the `unknown` stop reason instead of `stop`.
+- Added a first-class `venice` provider: `venice` is now a known provider, `VENICE_API_KEY` is detected from the environment, and the generated catalog includes the Venice model list served through the OpenAI-compatible chat completions API at `https://api.venice.ai/api/v1`.
+
 ## [0.9.0] - 2026-09-01
 
 - Refreshed the model catalog from live provider catalogs (pricing updates, new and removed models); fixed OpenCode Go Qwen routes mislabeled as Anthropic and excluded private dev/ Prime Inference routes.

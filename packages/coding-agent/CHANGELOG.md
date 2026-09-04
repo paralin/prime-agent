@@ -1,10 +1,112 @@
 # Changelog
 
+## [Unreleased]
+
+- Stopped automatic retries after a provider reports that reasoning exhausted the output budget.
+- Told the agent to preserve completed results, follow the newest user instruction, and take a distinct action instead of repeating a tool call.
+- Fixed live Merge Gateway model discovery dropping the session-affinity headers used by the bootstrap models.
+- Added native callable tools for MCP servers supplied by ACP clients. ([#2002](https://github.com/PrimeIntellect-ai/prime-agent/pull/2002))
+- Registered the per-session semantic-edge ledger with the agent-traces outbox as its own kind-tagged entry: durable upload intent at persist, an append-only byte cursor that never re-counts unchanged ledgers, startup catch-up counting, and pruning when a ledger is deleted with its session. No delivery endpoint exists yet, so pending ledgers are counted but never sent.
+- Added an ACP semantic-edges-v1 producer: each agent session appends an append-only `semantic-edges.jsonl` ledger beside its session artifacts, every provider turn and compaction summary call carries one opaque request ID on `X-ACP-Model-Request-ID` and `Idempotency-Key` (minted before the call, committed or failed when its stream resolves, and stable across retry attempts of the same call body), spawned subagents record their parent session and spawning request while successful children record their return, and `deriveSemanticEdges` folds a session tree's ledgers into commit-gated `continuation`/`subagent_call`/`subagent_return`/`compaction` edges matching the verifiers semantic-edges-v1 schema. Derivation only — nothing publishes or reads the ledger yet.
+- Running `prime-agent` with a running daemon opens the agents view instead of the most recently running agent. A launch with an initial prompt still opens a chat directly.
+- Made agents-list token and cost details opt-in with `agentsViewUsage.enabled`; the earlier age and message-count row details are now the default.
+- Aligned the generated system prompt with workspace-owned routing, publication, skill, and delegation policy.
+- Allowed `rlmActMaxDepth: 0` to remove unavailable Act guidance from the prompt.
+- Told the model not to use bash `sleep` or `asyncio.sleep` to wait on work, except a file-poll loop with sleep under 5 seconds.
+- Added argv-safe SSH transport to the IPython `bash()` helper with exact stdin script delivery, quoted remote cwd/env setup, transport-failure reporting, and existing timeout/job-watch integration.
+- Told parent agents to end their turn and rely on child message or completion wakeups instead of sleeping or repeatedly observing delegated work.
+- Fixed the interactive session-context test harnesses missing the elapsed tool label gate after it became a required `InteractiveMode` dependency.
+- Claude Code-backed subagents (opus, fable) now persist the same spawn ledger edge, display file, and session transcript as native subagents, so they appear in the agents view subagent list, stay selectable and openable, and survive daemon restarts. Their roster model label now shows the actual child model instead of the parent's.
+- Fixed scratch-handoff compaction to own its closeout turn, keep a missing checkpoint alive for one repair turn, and render the prompt as a compact system event.
+- Fixed context-window overflow after switching a compacted session to another provider: the latest compaction boundary now always bounds the rebuilt context, and provider-native history only replays on its originating provider (other providers receive the summary text).
+- The tray and footer context percentage now reads against the compaction trigger (window minus reserve, or the configured threshold) instead of the full context window, so it shows how close auto compaction is.
+- Told the model never to end a turn with a decided, verified action unexecuted; end a turn only to wait on child replies, independently completing work, a needed user decision, or an external dependency.
+- Fixed cross-worker agent messages losing their stable message id and replyTo at the supervisor forwarding hop: workers now forward mailbox identity so retries stay idempotent, and delivery to a pre-update worker fails safely instead of silently dropping the identity.
+- Fixed a replaced supervisor being handed worker agent-message sends: sends now fail closed unless the answering supervisor generation still matches the authenticated claim bound to the worker's supervisor socket.
+- Fixed stranded daemon worker registrations blocking session reopen: a fresh create now reclaims a dead failed worker registration exactly once after its owner is gone, while a connected owner or a non-create attach keeps authority over it.
+- Fixed daemon snapshot transfers serving stale transcript bytes when a replacement worker reused the previous worker's event sequence numbers; snapshot ids now derive from the serialized message content.
+- Fixed the daemon supervisor exiting on an unhandled rejection when a worker request timed out during send backpressure: the timeout now reaches the caller while the process stays alive and the same client remains usable.
+- A child agent's message to a parent that was just aborted is now parked and delivered as context on the parent's next turn, instead of failing with "Cannot admit a session action while queued session input is suspended". The child receives a queued receipt.
+- Reworked agent-trace upload scheduling as a disk-cursor outbox: upload intent and per-session uploaded-content cursors persist as one small entry file per session under `agent-traces-outbox/` in the agent dir, a startup catch-up uploads anything a previous process never finished (pruning cursors of deleted session files), scheduled and catch-up uploads never re-send unchanged sessions (the explicit `/traces upload` command still force-uploads), and rate-limited uploads reschedule (honoring an advertised Retry-After) instead of sleeping. Session disposal and process exit no longer wait on trace uploads at all, and upload timers never keep the process alive; the exit drain barrier is gone (the startup catch-up replaces it).
+- Fixed sessions with armed heartbeats showing as Running forever in the agents view; between firings they now list as Idle with the heartbeat badge and a `heartbeat · next <time>` label.
+- Added a dimmed heartbeat badge for sessions whose only heartbeats are paused.
+- Added an armed-heartbeat warning to the agents-view delete confirmation for sessions and subagents.
+- Changed sessions with armed heartbeats to passivate like any idle session; the daemon now wakes them when the next heartbeat is due, including after a daemon restart.
+- Fixed heartbeats of passivated sessions disappearing from the heartbeat list and agents-view badges.
+- Steered an English reminder and dropped Chinese assistant text blocks (not thinking traces) when the model replied in Chinese.
+- Extracted the RLM spawn ledger's crash-safety mechanics (single O_APPEND writes with optional fsync, bounded fail-closed replay, torn-final-line tolerance, repair-on-append) into a shared append-only event-log substrate; ledger behavior and public API are unchanged.
+- Added background event watches to the session status surfaces: a tray label and `/watches` menu next to heartbeats, and a distinct slow idle spinner when the agent is idle but watched jobs or heartbeats can still wake it.
+- Added bounded, event-driven kernel host admission for external session messages, including stable event-ID coalescing and existing steer/follow-up delivery.
+- Fixed Claude Code RLM spawns returning admission handles before the child runtime initialized.
+- Fixed OpenAI Codex model discovery to follow paginated catalogs and reject repeated cursors.
+- Fixed high daemon CPU and memory use when large RLM agent trees emit frequent child updates.
+- Fixed RLM heartbeats moving to another session when daemon active IDs are reused.
+- Fixed kernel snapshot restore reopening or truncating files referenced by saved file handles.
+- Fixed dropped live events when a legacy sequenced frame followed a generation cursor.
+- Fixed discovered Merge Gateway models losing provider compatibility settings.
+- Fixed passive RLM subagent sessions disappearing from the daemon session catalog after an active-only summary refresh, which broke later attach by session ID.
+- Fixed retained agents missing from the agents view until their sessions were woken.
+- Kept Merge Gateway GLM-5.3-Flash thinking-level maps on discovered models so default medium thinking does not become max.
+- Asked Merge Gateway GLM-5.3-Flash to write reasoning inside `<think>` tags and keep the visible answer outside them.
+- Changed saved-session catalogs (list, listAll, daemon catalog responses) to hide sessions whose only entries are lifecycle, state, or tool results; such sessions stay openable and resolvable by exact ID or unique prefix through `--resume` and session resolution.
+- Fixed daemon idle eviction stalling for the drain timeout and logging a timeout warning whenever any mutation was in flight: an in-flight mutation now skips that sweep (the scheduler retries once it ends), and mutations arriving during eviction still wait on the eviction fence before admission.
+- Added argv-safe `rg()` and `rsync()` helpers to the persistent IPython kernel.
+- Fixed IPython cells that assign a command string then call `bash(name)` so the TUI previews them as bash instead of `python · r = await bash(code, ...)`.
+- Warned IPython cells not to wrap bash heredocs or inner Python scripts in triple-quoted strings; write files in the kernel and `rsync` them instead.
+- Previewed IPython `subprocess.run` cells as bash, matching `bash()`, so a `go test` argv shows as a shell command instead of a Python cell.
+- Fixed IPython tool calls failing permanently after the kernel process died unexpectedly: the next call starts a fresh kernel, restores the last persisted snapshot, and reports the interrupted cell as failed instead of replaying it.
+- Changed the bare source launcher to reopen the most recent session instead of creating a sibling session.
+- Fixed source-launcher signals and exit status so supervised callers can stop the agent process.
+- Fixed Merge Gateway compression usage preventing local semantic compaction from triggering.
+- Paged Merge Gateway `GET /models` with `limit=500` and the catalog cursor so discovery does not silently truncate as the catalog grows.
+- Discover Merge Gateway catalog models as native `/v1/responses` clients instead of OpenAI-compatible `/v1/openai` or chat-completions routes.
+- Removed the Merge-specific reasoning prompt and aligned discovered models with the OpenCode-compatible Chat route.
+- Fixed Merge Gateway model discovery advertising capabilities that only some vendor routes support.
+- Fixed Merge Gateway models hiding supported thinking levels when live routes advertise the `thinking` control.
+- Preserved selected low, high, and max reasoning efforts when discovering Merge Gateway GLM-5.3-Flash.
+- `/new` starts the fresh session in the attached session's working directory instead of the TUI process's directory.
+- `/new` now creates the new session in the terminal process working directory instead of the attached session directory.
+- `/new` (and daemon `new_session` without a parent) no longer replaces the current session in place. It creates a fresh resident session in the daemon and rebinds the connection to it, leaving the previous session running exactly as if you had opened a different session from the agents list.
+- Fixed the agents view opening the new session when selecting the previous session after `/new`.
+- Fixed the stable installer failing under npm 12 when resolving verified release dependencies. ([Discussion #1988](https://github.com/PrimeIntellect-ai/prime-agent/discussions/1988))
+- Improved large-session responsiveness by incrementally indexing transcripts, skipping resident and bookkeeping scans, avoiding duplicate snapshot context, bounding initial UI work, passivating inactive children under resident pressure, and caching unchanged Git context.
+- Reduced large-session memory by keeping superseded provider-native compaction histories on disk until replay requires them.
+- Released completed child IPython processes immediately while preserving lazy snapshot restoration for follow-up work.
+- Fixed a running session keeping "Authentication failed ... Run /login" after a successful /login until restart: the request path now re-reads auth.json when another process rewrites it.
+- Fixed test runs leaking temporary sessions into the default session list.
+- Added `xhigh` and `max` token budgets and model configuration for compatible reasoning-budget servers.
+- Fixed the agent status line to show a direct agent as running while work continues in its nested agent tree.
+- Told agents to pass remote hosts and OpenSSH options through `bash()` parameters instead of nesting an `ssh` executable in the command body.
+- Removed the `/update` slash command and its startup update-available notices; updates now run through the top-level `prime-agent update` CLI command.
+- Recovered from repetition loops by cancelling the provider request and queueing a visible system notice that tells the model to step back and continue, instead of compacting.
+- Fixed finished agents lingering in the agents view Running section as "classifying" when their status summary text did not change.
+- Fixed the agents view undercounting running subagents: the "N subagents running" indicator now counts busy descendants at any depth, stays visible on collapsed groups, and idle sessions with busy subagents sort above plain idle sessions.
+- Changed the agents view Running section to mean the session's own work: sessions whose only activity is delegated to subagents now list as Idle with the running-subagents badge.
+- Added token and cost details to agents view rows: input/output tokens plus the session's own cost and its recursive total including all subagents; the message-count detail is gone.
+- Daemon- and runtime-hosted subagents record their spawn lineage again (the production runtime factory dropped it), and a compaction summary slice that resolves after a sibling already failed the compaction settles as failed instead of staying in-flight forever.
+- Fixed stopping or deleting an agent whose tree holds finished intermediate subagents: the walk no longer re-visits subtrees exponentially (which could freeze the worker on deep trees), and one cancel press reliably reaches every running descendant.
+- Fixed RLM agents attempting to spawn a child with `rlm(...)` when asked to message an existing agent: the system prompt now states that `rlm(...)` only spawns children, direct delivery to a reachable parent, sibling, or child uses `await agent_message.send(...)`, and `help(agent_message)` documents the messaging API.
+- Fixed daemon-hosted RLM model roles retrying only their first provider instead of advancing through the configured fallback chain.
+- Changed scratch handoff to use exact first and later closeout prompts and to preserve the old context when checkpoint creation, reading, or cancellation fails.
+- Added explicit scratch-handoff compaction with bounded PNG history, the complete labelled Org checkpoint, and its continuation instruction in one retained user message.
+- Made the transient session elapsed-time hint configurable with `sessionElapsedTime.enabled` and disabled it by default.
+- Pointed the system prompt at `.agents/skills/` and `~/.agents/skills/` instead of `.claude/skills/`.
+- Fixed daemon supervisor snapshot materialization serving stale transcript bytes when a replacement worker reused the previous snapshot's event sequence numbers; supervisor snapshot ids now derive from the serialized message content.
+- `switchSession` and `fork` no longer tear down the source session in place. They now create (or reuse) a resident worker for the target session and rebind the connection, so the source session stays alive and its identity is never recycled.
+- Sanded the default system prompt into the project letter's voice: ordinary words, the running program as truth, one positive long-work path, and no stacked detach-denial list.
+- Told the model to reason in thinking blocks and to put a short IPython cell comment stating intent and expected outcome.
+- Fixed daemon session creation after macOS timezone changes ([#879](https://github.com/PrimeIntellect-ai/prime-agent/issues/879))
+- Nudged the model after three consecutive `bash()` or Python syntax errors with no thinking in between, asking it to step back and check the syntax before retrying.
+- Added Venice AI as a built-in provider with display name "Venice AI" and default model `stealth-ox-alpha`; Venice stays last in default-provider precedence so it never outranks an already-selected provider when both credentials exist.
+
 ## [0.9.1] - 2026-09-01
-
 - Fixed a v0.9.0 regression: the agents view's Inactive section was empty on a fresh view until a search was typed. The saved-session catalog now loads (progressively) when the view opens; it was previously deferred to search because the roster's boot seed carried the saved corpus, which the seed scoping removed.
-
+- Fixed a v0.9.0 regression: the agents view's Inactive section was empty on a fresh view until a search was typed. The saved-session catalog now loads (progressively) when the view opens; it was previously deferred to search because the roster's boot seed carried the saved corpus, which the seed scoping removed.
 ## [0.9.0] - 2026-09-01
+
+- Added event-driven retained Bash jobs that wake their Prime Agent session with structured completion details instead of requiring heartbeat polling.
+
+- Added an optional `timeout=seconds` argument to the IPython `bash()` helper.
 
 - Fixed background (unattributed) kernel output missing from the expanded IPython cell view: it is now surfaced in the tool details and rendered under a "background output (unattributed)" label after stdout/stderr/result.
 - Fixed a protocol interrupt during a REPL state restore leaving a mixed old/new namespace: names are now staged first and applied atomically with SIGINT parked across the apply, and an interrupt landing anywhere between a committed snapshot or restore and its request finishing is recovered instead of misreporting the completed operation as failed.
@@ -169,7 +271,12 @@
 - Added a working hint that recommends sharing traces with Prime Intellect to help train open-source LLMs.
 - Restored bare `prime-agent --resume` opening the agents view and the `/resume [id|path]` slash command; bare commands open the agents view and an argument resumes that session in place.
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
-- Fixed ctrl+p ("Toggle agent message expansion") only toggling received agent messages; it now expands and collapses sent agent messages together with received ones.
+- Added xAI Grok subscription login alongside the existing xAI API-key option.
+- Added Codex V2 native compaction through the normal Responses stream, with legacy endpoint fallback.
+- Changed direct user instructions in the active conversation to override conflicting workspace-file rules for that request.
+- Fixed retained `rlm.act` sessions resuming abandoned work, and added bounded caller-history bitmap frames between Act calls.
+- Bounded and sorted IPython namespace names in recovery notices without changing provider-native compaction history.
+- Fixed short-lived version 2 IPython snapshots failing recovery after returning to the stable snapshot format.
 
 ## [0.7.2] - 2026-08-11
 
@@ -179,6 +286,7 @@
 - Changed expand/collapse hints to a consistent bracketed `(Ctrl+O to expand)` style across tool, message, summary, and error rows.
 - Added a configurable copy action to login dialogs so raw sign-in URLs can be copied without selecting wrapped text ([#643](https://github.com/PrimeIntellect-ai/prime-agent/issues/643)).
 - Added privacy-safe pseudonymous product analytics for onboarding, command use, execution modes, run outcomes, TTFT, latency, usage, tools, retries, and compactions, with disclosure and opt-out controls ([ENG-4682](https://linear.app/primeintellect/issue/ENG-4682/add-privacy-safe-posthog-analytics-to-prime-agent)).
+- Removed the bundled `prime-intellect` skill and its product reference files.
 - Changed sent agent messages in the IPython cell UI to show only the message text with a `╰─` gutter when expanded, matching received messages, and hid the raw `agent_message.send` receipt dictionary.
 - Fixed Homebrew installs attempting to self-update their versioned Cellar keg instead of directing users to `brew upgrade prime-agent` ([#844](https://github.com/PrimeIntellect-ai/prime-agent/issues/844))
 - Fixed the agents view collapsing expanded subagent lists when returning from an opened agent ([ENG-5105](https://linear.app/primeintellect/issue/ENG-5105/keep-the-agents-view-state-persistent)).
@@ -190,8 +298,28 @@
 
 ## [0.7.1] - 2026-08-07
 
+- Fixed active goals repeatedly starting provider turns while waiting on external input by adding model-callable pause and resume controls.
+- Added config-gated per-spawn RLM service-tier selection with validation, inheritance, and fast-mode clamping.
 - Fixed the bundled `websearch` skill description and missing-key guidance omitting the `/login` → **MCP Connections** step required to configure Serper.
 - Fixed `retry_worker` cancelling its own recovery when a stopped session worker left a saved stop marker behind, leaving the session stuck at "Session worker is not connected".
+- Added OpenRouter dashboard grouping and sticky routing through the existing opaque Prime session identifier.
+- Added the hot-reloaded, default-off `openRouter.responses` setting with Chat Completions fallback before streaming starts.
+- Added ordered RLM model-role configuration, with authenticated candidate selection, `rlm.find_models` discovery, and documented `task`, Luna, and DeepSeek routes. Model strings accept trailing effort suffixes such as `github-copilot/grok-4.5:high`.
+- Added immediate runtime provider fallback for native RLM children admitted through ordered model roles. Each fallback candidate keeps its configured effort and receives a fresh retry budget without changing global defaults.
+- Added provider-native OpenAI Codex compaction with opaque history persistence, same-provider replay, cancellation and timeout bounds, and automatic local-summary fallback. Native compaction is enabled by default.
+- Added interchangeable `settings.yml` and `settings.yaml` loading and format-preserving writes alongside `settings.json`.
+- Added `claude-code/<model>` RLM children through the Claude Agent SDK. The configured executable retains authentication, while Prime Agent retains admission, status, usage, cancellation, deletion, and family coordination.
+- Added durable family inbox and wait operations with stable message IDs, reply correlation, oldest-first consumption, cancellation, and daemon capability negotiation.
+
+- Changed agent-message acceptance to persist hidden mailbox state before returning a receipt. Model-visible prompt delivery remains separate from retained mailbox state.
+- Changed a lone `.` interactive submission to resume the prior intent through a hidden host continuation instead of adding a visible user message.
+- Changed explicit RLM model-role effort suffixes to pass their exact value to the provider even when model capability metadata marks that effort unsupported.
+- Changed file-backed settings to hot-reload global and project JSON or YAML edits, including `modelRoles`, while retaining runtime overrides.
+- Changed Ctrl+C to clear non-empty editor text before applying its existing interrupt and exit behavior to an empty editor.
+- Fixed large fragmented session-worker frames repeatedly copying their accumulated bytes and starving daemon commands such as session-tree requests.
+- Fixed native compaction failures launching an oversized local fallback request; Prime now checks the rebuilt portable request against the model context window and reports both failure causes.
+- Fixed an empty OpenAI Codex discovery catalog blocking configured RLM child models that remain usable through interactive selection. Nonempty catalogs still restrict child admission to the models they list.
+- Fixed Python `rlm.find_models` results discarding the availability state of configured model roles.
 
 ## [0.7.0] - 2026-08-05
 

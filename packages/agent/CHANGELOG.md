@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+- Stopped a third consecutive identical tool-call batch with unchanged results before executing it.
+- Stopped retrying a reasoning-exhausted response with the same output budget and effort.
+- Continued the active turn when a provider exhausts its output limit on thinking without producing text or a tool call.
+
 ## [0.8.0] - 2026-08-21
 
 - Added `AgentContinueError` with stable codes (`busy`, `nothing-to-continue`) for `Agent.continue()` precondition failures, so callers classify without matching message text.

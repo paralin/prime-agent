@@ -163,7 +163,13 @@ impl SessionUi {
         let Some(messages) = data.get("messages").and_then(Value::as_array) else {
             return;
         };
-        let entries = crate::snapshot::transcript_to_entries(messages);
+        let history = if messages.iter().any(|message| crate::snapshot::message_text(message).contains("<scratch-handoff-file ")) {
+            match self.bounded_request(Duration::from_millis(UI_REQUEST_TIMEOUT_MS), DaemonCommand::GetSessionTree { id: None, active_session_id: self.active_session_id.clone(), rest: Map::default() }).await {
+                Ok(tree) => crate::snapshot::transcript_history(&tree, messages),
+                Err(error) => { self.error_row(&format!("Could not load pre-compaction history: {error}"), view); messages.clone() }
+            }
+        } else { messages.clone() };
+        let entries = crate::snapshot::transcript_to_entries(&history);
         view.clear_chat();
         for entry in entries {
             view.push_entry(entry);

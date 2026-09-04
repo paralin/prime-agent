@@ -579,3 +579,6 @@ mod tool_fold;
 
 #[cfg(test)]
 mod tests;
+
+mod transcript_history;
+pub(crate) use transcript_history::transcript_history;

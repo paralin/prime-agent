@@ -5,7 +5,7 @@ use serde_json::json;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub const ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE: &str = "english_output_nudge";
-pub const ENGLISH_OUTPUT_NUDGE_PROMPT: &str = "Your previous response contained non-English text, which violates the language policy. Rewrite your response entirely in English for all communication, code, and reasoning. Do not mention this notice.";
+pub const ENGLISH_OUTPUT_NUDGE_PROMPT: &str = "Continue the user's active task from the latest tool result. Use English for subsequent user-facing explanations. This is a language reminder, not a new task: do not reconstruct the conversation or repeat completed work. No reply to this notice is needed.";
 
 /// # Panics
 /// Panics if the regex engine no longer supports the `Unified_Ideograph` property.
@@ -21,12 +21,8 @@ pub fn text_has_chinese(text: &str) -> bool {
 }
 
 #[must_use]
-pub fn strip_chinese_output_blocks(message: &AssistantMessage) -> Option<AssistantMessage> {
-    let mut filtered = message.clone();
-    filtered.content.retain(
-        |block| !matches!(block, AssistantContent::Text(text) if text_has_chinese(&text.text)),
-    );
-    (filtered.content.len() != message.content.len()).then_some(filtered)
+pub fn needs_english_output_nudge(message: &AssistantMessage) -> bool {
+    message.content.iter().any(|block| matches!(block, AssistantContent::Text(text) if text_has_chinese(&text.text)))
 }
 
 #[derive(Default)]
@@ -53,9 +49,9 @@ impl EnglishOutputNudgeRuntime {
     pub fn filter_hook(self: &Arc<Self>) -> FilterAssistantMessageFn {
         let runtime = self.clone();
         Arc::new(move |message| {
-            let Some(filtered) = strip_chinese_output_blocks(&message) else {
+            if !needs_english_output_nudge(&message) {
                 return Ok(Some(message));
-            };
+            }
             let agent = runtime
                 .agent
                 .lock()
@@ -82,7 +78,7 @@ impl EnglishOutputNudgeRuntime {
                     agent.steer(notice);
                 }
             }
-            Ok((!filtered.content.is_empty()).then_some(filtered))
+            Ok(Some(message))
         })
     }
 }
@@ -107,10 +103,8 @@ mod tests {
                 {"type":"toolCall","id":"1","name":"ipython","arguments":{"code":"print('中文')"}}],
             "api":"faux","provider":"faux","model":"faux","usage":pa_agent::types::Usage::zero(),"stopReason":"toolUse","timestamp":0
         })).unwrap();
-        let filtered = strip_chinese_output_blocks(&message).unwrap();
-        assert_eq!(filtered.content.len(), 3);
-        assert!(matches!(filtered.content[0], AssistantContent::Thinking(_)));
-        assert_eq!(filtered.tool_calls().len(), 1);
+        assert!(needs_english_output_nudge(&message));
+
     }
 
     #[test]
@@ -130,7 +124,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_session_removes_filtered_output_before_persistence_and_requests_rewrite() {
+    async fn live_session_preserves_output_and_continues_after_language_notice() {
         let provider = Arc::new(ScriptedProvider::new(Model::unknown()));
         provider.push_text_turn("中文回答");
         provider.push_text_turn("English answer");
@@ -162,7 +156,7 @@ mod tests {
             rows.iter()
                 .filter(|row| matches!(row, AgentMessage::Standard(Message::Assistant(_))))
                 .count(),
-            1
+            2
         );
         assert!(!serde_json::to_string(&session.entries().await)
             .unwrap()

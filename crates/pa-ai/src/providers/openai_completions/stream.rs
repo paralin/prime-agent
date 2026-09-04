@@ -208,6 +208,13 @@ fn handle_chunk(
     if !chunk.is_object() {
         return;
     }
+    if model.provider == "merge-gateway" {
+        if let Some(vendor) = chunk["routing"]["vendor_used"].as_str() {
+            if !state.output.diagnostics.as_ref().is_some_and(|entries| entries.iter().any(|entry| entry.type_ == "merge_routing")) {
+                state.output.diagnostics.get_or_insert_with(Vec::new).push(crate::types::AssistantMessageDiagnostic { type_: "merge_routing".into(), timestamp: crate::utils_inner::diagnostics::now_ms(), error: None, details: Some(Map::from_iter([("vendor_used".into(), json!(vendor))])) });
+            }
+        }
+    }
     if let Some(warnings) = chunk.get("warnings").and_then(Value::as_array) {
         for warning in warnings {
             if warning.get("code").and_then(Value::as_str).is_some()
@@ -647,6 +654,15 @@ async fn run_stream(
         }
     }
 
+    if model.provider == "merge-gateway" {
+        let mut details = Map::new();
+        for key in ["model", "vendor", "reasoning_effort", "max_tokens", "max_completion_tokens"] {
+            if let Some(value) = params.get(key).filter(|value| value.is_string() || value.is_number()) { details.insert(key.into(), value.clone()); }
+        }
+        if let Some(value) = params["thinking"]["type"].as_str() { details.insert("thinking_type".into(), json!(value)); }
+        if let Some(value) = params["thinking"]["budget_tokens"].as_u64() { details.insert("thinking_budget_tokens".into(), json!(value)); }
+        output.diagnostics.get_or_insert_with(Vec::new).push(crate::types::AssistantMessageDiagnostic { type_: "merge_request".into(), timestamp: crate::utils_inner::diagnostics::now_ms(), error: None, details: Some(details) });
+    }
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
     let mut headers = build_headers(
         model,

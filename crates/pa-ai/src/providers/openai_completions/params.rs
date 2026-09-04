@@ -26,6 +26,7 @@ pub(crate) fn build_params(
     let options = options.cloned().unwrap_or_default();
     let messages = convert_messages(model, context, compat);
     let mut params = Map::new();
+    if model.provider == "merge-gateway" { params.insert("include_routing_metadata".into(), json!(true)); }
     params.insert("model".into(), json!(model.id));
     params.insert("messages".into(), json!(messages));
     params.insert("stream".into(), json!(true));

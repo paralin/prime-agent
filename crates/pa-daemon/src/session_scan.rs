@@ -89,10 +89,7 @@ fn roster_session_info(path: &Path) -> Option<SessionInfo> {
 /// List every valid session file in a directory, most recently modified first
 /// (port of `SessionManager.listAll`): the directory read supplies the rows'
 /// identity keys (entry order, mtime), the bounded header gate skips foreign
-/// files without their fold, and the rich-field fold runs sequentially -
-/// a measured parallel fold loses to cross-core cacheline/futex costs on a
-/// loaded multi-core box (425ms vs 137ms over 1412 files), so the fold stays
-/// the loop the scan replaced.
+/// files without their fold. At most four transcript folds run concurrently.
 #[must_use]
 pub fn list_sessions(session_dir: &Path) -> Vec<SessionInfo> {
     list_sessions_with(session_dir, |_, _, _| true)
@@ -126,15 +123,16 @@ pub fn list_sessions_with(
     files.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
     let total = files.len();
     let mut infos = Vec::new();
-    for (index, (path, _)) in files.into_iter().enumerate() {
-        if let Some(info) = roster_session_info(&path) {
-            // `false` stops the scan: the stream consumer is gone (the
-            // connection loop dropped its channel), so the remaining
-            // folds serve nobody - the scan returns the rows it has.
-            if !on_row(index, total, &info) {
-                break;
+    for (batch, chunk) in files.chunks(4).enumerate() {
+        let rows = std::thread::scope(|scope| {
+            let workers = chunk.iter().map(|(path, _)| scope.spawn(move || roster_session_info(path))).collect::<Vec<_>>();
+            workers.into_iter().map(|worker| worker.join().expect("session metadata reader panicked")).collect::<Vec<_>>()
+        });
+        for (offset, row) in rows.into_iter().enumerate() {
+            if let Some(info) = row {
+                if !on_row(batch * 4 + offset, total, &info) { return infos; }
+                infos.push(info);
             }
-            infos.push(info);
         }
     }
     infos

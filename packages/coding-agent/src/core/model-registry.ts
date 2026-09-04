@@ -29,6 +29,7 @@ import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
+import { fetchMergeGatewayModels } from "./merge-gateway-models.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
 	fetchAuthorizedPrivatePrimeInferenceModelIds,
@@ -98,9 +99,12 @@ const ThinkingLevelMapSchema = Type.Object({
 });
 
 const OpenAICompletionsCompatSchema = Type.Object({
+	reasoningField: Type.Optional(Type.String()),
+	requireFinishReason: Type.Optional(Type.Boolean()),
 	supportsStore: Type.Optional(Type.Boolean()),
 	supportsDeveloperRole: Type.Optional(Type.Boolean()),
 	supportsReasoningEffort: Type.Optional(Type.Boolean()),
+	supportsReasoningBudgetTokens: Type.Optional(Type.Boolean()),
 	supportsUsageInStreaming: Type.Optional(Type.Boolean()),
 	maxTokensField: Type.Optional(Type.Union([Type.Literal("max_completion_tokens"), Type.Literal("max_tokens")])),
 	requiresToolResultName: Type.Optional(Type.Boolean()),
@@ -126,6 +130,13 @@ const OpenAICompletionsCompatSchema = Type.Object({
 
 const OpenAIResponsesCompatSchema = Type.Object({
 	sendSessionIdHeader: Type.Optional(Type.Boolean()),
+	supportsStore: Type.Optional(Type.Boolean()),
+	supportsPromptCache: Type.Optional(Type.Boolean()),
+	supportsReasoning: Type.Optional(Type.Boolean()),
+	supportsDeveloperRole: Type.Optional(Type.Boolean()),
+	supportsTools: Type.Optional(Type.Boolean()),
+	requiresStringMessageContent: Type.Optional(Type.Boolean()),
+	includeRoutingMetadata: Type.Optional(Type.Boolean()),
 	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
 });
 
@@ -396,18 +407,31 @@ function openAICodexModelsUrl(baseUrl: string): string {
 	return url.toString();
 }
 
-function readOpenAICodexModelIds(value: unknown): Set<string> {
+function readOpenAICodexModelPage(value: unknown): { modelIds: Set<string>; nextCursor?: string } {
 	if (!value || typeof value !== "object" || !("models" in value) || !Array.isArray(value.models)) {
 		throw new Error("Invalid OpenAI Codex model catalog");
 	}
-	return new Set(
-		value.models.flatMap((model) => {
+	const modelIds = new Set(
+		value.models.map((model) => {
 			if (!model || typeof model !== "object" || !("slug" in model) || typeof model.slug !== "string") {
-				return [];
+				throw new Error("Invalid OpenAI Codex model catalog");
 			}
-			return [model.slug];
+			return model.slug;
 		}),
 	);
+	if (!("next_cursor" in value) || value.next_cursor === null || value.next_cursor === "") {
+		return { modelIds };
+	}
+	if (typeof value.next_cursor !== "string") {
+		throw new Error("Invalid OpenAI Codex model catalog cursor");
+	}
+	const nextCursor = value.next_cursor.trim();
+	return nextCursor ? { modelIds, nextCursor } : { modelIds };
+}
+
+function filterModelsByOpenAICodexCatalog(models: Model<Api>[], modelIds: Set<string>): Model<Api>[] {
+	if (modelIds.size === 0) return models;
+	return models.filter((model) => model.provider !== "openai-codex" || modelIds.has(model.id));
 }
 
 const PRIVATE_PRIME_AUTHORIZATION_CACHE_FILE = "prime-inference-private-models.json";
@@ -777,8 +801,30 @@ export class ModelRegistry {
 		const previousPrivateModelIds = new Set(this.authorizedPrivatePrimeInferenceModelIds);
 		const previousTeamId = this.authorizedPrivatePrimeInferenceTeamId;
 		this.refresh();
-		await this.refreshPrivatePrimeInferenceAuthorization(previousPrivateModelIds, previousTeamId);
+		await Promise.all([
+			this.refreshPrivatePrimeInferenceAuthorization(previousPrivateModelIds, previousTeamId),
+			this.refreshMergeGatewayModels(),
+		]);
 		return this.getAvailable();
+	}
+
+	private async refreshMergeGatewayModels(): Promise<void> {
+		const seed = this.models.find((model) => model.provider === "merge-gateway");
+		if (!seed || isOfflineModeEnabled()) {
+			return;
+		}
+		const auth = await this.getApiKeyAndHeaders(seed);
+		if (!auth.ok || !auth.apiKey) {
+			return;
+		}
+		try {
+			const discovered = await fetchMergeGatewayModels(auth.apiKey, this.models);
+			const otherProviders = this.models.filter((model) => model.provider !== "merge-gateway");
+			const bootstrap = this.models.filter((model) => model.provider === "merge-gateway");
+			this.models = [...otherProviders, ...this.mergeCustomModels(bootstrap, discovered)];
+		} catch {
+			// Keep the generated catalog when discovery is unavailable.
+		}
 	}
 
 	private async refreshPrivatePrimeInferenceAuthorization(
@@ -975,7 +1021,7 @@ export class ModelRegistry {
 		const authFingerprint = createHash("sha256").update(auth.apiKey).digest("hex");
 		const cached = this.openAICodexModelsCache;
 		if (cached?.authFingerprint === authFingerprint && Date.now() - cached.refreshedAt < 300_000) {
-			return availableModels.filter((model) => model.provider !== "openai-codex" || cached.modelIds.has(model.id));
+			return filterModelsByOpenAICodexCatalog(availableModels, cached.modelIds);
 		}
 
 		const accountId = readOpenAICodexAccountId(auth.apiKey);
@@ -983,26 +1029,36 @@ export class ModelRegistry {
 			return availableModels.filter((model) => model.provider !== "openai-codex");
 		}
 		try {
-			const response = await fetch(openAICodexModelsUrl(codexModels[0]!.baseUrl), {
-				headers: {
-					...auth.headers,
-					Authorization: `Bearer ${auth.apiKey}`,
-					"chatgpt-account-id": accountId,
-					originator: "pi",
-				},
-				signal: AbortSignal.timeout(5_000),
-			});
-			if (!response.ok) {
-				throw new Error(`OpenAI Codex model discovery failed with HTTP ${response.status}`);
+			const modelIds = new Set<string>();
+			const seenCursors = new Set<string>();
+			const modelsUrl = new URL(openAICodexModelsUrl(codexModels[0]!.baseUrl));
+			for (;;) {
+				const response = await fetch(modelsUrl.toString(), {
+					headers: {
+						...auth.headers,
+						Authorization: `Bearer ${auth.apiKey}`,
+						"chatgpt-account-id": accountId,
+						originator: "pi",
+					},
+					signal: AbortSignal.timeout(5_000),
+				});
+				if (!response.ok) {
+					throw new Error(`OpenAI Codex model discovery failed with HTTP ${response.status}`);
+				}
+				const page = readOpenAICodexModelPage(await response.json());
+				for (const modelId of page.modelIds) modelIds.add(modelId);
+				if (!page.nextCursor) break;
+				if (seenCursors.has(page.nextCursor)) {
+					throw new Error("OpenAI Codex model discovery repeated its pagination cursor");
+				}
+				seenCursors.add(page.nextCursor);
+				modelsUrl.searchParams.set("cursor", page.nextCursor);
 			}
-			const modelIds = readOpenAICodexModelIds(await response.json());
 			this.openAICodexModelsCache = { authFingerprint, modelIds, refreshedAt: Date.now() };
-			return availableModels.filter((model) => model.provider !== "openai-codex" || modelIds.has(model.id));
+			return filterModelsByOpenAICodexCatalog(availableModels, modelIds);
 		} catch {
 			if (cached?.authFingerprint === authFingerprint && Date.now() - cached.refreshedAt < 300_000) {
-				return availableModels.filter(
-					(model) => model.provider !== "openai-codex" || cached.modelIds.has(model.id),
-				);
+				return filterModelsByOpenAICodexCatalog(availableModels, cached.modelIds);
 			}
 			return availableModels.filter((model) => model.provider !== "openai-codex");
 		}

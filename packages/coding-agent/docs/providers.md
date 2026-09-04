@@ -18,6 +18,7 @@ Use `/login` in interactive mode, then select a provider:
 - ChatGPT Plus/Pro (Codex)
 - Claude Pro/Max
 - GitHub Copilot
+- xAI Grok (SuperGrok / X Premium+)
 
 Use `/logout` to clear credentials. Tokens are stored in `~/.prime/agent/auth.json` and auto-refresh when expired.
 
@@ -25,6 +26,17 @@ Use `/logout` to clear credentials. Tokens are stored in `~/.prime/agent/auth.js
 
 - Requires ChatGPT Plus or Pro subscription
 - Officially endorsed by OpenAI: [Codex for OSS](https://developers.openai.com/community/codex-for-oss)
+
+Set the global Prime Agent configuration to load an ordered list of Codex CLI homes without copying their credentials into its own `auth.json`:
+
+```yaml
+codexHomes:
+  - ~/.codex
+  - ~/.codex-live
+  - ~/.codex-aperture
+```
+
+The daemon reads each home's `auth.json` and uses the first valid credential. When OpenAI reports that account's ChatGPT usage is exhausted, every session in the daemon advances to the next valid home. Explicit `--api-key` credentials remain higher priority. Chain state and tokens remain process-local and reset when the daemon restarts.
 
 ### Claude Pro/Max
 
@@ -34,6 +46,10 @@ Anthropic subscription auth is active for Claude Pro/Max accounts. Third-party h
 
 - Press Enter for github.com, or enter your GitHub Enterprise Server domain
 - If you get "model not supported", enable it in VS Code: Copilot Chat → model selector → select model → "Enable"
+
+### xAI Grok
+
+Select **xAI Grok (SuperGrok / X Premium+)** to sign in with xAI's device flow. Open the displayed URL, enter the code if prompted, and approve access. Prime Agent stores and refreshes the OAuth tokens automatically and routes xAI models through the Responses API while this login is active. The separate API-key option continues to use `XAI_API_KEY`.
 
 ## API Keys
 
@@ -118,6 +134,12 @@ The `key` field supports three formats:
   ```
 
 OAuth credentials are also stored here after `/login` and managed automatically.
+
+### OpenRouter
+
+Prime Agent sends its opaque local session UUID as OpenRouter's `session_id` request field. OpenRouter groups related requests in its dashboard and uses the identifier for sticky upstream routing. Prime Agent still sends the complete conversation context on every request.
+
+OpenRouter uses Chat Completions by default. Set `openRouter.responses: true` in `settings.json`, `settings.yml`, or `settings.yaml` to prefer the stateless Responses API. Prime Agent falls back to Chat only when Responses is unavailable before streaming starts. The setting is read for each request and therefore hot reloads without restarting the session.
 
 ### Prime Inference
 

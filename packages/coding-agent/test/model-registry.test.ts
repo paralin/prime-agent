@@ -403,7 +403,7 @@ describe("ModelRegistry", () => {
 			}
 		});
 
-		test("model schema accepts thinkingLevelMap and compat schema accepts supportsStrictMode and cacheControlFormat", () => {
+		test("model schema accepts thinking and OpenAI compatibility controls", () => {
 			writeRawModelsJson({
 				demo: {
 					baseUrl: "https://example.com/v1",
@@ -423,6 +423,7 @@ describe("ModelRegistry", () => {
 							},
 							compat: {
 								supportsStrictMode: false,
+								supportsReasoningBudgetTokens: true,
 								cacheControlFormat: "anthropic",
 							},
 						},
@@ -437,6 +438,7 @@ describe("ModelRegistry", () => {
 			expect(registry.getError()).toBeUndefined();
 			expect(model?.thinkingLevelMap).toEqual({ minimal: null, high: "max" });
 			expect(compat?.supportsStrictMode).toBe(false);
+			expect(compat?.supportsReasoningBudgetTokens).toBe(true);
 			expect(compat?.cacheControlFormat).toBe("anthropic");
 		});
 

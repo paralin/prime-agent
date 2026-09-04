@@ -264,7 +264,7 @@ import {
 } from "./model-resolver.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
-import { renderScratchHandoffCloseoutMessage } from "./prompts/scratch-handoff.js";
+import { renderScratchHandoffCloseoutMessage, SCRATCH_HANDOFF_CLOSEOUT_GUIDANCE } from "./prompts/scratch-handoff.js";
 import {
 	type AutoRefineReason,
 	type AutoRefineReview,
@@ -8503,6 +8503,7 @@ export class AgentSession {
 			phase: create ? "create" : "update",
 			content: prompt,
 		});
+		const previousSystemPrompt = this.agent.state.systemPrompt;
 		try {
 			await this.agent.waitForIdle();
 			if (signal.aborted) throw new Error("Compaction cancelled");
@@ -8515,6 +8516,7 @@ export class AgentSession {
 			);
 			if (signal.aborted) throw new Error("Compaction cancelled");
 			this._applyPreparedSystemPrompt({ result: extensionResult, basePromptSnapshot }, true);
+			this.agent.state.systemPrompt += `\n\n${SCRATCH_HANDOFF_CLOSEOUT_GUIDANCE}`;
 			const messages: AgentMessage[] = [message];
 			this._appendBeforeAgentStartMessages(messages, extensionResult);
 			this._scratchCloseoutRunActive = true;
@@ -8525,6 +8527,7 @@ export class AgentSession {
 			closeout.status = finalAssistant?.stopReason === "stop" ? "complete" : "failed";
 		} finally {
 			this._scratchCloseoutRunActive = false;
+			this.agent.state.systemPrompt = previousSystemPrompt;
 		}
 	}
 
@@ -8538,7 +8541,9 @@ export class AgentSession {
 		const closeout = this._scratchCloseout?.displayPath === displayPath ? this._scratchCloseout : undefined;
 		if (closeout?.status !== "complete") {
 			this._scratchCloseout = undefined;
-			throw new Error("Scratch handoff closeout did not run before compaction");
+			throw new Error(
+				`Scratch handoff closeout did not run to completion; original context retained. ${closeout?.finalAssistant?.errorMessage ?? "Retry /compact after resolving the closeout failure."}`,
+			);
 		}
 		let scratchText: string | undefined;
 		try {

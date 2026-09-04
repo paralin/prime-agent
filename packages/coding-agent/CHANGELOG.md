@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added draft-first scratch closeout guidance and surfaced closeout failures without discarding the original context.
 - Fixed Merge auto-compaction to use the same local context estimate as the usage display.
 - Fixed scratch handoff accepting output-exhausted closeouts and losing snapshot source across generations; disclosed image-history omissions.
 - Accelerated cold session listings with bounded concurrent transcript scans so large sessions do not block smaller ones.

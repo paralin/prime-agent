@@ -80,25 +80,22 @@ describe("reasoning exhaustion recovery", () => {
 	it("does not treat an unused local thinking budget as a provider output limit", async () => {
 		const partial = response(32_000);
 		const { requests, messages } = await run([partial, response(100, false)], { thinkingBudgets: { low: 1024 } });
-		expect(requests.map((request) => request.options?.maxTokens)).toEqual([undefined, 64_000]);
-		expect(messages.at(-1)).toMatchObject({ stopReason: "stop" });
+		expect(requests.map((request) => request.options?.maxTokens)).toEqual([undefined]);
+		expect(messages.at(-1)).toMatchObject({ stopReason: "error" });
 	});
 
-	it.each([true, false])("recovers with visible reasoning=%s and retains the active request", async (visible) => {
+	it.each([true, false])("stops with visible reasoning=%s and retains the active request", async (visible) => {
 		const partial = response(32_000);
 		if (!visible) partial.content = [];
 		const { requests, messages, config } = await run([partial, response(100, false)]);
-		expect(requests.map((request) => request.options?.maxTokens)).toEqual([undefined, 64_000]);
-		expect(requests[1].options?.reasoning).toBe("low");
-		expect(requests[1].messages).toEqual([
-			{ role: "user", content: "Answer the current question", timestamp: 0 },
-			partial,
-		]);
-		expect(messages.at(-1)).toMatchObject({ stopReason: "stop" });
+		expect(requests.map((request) => request.options?.maxTokens)).toEqual([undefined]);
+		expect(requests[0].options?.reasoning).toBe("low");
+		expect(requests[0].messages).toEqual([{ role: "user", content: "Answer the current question", timestamp: 0 }]);
+		expect(messages.at(-1)).toMatchObject({ stopReason: "error" });
 		expect(config.maxTokens).toBeUndefined();
 	});
 
-	it("restores the default allowance after a completed response", async () => {
+	it("does not consume queued followups to retry exhausted reasoning", async () => {
 		let followedUp = false;
 		const { requests } = await run([response(32_000), response(100, false), response(100, false)], {
 			getFollowUpMessages: async () => {
@@ -107,20 +104,21 @@ describe("reasoning exhaustion recovery", () => {
 				return [{ role: "user", content: "Next question", timestamp: 1 }];
 			},
 		});
-		expect(requests.map((request) => request.options?.maxTokens)).toEqual([undefined, 64_000, undefined]);
+		expect(requests.map((request) => request.options?.maxTokens)).toEqual([undefined]);
+		expect(followedUp).toBe(false);
 	});
 
-	it("stops after three exhausted responses even when the model allows more", async () => {
+	it("stops after one exhausted response even when the model allows more", async () => {
 		const { requests, messages } = await run([response(32_000), response(64_000), response(128_000)]);
-		expect(requests.map((request) => request.options?.maxTokens)).toEqual([undefined, 64_000, 128_000]);
+		expect(requests.map((request) => request.options?.maxTokens)).toEqual([undefined]);
 		expect(messages.at(-1)).toMatchObject({ stopReason: "error" });
 	});
 
-	it("clamps recovery to the model limit and stops when that limit is exhausted", async () => {
+	it("does not raise output to the model limit", async () => {
 		const { requests, messages } = await run([response(32_000), response(40_000)], {
 			model: { ...model, maxTokens: 40_000 },
 		});
-		expect(requests.map((request) => request.options?.maxTokens)).toEqual([undefined, 40_000]);
+		expect(requests.map((request) => request.options?.maxTokens)).toEqual([undefined]);
 		expect(messages.at(-1)).toMatchObject({ stopReason: "error" });
 	});
 

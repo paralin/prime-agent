@@ -483,7 +483,6 @@ async function runLoop(
 ): Promise<void> {
 	let firstTurn = true;
 	let consecutiveIncompleteResponses = 0;
-	let recoveryMaxTokens: number | undefined;
 	const toolCallRepetitionDetector = new ToolCallRepetitionDetector();
 	let lastTurn: Parameters<NonNullable<AgentLoopConfig["getContinuationMessages"]>>[0] | undefined;
 	let pendingMessages: AgentMessage[] = await pollMessagesUnlessAborted(config.getSteeringMessages, signal);
@@ -503,7 +502,6 @@ async function runLoop(
 			}
 
 			if (pendingMessages.length > 0) {
-				recoveryMaxTokens = undefined;
 				toolCallRepetitionDetector.reset();
 				for (const message of pendingMessages) {
 					await emit({ type: "message_start", message });
@@ -514,15 +512,8 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
-			const requestConfig = recoveryMaxTokens === undefined ? config : { ...config, maxTokens: recoveryMaxTokens };
-			const message = await streamAssistantResponse(
-				currentContext,
-				requestConfig,
-				signal,
-				emit,
-				streamFn,
-				(candidate) =>
-					toolCallRepetitionDetector.observe(candidate) ? finalizeToolCallRepetitionMessage(candidate) : candidate,
+			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn, (candidate) =>
+				toolCallRepetitionDetector.observe(candidate) ? finalizeToolCallRepetitionMessage(candidate) : candidate,
 			);
 			newMessages.push(message);
 
@@ -540,19 +531,12 @@ async function runLoop(
 				toolCalls.length === 0 &&
 				hasReasoningExhaustedWarning(message)
 			) {
-				const usedBudget = Math.max(message.usage.output, requestConfig.maxTokens ?? 0);
-				const nextBudget = Math.min(usedBudget * 2, config.model.maxTokens);
-				// Grow only the provider's default allowance. An explicit caller cap
-				// remains authoritative, and the incomplete-response limit bounds retries.
-				if (config.maxTokens !== undefined || !(nextBudget > usedBudget)) {
-					message.stopReason = "error";
-					message.errorMessage =
-						"Provider exhausted the output budget on reasoning without producing an answer; increase the output budget or lower the reasoning effort";
-					await emit({ type: "turn_end", message, toolResults: [] });
-					await emit({ type: "agent_end", messages: newMessages });
-					return;
-				}
-				recoveryMaxTokens = nextBudget;
+				message.stopReason = "error";
+				message.errorMessage =
+					"Provider exhausted the output budget on reasoning without producing an answer; increase the output budget or lower the reasoning effort";
+				await emit({ type: "turn_end", message, toolResults: [] });
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
 			}
 			const incompleteResponse =
 				message.stopReason === "unknown" ||
@@ -574,7 +558,6 @@ async function runLoop(
 				hasMoreToolCalls = true;
 			} else {
 				consecutiveIncompleteResponses = 0;
-				recoveryMaxTokens = undefined;
 				hasMoreToolCalls = false;
 			}
 

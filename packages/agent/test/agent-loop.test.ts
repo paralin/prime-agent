@@ -2313,6 +2313,8 @@ describe("agent loop incomplete-response continuation", () => {
 	it("stops after a reasoning-exhausted warning instead of retrying the same budget", async () => {
 		const context = emptyContext();
 		const exhausted = createAssistantMessage([{ type: "thinking", thinking: "partial" }], "length");
+		exhausted.usage.output = 32000;
+		exhausted.usage.totalTokens = 32000;
 		exhausted.diagnostics = [
 			{
 				type: "provider_warning",
@@ -2328,7 +2330,7 @@ describe("agent loop incomplete-response continuation", () => {
 		const messages = await runAgentLoop(
 			[createUserMessage("Finish the answer")],
 			context,
-			{ model: createModel(), convertToLlm: identityConverter },
+			{ model: { ...createModel(), maxTokens: 128000 }, convertToLlm: identityConverter },
 			vi.fn(),
 			undefined,
 			recordedStreamFn([exhausted], callCount),

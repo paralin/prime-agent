@@ -35,6 +35,9 @@ describe("scratch handoff compaction", () => {
 				fauxAssistantMessage("fact before first boundary"),
 				(context) => {
 					seenCloseouts.push(JSON.stringify(context.messages.at(-1)));
+					expect(context.systemPrompt).toContain(
+						"Write a useful draft checkpoint before investigating uncertain details",
+					);
 					mkdirSync(dirname(expectedPath), { recursive: true });
 					writeFileSync(
 						expectedPath,
@@ -94,6 +97,7 @@ describe("scratch handoff compaction", () => {
 				`Stop working for now; please create a .org file brain-dump of your ongoing work to ${expectedPath}`,
 			);
 			assertContinuation(session.agent.state.messages, expectedPath, "** TODO Prove second boundary");
+			expect(session.agent.state.systemPrompt).not.toContain("This turn only prepares the handoff file");
 
 			await session.prompt("do the second piece of work");
 			await session.waitForIdle();
@@ -299,6 +303,19 @@ describe("scratch handoff compaction", () => {
 		["cancelled", { stopReason: "aborted" as const }],
 		["failed", { stopReason: "error" as const, errorMessage: "closeout provider failed" }],
 		["exhausted", { stopReason: "length" as const }],
+		[
+			"reasoning-exhausted",
+			{
+				stopReason: "length" as const,
+				diagnostics: [
+					{
+						type: "provider_warning" as const,
+						timestamp: 0,
+						error: { code: "reasoning_exhausted", message: "No answer" },
+					},
+				],
+			},
+		],
 	])("does not retry or compact after a %s /compact closeout", async (_label, closeoutResult) => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-scratch-command-failure-"));
 		const faux = registerFauxProvider();
@@ -308,7 +325,10 @@ describe("scratch handoff compaction", () => {
 				fauxAssistantMessage("work remains authoritative"),
 				() => {
 					closeoutCalls++;
-					return fauxAssistantMessage("", closeoutResult);
+					const message = fauxAssistantMessage("", closeoutResult);
+					message.usage.output = 100;
+					message.usage.totalTokens = 100;
+					return message;
 				},
 			]);
 			const authStorage = AuthStorage.inMemory();

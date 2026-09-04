@@ -872,6 +872,87 @@ async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 	}
 }
 
+function getMergeGatewayModels(): Model<"openai-completions">[] {
+	// The coding agent replaces this bootstrap list from Merge Gateway's authenticated /models catalog.
+	const baseUrl = "https://api-gateway.merge.dev/v1/ai-sdk";
+	const compat: NonNullable<Model<"openai-completions">["compat"]> = {
+		reasoningField: "thinking",
+		requireFinishReason: true,
+		supportsStore: true,
+		supportsDeveloperRole: false,
+		supportsReasoningEffort: true,
+		maxTokensField: "max_tokens",
+		thinkingFormat: "merge",
+		sendSessionAffinityHeaders: ["x-session-affinity", "X-Session-Id"],
+	};
+
+	return [
+		{
+			id: "anthropic/claude-opus-4-6",
+			name: "Claude Opus 4.6",
+			api: "openai-completions",
+			provider: "merge-gateway",
+			baseUrl,
+			compat,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 2.5, output: 10, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000000,
+			maxTokens: 32768,
+		},
+		{
+			id: "anthropic/claude-sonnet-4-6",
+			name: "Claude Sonnet 4.6",
+			api: "openai-completions",
+			provider: "merge-gateway",
+			baseUrl,
+			compat,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000000,
+			maxTokens: 64000,
+		},
+		{
+			id: "google/gemini-3.5-flash",
+			name: "Gemini 3.5 Flash",
+			api: "openai-completions",
+			provider: "merge-gateway",
+			baseUrl,
+			compat,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1048576,
+			maxTokens: 65536,
+		},
+		{
+			id: "zai/glm-5.3-flash",
+			name: "GLM 5.3 Flash",
+			api: "openai-completions",
+			provider: "merge-gateway",
+			baseUrl,
+			compat,
+			// GLM-5.3-Flash accepts only low, high, and max. Null entries keep
+			// unsupported Prime levels out of selection instead of silently aliasing them.
+			thinkingLevelMap: {
+				off: null,
+				minimal: null,
+				low: "low",
+				medium: null,
+				high: "high",
+				xhigh: null,
+				max: "max",
+			},
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0.015, output: 0.05, cacheRead: 0.003, cacheWrite: 0 },
+			contextWindow: 1000000,
+			maxTokens: 131000,
+		},
+	];
+}
+
 function getRunInfraModels(): Model<"openai-completions">[] {
 	const baseUrl = "https://api.runinfra.ai/v1";
 	const models = [
@@ -1637,10 +1718,11 @@ async function generateModels() {
 	const modelsDevModels = await loadModelsDevData();
 	const openRouterModels = await fetchOpenRouterModels();
 	const aiGatewayModels = await fetchAiGatewayModels();
+	const mergeGatewayModels = getMergeGatewayModels();
 	const runInfraModels = getRunInfraModels();
 
 	// Combine models (models.dev has priority)
-	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels, ...runInfraModels].filter(
+	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels, ...mergeGatewayModels, ...runInfraModels].filter(
 		(model) =>
 			!((model.provider === "opencode" || model.provider === "opencode-go") && model.id === "gpt-5.3-codex-spark"),
 	);

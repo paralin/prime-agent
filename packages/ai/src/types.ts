@@ -43,6 +43,7 @@ export type KnownProvider =
 	| "opencode"
 	| "opencode-go"
 	| "kimi-coding"
+	| "merge-gateway"
 	| "runinfra"
 	| "cloudflare-workers-ai"
 	| "cloudflare-ai-gateway"

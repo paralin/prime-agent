@@ -29,6 +29,7 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "huggingface" => "moonshotai/Kimi-K2.6",
         "fireworks" => "accounts/fireworks/models/kimi-k2p6",
         "kimi-coding" => "kimi-for-coding",
+        "runinfra" => "deepseek-v4-flash",
         "cloudflare-workers-ai" => "@cf/moonshotai/kimi-k2.6",
         "cloudflare-ai-gateway" => "claude-sonnet-4.5",
         "xiaomi" | "xiaomi-token-plan-cn" | "xiaomi-token-plan-ams" | "xiaomi-token-plan-sgp" => {
@@ -655,6 +656,28 @@ mod tests {
             model("prime-inference", "z-ai/glm-5.3", "GLM"),
             model("openrouter", "openai/gpt-4o", "GPT-4o"),
         ]
+    }
+
+    #[test]
+    fn runinfra_selects_its_documented_default() {
+        let models: Vec<Model> = pa_ai::fork_catalog::get_models("runinfra")
+            .into_iter()
+            .cloned()
+            .collect();
+        assert_eq!(
+            default_model_per_provider("runinfra"),
+            Some("deepseek-v4-flash")
+        );
+        assert_eq!(
+            find_preferred_default_model(&models).unwrap().id,
+            "deepseek-v4-flash"
+        );
+        assert_eq!(
+            build_fallback_model("runinfra", "custom", &models)
+                .unwrap()
+                .base_url,
+            "https://api.runinfra.ai/v1"
+        );
     }
 
     #[test]

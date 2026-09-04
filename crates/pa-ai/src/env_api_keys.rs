@@ -32,6 +32,7 @@ pub fn get_api_key_env_vars(provider: &str) -> Option<Vec<&'static str>> {
                 "fireworks" => "FIREWORKS_API_KEY",
                 "opencode" | "opencode-go" => "OPENCODE_API_KEY",
                 "kimi-coding" => "KIMI_API_KEY",
+                "runinfra" => "RUNINFRA_GATEWAY_KEY",
                 "cloudflare-workers-ai" | "cloudflare-ai-gateway" => "CLOUDFLARE_API_KEY",
                 "xiaomi" => "XIAOMI_API_KEY",
                 "xiaomi-token-plan-cn" => "XIAOMI_TOKEN_PLAN_CN_API_KEY",

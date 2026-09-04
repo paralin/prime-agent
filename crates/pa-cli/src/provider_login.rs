@@ -56,6 +56,7 @@ const BUILT_IN_PROVIDER_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("openrouter", "OpenRouter"),
     ("prime-agent-traces", "Prime Agent Traces"),
     ("prime-inference", "Prime Inference"),
+    ("runinfra", "RunInfra"),
     ("vercel-ai-gateway", "Vercel AI Gateway"),
     ("xai", "xAI (Grok)"),
     ("zai", "ZAI"),

@@ -146,7 +146,7 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
 
     let is_non_standard = provider == "cerebras"
         || provider == "runinfra"
-        || base_url.contains("runinfra.com")
+        || base_url.contains("runinfra.ai")
         || base_url.contains("cerebras.ai")
         || provider == "xai"
         || base_url.contains("api.x.ai")

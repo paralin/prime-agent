@@ -17,6 +17,9 @@ pub mod openai_responses_hooks;
 pub mod openai_responses_shared;
 pub mod openai_responses_stream;
 mod openrouter_responses;
+
+#[cfg(test)]
+mod runinfra_tests;
 pub mod simple_options;
 #[cfg(test)]
 mod test_http;

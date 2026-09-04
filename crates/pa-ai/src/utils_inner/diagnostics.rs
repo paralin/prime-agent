@@ -38,3 +38,15 @@ pub fn append_assistant_message_diagnostic(
         .get_or_insert_with(Vec::new)
         .push(diagnostic);
 }
+
+/// Failed reasoning-only responses, including older journals saved as length.
+#[must_use]
+pub fn is_reasoning_exhausted_response(message: &AssistantMessage) -> bool {
+    message.stop_reason == crate::types::StopReason::Length
+        && !message.content.iter().any(|part| match part {
+            crate::types::AssistantContent::ToolCall(_) => true,
+            crate::types::AssistantContent::Text(text) => !text.text.trim().is_empty(),
+            crate::types::AssistantContent::Thinking(_) => false,
+        })
+        && message.diagnostics.as_ref().is_some_and(|entries| entries.iter().any(|entry| entry.type_ == "provider_warning" && entry.error.as_ref().is_some_and(|error| error.code.as_deref() == Some("reasoning_exhausted"))))
+}

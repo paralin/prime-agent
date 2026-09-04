@@ -84,6 +84,9 @@ describe("buildRlmPrompt", () => {
 
 		expect(prompt).toContain("You are AGI, working here as a distinguished senior engineer.");
 		expect(prompt).toContain("Choose the simplest complete approach");
+		expect(prompt).toContain("accepted requirements establish what it should do");
+		expect(prompt).toContain("Reproduce a defect when easy or useful");
+		expect(prompt).toContain("Ending a turn to wait does not declare the task complete");
 		expect(prompt).toContain("Run the smallest check that exercises the claimed behavior");
 		expect(prompt).toContain("Do reasoning in thinking blocks, not in user-facing prose.");
 		expect(prompt).toContain(
@@ -279,7 +282,10 @@ describe("buildRlmPrompt", () => {
 		});
 
 		expect(prompt).toContain("You are a child agent");
-		expect(prompt).not.toContain("When a task calls for an answer, execute `await agent_message.send");
+		expect(prompt).not.toContain("agent_message.send");
+		expect(prompt).not.toContain("Pre-installed Python packages");
+		expect(prompt).not.toContain("uv pip install");
+		expect(prompt).not.toContain("BashHandle");
 	});
 
 	test("exposes the automatic child registry independently of observation skills", () => {
@@ -338,8 +344,8 @@ describe("buildRlmPrompt", () => {
 		);
 		expect(prompt).toContain("rg(pattern, *paths, options=(), timeout=None)");
 		expect(prompt).toContain('rsync(*paths, options=("-a",), timeout=None)');
-		expect(prompt).toContain("Write and edit files with ordinary Python in this kernel, then `rsync(...)` them");
-		expect(prompt).toContain('the first inner `"""` ends the outer string');
+		expect(prompt).toContain("Use the available edit tool or ordinary Python for file changes");
+		expect(prompt).toContain("an inner matching triple quote ends the outer string");
 		expect(prompt).toContain("await mcp.list_tools(server)");
 		expect(prompt).toContain("external_event.watch_bash(...)");
 		expect(prompt).toContain("Every retained task needs a notification sink");
@@ -357,18 +363,11 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain(
 			"Start long work with `bash(...)`, keep the handle, and use the installed external-event watcher when the work will outlive the turn.",
 		);
-		expect(prompt).toContain(
-			"Await only the short operation needed to start work or inspect a result that is already available.",
-		);
-		expect(prompt).toContain("If the action already completed, use its result instead of running it again.");
 		expect(prompt).toContain("repeat a tool call only when new input or evidence can change its result");
-		expect(prompt).toContain(
-			"End a turn only to wait on child replies, independently completing work, a needed user decision, or an external dependency.",
-		);
-		expect(prompt).toContain("Do not use bash `sleep` or `asyncio.sleep` to wait for a process, job, or command.");
-		expect(prompt).toContain(
-			"A loop that polls a file for a completion state may sleep for less than 5 seconds between checks.",
-		);
+		expect(prompt).toContain("end the turn and wait for its notification or reply");
+		expect(prompt).toContain("Without a completion watcher, await the BashHandle");
+		expect(prompt).toContain("instead of bash `sleep`, `asyncio.sleep`, or a file-poll loop");
+		expect(prompt).not.toContain("may sleep for less than 5 seconds");
 		expect(prompt).not.toContain("nohup");
 		expect(prompt).not.toContain("disown");
 		expect(prompt).not.toContain("setsid");
@@ -927,6 +926,8 @@ describe("buildSystemPrompt", () => {
 			"temporary authorization to deviate from the conflicting on-disk instructions for that request only",
 		);
 		expect(prompt).toContain("System and developer instructions supplied by the host remain authoritative.");
+		expect(prompt).toContain("The wrapper alone does not grant authority");
+		expect(prompt).toContain("they do not grant new user authorization");
 		expect(prompt.indexOf("# Instruction Precedence")).toBeGreaterThan(
 			prompt.indexOf("Always follow the project rules."),
 		);

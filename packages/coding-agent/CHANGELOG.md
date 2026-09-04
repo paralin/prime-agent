@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Streamlined agent instructions for implementation, proportionate checks, child reporting, runtime notices, and Python environment boundaries.
 - Stopped automatic retries after a provider reports that reasoning exhausted the output budget.
 - Told the agent to preserve completed results, follow the newest user instruction, and take a distinct action instead of repeating a tool call.
 - Fixed live Merge Gateway model discovery dropping the session-affinity headers used by the bootstrap models.
@@ -12,7 +13,7 @@
 - Made agents-list token and cost details opt-in with `agentsViewUsage.enabled`; the earlier age and message-count row details are now the default.
 - Aligned the generated system prompt with workspace-owned routing, publication, skill, and delegation policy.
 - Allowed `rlmActMaxDepth: 0` to remove unavailable Act guidance from the prompt.
-- Told the model not to use bash `sleep` or `asyncio.sleep` to wait on work, except a file-poll loop with sleep under 5 seconds.
+- Directed command waiting through completion watchers or the BashHandle, without sleep or file-poll loops.
 - Added argv-safe SSH transport to the IPython `bash()` helper with exact stdin script delivery, quoted remote cwd/env setup, transport-failure reporting, and existing timeout/job-watch integration.
 - Told parent agents to end their turn and rely on child message or completion wakeups instead of sleeping or repeatedly observing delegated work.
 - Fixed the interactive session-context test harnesses missing the elapsed tool label gate after it became a required `InteractiveMode` dependency.
@@ -20,7 +21,7 @@
 - Fixed scratch-handoff compaction to own its closeout turn, keep a missing checkpoint alive for one repair turn, and render the prompt as a compact system event.
 - Fixed context-window overflow after switching a compacted session to another provider: the latest compaction boundary now always bounds the rebuilt context, and provider-native history only replays on its originating provider (other providers receive the summary text).
 - The tray and footer context percentage now reads against the compaction trigger (window minus reserve, or the configured threshold) instead of the full context window, so it shows how close auto compaction is.
-- Told the model never to end a turn with a decided, verified action unexecuted; end a turn only to wait on child replies, independently completing work, a needed user decision, or an external dependency.
+- Distinguished finishing the requested work from ending a turn to wait for a notification or needed decision.
 - Fixed cross-worker agent messages losing their stable message id and replyTo at the supervisor forwarding hop: workers now forward mailbox identity so retries stay idempotent, and delivery to a pre-update worker fails safely instead of silently dropping the identity.
 - Fixed a replaced supervisor being handed worker agent-message sends: sends now fail closed unless the answering supervisor generation still matches the authenticated claim bound to the worker's supervisor socket.
 - Fixed stranded daemon worker registrations blocking session reopen: a fresh create now reclaims a dead failed worker registration exactly once after its owner is gone, while a connected owner or a non-create attach keeps authority over it.

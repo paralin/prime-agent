@@ -77,15 +77,11 @@ async function run(responses: AssistantMessage[], overrides: Partial<AgentLoopCo
 }
 
 describe("reasoning exhaustion recovery", () => {
-	it("does not amplify reasoning exhaustion past a configured thinking budget", async () => {
+	it("does not treat an unused local thinking budget as a provider output limit", async () => {
 		const partial = response(32_000);
-		const { requests, messages } = await run([partial], { thinkingBudgets: { low: 1024 } });
-		expect(requests).toHaveLength(1);
-		expect(messages.at(-1)).toMatchObject({
-			stopReason: "error",
-			errorMessage: expect.stringContaining("automatic budget growth was stopped"),
-			diagnostics: partial.diagnostics,
-		});
+		const { requests, messages } = await run([partial, response(100, false)], { thinkingBudgets: { low: 1024 } });
+		expect(requests.map((request) => request.options?.maxTokens)).toEqual([undefined, 64_000]);
+		expect(messages.at(-1)).toMatchObject({ stopReason: "stop" });
 	});
 
 	it.each([true, false])("recovers with visible reasoning=%s and retains the active request", async (visible) => {

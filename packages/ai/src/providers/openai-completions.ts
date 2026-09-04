@@ -967,7 +967,11 @@ function buildParams(
 				model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
 		}
 	} else if (compat.thinkingFormat === "merge" && model.reasoning) {
-		if (options?.reasoningBudgetTokens !== undefined) {
+		// Prefer the route's native effort control; a local budget is not a second limit.
+		if (options?.reasoningEffort && compat.supportsReasoningEffort) {
+			(params as any).reasoning_effort =
+				model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
+		} else if (options?.reasoningBudgetTokens !== undefined) {
 			if (
 				!Number.isInteger(options.reasoningBudgetTokens) ||
 				options.reasoningBudgetTokens <= 0 ||
@@ -978,10 +982,6 @@ function buildParams(
 			(params as any).thinking = { type: "enabled", budget_tokens: options.reasoningBudgetTokens };
 		} else if (options?.reasoningEnabled === false && model.thinkingLevelMap?.off !== null) {
 			(params as any).thinking = { type: "disabled" };
-		}
-		if (options?.reasoningEffort && compat.supportsReasoningEffort) {
-			(params as any).reasoning_effort =
-				model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
 		}
 	} else if (compat.thinkingFormat === "openrouter" && model.reasoning) {
 		// OpenRouter distinguishes an omitted reasoning preference (use the model

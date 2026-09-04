@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Stopped automatic output-budget growth when reasoning-only exhaustion reaches the configured thinking budget.
+- Kept reasoning-exhaustion recovery independent of local thinking budgets that a provider may not use.
 - Stopped a third consecutive identical tool-call batch with unchanged results before executing it.
 - Recovered from reasoning-exhausted responses with bounded increases to the default output allowance while respecting explicit caller and model limits.
 - Continued the active turn when a provider exhausts its output limit on thinking without producing text or a tool call.

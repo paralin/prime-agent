@@ -6,7 +6,7 @@
 - Fixed Merge Gateway replay of legacy native reasoning and reasoning-only responses without turning internal plans into assistant text.
 - Rejected malformed terminal tool arguments and Merge thinking budgets that leave no room for an answer.
 - Fixed Merge Gateway Chat tool loops dropping signed reasoning before follow-up requests.
-- Fixed Merge Gateway reasoning requests to send both the selected effort and its configured thinking-token budget.
+- Preferred native Merge Gateway reasoning effort without also sending a thinking-token budget; retained budgets for routes requiring Gateway-controlled thinking.
 - Added GLM 5.3 Flash to the RunInfra model list.
 - Mapped Merge Gateway GLM-5.3-Flash thinking levels so off/minimal send low and medium sends high. Other values were coerced to max and produced runaway thinking.
 - Corrected Merge Gateway GLM-5.3 Flash cache-read estimates to Particle AI's $0.003 per million tokens rate.

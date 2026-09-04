@@ -316,26 +316,53 @@ describe("Merge Gateway provider", () => {
 		["low", 1_024],
 		["high", 4_096],
 		["max", 16_384],
-	] as const)("sends the selected %s reasoning effort and token budget", async (effort, budgetTokens) => {
+	] as const)(
+		"sends only the selected %s native effort despite configured token budgets",
+		async (effort, budgetTokens) => {
+			const { server, url, requests } = await startMergeGatewayMock((_request, response) => {
+				response.writeHead(200, { "content-type": "text/event-stream" });
+				response.end(
+					chatSse([{ id: "chat_effort", choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }]),
+				);
+			});
+
+			try {
+				const result = await streamSimpleOpenAICompletions(
+					mergeModel(`${url}/v1/ai-sdk`),
+					{ messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+					{
+						apiKey: MERGE_GATEWAY_API_KEY,
+						reasoning: effort,
+						thinkingBudgets: { [effort]: budgetTokens },
+					},
+				).result();
+
+				expect(result.stopReason).toBe("stop");
+				expect(requests[0]?.body.reasoning_effort).toBe(effort);
+				expect(requests[0]?.body.thinking).toBeUndefined();
+				expect(requests[0]?.body.max_tokens).toBe(32_000);
+			} finally {
+				await closeServer(server);
+			}
+		},
+	);
+
+	it("retains a budget for a Gateway-thinking route without native effort support", async () => {
 		const { server, url, requests } = await startMergeGatewayMock((_request, response) => {
 			response.writeHead(200, { "content-type": "text/event-stream" });
-			response.end(chatSse([{ id: "chat_effort", choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }]));
+			response.end(chatSse([{ id: "budget_only", choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }]));
 		});
-
 		try {
-			const result = await streamSimpleOpenAICompletions(
-				mergeModel(`${url}/v1/ai-sdk`),
-				{ messages: [{ role: "user", content: "hello", timestamp: 0 }] },
-				{
-					apiKey: MERGE_GATEWAY_API_KEY,
-					reasoning: effort,
-					thinkingBudgets: { [effort]: budgetTokens },
-				},
-			).result();
-
+			const model = mergeModel(`${url}/v1/ai-sdk`);
+			model.compat = { ...model.compat, supportsReasoningEffort: false };
+			const result = await streamSimpleOpenAICompletions(model, context, {
+				apiKey: MERGE_GATEWAY_API_KEY,
+				reasoning: "low",
+				thinkingBudgets: { low: 1024 },
+			}).result();
 			expect(result.stopReason).toBe("stop");
-			expect(requests[0]?.body.reasoning_effort).toBe(effort);
-			expect(requests[0]?.body.thinking).toEqual({ type: "enabled", budget_tokens: budgetTokens });
+			expect(requests[0].body.reasoning_effort).toBeUndefined();
+			expect(requests[0].body.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
 		} finally {
 			await closeServer(server);
 		}
@@ -448,7 +475,6 @@ describe("Merge Gateway provider", () => {
 					},
 				],
 				reasoning_effort: "high",
-				thinking: { type: "enabled", budget_tokens: 4_096 },
 			});
 			expect(result.stopReason).toBe("toolUse");
 			expect(result.content).toEqual([
@@ -566,8 +592,6 @@ describe("Merge Gateway provider", () => {
 						vendor: "particle",
 						reasoning_effort: "low",
 						max_tokens: 4096,
-						thinking_type: "enabled",
-						thinking_budget_tokens: 1024,
 					},
 				},
 				{ type: "merge_routing", timestamp: expect.any(Number), details: { vendor_used: "particle" } },

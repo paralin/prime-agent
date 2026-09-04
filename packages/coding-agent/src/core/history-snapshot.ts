@@ -76,11 +76,9 @@ export function buildHistorySnapshot(text: string, messageCount: number): Histor
 	const normalized = normalize(text);
 	if (!normalized) return { text: "", images: [], messageCount, truncated: false };
 	const layout = layoutHistoryText(normalized);
-	const boundedText = layout.truncated
-		? truncate(normalized, Math.min(MAX_RENDERED_CELLS, Math.max(1, normalized.length - 1)))
-		: normalized;
 	return {
-		text: boundedText,
+		// Keep the source intact so later generations do not compound image loss.
+		text: normalized,
 		images: renderFrames(layout.pages),
 		messageCount,
 		truncated: layout.truncated,

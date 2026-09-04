@@ -49,4 +49,15 @@ describe("history snapshots", () => {
 		expect(history.images).toHaveLength(8);
 		expect(layoutHistoryText(history.text).pages.at(-1)).toContain("NEWEST_FACT");
 	});
+
+	it("retains source omitted from images across subsequent generations", () => {
+		const text = `${"a".repeat(100_000)}MIDDLE_FACT${"b".repeat(100_000)}`;
+		const first = buildSessionHistorySnapshot({ entries: [userEntry("large", text)] });
+		expect(first.truncated).toBe(true);
+		expect(first.text).toContain("MIDDLE_FACT");
+		const second = buildSessionHistorySnapshot({ entries: [userEntry("next", "NEW_FACT")], previous: first });
+		expect(second.text).toContain("MIDDLE_FACT");
+		expect(second.text).toContain("NEW_FACT");
+		expect(second.truncated).toBe(true);
+	});
 });

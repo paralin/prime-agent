@@ -97,6 +97,20 @@ describe("persisted scratch identity", () => {
 });
 
 describe("scratch handoff messages", () => {
+	it("discloses omitted image history without truncating the checkpoint", () => {
+		const message = buildScratchHandoffContinuation({
+			displayPath: "agent/work.org",
+			scratchText: "* TODO Current task",
+			history: { text: "full source", images: [], messageCount: 100, truncated: true },
+		});
+		expect(message.content).toEqual([
+			{
+				type: "text",
+				text: expect.stringContaining("not the complete transcript"),
+			},
+		]);
+		expect(JSON.stringify(message.content)).toContain("* TODO Current task");
+	});
 	it("uses the exact first and later closeout prompts", () => {
 		expect(renderScratchHandoffCloseoutMessage("agent/x.org", true)).toBe(
 			"Stop working for now; please create a .org file brain-dump of your ongoing work to agent/x.org, use org-todo structure including TODO subheadings, subheadings of subheadings, TODOs on nested subheadings, and so on. It should be detailed enough to hand off this work to a colleague.",

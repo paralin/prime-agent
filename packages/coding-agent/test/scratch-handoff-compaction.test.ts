@@ -298,6 +298,7 @@ describe("scratch handoff compaction", () => {
 	it.each([
 		["cancelled", { stopReason: "aborted" as const }],
 		["failed", { stopReason: "error" as const, errorMessage: "closeout provider failed" }],
+		["exhausted", { stopReason: "length" as const }],
 	])("does not retry or compact after a %s /compact closeout", async (_label, closeoutResult) => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-scratch-command-failure-"));
 		const faux = registerFauxProvider();
@@ -329,6 +330,13 @@ describe("scratch handoff compaction", () => {
 				cwd: tempDir,
 			});
 
+			const checkpoint = resolveScratchHandoffPath({
+				cwd: tempDir,
+				rootDir: join(tempDir, "scratch"),
+				sessionId: session.sessionId,
+			}).absolutePath;
+			mkdirSync(dirname(checkpoint), { recursive: true });
+			writeFileSync(checkpoint, "* TODO Old checkpoint must not authorize a failed closeout\n");
 			await session.prompt("do work before the failed command boundary");
 			await session.prompt("/compact").catch(() => undefined);
 			await session.waitForIdle();

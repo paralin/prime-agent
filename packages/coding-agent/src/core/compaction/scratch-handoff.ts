@@ -181,9 +181,12 @@ export function buildScratchHandoffContinuation(input: {
 	history: HistorySnapshot;
 	timestamp?: number;
 }): UserMessage {
+	const historyNotice = input.history.truncated
+		? "The preceding images are a bounded historical snapshot with omissions, not the complete transcript. Use the Org checkpoint below for current work; consult the conversation log for missing details.\n\n"
+		: "";
 	const text: TextContent = {
 		type: "text",
-		text: `<scratch-handoff-file path="${escapeAttribute(input.displayPath)}">\n${input.scratchText}\n</scratch-handoff-file>\n\n${SCRATCH_HANDOFF_CONTINUE_INSTRUCTION}`,
+		text: `${historyNotice}<scratch-handoff-file path="${escapeAttribute(input.displayPath)}">\n${input.scratchText}\n</scratch-handoff-file>\n\n${SCRATCH_HANDOFF_CONTINUE_INSTRUCTION}`,
 	};
 	return {
 		role: "user",

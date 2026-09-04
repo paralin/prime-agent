@@ -3119,7 +3119,7 @@ export class AgentSession {
 			return false;
 		}
 
-		const contextTokens = this._getThresholdContextTokens(context.message, compactionTimestamp);
+		const contextTokens = this._getThresholdContextTokens(compactionTimestamp);
 		if (contextTokens === undefined || !shouldCompact(contextTokens, contextWindow, settings)) {
 			return false;
 		}
@@ -3755,7 +3755,7 @@ export class AgentSession {
 	): Promise<AgentMessage[]> {
 		const closeout = this._scratchCloseout;
 		if (this._scratchCloseoutRunActive && closeout) {
-			if (signal?.aborted || context.message.stopReason === "error" || context.message.stopReason === "aborted") {
+			if (signal?.aborted || context.message.stopReason !== "stop") {
 				return [];
 			}
 			const scratchText = await readScratchHandoffText(resolveToCwd(closeout.displayPath, this._cwd));
@@ -8522,10 +8522,7 @@ export class AgentSession {
 			await this._agentEventQueue;
 			if (signal.aborted) throw new Error("Compaction cancelled");
 			const finalAssistant = closeout.finalAssistant;
-			closeout.status =
-				!finalAssistant || finalAssistant.stopReason === "error" || finalAssistant.stopReason === "aborted"
-					? "failed"
-					: "complete";
+			closeout.status = finalAssistant?.stopReason === "stop" ? "complete" : "failed";
 		} finally {
 			this._scratchCloseoutRunActive = false;
 		}
@@ -9442,21 +9439,8 @@ export class AgentSession {
 		this._branchSummaryAbortController?.abort();
 	}
 
-	/**
-	 * Check if compaction is needed and run it.
-	 * Called after agent_end and before prompt submission.
-	 *
-	 * Two cases:
-	 * 1. Overflow: LLM returned context overflow error, remove error message from agent state, compact, auto-retry
-	 * 2. Threshold: Context over threshold, compact, and continue only for stopped in-progress loops or queued messages
-	 *
-	 * @param assistantMessage The assistant message to check
-	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
-	 */
-	private _getThresholdContextTokens(
-		assistantMessage: AssistantMessage,
-		compactionTimestamp: number | undefined,
-	): number | undefined {
+	/** Use current context estimates, rejecting stale provider usage retained across compaction. */
+	private _getThresholdContextTokens(compactionTimestamp: number | undefined): number | undefined {
 		const messages = this.agent.state.messages;
 		const estimate = estimateContextTokens(messages);
 		if (estimate.lastUsageIndex !== null) {
@@ -9473,8 +9457,9 @@ export class AgentSession {
 			}
 			return estimate.tokens;
 		}
-		if (assistantMessage.stopReason === "error") return undefined;
-		return calculateContextTokens(assistantMessage.usage);
+		// A local estimate has no provider checkpoint, notably for Merge. It is
+		// already scoped to the current context and must also drive compaction.
+		return estimate.tokens;
 	}
 
 	private _hasQueuedCompactCommand(): boolean {
@@ -9573,7 +9558,7 @@ export class AgentSession {
 		// Case 3: Threshold - context is getting large.
 		// Use the full-session estimate so messages appended after the last successful
 		// assistant usage are included, matching the /usage context display.
-		const contextTokens = this._getThresholdContextTokens(assistantMessage, compactionTimestamp);
+		const contextTokens = this._getThresholdContextTokens(compactionTimestamp);
 		if (contextTokens === undefined) return false;
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
 			if (queueAutonomousContinuation && this._queueGoalContinuationForThresholdCompaction(assistantMessage)) {

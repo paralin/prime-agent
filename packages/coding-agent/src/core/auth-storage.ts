@@ -15,7 +15,7 @@ import {
 	type OAuthProviderId,
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
@@ -58,6 +58,7 @@ export type AuthStatus = {
 	source?:
 		| "stored"
 		| "runtime"
+		| "runtime_chain"
 		| "environment"
 		| "prime_cli"
 		| "fallback"
@@ -70,7 +71,13 @@ export type AuthStatus = {
 export type AuthStorageOptions = {
 	primeCliConfigPath?: string;
 	usePrimeCliConfig?: boolean;
+	runtimeApiKeyChainState?: RuntimeApiKeyChainState;
 };
+
+export interface RuntimeApiKeyChainCredential {
+	key: string;
+	label?: string;
+}
 
 type LockResult<T> = {
 	result: T;
@@ -85,6 +92,64 @@ export type AuthSourceToken = {
 	identityFingerprint: string;
 	valueFingerprint: string;
 };
+
+/** Daemon-wide Codex-home rotation state shared without sharing per-session auth storage. */
+export class RuntimeApiKeyChainState {
+	private credentials = new Map<string, RuntimeApiKeyChainCredential[]>();
+	private staleSources = new Map<string, AuthSourceToken[]>();
+
+	setRuntimeApiKeyChain(provider: string, credentials: readonly RuntimeApiKeyChainCredential[]): void {
+		const normalized = credentials.map((credential) => {
+			const key = credential.key.trim();
+			if (!key) throw new Error("runtime API key chain entries must contain a non-empty key");
+			const label = credential.label?.trim();
+			return { key, ...(label ? { label } : {}) };
+		});
+		this.staleSources.delete(provider);
+		if (normalized.length === 0) {
+			this.credentials.delete(provider);
+			return;
+		}
+		this.credentials.set(provider, normalized);
+	}
+
+	removeRuntimeApiKeyChain(provider: string): void {
+		this.staleSources.delete(provider);
+		this.credentials.delete(provider);
+	}
+
+	getCredentials(provider: string): readonly RuntimeApiKeyChainCredential[] {
+		return this.credentials.get(provider) ?? [];
+	}
+
+	has(provider: string): boolean {
+		return this.credentials.has(provider);
+	}
+
+	getStaleSources(provider: string): readonly AuthSourceToken[] {
+		return this.staleSources.get(provider) ?? [];
+	}
+
+	clearStaleSources(provider: string): void {
+		this.staleSources.delete(provider);
+	}
+
+	markStale(token: AuthSourceToken): boolean {
+		const stale = this.staleSources.get(token.provider) ?? [];
+		if (
+			stale.some(
+				(existing) =>
+					existing.identityFingerprint === token.identityFingerprint &&
+					existing.valueFingerprint === token.valueFingerprint,
+			)
+		) {
+			return false;
+		}
+		stale.push(token);
+		this.staleSources.set(token.provider, stale);
+		return true;
+	}
+}
 
 type AuthSourceCandidate = {
 	source: ActiveAuthStatusSource;
@@ -107,6 +172,16 @@ export interface AuthStorageBackend {
 
 export class FileAuthStorageBackend implements AuthStorageBackend {
 	constructor(private authPath: string = join(getAgentDir(), "auth.json")) {}
+
+	/** Cheap change probe so consumers can skip a locked reload when the file is untouched. */
+	statFile(): { mtimeMs: number; size: number } | undefined {
+		try {
+			const stats = statSync(this.authPath);
+			return { mtimeMs: stats.mtimeMs, size: stats.size };
+		} catch {
+			return undefined;
+		}
+	}
 
 	private ensureParentDir(): void {
 		const dir = dirname(this.authPath);
@@ -256,15 +331,18 @@ export class InMemoryAuthStorageBackend implements AuthStorageBackend {
 export class AuthStorage {
 	private data: AuthStorageData = {};
 	private runtimeOverrides: Map<string, string> = new Map();
+	private runtimeApiKeyChainState: RuntimeApiKeyChainState;
 	private staleAuthSources: Map<string, AuthSourceToken[]> = new Map();
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
+	private lastSync: { mtimeMs: number; size: number } | undefined;
 
 	private constructor(
 		private storage: AuthStorageBackend,
 		private options: AuthStorageOptions = {},
 	) {
+		this.runtimeApiKeyChainState = options.runtimeApiKeyChainState ?? new RuntimeApiKeyChainState();
 		this.reload();
 	}
 
@@ -298,6 +376,15 @@ export class AuthStorage {
 	removeRuntimeApiKey(provider: string): void {
 		this.clearStaleAuthSource(provider, "runtime");
 		this.runtimeOverrides.delete(provider);
+	}
+
+	/** Replace an ordered process-local credential chain without persisting its secrets. */
+	setRuntimeApiKeyChain(provider: string, credentials: readonly RuntimeApiKeyChainCredential[]): void {
+		this.runtimeApiKeyChainState.setRuntimeApiKeyChain(provider, credentials);
+	}
+
+	removeRuntimeApiKeyChain(provider: string): void {
+		this.runtimeApiKeyChainState.removeRuntimeApiKeyChain(provider);
 	}
 
 	/**
@@ -382,6 +469,33 @@ export class AuthStorage {
 				valueMaterial: apiKey,
 			}),
 		};
+	}
+
+	private getRuntimeAuthChainCandidates(provider: string): AuthSourceCandidate[] {
+		return this.runtimeApiKeyChainState.getCredentials(provider).map((credential, index) =>
+			this.createAuthSourceCandidate({
+				configured: false,
+				source: "runtime_chain",
+				label: credential.label ?? `credential ${index + 1}`,
+				identityMaterial: `${provider}:${index}:${credential.label ?? ""}`,
+				valueMaterial: credential.key,
+			}),
+		);
+	}
+
+	private getAvailableRuntimeAuthChainCredential(
+		provider: string,
+	): { credential: RuntimeApiKeyChainCredential; candidate: AuthSourceCandidate } | undefined {
+		const credentials = this.runtimeApiKeyChainState.getCredentials(provider);
+		const candidates = this.getRuntimeAuthChainCandidates(provider);
+		for (let index = 0; index < candidates.length; index++) {
+			const candidate = candidates[index];
+			const credential = credentials[index];
+			if (candidate && credential && !this.isAuthSourceStale(provider, candidate)) {
+				return { credential, candidate };
+			}
+		}
+		return undefined;
 	}
 
 	private getPrimeCliAuthCandidate(provider: string): AuthSourceCandidate | undefined {
@@ -490,6 +604,12 @@ export class AuthStorage {
 	}
 
 	private getAuthSourceCandidates(provider: string, options?: { includeFallback?: boolean }): AuthSourceCandidate[] {
+		const runtimeChainCandidates = this.getRuntimeAuthChainCandidates(provider);
+		if (runtimeChainCandidates.length > 0) {
+			return [this.getRuntimeAuthCandidate(provider), ...runtimeChainCandidates].filter(
+				(candidate): candidate is AuthSourceCandidate => candidate !== undefined,
+			);
+		}
 		const fallbackCandidate =
 			options?.includeFallback === false ? undefined : this.getFallbackAuthCandidate(provider);
 		const candidates =
@@ -520,7 +640,10 @@ export class AuthStorage {
 	}
 
 	private getMatchingStaleAuthSources(provider: string, candidate: AuthSourceCandidate): AuthSourceToken[] {
-		const stale = this.staleAuthSources.get(provider);
+		const stale =
+			candidate.source === "runtime_chain"
+				? this.runtimeApiKeyChainState.getStaleSources(provider)
+				: this.staleAuthSources.get(provider);
 		if (!stale) {
 			return [];
 		}
@@ -596,6 +719,9 @@ export class AuthStorage {
 		if (token.provider.length === 0) {
 			return false;
 		}
+		if (token.source === "runtime_chain") {
+			return this.runtimeApiKeyChainState.markStale(token);
+		}
 		const stale = this.staleAuthSources.get(token.provider) ?? [];
 		if (
 			!stale.some(
@@ -612,6 +738,10 @@ export class AuthStorage {
 	}
 
 	private clearStaleAuthSource(provider: string, source: ActiveAuthStatusSource): void {
+		if (source === "runtime_chain") {
+			this.runtimeApiKeyChainState.clearStaleSources(provider);
+			return;
+		}
 		const stale = this.staleAuthSources.get(provider);
 		if (!stale) {
 			return;
@@ -643,10 +773,33 @@ export class AuthStorage {
 			});
 			this.data = this.parseStorageData(content);
 			this.loadError = null;
+			this.lastSync = this.storage instanceof FileAuthStorageBackend ? this.storage.statFile() : undefined;
 		} catch (error) {
 			this.loadError = error as Error;
 			this.recordError(error);
 		}
+	}
+
+	/**
+	 * Reload credentials only when the storage file changed on disk.
+	 *
+	 * Credentials are written by other processes (an interactive /login while
+	 * this session keeps running), so the request path must observe them; the
+	 * stat probe keeps the per-request cost to one stat call.
+	 */
+	reloadIfChanged(): void {
+		if (!(this.storage instanceof FileAuthStorageBackend)) {
+			return;
+		}
+		const current = this.storage.statFile();
+		if (!current) {
+			return;
+		}
+		const last = this.lastSync;
+		if (last && last.mtimeMs === current.mtimeMs && last.size === current.size) {
+			return;
+		}
+		this.reload();
 	}
 
 	private persistProviderChange(provider: string, credential: AuthCredential | undefined): void {
@@ -740,6 +893,7 @@ export class AuthStorage {
 	 * Return auth status without exposing credential values or refreshing tokens.
 	 */
 	getAuthStatus(provider: string): AuthStatus {
+		this.reloadIfChanged();
 		return this.getAuthStatusFromCandidates(provider);
 	}
 
@@ -847,6 +1001,9 @@ export class AuthStorage {
 		providerId: string,
 		options?: { includeFallback?: boolean },
 	): Promise<AuthApiKeyResult> {
+		// Credentials may have been rewritten by another process (e.g. /login
+		// in the UI process) since this instance last loaded them.
+		this.reloadIfChanged();
 		// Runtime overrides take precedence over stored credentials and environment keys.
 		const runtimeCandidate = this.getRuntimeAuthCandidate(providerId);
 		const runtimeKey = this.runtimeOverrides.get(providerId);
@@ -855,6 +1012,17 @@ export class AuthStorage {
 				apiKey: runtimeKey,
 				sourceToken: this.getAuthSourceTokenForCandidate(providerId, runtimeCandidate),
 			};
+		}
+
+		const runtimeChain = this.getAvailableRuntimeAuthChainCredential(providerId);
+		if (runtimeChain) {
+			return {
+				apiKey: runtimeChain.credential.key,
+				sourceToken: this.getAuthSourceTokenForCandidate(providerId, runtimeChain.candidate),
+			};
+		}
+		if (this.runtimeApiKeyChainState.has(providerId)) {
+			return {};
 		}
 
 		const envCandidate = this.getEnvironmentAuthCandidate(providerId);

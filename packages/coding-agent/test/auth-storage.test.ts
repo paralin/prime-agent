@@ -310,6 +310,39 @@ describe("AuthStorage", () => {
 			await expect(authStorage.getApiKey("anthropic")).resolves.toBeUndefined();
 		});
 
+		test("credential rewritten by another process revives a stale-marked provider without restart", async () => {
+			writeAuthJson({
+				"openai-codex": { type: "api_key", key: "old-access-token" },
+			});
+			authStorage = AuthStorage.create(authJsonPath);
+			await expect(authStorage.getApiKey("openai-codex")).resolves.toBe("old-access-token");
+
+			// A failed request marks the current source stale, as the session does.
+			expect(authStorage.markAuthStale("openai-codex")).toBe(true);
+			await expect(authStorage.getApiKey("openai-codex")).resolves.toBeUndefined();
+
+			// /login in the UI process rewrites auth.json with fresh credentials.
+			writeAuthJson({
+				"openai-codex": { type: "api_key", key: "new-access-token" },
+			});
+
+			// The still-running session must pick the new credential up; the
+			// stale marker belongs to the old value and must not apply.
+			await expect(authStorage.getApiKey("openai-codex")).resolves.toBe("new-access-token");
+			expect(authStorage.getAuthStatus("openai-codex")).toEqual({ configured: true, source: "stored" });
+		});
+
+		test("unchanged auth.json does not trigger a reload on every request", async () => {
+			writeAuthJson({
+				anthropic: { type: "api_key", key: "sk-ant-literal-key" },
+			});
+			authStorage = AuthStorage.create(authJsonPath);
+			const reloadSpy = vi.spyOn(authStorage, "reload");
+			await authStorage.getApiKey("anthropic");
+			await authStorage.getApiKey("anthropic");
+			expect(reloadSpy).toHaveBeenCalledTimes(0);
+		});
+
 		test("changed command-backed stored key no longer matches stale auth marker", async () => {
 			const tokenFile = join(tempDir, "command-token");
 			writeFileSync(tokenFile, "stale-key");
@@ -898,6 +931,39 @@ describe("AuthStorage", () => {
 					}
 				}
 			});
+		});
+	});
+
+	describe("OAuth refresh persistence", () => {
+		test("persists a rotated xAI refresh token without refreshing every lookup", async () => {
+			writeAuthJson({
+				xai: {
+					type: "oauth",
+					access: "expired-access",
+					refresh: "old-refresh",
+					expires: Date.now() - 1,
+					tokenEndpoint: "https://auth.x.ai/oauth2/token",
+				},
+			});
+			const fetchSpy = vi
+				.spyOn(globalThis, "fetch")
+				.mockResolvedValue(
+					new Response(
+						JSON.stringify({ access_token: "new-access", refresh_token: "new-refresh", expires_in: 900 }),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					),
+				);
+			authStorage = AuthStorage.create(authJsonPath);
+
+			expect(await authStorage.getApiKey("xai")).toBe("new-access");
+			expect(await authStorage.getApiKey("xai")).toBe("new-access");
+			expect(fetchSpy).toHaveBeenCalledOnce();
+
+			const stored = JSON.parse(readFileSync(authJsonPath, "utf-8")) as {
+				xai: { access: string; refresh: string; expires: number };
+			};
+			expect(stored.xai).toMatchObject({ access: "new-access", refresh: "new-refresh" });
+			expect(stored.xai.expires).toBeGreaterThan(Date.now());
 		});
 	});
 

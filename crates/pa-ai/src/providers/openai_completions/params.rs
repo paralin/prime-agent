@@ -100,7 +100,7 @@ pub(crate) fn build_params(
     if supports_thinking(model) {
         match compat.thinking_format {
             crate::types::ThinkingFormat::Merge => {
-                if let Some(budget) = options.reasoning_budget_tokens {
+                if let Some(budget) = options.reasoning_budget_tokens.filter(|_| options.reasoning_effort.is_none() || !compat.supports_reasoning_effort) {
                     params.insert(
                         "thinking".into(),
                         json!({"type":"enabled", "budget_tokens":budget}),

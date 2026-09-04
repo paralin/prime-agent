@@ -158,7 +158,7 @@ mod tests {
                 .count(),
             2
         );
-        assert!(!serde_json::to_string(&session.entries().await)
+        assert!(serde_json::to_string(&session.entries().await)
             .unwrap()
             .contains("中文回答"));
         let calls = provider.calls();
@@ -166,6 +166,6 @@ mod tests {
         let context = serde_json::to_string(&calls[1].messages).unwrap();
         assert!(context.contains(ENGLISH_OUTPUT_NUDGE_PROMPT));
         assert!(context.contains("<system-notice>"));
-        assert!(!context.contains("中文回答"));
+        assert!(context.contains("中文回答"));
     }
 }

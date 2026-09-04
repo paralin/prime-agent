@@ -10,16 +10,14 @@
  * Steps:
  * 1. Check for uncommitted changes
  * 2. Bump version via npm run version:xxx or set an explicit version
- * 3. Update CHANGELOG.md files: aggregate .changes/*.md fragments into a
- *    [version] - date section, git rm the consumed fragments
+ * 3. Rename each CHANGELOG.md [Unreleased] section to [version] - date
  * 4. Commit and tag
  * 5. Publish to npm
  */
 
 import { execSync } from "child_process";
 import { readFileSync, writeFileSync, readdirSync, existsSync } from "fs";
-import { dirname, join } from "path";
-import { buildReleaseSection } from "./lib/changelog-fragments.mjs";
+import { join } from "path";
 
 const DRY_RUN = process.argv.includes("--dry-run");
 const RELEASE_TARGET = process.argv.slice(2).find((arg) => !arg.startsWith("--"));
@@ -106,68 +104,28 @@ function getChangelogs() {
 		.filter((path) => existsSync(path));
 }
 
-function listFragments(pkgDir) {
-	const changesDir = join(pkgDir, ".changes");
-	if (!existsSync(changesDir)) {
-		return [];
-	}
-
-	const files = readdirSync(changesDir)
-		.filter((name) => name.endsWith(".md") && name !== "README.md")
-		.map((name) => join(changesDir, name));
-	return files
-		.map((path) => ({ path, key: fragmentSortKey(path) }))
-		.sort((a, b) => a.key - b.key || (a.path < b.path ? -1 : 1))
-		.map(({ path }) => ({ name: path, content: readFileSync(path, "utf-8") }));
-}
-
-function fragmentSortKey(path) {
-	const output = run(`git log --diff-filter=A --format=%ct -1 -- ${shellQuote(path)}`, {
-		silent: true,
-		ignoreError: true,
-	});
-	const epoch = Number.parseInt((output || "").trim(), 10);
-	return Number.isFinite(epoch) ? epoch : Infinity;
-}
-
 function updateChangelogsForRelease(version) {
 	const date = new Date().toISOString().split("T")[0];
 	const changelogs = getChangelogs();
-	const consumedFragments = [];
+	const unreleasedHeader = "## [Unreleased]";
+	const releaseHeader = `## [${version}] - ${date}`;
 
 	for (const changelog of changelogs) {
 		const content = readFileSync(changelog, "utf-8");
-		const allFragments = listFragments(dirname(changelog));
-		// Empty fragments are skipped, not consumed, so nothing is ever lost silently.
-		const empty = allFragments.filter((fragment) => !fragment.content.trim());
-		for (const fragment of empty) {
-			console.warn(`  Warning: skipping empty fragment ${fragment.name}; delete it or add content.`);
-		}
-		const fragments = allFragments.filter((fragment) => fragment.content.trim());
-		const result = buildReleaseSection(content, fragments, version, date);
-
-		if (!result.changed) {
-			console.log(`  Skipping ${changelog}: no fragments`);
+		if (!content.includes(unreleasedHeader)) {
+			console.log(`  Skipping ${changelog}: no unreleased section`);
 			continue;
 		}
+		const updated = content.replace(unreleasedHeader, releaseHeader);
 
 		if (DRY_RUN) {
-			console.log(`\n--- ${changelog} (${fragments.length} fragments) ---`);
+			console.log(`\n--- ${changelog} ---`);
 			const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 			const sectionRe = new RegExp(`## \\[${escapedVersion}\\][\\s\\S]*?(?=\\n## \\[|$)`);
-			console.log((result.content.match(sectionRe) || ["(no release section)"])[0]);
+			console.log((updated.match(sectionRe) || ["(no release section)"])[0]);
 		} else {
-			writeFileSync(changelog, result.content);
-			console.log(`  Updated ${changelog} (${fragments.length} fragments)`);
-		}
-		consumedFragments.push(...fragments.map((fragment) => fragment.name));
-	}
-
-	if (consumedFragments.length > 0) {
-		if (DRY_RUN) {
-			console.log(`\nWould git rm: ${consumedFragments.join(", ")}`);
-		} else {
-			run(`git rm -q -- ${consumedFragments.map(shellQuote).join(" ")}`);
+			writeFileSync(changelog, updated);
+			console.log(`  Updated ${changelog}`);
 		}
 	}
 }

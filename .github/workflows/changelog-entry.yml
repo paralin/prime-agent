@@ -1,4 +1,4 @@
-name: Changelog fragment
+name: Changelog entry
 
 on:
   pull_request:
@@ -9,12 +9,12 @@ permissions:
   pull-requests: read
 
 jobs:
-  changelog-fragment:
-    name: Check changelog fragment
+  changelog-entry:
+    name: Check changelog entry
     runs-on: ubuntu-latest
     if: github.event.pull_request.user.type != 'Bot'
     steps:
-      - name: Require a changelog fragment for changed packages or an explicit opt-out
+      - name: Require a changelog entry for changed packages or an explicit opt-out
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
@@ -23,7 +23,6 @@ jobs:
               core.info("Label no-changelog is set; skipping changelog check.");
               return;
             }
-            // listFiles caps at 3000 files; beyond that the check cannot see every change.
             if (pr.changed_files > 3000) {
               core.setFailed("PR changes more than 3000 files; split it or apply the no-changelog label.");
               return;
@@ -39,38 +38,27 @@ jobs:
             for (const pkg of packages) {
               const srcPrefix = `packages/${pkg}/src/`;
               const srcChanged = files.some(
-                (f) =>
-                  f.filename.startsWith(srcPrefix) ||
-                  (f.previous_filename !== undefined && f.previous_filename.startsWith(srcPrefix)),
+                (file) =>
+                  file.filename.startsWith(srcPrefix) ||
+                  (file.previous_filename !== undefined && file.previous_filename.startsWith(srcPrefix)),
               );
-              if (!srcChanged) {
-                continue;
-              }
-              // Fragments must be direct children of .changes/ — release.mjs ignores nested paths.
-              const fragmentRe = new RegExp(`^packages/${pkg}/\\.changes/[^/]+\\.md$`);
-              const hasFragment = files.some(
-                (f) =>
-                  f.status === "added" &&
-                  f.additions > 0 &&
-                  fragmentRe.test(f.filename) &&
-                  !f.filename.endsWith("/README.md"),
+              const changelogChanged = files.some(
+                (file) => file.filename === `packages/${pkg}/CHANGELOG.md` && file.additions > 0,
               );
-              if (!hasFragment) {
+              if (srcChanged && !changelogChanged) {
                 failing.push(pkg);
               }
             }
             if (failing.length === 0) {
-              core.info("Changelog fragments present for all changed packages.");
+              core.info("Changelog entries present for all changed packages.");
               return;
             }
             core.setFailed(
               failing
                 .map(
                   (pkg) =>
-                    `packages/${pkg}/src changed but no changelog entry found. ` +
-                    `Add packages/${pkg}/.changes/<branch-slug>.md containing e.g. ` +
-                    "`- Fixed the frobnicator dropping input on resize.`, " +
-                    "or apply the no-changelog label.",
+                    `packages/${pkg}/src changed but its CHANGELOG.md has no added entry. ` +
+                    "Add a bullet under ## [Unreleased], or apply the no-changelog label.",
                 )
                 .join("\n"),
             );

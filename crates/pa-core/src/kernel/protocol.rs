@@ -1,4 +1,4 @@
-//! Wire types of the REPL runtime protocol (version 3).
+//! Wire types of the REPL runtime protocol (version 4).
 //!
 //! Requests are newline-delimited JSON objects written to the kernel's stdin;
 //! events arrive as newline-delimited JSON objects on the runtime's private
@@ -11,7 +11,7 @@ use crate::kernel::shared::KernelSentAgentMessage;
 
 /// Protocol version the manager speaks; the runtime announces its own in the
 /// `ready` event and the handshake must match exactly.
-pub const REPL_PROTOCOL_VERSION: u64 = 3;
+pub const REPL_PROTOCOL_VERSION: u64 = 4;
 
 /// One request frame.
 #[derive(Debug, Clone)]

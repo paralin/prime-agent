@@ -109,6 +109,29 @@ class RlmSubagentRegistryTest(unittest.TestCase):
             with self.assertRaisesRegex(AttributeError, r"rlm\.run was renamed; spawn a child with: handle = await rlm\.spawn\("):
                 target.run
             self.assertFalse(hasattr(target, "run"))
+    def test_forwards_per_spawn_service_tier_to_host(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "rlm_child_id": "sub-a1b2c3d4",
+                "name": "priority-worker",
+                "session_dir": "/tmp/parent/sub-a1b2c3d4",
+                "model": "openai-codex/gpt-5.5",
+            }
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            asyncio.run(rlm_module.rlm.spawn("use the priority tier", name="priority-worker", service_tier="priority"))
+            asyncio.run(rlm_module.rlm.spawn("use the default tier", name="priority-worker", service_tier=None))
+
+        self.assertEqual(host_request.await_args_list[0].args[1]["kwargs"]["service_tier"], "priority")
+        self.assertNotIn("service_tier", host_request.await_args_list[1].args[1]["kwargs"])
+
+    def test_rejects_invalid_per_spawn_service_tier(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "service_tier must be one of auto, default, flex, scale, priority or None",
+        ):
+            asyncio.run(rlm_module.rlm.spawn("invalid tier", name="priority-worker", service_tier="fast"))
 
     def test_finds_authenticated_models_through_host(self) -> None:
         host_request = AsyncMock(
@@ -118,7 +141,9 @@ class RlmSubagentRegistryTest(unittest.TestCase):
                         "provider": "anthropic",
                         "id": "claude-opus-4-7",
                         "name": "Claude Opus 4.7",
-                        "selector": "anthropic/claude-opus-4-7",
+                        "selector": "@opus",
+                        "concreteSelector": "anthropic/claude-opus-4-7",
+                        "available": False,
                     }
                 ]
             }
@@ -130,7 +155,9 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         self.assertEqual(models[0].provider, "anthropic")
         self.assertEqual(models[0].id, "claude-opus-4-7")
         self.assertEqual(models[0].name, "Claude Opus 4.7")
-        self.assertEqual(models[0].selector, "anthropic/claude-opus-4-7")
+        self.assertEqual(models[0].selector, "@opus")
+        self.assertEqual(models[0].concrete_selector, "anthropic/claude-opus-4-7")
+        self.assertIs(models[0].available, False)
         host_request.assert_awaited_once_with(
             "rlm.find_models",
             {"query": "opus", "limit": 3},
@@ -143,6 +170,23 @@ class RlmSubagentRegistryTest(unittest.TestCase):
             asyncio.run(rlm_module.find_models("opus", limit="3"))
 
         host_request = AsyncMock(return_value={"models": [{"provider": "anthropic"}]})
+        with patch.object(rlm_module, "host_request", host_request):
+            with self.assertRaisesRegex(RuntimeError, "invalid model entry"):
+                asyncio.run(rlm_module.find_models("opus"))
+
+        host_request = AsyncMock(
+            return_value={
+                "models": [
+                    {
+                        "provider": "anthropic",
+                        "id": "claude-opus-4-7",
+                        "name": "Claude Opus 4.7",
+                        "selector": "@opus",
+                        "available": "yes",
+                    }
+                ]
+            }
+        )
         with patch.object(rlm_module, "host_request", host_request):
             with self.assertRaisesRegex(RuntimeError, "invalid model entry"):
                 asyncio.run(rlm_module.find_models("opus"))

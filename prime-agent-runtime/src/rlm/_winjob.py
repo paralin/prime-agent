@@ -146,6 +146,22 @@ def _open_reader(handle: int) -> BinaryIO:
         raise
 
 
+def _open_writer(handle: int) -> BinaryIO:
+    """Wrap the pipe HANDLE in a binary writer, consuming the HANDLE on every path."""
+    import msvcrt
+
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_WRONLY)
+    except BaseException:
+        _kernel32().CloseHandle(handle)
+        raise
+    try:
+        return os.fdopen(fd, "wb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def create_job() -> int | None:
     """A new kill-on-close job handle, or None when jobs are unavailable."""
     try:
@@ -166,9 +182,17 @@ def create_job() -> int | None:
 class JobProcess:
     """Minimal Popen-like surface for a child spawn_in_job() created suspended."""
 
-    def __init__(self, hprocess: int, hthread: int, pid: int, stdout: BinaryIO) -> None:
+    def __init__(
+        self,
+        hprocess: int,
+        hthread: int,
+        pid: int,
+        stdout: BinaryIO,
+        stdin: BinaryIO | None = None,
+    ) -> None:
         self.pid = pid
         self.stdout: BinaryIO | None = stdout
+        self.stdin: BinaryIO | None = stdin
         # Guards every (_exit_code, _hprocess, _hthread, _waiters) transition; never held blocking.
         self._lock = threading.Lock()
         self._hprocess: int | None = hprocess
@@ -188,6 +212,12 @@ class JobProcess:
 
     def close(self) -> None:
         """Release the process handle (idempotent); owned by BashHandle after reap."""
+        if self.stdin is not None:
+            try:
+                self.stdin.close()
+            except OSError:
+                pass
+            self.stdin = None
         with self._lock:
             self._close_requested = True
             self._close_hprocess_locked()
@@ -265,7 +295,14 @@ class JobProcess:
             raise OSError(f"TerminateProcess failed: {_last_error()}")
 
 
-def spawn_in_job(job: int, argv: list[str], cwd: str, env: dict[str, str]) -> JobProcess:
+def spawn_in_job(
+    job: int,
+    argv: list[str],
+    cwd: str,
+    env: dict[str, str],
+    *,
+    pipe_stdin: bool = False,
+) -> JobProcess:
     """Create argv suspended and atomically inside the caller-owned job (JOB_LIST
     attribute, no assignment window); raises OSError on any failure (nothing spawned)."""
     try:
@@ -273,6 +310,7 @@ def spawn_in_job(job: int, argv: list[str], cwd: str, env: dict[str, str]) -> Jo
     except (OSError, AttributeError) as exc:
         raise OSError("kernel32 unavailable") from exc
     read_handle = write_handle = nul_handle = None
+    child_stdin_handle = parent_stdin_handle = None
     attr_list = None
     proc = None
     try:
@@ -282,6 +320,16 @@ def spawn_in_job(job: int, argv: list[str], cwd: str, env: dict[str, str]) -> Jo
         read_handle, write_handle = int(read_out.value or 0), int(write_out.value or 0)
         if not k32.SetHandleInformation(write_handle, _HANDLE_FLAG_INHERIT, _HANDLE_FLAG_INHERIT):
             raise OSError(f"SetHandleInformation failed: {_last_error()}")
+        if pipe_stdin:
+            read_in, write_in = wintypes.HANDLE(), wintypes.HANDLE()
+            if not k32.CreatePipe(ctypes.byref(read_in), ctypes.byref(write_in), None, 0):
+                raise OSError(f"CreatePipe failed: {_last_error()}")
+            child_stdin_handle = int(read_in.value or 0)
+            parent_stdin_handle = int(write_in.value or 0)
+            if not k32.SetHandleInformation(
+                child_stdin_handle, _HANDLE_FLAG_INHERIT, _HANDLE_FLAG_INHERIT
+            ):
+                raise OSError(f"SetHandleInformation failed: {_last_error()}")
         nul = k32.CreateFileW(
             "NUL", _GENERIC_READ, _FILE_SHARE_READ_WRITE, None, _OPEN_EXISTING, 0, None)
         if not nul or nul == _INVALID_HANDLE_VALUE:
@@ -303,8 +351,9 @@ def spawn_in_job(job: int, argv: list[str], cwd: str, env: dict[str, str]) -> Jo
             attr_list, 0, _PROC_THREAD_ATTRIBUTE_JOB_LIST, ctypes.byref(jobs),
             ctypes.sizeof(jobs), None, None):
             raise OSError(f"UpdateProcThreadAttribute failed: {_last_error()}")
-        # HANDLE_LIST blocks concurrent spawns' handle leaks; both arrays outlive CreateProcessW.
-        inheritable = (wintypes.HANDLE * 2)(write_handle, nul_handle)
+        # HANDLE_LIST blocks concurrent spawns' handle leaks; the array outlives CreateProcessW.
+        inherited_handles = [write_handle, child_stdin_handle or nul_handle]
+        inheritable = (wintypes.HANDLE * len(inherited_handles))(*inherited_handles)
         if not k32.UpdateProcThreadAttribute(
             attr_list, 0, _PROC_THREAD_ATTRIBUTE_HANDLE_LIST, ctypes.byref(inheritable),
             ctypes.sizeof(inheritable), None, None):
@@ -312,7 +361,7 @@ def spawn_in_job(job: int, argv: list[str], cwd: str, env: dict[str, str]) -> Jo
         startup = _STARTUPINFOEXW()
         startup.StartupInfo.cb = ctypes.sizeof(_STARTUPINFOEXW)
         startup.StartupInfo.dwFlags = _STARTF_USESTDHANDLES
-        startup.StartupInfo.hStdInput = nul_handle
+        startup.StartupInfo.hStdInput = child_stdin_handle or nul_handle
         startup.StartupInfo.hStdOutput = startup.StartupInfo.hStdError = write_handle
         startup.lpAttributeList = ctypes.cast(attr_list, wintypes.LPVOID)
         # CreateProcessW may rewrite lpCommandLine in place: a writable buffer is mandatory.
@@ -331,9 +380,22 @@ def spawn_in_job(job: int, argv: list[str], cwd: str, env: dict[str, str]) -> Jo
         try:
             # _open_reader consumes the read handle on every path: drop it at the call.
             reader_handle, read_handle = read_handle, None
+            reader = _open_reader(reader_handle)
+            try:
+                writer = None
+                if parent_stdin_handle is not None:
+                    writer_handle, parent_stdin_handle = parent_stdin_handle, None
+                    writer = _open_writer(writer_handle)
+            except BaseException:
+                reader.close()
+                raise
             proc = JobProcess(
-                int(info.hProcess or 0), int(info.hThread or 0), int(info.dwProcessId),
-                _open_reader(reader_handle))
+                int(info.hProcess or 0),
+                int(info.hThread or 0),
+                int(info.dwProcessId),
+                reader,
+                writer,
+            )
         except BaseException:
             # No JobProcess owns these yet; the caller's kill-on-close job reaps the child.
             for handle in (info.hProcess, info.hThread):
@@ -343,7 +405,7 @@ def spawn_in_job(job: int, argv: list[str], cwd: str, env: dict[str, str]) -> Jo
     finally:
         if attr_list is not None:
             k32.DeleteProcThreadAttributeList(attr_list)
-        for handle in (write_handle, nul_handle):
+        for handle in (write_handle, nul_handle, child_stdin_handle, parent_stdin_handle):
             if handle is not None:
                 k32.CloseHandle(handle)
         if read_handle is not None:  # only when _open_reader was never invoked

@@ -30,7 +30,7 @@ use pa_core::kernel::shared::{
     ExecuteOptions, ExecuteStatus, HostRequestHandlers, KernelManagerOptions, KernelShutdownOptions,
 };
 
-/// Speaks protocol v3: ready, then per request the oversized unterminated
+/// Speaks protocol v4: ready, then per request the oversized unterminated
 /// line (the corruption under test), a multi-MiB blank line followed by a
 /// plain stdout frame (the linear-scan test), or a plain done frame.
 const FAKE_RUNTIME: &str = r#"#!/usr/bin/env python3
@@ -38,7 +38,7 @@ import json
 import sys
 import time
 
-print(json.dumps({"event": "ready", "protocol": 3, "python": "3.13.0"}), flush=True)
+print(json.dumps({"event": "ready", "protocol": 4, "python": "3.13.0"}), flush=True)
 for line in sys.stdin:
     try:
         req = json.loads(line)

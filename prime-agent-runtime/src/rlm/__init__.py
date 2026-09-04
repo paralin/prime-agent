@@ -2,14 +2,35 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
-from .bash import BashHandle, BashResult, bash
+from ._act import _ActCellResult, _ActInterrupted, _run_cells, done
+from .bash import BashHandle, BashResult, bash, rg, rsync, ssh_forward
 from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
+ACT_CANCELLATION_CAPABILITY = "posix-managed" if os.name == "posix" else "cooperative-only"
+RLM_SERVICE_TIERS = ("auto", "default", "flex", "scale", "priority")
+
+
+def _validate_service_tier(value: Any) -> None:
+    if value is None or value in RLM_SERVICE_TIERS:
+        return
+    raise ValueError(f"service_tier must be one of {', '.join(RLM_SERVICE_TIERS)} or None")
+
+
+class ActError(RuntimeError):
+    """An Act ended without an accepted terminal value."""
+
+
+class ActCancelledError(ActError):
+    """The host accepted Act cancellation under ACT_CANCELLATION_CAPABILITY."""
+
+
 
 _NOT_CALLABLE_MESSAGE = "'rlm' is not callable; spawn a child with: handle = await rlm.spawn('sub-task', name='worker')"
 _RENAMED_RUN_MESSAGE = "rlm.run was renamed; spawn a child with: handle = await rlm.spawn('sub-task', name='worker')"
@@ -38,6 +59,8 @@ class RLMModel:
     id: str
     name: str
     selector: str
+    concrete_selector: str | None = None
+    available: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +146,137 @@ def _create_session_handle_from_payload(payload: Any) -> RLMCreateSessionHandle:
     )
 
 
+class _ActExchange:
+    def __init__(self, prompt: str, model: str | None = None) -> None:
+        from . import repl
+
+        payload: dict[str, str] = {"prompt": prompt, "type": "rlm.act"}
+        if model is not None:
+            payload["model"] = model
+        self._exchange = repl.open_host_exchange(payload)
+        self._messages: asyncio.Queue[dict[str, Any] | BaseException] = asyncio.Queue()
+        self._cancelled = asyncio.Event()
+        self._closed = False
+        self._reader = asyncio.create_task(self._read_messages())
+
+    async def _read_messages(self) -> None:
+        try:
+            while True:
+                message = await self._exchange.receive()
+                result = message.get("result")
+                if message.get("status") == "ok" and isinstance(result, dict):
+                    message = {"status": "ok", **result}
+                if message.get("status") == "aborted" or (
+                    message.get("status") == "ok" and message.get("outcome") == "cancelled"
+                ):
+                    self._cancelled.set()
+                self._messages.put_nowait(message)
+        except BaseException as error:
+            self._cancelled.set()
+            self._messages.put_nowait(error)
+
+    async def _receive(self) -> dict[str, Any]:
+        message = await self._messages.get()
+        if isinstance(message, BaseException):
+            raise message
+        return message
+
+    async def wait_cancelled(self) -> None:
+        await self._cancelled.wait()
+
+    async def cells(self) -> AsyncIterator[str]:
+        while True:
+            message = await self._receive()
+            status = message.get("status")
+            if status == "event" and message.get("type") == "cell":
+                code = message.get("code")
+                if not isinstance(code, str):
+                    raise ActError("Act returned a cell event without string code")
+                yield code
+                continue
+            if status == "ok":
+                if message.get("outcome") == "cancelled":
+                    self._cancelled.set()
+                    raise _ActInterrupted
+                return
+            if status == "error":
+                raise ActError(str(message.get("error") or "Act host failed"))
+            if status == "aborted":
+                self._cancelled.set()
+                raise _ActInterrupted
+            raise ActError(f"Act returned an unexpected message: {message!r}")
+
+    async def send_cell_result(self, result: _ActCellResult) -> None:
+        self._exchange.send(
+            {
+                "type": "cell_result",
+                "durationMs": result.duration_ms,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "result": result.result,
+                "error": result.error,
+            }
+        )
+
+    async def acknowledge_done(self) -> None:
+        self._exchange.send({"type": "done"})
+        message = await self._receive()
+        status = message.get("status")
+        if status == "ok" and message.get("outcome") == "done":
+            return
+        if status == "ok" and message.get("outcome") == "cancelled":
+            raise _ActInterrupted
+        if status == "error":
+            raise ActError(str(message.get("error") or "Act completion failed"))
+        if status == "aborted":
+            raise _ActInterrupted
+        raise ActError(f"Act completion returned an unexpected message: {message!r}")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._reader.cancel()
+        self._exchange.close()
+
+
+async def act(prompt: str, model: str | None = None) -> Any:
+    """Run one retained low-level task in the serving REPL's live namespace.
+
+    Cancellation always aborts provider work and cooperative awaited Python.
+    ``ACT_CANCELLATION_CAPABILITY == "posix-managed"`` additionally covers a
+    correlated synchronous inner-cell interrupt and managed ``bash()`` process
+    groups. ``"cooperative-only"`` does not promise to stop synchronous Python
+    or blocking shell work before it returns.
+    """
+    if not isinstance(prompt, str):
+        raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
+    if not prompt.strip():
+        raise ValueError("prompt must not be empty")
+    if model is not None and not isinstance(model, str):
+        raise TypeError(f"model must be str or None, got {type(model).__name__}")
+    if isinstance(model, str):
+        model = model.strip()
+        if not model:
+            raise ValueError("model must not be empty")
+    exchange = _ActExchange(prompt, model)
+    try:
+        return await _run_cells(
+            exchange.cells(),
+            cancel=exchange.wait_cancelled(),
+            on_cell_result=exchange.send_cell_result,
+            on_done=exchange.acknowledge_done,
+        )
+    except _ActInterrupted as error:
+        raise ActCancelledError("Act was cancelled") from error
+    except ActError:
+        raise
+    except RuntimeError as error:
+        raise ActError(str(error)) from error
+    finally:
+        exchange.close()
+
+
 def _parse_host_reply(request_type: str, reply: dict[str, Any]) -> dict[str, Any]:
     status = reply.get("status")
     if status == "ok":
@@ -152,7 +306,7 @@ async def host_request(request_type: str, payload: dict[str, Any] | None = None)
 
 
 def emit(data: dict[str, Any]) -> None:
-    """Ship one display event (dict of MIME type -> JSON payload) to the host."""
+    """Ship one display event to the host."""
     from . import repl
 
     repl.emit(data)
@@ -164,13 +318,13 @@ async def spawn(
     name: str,
     model: str | None = None,
     thinking: str | None = None,
+    service_tier: str | None = None,
 ) -> RLMSpawnHandle:
     """Spawn a recursive Prime Agent child and return once its task is admitted.
 
     ``name`` is required and must be unique among siblings.
     ``model`` selects a child with an exact ``provider/model`` selector.
-    ``thinking`` sets the child reasoning level (e.g. 'off', 'low', 'medium', 'high');
-    defaults to the parent level; levels invalid for the resolved model fail the spawn.
+    ``service_tier`` requests an allowed override of the parent tier for this child.
     """
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
@@ -179,6 +333,9 @@ async def spawn(
         kwargs["model"] = model
     if thinking is not None:
         kwargs["thinking"] = thinking
+    if service_tier is not None:
+        _validate_service_tier(service_tier)
+        kwargs["service_tier"] = service_tier
     # Wire type stays "rlm.run" so kernels and hosts of different versions stay compatible.
     payload = await host_request("rlm.run", {"prompt": prompt, "kwargs": kwargs})
     return _spawn_handle_from_payload(payload)
@@ -193,7 +350,20 @@ def _model_from_payload(payload: Any) -> RLMModel:
     selector = payload.get("selector")
     if not all(isinstance(value, str) and value for value in (provider, model_id, name, selector)):
         raise RuntimeError("rlm.find_models returned an invalid model entry")
-    return RLMModel(provider=provider, id=model_id, name=name, selector=selector)
+    concrete_selector = payload.get("concreteSelector")
+    if concrete_selector is not None and (not isinstance(concrete_selector, str) or not concrete_selector):
+        raise RuntimeError("rlm.find_models returned an invalid model entry")
+    available = payload.get("available")
+    if available is not None and not isinstance(available, bool):
+        raise RuntimeError("rlm.find_models returned an invalid model entry")
+    return RLMModel(
+        provider=provider,
+        id=model_id,
+        name=name,
+        selector=selector,
+        concrete_selector=concrete_selector,
+        available=available,
+    )
 
 
 async def create_session(
@@ -482,12 +652,13 @@ class _HarnessProxy:
     """Resolve the harness state against the current environment on every access.
 
     Session env vars may be applied after import, so a state bound at import
-    time could freeze an env-less resolution. Resolution must never raise (a
-    failure inside the kernel namespace would take down the kernel). When the
-    local store is genuinely unconfigured (no session env, e.g. --no-session)
-    reads see an empty view but local writes raise instructively instead of
-    vanishing on kernel exit; any other resolution failure degrades to a shared
-    in-memory store until local resolution starts succeeding.
+    time could freeze an env-less resolution. Resolving per access picks up the env
+    applied after fork. Resolution must never raise (a failure inside the kernel
+    namespace would take down the kernel). When the local store is genuinely
+    unconfigured (no session env, e.g. --no-session) reads see an empty view but
+    local writes raise instructively instead of vanishing on kernel exit; any
+    other resolution failure degrades to a shared in-memory store until local
+    resolution starts succeeding.
     """
 
     _fallback: HarnessState | None = None
@@ -528,8 +699,13 @@ _harness_state = _HarnessProxy()
 
 
 class _RLMNamespace:
+    ACT_CANCELLATION_CAPABILITY = ACT_CANCELLATION_CAPABILITY
     harness = _harness_state
     get_harness_state = staticmethod(get_harness_state)
+    done = staticmethod(done)
+
+    async def act(self, prompt: str, model: str | None = None) -> Any:
+        return await act(prompt, model)
 
     async def spawn(
         self,
@@ -538,8 +714,9 @@ class _RLMNamespace:
         name: str,
         model: str | None = None,
         thinking: str | None = None,
+        service_tier: str | None = None,
     ) -> RLMSpawnHandle:
-        return await spawn(prompt, name=name, model=model, thinking=thinking)
+        return await spawn(prompt, name=name, model=model, thinking=thinking, service_tier=service_tier)
 
     async def create_session(
         self,
@@ -588,6 +765,9 @@ class _NotCallableModule(types.ModuleType):
 sys.modules[__name__].__class__ = _NotCallableModule
 
 __all__ = [
+    "ACT_CANCELLATION_CAPABILITY",
+    "ActCancelledError",
+    "ActError",
     "BashHandle",
     "BashResult",
     "HarnessEntry",
@@ -604,8 +784,13 @@ __all__ = [
     "RLMSubagentActivity",
     "create_session",
     "RefinementEvent",
+    "act",
     "bash",
+    "rg",
+    "rsync",
+    "ssh_forward",
     "delete_subagent",
+    "done",
     "emit",
     "find_models",
     "get_harness_state",

@@ -1,0 +1,1 @@
+- Added shared-kernel Act client APIs, managed SSH and argv execution, remote editing, and retained job event clients.

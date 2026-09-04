@@ -77,9 +77,13 @@ pub(crate) async fn run_loop(
                 }
             }
 
+            let mut request_config = config.clone();
+            if let Some(budget) = progress.recovery_max_tokens {
+                request_config.max_tokens = Some(budget);
+            }
             let (message, retained) = stream_assistant_response(
                 current_context,
-                config,
+                &request_config,
                 signal,
                 emit,
                 stream_fn,

@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 - Stopped a third consecutive identical tool-call batch with unchanged results before executing it.
-- Stopped retrying a reasoning-exhausted response with the same output budget and effort.
+- Recovered from reasoning-exhausted responses with bounded increases to the default output allowance while respecting explicit caller and model limits.
 - Continued the active turn when a provider exhausts its output limit on thinking without producing text or a tool call.
 
 ## [0.8.0] - 2026-08-21

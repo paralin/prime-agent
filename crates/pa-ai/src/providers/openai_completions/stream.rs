@@ -634,6 +634,13 @@ async fn run_stream(
         cache_retention,
         cache_control.as_ref(),
     );
+    if compat.thinking_format == crate::types::ThinkingFormat::Merge {
+        if let Some(budget) = params["thinking"]["budget_tokens"].as_u64() {
+            if budget == 0 || params["max_tokens"].as_u64().is_some_and(|maximum| budget >= maximum) {
+                return Err(ProviderError::Message("Merge thinking budget must be a positive integer smaller than max_tokens".into()));
+            }
+        }
+    }
     if let Some(on_payload) = &base_options.on_payload {
         if let Some(next) = on_payload(params.clone(), model) {
             params = next;
@@ -813,6 +820,16 @@ fn validate_stream_end(state: &StreamingState, required: bool) -> Result<(), Pro
     }
     if required && state.output.content.iter().any(|block| matches!(block, AssistantContent::ToolCall(call) if call.id.is_empty() || call.name.is_empty())) {
         return Err(ProviderError::Message("OpenAI Chat tool call delta is missing id or name".into()));
+    }
+    if required {
+        for accumulator in state.tool_call_partial_args.values() {
+            let text = accumulator.text();
+            let arguments: Value = serde_json::from_str(if text.is_empty() { "{}" } else { text })
+                .map_err(|_| ProviderError::Message("OpenAI Chat tool call arguments are not complete JSON".into()))?;
+            if !arguments.is_object() {
+                return Err(ProviderError::Message("OpenAI Chat tool call arguments must be a JSON object".into()));
+            }
+        }
     }
     Ok(())
 }

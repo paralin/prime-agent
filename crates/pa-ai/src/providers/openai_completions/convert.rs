@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 
 use crate::models::{calculate_cost, CostOverrides};
 use crate::providers::openai_completions::{
-    decode_chat_thinking_signature, decode_reasoning_details, ResolvedCompat,
+    decode_chat_thinking_signature, decode_reasoning_details, encode_chat_thinking_signature, ResolvedCompat,
 };
 use crate::providers::transform_messages::transform_messages_with_normalizer;
 use crate::types::{
@@ -22,8 +22,25 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
     use crate::types::Message;
     let mut params: Vec<Value> = Vec::new();
 
+    let mut replay = context.messages.clone();
+    if model.provider == "merge-gateway" {
+        for message in &mut replay {
+            if let Message::Assistant(assistant) = message {
+                if assistant.provider == model.provider && assistant.model == model.id && assistant.api == "merge-gateway-responses" {
+                    assistant.api.clone_from(&model.api);
+                    for block in &mut assistant.content {
+                        if let AssistantContent::Thinking(thinking) = block {
+                            if thinking.redacted != Some(true) {
+                                thinking.thinking_signature = Some(thinking.thinking_signature.as_ref().map_or_else(|| "thinking".into(), |signature| encode_chat_thinking_signature("thinking", signature)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     let transformed =
-        transform_messages_with_normalizer(&context.messages, model, &|id, model, _| {
+        transform_messages_with_normalizer(&replay, model, &|id, model, _| {
             Some(normalize_tool_call_id(id, model))
         });
 
@@ -138,7 +155,7 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                         AssistantContent::Thinking(thinking)
                             if decode_reasoning_details(thinking.thinking_signature.as_deref())
                                 .is_none()
-                                && !thinking.thinking.trim().is_empty() =>
+                                && (model.provider == "merge-gateway" || !thinking.thinking.trim().is_empty()) =>
                         {
                             Some(thinking)
                         }
@@ -179,7 +196,7 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                             .iter()
                             .map(|block| sanitize_surrogates(&block.thinking))
                             .collect::<Vec<_>>()
-                            .join("\n");
+                            .join(if model.provider == "merge-gateway" { "" } else { "\n" });
                         let envelope = decode_chat_thinking_signature(
                             non_empty_thinking_blocks[0].thinking_signature.as_deref(),
                         );

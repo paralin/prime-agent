@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { findEnvKeys, getEnvApiKey } from "../src/env-api-keys.js";
 import { getModel, getSupportedThinkingLevels } from "../src/models.js";
 import { streamOpenAICompletions, streamSimpleOpenAICompletions } from "../src/providers/openai-completions.js";
-import type { AssistantMessageEvent, Context, Model } from "../src/types.js";
+import type { AssistantMessage, AssistantMessageEvent, Context, Model } from "../src/types.js";
 
 const MERGE_GATEWAY_API_KEY = "mg-test-secret-1234";
 const MODEL_ID = "zai/glm-5.3-flash";
@@ -128,6 +128,161 @@ const context: Context = {
 };
 
 describe("Merge Gateway provider", () => {
+	it.each([0, -1, 100, 101])("rejects a thinking budget that leaves no valid answer allowance: %s", async (budget) => {
+		let dispatched = false;
+		const result = await streamOpenAICompletions(
+			mergeModel(),
+			{ messages: [] },
+			{
+				apiKey: MERGE_GATEWAY_API_KEY,
+				maxTokens: 100,
+				reasoningBudgetTokens: budget,
+				onPayload() {
+					dispatched = true;
+					throw new Error("must not dispatch");
+				},
+			},
+		).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("thinking budget");
+		expect(dispatched).toBe(false);
+	});
+	it.each([undefined, "native-signature"])(
+		"replays legacy native reasoning without exposing it as assistant text (%s)",
+		async (signature) => {
+			const { server, url, requests } = await startMergeGatewayMock((_request, response) => {
+				response.writeHead(200, { "content-type": "text/event-stream" });
+				response.end(
+					chatSse([{ id: "chat_migration", choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }]),
+				);
+			});
+			try {
+				const legacy: AssistantMessage = {
+					...(context.messages[1] as AssistantMessage),
+					api: "merge-gateway-responses",
+					content: [
+						{ type: "thinking", thinking: "  Previous internal plan.\n", thinkingSignature: signature },
+						{ type: "text", text: "I inspected the file." },
+						{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "image.png" } },
+					],
+				};
+				const before = JSON.stringify(legacy);
+				await streamOpenAICompletions(
+					mergeModel(`${url}/v1/ai-sdk`),
+					{
+						...context,
+						messages: [
+							context.messages[0],
+							legacy,
+							context.messages[2],
+							{ role: "user", content: "Answer my new question", timestamp: 3 },
+						],
+					},
+					{ apiKey: MERGE_GATEWAY_API_KEY },
+				).result();
+				const messages = requests[0].body.messages as Record<string, unknown>[];
+				expect(messages[2]).toMatchObject({
+					role: "assistant",
+					content: "I inspected the file.",
+					thinking: "  Previous internal plan.\n",
+					tool_calls: [
+						{ id: "call_1", type: "function", function: { name: "read", arguments: '{"path":"image.png"}' } },
+					],
+				});
+				expect(messages[2].thinking_signature).toBe(signature);
+				expect(messages[3]).toMatchObject({ role: "tool", tool_call_id: "call_1", content: "image contents" });
+				expect(messages[4]).toEqual({ role: "user", content: "Answer my new question" });
+				expect(JSON.stringify(legacy)).toBe(before);
+			} finally {
+				await closeServer(server);
+			}
+		},
+	);
+
+	it.each([false, true])("replays a reasoning-only response across HTTP requests (signed=%s)", async (signed) => {
+		let round = 0;
+		const { server, url, requests } = await startMergeGatewayMock((_request, response) => {
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			response.end(
+				chatSse(
+					++round === 1
+						? [
+								{
+									id: "partial",
+									choices: [{ delta: { thinking: "  Keep this reasoning.\n" }, finish_reason: null }],
+								},
+								{
+									id: "partial",
+									choices: [
+										{
+											delta: signed ? { thinking_signature: "signed-partial" } : {},
+											finish_reason: "length",
+										},
+									],
+								},
+							]
+						: [{ id: "answer", choices: [{ delta: { content: "Done" }, finish_reason: "stop" }] }],
+				),
+			);
+		});
+		try {
+			const model = mergeModel(`${url}/v1/ai-sdk`);
+			const first: Context = { messages: [{ role: "user", content: "Finish the answer", timestamp: 0 }] };
+			const partial = await streamOpenAICompletions(model, first, { apiKey: MERGE_GATEWAY_API_KEY }).result();
+			await streamOpenAICompletions(
+				model,
+				{ messages: [...first.messages, partial] },
+				{ apiKey: MERGE_GATEWAY_API_KEY },
+			).result();
+			const messages = requests[1].body.messages as Record<string, unknown>[];
+			expect(messages).toHaveLength(2);
+			expect(messages[1]).toMatchObject({ role: "assistant", content: null, thinking: "  Keep this reasoning.\n" });
+			expect(messages[1].thinking_signature).toBe(signed ? "signed-partial" : undefined);
+		} finally {
+			await closeServer(server);
+		}
+	});
+
+	it.each(['{"path":"unfinished', "[]", "null"])(
+		"rejects invalid terminal tool arguments: %s",
+		async (argumentsText) => {
+			const { server, url } = await startMergeGatewayMock((_request, response) => {
+				response.writeHead(200, { "content-type": "text/event-stream" });
+				response.end(
+					chatSse([
+						{
+							id: "bad_args",
+							choices: [
+								{
+									delta: {
+										tool_calls: [
+											{
+												index: 0,
+												id: "call_bad",
+												type: "function",
+												function: { name: "read", arguments: argumentsText },
+											},
+										],
+									},
+									finish_reason: "tool_calls",
+								},
+							],
+						},
+					]),
+				);
+			});
+			try {
+				const result = await streamOpenAICompletions(mergeModel(`${url}/v1/ai-sdk`), context, {
+					apiKey: MERGE_GATEWAY_API_KEY,
+				}).result();
+				expect(result.stopReason).toBe("error");
+				expect(result.errorMessage).toContain("tool call arguments");
+			} finally {
+				await closeServer(server);
+			}
+		},
+	);
+
 	it("resolves MERGE_GATEWAY_API_KEY from the environment", () => {
 		process.env.MERGE_GATEWAY_API_KEY = MERGE_GATEWAY_API_KEY;
 
@@ -231,7 +386,7 @@ describe("Merge Gateway provider", () => {
 			const events: AssistantMessageEvent[] = [];
 			const stream = streamOpenAICompletions(mergeModel(`${url}/v1/ai-sdk`), context, {
 				apiKey: MERGE_GATEWAY_API_KEY,
-				maxTokens: 100,
+				maxTokens: 8_192,
 				reasoningEffort: "high",
 				reasoningBudgetTokens: 4_096,
 				sessionId: "merge-session-1",
@@ -279,7 +434,7 @@ describe("Merge Gateway provider", () => {
 				stream: true,
 				stream_options: { include_usage: true },
 				store: false,
-				max_tokens: 100,
+				max_tokens: 8_192,
 				tools: [
 					{
 						type: "function",

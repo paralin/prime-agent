@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { type Api, type Model, streamSimple } from "@earendil-works/pi-ai";
 import { describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { fetchMergeGatewayModels } from "../src/core/merge-gateway-models.js";
@@ -21,6 +21,57 @@ const knownModel: Model<Api> = {
 };
 
 describe("Merge Gateway model discovery", () => {
+	test("keeps native effort controls without sending unsupported thinking budgets", async () => {
+		const fetchFn = vi.fn(
+			async () =>
+				new Response(
+					JSON.stringify({
+						data: [
+							{
+								model: "example/native-reasoning",
+								vendors: {
+									native: {
+										capabilities: {
+											input: ["text"],
+											output: ["text"],
+											supports_tool_calling: true,
+											supports_reasoning: true,
+											reasoning: {
+												controls: ["reasoning_effort"],
+												effort_values: ["low", "high"],
+												disable_supported: false,
+											},
+										},
+									},
+								},
+							},
+						],
+					}),
+				),
+		);
+		const [model] = await fetchMergeGatewayModels("merge-key", [], fetchFn);
+		expect(model).toMatchObject({
+			reasoning: true,
+			compat: { supportsReasoningEffort: true, thinkingFormat: "openai" },
+		});
+		let payload: unknown;
+		await streamSimple(
+			model,
+			{ messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+			{
+				apiKey: "offline-test",
+				reasoning: "low",
+				thinkingBudgets: { low: 1024 },
+				onPayload(value) {
+					payload = value;
+					throw new Error("offline capture");
+				},
+			},
+		).result();
+		expect(payload).toMatchObject({ reasoning_effort: "low" });
+		expect(payload).not.toHaveProperty("thinking");
+	});
+
 	test("lists every catalog model and reuses known metadata", async () => {
 		const fetchFn = vi.fn(
 			async () =>

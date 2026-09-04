@@ -27,6 +27,7 @@ interface CatalogModel {
 	compat?: {
 		supportsReasoningEffort: boolean;
 		supportsReasoningDisable: boolean;
+		thinkingFormat: "merge" | "openai";
 	};
 	supportedEfforts?: ThinkingLevel[];
 }
@@ -117,16 +118,17 @@ function readCatalog(value: unknown): CatalogModel[] {
 		});
 		if (vendors.length === 0) return [];
 		const routes = vendors.map(([, vendor]) => vendor);
-		const supportsReasoning = routes.every((vendor) => {
-			const controls = vendor.capabilities?.reasoning?.controls;
-			return (
-				vendor.capabilities?.supports_reasoning === true &&
-				Array.isArray(controls) &&
-				(controls.includes("thinking") || controls.includes("thinking.budget_tokens"))
-			);
-		});
+		const supportsReasoning = routes.every((vendor) => vendor.capabilities?.supports_reasoning === true);
+		const supportsThinkingBudget =
+			supportsReasoning &&
+			routes.every((vendor) => {
+				const controls = vendor.capabilities?.reasoning?.controls;
+				return (
+					Array.isArray(controls) && (controls.includes("thinking") || controls.includes("thinking.budget_tokens"))
+				);
+			});
 		const supportsDisable =
-			supportsReasoning && routes.every((vendor) => vendor.capabilities?.reasoning?.disable_supported === true);
+			supportsThinkingBudget && routes.every((vendor) => vendor.capabilities?.reasoning?.disable_supported === true);
 		const supportedEfforts = supportsReasoning ? commonEffortValues(routes) : undefined;
 		const finiteMinimum = (values: unknown[]): number | undefined => {
 			const numbers = values.filter(
@@ -149,6 +151,7 @@ function readCatalog(value: unknown): CatalogModel[] {
 				compat: {
 					supportsReasoningEffort: supportedEfforts !== undefined,
 					supportsReasoningDisable: supportsDisable,
+					thinkingFormat: supportsThinkingBudget ? "merge" : "openai",
 				},
 				...(supportedEfforts ? { supportedEfforts } : {}),
 			},
@@ -237,7 +240,12 @@ export async function fetchMergeGatewayModels(
 			baseUrl: MERGE_GATEWAY_CHAT_BASE_URL,
 			compat: {
 				...MERGE_GATEWAY_COMPAT,
-				...(entry.compat ? { supportsReasoningEffort: entry.compat.supportsReasoningEffort } : {}),
+				...(entry.compat
+					? {
+							supportsReasoningEffort: entry.compat.supportsReasoningEffort,
+							thinkingFormat: entry.compat.thinkingFormat,
+						}
+					: {}),
 			},
 			...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 			reasoning: entry.reasoning ?? known?.reasoning ?? true,

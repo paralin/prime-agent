@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed Merge Gateway replay of legacy native reasoning and reasoning-only responses without turning internal plans into assistant text.
+- Rejected malformed terminal tool arguments and Merge thinking budgets that leave no room for an answer.
 - Fixed Merge Gateway Chat tool loops dropping signed reasoning before follow-up requests.
 - Fixed Merge Gateway reasoning requests to send both the selected effort and its configured thinking-token budget.
 - Added GLM 5.3 Flash to the RunInfra model list.

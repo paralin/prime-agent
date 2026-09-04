@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed Merge Gateway discovery for routes with native reasoning-effort controls but no thinking-budget support.
 - Streamlined agent instructions for implementation, proportionate checks, child reporting, runtime notices, and Python environment boundaries.
 - Stopped automatic retries after a provider reports that reasoning exhausted the output budget.
 - Told the agent to preserve completed results, follow the newest user instruction, and take a distinct action instead of repeating a tool call.

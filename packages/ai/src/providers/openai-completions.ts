@@ -303,7 +303,20 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 						partial: output,
 					});
 				} else if (block.type === "toolCall") {
-					block.arguments = parseStreamingJson(block.partialArgs);
+					if (compat.requireFinishReason) {
+						let argumentsValue: unknown;
+						try {
+							argumentsValue = JSON.parse(block.partialArgs || "{}");
+						} catch {
+							throw new Error("OpenAI Chat tool call arguments are not complete JSON");
+						}
+						if (!argumentsValue || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) {
+							throw new Error("OpenAI Chat tool call arguments must be a JSON object");
+						}
+						block.arguments = argumentsValue as Record<string, unknown>;
+					} else {
+						block.arguments = parseStreamingJson(block.partialArgs);
+					}
 					// Finalize in-place and strip the scratch buffers so replay only
 					// carries parsed arguments.
 					delete block.partialArgs;
@@ -925,6 +938,13 @@ function buildParams(
 		}
 	} else if (compat.thinkingFormat === "merge" && model.reasoning) {
 		if (options?.reasoningBudgetTokens !== undefined) {
+			if (
+				!Number.isInteger(options.reasoningBudgetTokens) ||
+				options.reasoningBudgetTokens <= 0 ||
+				(options.maxTokens !== undefined && options.reasoningBudgetTokens >= options.maxTokens)
+			) {
+				throw new Error("Merge thinking budget must be a positive integer smaller than max_tokens");
+			}
 			(params as any).thinking = { type: "enabled", budget_tokens: options.reasoningBudgetTokens };
 		} else if (options?.reasoningEnabled === false && model.thinkingLevelMap?.off !== null) {
 			(params as any).thinking = { type: "disabled" };
@@ -1090,6 +1110,33 @@ function addCacheControlToTextContent(
 	return false;
 }
 
+/** Convert persisted native Merge turns to Chat replay without changing stored history. */
+function migrateMergeMessages(messages: Message[], model: Model<"openai-completions">): Message[] {
+	if (model.provider !== "merge-gateway") return messages;
+	return messages.map((message) => {
+		if (
+			message.role !== "assistant" ||
+			message.provider !== model.provider ||
+			message.model !== model.id ||
+			message.api !== "merge-gateway-responses"
+		)
+			return message;
+		return {
+			...message,
+			api: model.api,
+			content: message.content.map((block) => {
+				if (block.type !== "thinking" || block.redacted) return block;
+				return {
+					...block,
+					thinkingSignature: block.thinkingSignature
+						? encodeChatThinkingSignature("thinking", "thinking_signature", block.thinkingSignature)
+						: "thinking",
+				};
+			}),
+		};
+	});
+}
+
 export function convertMessages(
 	model: Model<"openai-completions">,
 	context: Context,
@@ -1112,7 +1159,9 @@ export function convertMessages(
 		return id;
 	};
 
-	const transformedMessages = transformMessages(context.messages, model, (id) => normalizeToolCallId(id));
+	const transformedMessages = transformMessages(migrateMergeMessages(context.messages, model), model, (id) =>
+		normalizeToolCallId(id),
+	);
 
 	if (context.systemPrompt) {
 		const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
@@ -1218,8 +1267,8 @@ export function convertMessages(
 					// when the provider requires it; otherwise round-trip the recorded field.
 					const reasoningText = chatThinkingBlocks
 						.map((block) => sanitizeSurrogates(block.thinking))
-						.filter((thinking) => thinking.trim().length > 0)
-						.join("\n");
+						.filter((thinking) => model.provider === "merge-gateway" || thinking.trim().length > 0)
+						.join(model.provider === "merge-gateway" ? "" : "\n");
 					const reasoningField =
 						compat.reasoningField ??
 						signedThinking?.reasoningField ??
@@ -1289,7 +1338,9 @@ export function convertMessages(
 				content !== null &&
 				content !== undefined &&
 				(typeof content === "string" ? content.length > 0 : content.length > 0);
-			if (!hasContent && !assistantMsg.tool_calls && replayReasoningDetails.length === 0) {
+			const hasMergeThinking =
+				model.provider === "merge-gateway" && (nonEmptyThinkingBlocks.length > 0 || signedThinking !== undefined);
+			if (!hasContent && !assistantMsg.tool_calls && replayReasoningDetails.length === 0 && !hasMergeThinking) {
 				continue;
 			}
 			params.push(assistantMsg);

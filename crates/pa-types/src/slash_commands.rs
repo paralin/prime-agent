@@ -49,7 +49,8 @@ pub struct BuiltinSlashCommand {
 
 const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "settings", description: "Open settings menu", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
-    BuiltinSlashCommand { name: "model", description: "Select model (opens selector UI; Tab filters by typed text)", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
+    BuiltinSlashCommand { name: "model", description: "Select model and save it as the default", execution: SlashCommandExecution::Client, argument_hint: Some("[search]"), aliases: &[], takes_argument: true },
+    BuiltinSlashCommand { name: "switch", description: "Switch model for this session without changing the default", execution: SlashCommandExecution::Client, argument_hint: Some("[search]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "effort", description: "Select reasoning/thinking level (opens selector UI)", execution: SlashCommandExecution::Client, argument_hint: Some("[level]"), aliases: &["thinking"], takes_argument: false },
     BuiltinSlashCommand { name: "fast", description: "Toggle OpenAI Fast mode", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "tier", description: "Show or set the service tier", execution: SlashCommandExecution::Client, argument_hint: Some("[default|flex|priority|auto]"), aliases: &[], takes_argument: false },
@@ -65,7 +66,6 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "traces", description: "Preview, upload, or configure Prime Agent traces", execution: SlashCommandExecution::Client, argument_hint: Some("[status|on|off|preview|upload|upload-current|upload-all|login]"), aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "context", description: "Show token, cost, and context usage for agent and sub-agents", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &["usage"], takes_argument: false },
     BuiltinSlashCommand { name: "changelog", description: "Show changelog entries", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
-    BuiltinSlashCommand { name: "update", description: "Update to the latest Rust build (uninstalls the TypeScript version; sessions preserved)", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "nightly", description: "Switch Prime Agent updates to the nightly channel (unreleased builds, may be broken)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off|status]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "hotkeys", description: "Show all keyboard shortcuts", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "fork", description: "Create a new fork from a previous user message", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
@@ -83,6 +83,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "rlm-max-depth", description: "Set/view the per-chat persistent RLM max depth immediately; never interrupts or queues the running turn", execution: SlashCommandExecution::Client, argument_hint: Some("[<int> [--global]]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "heartbeat", description: "Set or view a persistent heartbeat; delivery defaults to steer, use --follow-up to queue; supports pause, resume, stop, and clear", execution: SlashCommandExecution::Client, argument_hint: Some("[status|pause|resume|stop|[every <duration>] [--steer|--follow-up] <instruction>]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "heartbeats", description: "View and manage all user and agent heartbeats", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
+    BuiltinSlashCommand { name: "watches", description: "List active background event watches", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "resume", description: "Open the agents view, or resume a session by id or path", execution: SlashCommandExecution::Client, argument_hint: Some("[id|path]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "reload", description: "Reload keybindings, skills, prompts, and themes", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "speed", description: "Toggle footer readout of model output tok/sec (latest response and session average)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off]"), aliases: &[], takes_argument: true },

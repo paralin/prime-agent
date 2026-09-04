@@ -66,6 +66,7 @@ impl SessionUi {
                 self.refresh_list(view).await?;
                 return Ok(());
             }
+            "watches" => { self.open_watches_panel(view); }
             "switch" => {
                 if args.is_empty() {
                     self.note("usage: /switch <n|id> (run /list first)", view);

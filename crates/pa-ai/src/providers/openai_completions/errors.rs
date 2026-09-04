@@ -5,9 +5,27 @@
 //! the TS provider surfaces verbatim — unlike the anthropic/responses
 //! providers, which classify through `formatStreamFailureMessage`.
 
+use std::fmt::Write as _;
+
 use serde_json::Value;
 
 use crate::utils_inner::stream_failure::{ProviderError, ProviderHttpError};
+
+pub(crate) fn annotate_retry_delay(error: &mut ProviderError, maximum: u64) {
+    let ProviderError::Http(http) = error else {
+        return;
+    };
+    let delay = crate::utils_inner::stream_failure::parse_retry_after_ms(&http.headers);
+    http.retry_after_ms = delay;
+    if let Some(delay) = delay.filter(|delay| maximum > 0 && *delay > maximum) {
+        http.headers
+            .insert("x-prime-requested-retry-delay-ms".into(), delay.to_string());
+        let _ = write!(
+            http.message,
+            " (Provider requested a {delay}ms retry delay, above the {maximum}ms maximum)"
+        );
+    }
+}
 
 /// Build the user-facing message for a non-OK provider response, mirroring the
 /// `openai` SDK's `APIError` text (which `streamOpenAICompletions` copies into
@@ -123,6 +141,23 @@ fn js_to_string(value: &Value) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn retry_delay_cap_keeps_status_and_requested_delay() {
+        let mut error = openai_http_error(
+            429,
+            r#"{"error":{"message":"weekly usage limit reached"}}"#,
+            HashMap::from([("Retry-After".into(), "3600".into())]),
+        );
+        annotate_retry_delay(&mut error, 10);
+        let ProviderError::Http(http) = error else {
+            panic!("expected HTTP error");
+        };
+        assert_eq!(http.status, Some(429));
+        assert_eq!(http.retry_after_ms, Some(3_600_000));
+        assert!(http.message.contains("above the 10ms maximum"));
+        assert_eq!(http.headers["x-prime-requested-retry-delay-ms"], "3600000");
+    }
 
     /// The exact composition the TS `openai` SDK produces for an `OpenAI` error
     /// body and the TS provider surfaces verbatim (the parity harness's

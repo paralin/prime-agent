@@ -1059,7 +1059,7 @@ fn stop_reason(last_assistant: Option<&AssistantMessage>) -> &'static str {
         Some(StopReason::ToolUse) => "toolUse",
         Some(StopReason::Error) => "error",
         Some(StopReason::Aborted) => "aborted",
-        None => "unknown",
+        Some(StopReason::Unknown) | None => "unknown",
     }
 }
 

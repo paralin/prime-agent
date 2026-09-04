@@ -12,6 +12,21 @@ use crate::types::{Context, Model, SimpleStreamOptions, StreamOptions};
 
 /// A provider implementation for one API (the TS `ApiProvider`).
 pub trait Provider: Send + Sync {
+    fn compact<'a>(
+        &'a self,
+        model: &'a Model,
+        _context: &'a Context,
+        _options: &'a crate::types::ProviderNativeCompactionOptions,
+    ) -> crate::types::NativeCompactionFuture<'a> {
+        Box::pin(async move {
+            Err(crate::utils_inner::stream_failure::ProviderError::Message(
+                format!(
+                    "API provider does not support native compaction: {}",
+                    model.api
+                ),
+            ))
+        })
+    }
     /// The `api` identifier this provider serves, e.g. "openai-completions".
     fn api(&self) -> &str;
 

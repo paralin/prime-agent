@@ -184,9 +184,11 @@ pub fn stream_once(
             headers: headers.map(|headers| headers.into_iter().collect()),
             metadata: None,
             timeout_ms: None,
+            max_retry_delay_ms: None,
         },
         reasoning: Some(model_thinking_level(options.reasoning)),
         thinking_budgets: None,
+        open_router_responses: None,
     };
     let stream = pa_ai::stream_simple(model, &ai_context, Some(stream_options))
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;

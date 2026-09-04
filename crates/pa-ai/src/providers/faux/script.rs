@@ -64,6 +64,11 @@ pub fn parse_faux_script(script: &Value) -> Result<FauxScript, String> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         ),
+        thinking_level_map: object
+            .get("thinkingLevelMap")
+            .map(|map| serde_json::from_value(map.clone()))
+            .transpose()
+            .map_err(|error| format!("invalid faux thinkingLevelMap: {error}"))?,
         input: Some(vec![
             crate::types::ModelInput::Text,
             crate::types::ModelInput::Image,
@@ -129,6 +134,7 @@ fn parse_script_step(entry: &Value) -> Result<FauxResponseStep, String> {
     };
     let stop_reason = match entry.get("stopReason").and_then(Value::as_str) {
         Some("stop") => Some(StopReason::Stop),
+        Some("unknown") => Some(StopReason::Unknown),
         Some("length") => Some(StopReason::Length),
         Some("toolUse") => Some(StopReason::ToolUse),
         Some("error") => Some(StopReason::Error),
@@ -216,6 +222,7 @@ pub fn register_faux_provider_from_script(script: &FauxScript) -> FauxProviderRe
         tokens_per_second: script.tokens_per_second,
         token_size_min: None,
         token_size_max: None,
+        compact: None,
     });
     registration.set_responses(script.responses.clone());
     registration.set_repeat_last_response(script.repeat_last_response);

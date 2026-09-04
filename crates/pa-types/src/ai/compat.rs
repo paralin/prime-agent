@@ -8,6 +8,12 @@ use super::{Deserialize, JsonMap, OpenRouterRouting, Serialize, Value, VercelGat
 #[serde(rename_all = "camelCase")]
 pub struct OpenAiCompletionsCompat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_finish_reason: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning_budget_tokens: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_store: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_developer_role: Option<bool>,
@@ -58,6 +64,7 @@ pub enum ThinkingFormat {
     Deepseek,
     Zai,
     Qwen,
+    Merge,
     #[serde(rename = "qwen-chat-template")]
     QwenChatTemplate,
 }
@@ -72,6 +79,22 @@ pub enum CacheControlFormat {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenAiResponsesCompat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_store: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_prompt_cache: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_developer_role: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_tools: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_string_message_content: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_routing_metadata: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_router_routing: Option<Box<OpenRouterRouting>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_session_id_header: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

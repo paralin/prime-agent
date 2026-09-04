@@ -93,6 +93,7 @@ pub struct StreamOptions {
     pub on_response: Option<OnResponseHook>,
     pub headers: Option<std::collections::HashMap<String, String>>,
     pub timeout_ms: Option<u64>,
+    pub max_retry_delay_ms: Option<u64>,
     pub metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
@@ -107,6 +108,7 @@ impl std::fmt::Debug for StreamOptions {
             .field("service_tier", &self.service_tier)
             .field("cache_retention", &self.cache_retention)
             .field("session_id", &self.session_id)
+            .field("max_retry_delay_ms", &self.max_retry_delay_ms)
             .field("on_payload", &self.on_payload.is_some())
             .field("on_response", &self.on_response.is_some())
             .field("headers", &self.headers)
@@ -123,6 +125,7 @@ pub struct SimpleStreamOptions {
     /// Explicit model reasoning selection. Omit to preserve the provider default.
     pub reasoning: Option<ModelThinkingLevel>,
     pub thinking_budgets: Option<ThinkingBudgets>,
+    pub open_router_responses: Option<bool>,
 }
 
 impl SimpleStreamOptions {
@@ -132,9 +135,45 @@ impl SimpleStreamOptions {
             base,
             reasoning: None,
             thinking_budgets: None,
+            open_router_responses: None,
         }
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct ProviderNativeCompactionOptions {
+    pub base: StreamOptions,
+    pub instructions: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderNativeCompactionResult {
+    pub provider: String,
+    pub replacement_history: Vec<serde_json::Value>,
+    pub compaction_item: serde_json::Value,
+}
+
+pub type NativeCompactionFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    ProviderNativeCompactionResult,
+                    crate::utils_inner::stream_failure::ProviderError,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
+
+pub type NativeCompactionFunction = std::sync::Arc<
+    dyn for<'a> Fn(
+            &'a Model,
+            &'a Context,
+            &'a ProviderNativeCompactionOptions,
+        ) -> NativeCompactionFuture<'a>
+        + Send
+        + Sync,
+>;
 
 // ---------------------------------------------------------------------------
 // Extension helpers over the shared wire types
@@ -186,6 +225,7 @@ impl ModelExt for Model {
 pub fn done_reason(reason: StopReason) -> DoneStopReason {
     match reason {
         StopReason::Stop => DoneStopReason::Stop,
+        StopReason::Unknown => DoneStopReason::Unknown,
         StopReason::Length => DoneStopReason::Length,
         StopReason::ToolUse => DoneStopReason::ToolUse,
         reason => panic!("stop reason {reason:?} cannot terminate a done event"),

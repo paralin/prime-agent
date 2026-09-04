@@ -1083,7 +1083,7 @@ mod tests {
 
     #[test]
     fn envelope_round_trips() {
-        let line = r#"{"type":"command","id":"c1","protocol":{"name":"prime-agent.daemon","version":7},"command":{"type":"list","all":true}}"#;
+        let line = r#"{"type":"command","id":"c1","protocol":{"name":"prime-agent.daemon","version":8},"command":{"type":"list","all":true}}"#;
         let envelope = parse_daemon_command_line(line).expect("envelope parses");
         assert_eq!(envelope.id, "c1");
         assert!(matches!(envelope.command, DaemonCommand::List { .. }));
@@ -1094,26 +1094,26 @@ mod tests {
         let cases = [
             (
                 r#"{"type":"list"}"#,
-                "Daemon commands require protocol 7 or newer",
+                "Daemon commands require protocol 8 or newer",
             ),
             (
-                r#"{"type":"command","protocol":{"name":"prime-agent.daemon","version":7},"command":{"type":"list"}}"#,
+                r#"{"type":"command","protocol":{"name":"prime-agent.daemon","version":8},"command":{"type":"list"}}"#,
                 "Invalid daemon command: command envelope is missing id",
             ),
             (
-                r#"{"type":"command","id":"x","protocol":{"name":"prime-agent.daemon","version":7},"clientId":42,"command":{"type":"list"}}"#,
+                r#"{"type":"command","id":"x","protocol":{"name":"prime-agent.daemon","version":8},"clientId":42,"command":{"type":"list"}}"#,
                 "Invalid daemon command: clientId must be a string",
             ),
             (
-                r#"{"type":"command","id":"x","protocol":{"name":"prime-agent.daemon","version":7}}"#,
+                r#"{"type":"command","id":"x","protocol":{"name":"prime-agent.daemon","version":8}}"#,
                 "Invalid daemon command: command envelope is missing command",
             ),
             (
-                r#"{"type":"command","id":"x","protocol":{"name":"prime-agent.daemon","version":7},"command":{"type":"not-real"}}"#,
+                r#"{"type":"command","id":"x","protocol":{"name":"prime-agent.daemon","version":8},"command":{"type":"not-real"}}"#,
                 "Unknown daemon command: not-real",
             ),
             (
-                r#"{"type":"command","id":"x","protocol":{"name":"prime-agent.daemon","version":7},"command":{"type":"prompt"}}"#,
+                r#"{"type":"command","id":"x","protocol":{"name":"prime-agent.daemon","version":8},"command":{"type":"prompt"}}"#,
                 "Invalid daemon command: malformed prompt command",
             ),
         ];
@@ -1124,7 +1124,7 @@ mod tests {
             );
         }
         let command = json!({"type":"prompt", "activeSessionId":"s", "message":"hello", "content":{"blocks":[{"text":"nested"}]}});
-        let line = json!({"type":"command", "id":"x", "clientId":"client", "protocol":{"name":"prime-agent.daemon","version":7}, "command":command}).to_string();
+        let line = json!({"type":"command", "id":"x", "clientId":"client", "protocol":{"name":"prime-agent.daemon","version":8}, "command":command}).to_string();
         let parsed = parse_supervisor_command_line(&line).unwrap();
         assert_eq!(parsed.id, "x");
         assert_eq!(parsed.client_id.as_deref(), Some("client"));
@@ -1133,16 +1133,16 @@ mod tests {
 
     #[test]
     fn unknown_command_is_preserved() {
-        let line = r#"{"type":"command","id":"c2","protocol":{"name":"prime-agent.daemon","version":7},"command":{"type":"bogus_command","activeSessionId":"x"}}"#;
+        let line = r#"{"type":"command","id":"c2","protocol":{"name":"prime-agent.daemon","version":8},"command":{"type":"bogus_command","activeSessionId":"x"}}"#;
         let err = parse_daemon_command_line(line).unwrap_err();
         assert_eq!(err.to_string(), "Unknown daemon command: bogus_command");
     }
 
     #[test]
     fn old_protocol_is_rejected() {
-        let line = r#"{"type":"command","id":"c3","protocol":{"name":"prime-agent.daemon","version":6},"command":{"type":"list"}}"#;
+        let line = r#"{"type":"command","id":"c3","protocol":{"name":"prime-agent.daemon","version":7},"command":{"type":"list"}}"#;
         let err = parse_daemon_command_line(line).unwrap_err();
-        assert!(err.to_string().contains("protocol 7 or newer"));
+        assert!(err.to_string().contains("protocol 8 or newer"));
     }
 
     #[test]

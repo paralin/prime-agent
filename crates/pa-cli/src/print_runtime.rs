@@ -1615,6 +1615,7 @@ async fn build_faux_engine_with(
                 id: "faux-1".to_string(),
                 name: Some("Faux Model".to_string()),
                 reasoning: Some(reasoning),
+                thinking_level_map: None,
                 input: Some(vec![pa_types::ai::ModelInput::Text]),
                 cost: None,
                 context_window: Some(context_window),

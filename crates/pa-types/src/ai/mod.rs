@@ -166,6 +166,10 @@ pub struct ThinkingBudgets {
     pub medium: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xhigh: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +481,7 @@ pub struct Usage {
 #[serde(rename_all = "camelCase")]
 pub enum StopReason {
     Stop,
+    Unknown,
     Length,
     /// Terminal reason of a turn that ended in tool calls. Deserialization
     /// also accepts the raw `OpenAI` wire value `tool_calls` (TS's loader
@@ -493,6 +498,7 @@ pub enum StopReason {
 #[serde(rename_all = "camelCase")]
 pub enum DoneStopReason {
     Stop,
+    Unknown,
     Length,
     ToolUse,
 }

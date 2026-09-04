@@ -68,7 +68,8 @@ fn parse_text_signature(signature: Option<&str>) -> Option<ParsedTextSignature> 
 
 /// Providers whose tool-call IDs may carry the `call_id|item_id` Responses
 /// encoding natively.
-pub const OPENAI_TOOL_CALL_PROVIDERS: [&str; 3] = ["openai", "openai-codex", "opencode"];
+pub const OPENAI_TOOL_CALL_PROVIDERS: [&str; 5] =
+    ["openai", "openai-codex", "opencode", "openrouter", "xai"];
 pub const AZURE_TOOL_CALL_PROVIDERS: [&str; 4] = [
     "openai",
     "openai-codex",
@@ -79,12 +80,14 @@ pub const AZURE_TOOL_CALL_PROVIDERS: [&str; 4] = [
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConvertResponsesMessagesOptions {
     pub include_system_prompt: bool,
+    pub merge_gateway_tool_format: bool,
 }
 
 impl ConvertResponsesMessagesOptions {
     pub fn include_system_prompt() -> Self {
         Self {
             include_system_prompt: true,
+            ..Self::default()
         }
     }
 }
@@ -152,7 +155,11 @@ pub fn convert_responses_messages(
 
     let transformed =
         transform_messages_with_normalizer(&context.messages, model, &|id, _model, source| {
-            Some(normalize_tool_call_id(id, source))
+            Some(if options.merge_gateway_tool_format {
+                id.to_string()
+            } else {
+                normalize_tool_call_id(id, source)
+            })
         });
 
     let include_system_prompt = options.include_system_prompt;
@@ -171,6 +178,19 @@ pub fn convert_responses_messages(
     }
 
     for (msg_index, msg) in transformed.iter().enumerate() {
+        if let Message::User(user) = msg {
+            if let Some(payload) = user.rest.get("providerPayload") {
+                if payload.get("type").and_then(Value::as_str) == Some("openaiResponsesHistory")
+                    && payload.get("provider").and_then(Value::as_str)
+                        == Some(model.provider.as_str())
+                {
+                    if let Some(items) = payload.get("items").and_then(Value::as_array) {
+                        messages.extend(items.iter().filter(|item| item.is_object()).cloned());
+                        continue;
+                    }
+                }
+            }
+        }
         match msg {
             Message::User(user) => match &user.content {
                 UserMessageContent::Text(text) => messages.push(json!({
@@ -206,6 +226,19 @@ pub fn convert_responses_messages(
                 }
             },
             Message::Assistant(assistant) => {
+                if options.merge_gateway_tool_format {
+                    let blocks: Vec<Value> = assistant.content.iter().filter_map(|block| match block {
+                        AssistantContent::Text(text) if !text.text.is_empty() => Some(json!({"type":"text", "text":sanitize_surrogates(&text.text)})),
+                        AssistantContent::Thinking(thinking) if !thinking.thinking.is_empty() => Some(json!({"type":"thinking", "thinking":sanitize_surrogates(&thinking.thinking)})),
+                        AssistantContent::ToolCall(call) => Some(json!({"type":"tool_use", "id":call.id, "name":call.name, "input":call.arguments})),
+                        _ => None,
+                    }).collect();
+                    if !blocks.is_empty() {
+                        messages
+                            .push(json!({"type":"message", "role":"assistant", "content":blocks}));
+                    }
+                    continue;
+                }
                 let mut output: Vec<Value> = Vec::new();
                 let is_different_model = assistant.model != model.id
                     && assistant.provider == model.provider
@@ -315,6 +348,10 @@ pub fn convert_responses_messages(
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
+                if options.merge_gateway_tool_format {
+                    messages.push(json!({"type":"tool_result", "tool_use_id":tool_result.tool_call_id, "content":sanitize_surrogates(&text_result)}));
+                    continue;
+                }
                 let has_images = tool_result
                     .content
                     .iter()
@@ -489,6 +526,7 @@ mod tests {
             &OPENAI_TOOL_CALL_PROVIDERS,
             ConvertResponsesMessagesOptions {
                 include_system_prompt: false,
+                ..Default::default()
             },
         )
     }

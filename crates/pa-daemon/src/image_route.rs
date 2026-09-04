@@ -437,6 +437,7 @@ mod tests {
                         id: "mock-1".to_string(),
                         name: Some("Mock 1".to_string()),
                         reasoning: Some(false),
+                        thinking_level_map: None,
                         input: Some(vec![pa_types::ai::ModelInput::Text]),
                         cost: None,
                         context_window: Some(128_000),
@@ -446,6 +447,7 @@ mod tests {
                         id: "mock-vision".to_string(),
                         name: Some("Mock Vision".to_string()),
                         reasoning: Some(false),
+                        thinking_level_map: None,
                         input: Some(vec![
                             pa_types::ai::ModelInput::Text,
                             pa_types::ai::ModelInput::Image,
@@ -526,6 +528,7 @@ mod tests {
                     id: "mock-1".to_string(),
                     name: Some("Mock 1".to_string()),
                     reasoning: Some(false),
+                    thinking_level_map: None,
                     input: Some(vec![pa_types::ai::ModelInput::Text]),
                     cost: None,
                     context_window: Some(128_000),

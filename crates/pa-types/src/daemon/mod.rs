@@ -15,13 +15,11 @@ use crate::session::AgentMessage;
 use crate::JsonMap;
 
 pub const DAEMON_PROTOCOL_NAME: &str = "prime-agent.daemon";
-pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
-/// Revision 30 publishes `deletedDescendantUsage` on saved-session rows
-/// (TS #2506's field, landing ahead of TS main: the Rust deletion lifecycle
-/// captures the tombstoned child's usage durably before any unlink, so the
-/// field is populated where TS's open PR reads a removed path).
-pub const DAEMON_SCHEMA_REVISION: u64 = 30;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-30-8e4b17c2a9f5";
+pub const DAEMON_PROTOCOL_VERSION: u64 = 8;
+/// Revision 31 adds the `unknown` assistant stop reason. The closed stop-reason
+/// enums used by older clients require protocol 8 for message-bearing frames.
+pub const DAEMON_SCHEMA_REVISION: u64 = 31;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-8-schema-31-unknown-stop-reason";
 
 pub type DaemonClientId = String;
 pub type DaemonCommandId = String;
@@ -109,6 +107,7 @@ pub struct DaemonEventMeta {
 
 pub mod agent_roster;
 mod command;
+pub mod compatibility;
 pub mod framing;
 mod outbound;
 mod plane;
@@ -184,9 +183,9 @@ mod tests {
     #[test]
     fn protocol_constants_match_ts() {
         assert_eq!(DAEMON_PROTOCOL_NAME, "prime-agent.daemon");
-        assert_eq!(DAEMON_PROTOCOL_VERSION, 7);
-        assert_eq!(DAEMON_SCHEMA_REVISION, 30);
-        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-30-8e4b17c2a9f5");
+        assert_eq!(DAEMON_PROTOCOL_VERSION, 8);
+        assert_eq!(DAEMON_SCHEMA_REVISION, 31);
+        assert_eq!(DAEMON_SCHEMA_ID, "protocol-8-schema-31-unknown-stop-reason");
         assert_eq!(DAEMON_UPDATE_RESTART_FORMAT_VERSION, 1);
     }
 }

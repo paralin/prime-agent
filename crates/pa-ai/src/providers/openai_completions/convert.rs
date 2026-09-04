@@ -4,7 +4,9 @@
 use serde_json::{json, Map, Value};
 
 use crate::models::{calculate_cost, CostOverrides};
-use crate::providers::openai_completions::{decode_reasoning_details, ResolvedCompat};
+use crate::providers::openai_completions::{
+    decode_chat_thinking_signature, decode_reasoning_details, ResolvedCompat,
+};
 use crate::providers::transform_messages::transform_messages_with_normalizer;
 use crate::types::{
     AssistantContent, Context, MessageExt, Model, ModelInput, StopReason, TextContent,
@@ -178,8 +180,15 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                             .map(|block| sanitize_surrogates(&block.thinking))
                             .collect::<Vec<_>>()
                             .join("\n");
+                        let envelope = decode_chat_thinking_signature(
+                            non_empty_thinking_blocks[0].thinking_signature.as_deref(),
+                        );
                         let reasoning_field =
-                            if compat.requires_reasoning_content_on_assistant_messages {
+                            if let Some(field) = compat.reasoning_content_field.as_deref() {
+                                Some(field)
+                            } else if let Some(envelope) = &envelope {
+                                envelope.get("reasoningField").and_then(Value::as_str)
+                            } else if compat.requires_reasoning_content_on_assistant_messages {
                                 Some("reasoning_content")
                             } else {
                                 non_empty_thinking_blocks[0].thinking_signature.as_deref()
@@ -202,6 +211,20 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                     }
                 } else if !assistant_text.is_empty() {
                     assistant_msg.insert("content".into(), json!(assistant_text));
+                }
+                for block in &assistant.content {
+                    if let AssistantContent::Thinking(thinking) = block {
+                        if let Some(envelope) =
+                            decode_chat_thinking_signature(thinking.thinking_signature.as_deref())
+                        {
+                            if let (Some(field), Some(signature)) = (
+                                envelope.get("signatureField").and_then(Value::as_str),
+                                envelope.get("signature"),
+                            ) {
+                                assistant_msg.insert(field.to_string(), signature.clone());
+                            }
+                        }
+                    }
                 }
 
                 let tool_calls: Vec<&ToolCall> = assistant
@@ -263,6 +286,9 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                 if !has_content
                     && !assistant_msg.contains_key("tool_calls")
                     && replay_reasoning_details.is_empty()
+                    && !assistant.content.iter().any(|block| {
+                        matches!(block, AssistantContent::Thinking(thinking) if decode_chat_thinking_signature(thinking.thinking_signature.as_deref()).is_some())
+                    })
                 {
                     index += 1;
                     continue;
@@ -414,6 +440,7 @@ pub(crate) fn parse_chunk_usage(
         .and_then(|details| details.get("cached_tokens"))
         .map(get_u64)
         .or_else(|| raw_usage.get("prompt_cache_hit_tokens").map(get_u64))
+        .or_else(|| raw_usage.get("cached_tokens").map(get_u64))
         .unwrap_or(0);
     let cache_write_tokens = raw_usage
         .get("prompt_tokens_details")

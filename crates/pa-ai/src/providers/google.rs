@@ -280,6 +280,7 @@ async fn run_stream(
         }
     }
     headers.push(("x-goog-api-key".into(), api_key));
+    crate::providers::conversation_headers::apply(&mut headers, model, &options.base);
 
     let mut response: HttpResponse = send(RequestOptions {
         method: reqwest::Method::POST,

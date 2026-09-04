@@ -51,6 +51,7 @@ pub fn build_base_options(
         on_response: base.on_response,
         headers: base.headers,
         timeout_ms: base.timeout_ms,
+        max_retry_delay_ms: base.max_retry_delay_ms,
         metadata: base.metadata,
     }
 }
@@ -78,6 +79,8 @@ pub fn adjust_max_tokens_for_thinking(
         low: Some(2048),
         medium: Some(8192),
         high: Some(16384),
+        xhigh: Some(16384),
+        max: Some(16384),
     };
     let budgets = match custom_budgets {
         Some(custom) => ThinkingBudgets {
@@ -85,6 +88,12 @@ pub fn adjust_max_tokens_for_thinking(
             low: custom.low.or(default_budgets.low),
             medium: custom.medium.or(default_budgets.medium),
             high: custom.high.or(default_budgets.high),
+            xhigh: custom.xhigh.or(custom.high).or(default_budgets.xhigh),
+            max: custom
+                .max
+                .or(custom.xhigh)
+                .or(custom.high)
+                .or(default_budgets.max),
         },
         None => default_budgets,
     };

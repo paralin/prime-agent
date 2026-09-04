@@ -78,6 +78,7 @@ impl HeadlessPrimary {
 
 fn stop_reason_name(reason: pa_types::ai::StopReason) -> &'static str {
     match reason {
+        pa_types::ai::StopReason::Unknown => "unknown",
         pa_types::ai::StopReason::Stop => "stop",
         pa_types::ai::StopReason::Length => "length",
         pa_types::ai::StopReason::ToolUse => "tool_use",

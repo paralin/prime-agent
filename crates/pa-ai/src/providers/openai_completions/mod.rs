@@ -18,8 +18,8 @@ use crate::models::clamp_thinking_level;
 use crate::providers::simple_options::build_base_options;
 use crate::registry::Provider;
 use crate::types::{
-    AssistantContent, AssistantMessage, CacheRetention, Context, Model, ModelExt,
-    ModelThinkingLevel, SimpleStreamOptions, StopReason, StreamOptions, Usage, UsageCost,
+    AssistantContent, AssistantMessage, CacheRetention, Context, Model, ModelThinkingLevel,
+    SimpleStreamOptions, StopReason, StreamOptions, Usage, UsageCost,
 };
 
 mod convert;
@@ -32,6 +32,7 @@ pub use stream::stream_openai_completions;
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
 
 const REASONING_DETAILS_SIGNATURE_TYPE: &str = "openai-completions.reasoning_details.v1";
+const CHAT_THINKING_SIGNATURE_TYPE: &str = "openai-completions.chat_thinking_signature.v1";
 pub(crate) const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
 
 /// Tool selection passed to the API.
@@ -66,6 +67,7 @@ pub struct OpenAICompletionsOptions {
     pub reasoning_effort: Option<ModelThinkingLevel>,
     /// Explicit reasoning toggle. `None` preserves the provider/model default.
     pub reasoning_enabled: Option<bool>,
+    pub reasoning_budget_tokens: Option<u64>,
 }
 
 impl OpenAICompletionsOptions {
@@ -75,6 +77,7 @@ impl OpenAICompletionsOptions {
             tool_choice: None,
             reasoning_effort: None,
             reasoning_enabled: None,
+            reasoning_budget_tokens: None,
         }
     }
 }
@@ -118,6 +121,10 @@ pub struct ResolvedCompat {
     pub zai_tool_stream: bool,
     pub open_router_routing: Option<crate::types::OpenRouterRouting>,
     pub vercel_gateway_routing: Option<pa_types::ai::VercelGatewayRouting>,
+    pub reasoning_content_field: Option<String>,
+    pub require_finish_reason: bool,
+    pub supports_reasoning_budget_tokens: bool,
+    pub session_affinity_header_names: Vec<String>,
 }
 
 /// Detect compatibility settings from provider and baseUrl for known providers.
@@ -138,6 +145,8 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         provider == "prime-inference" || base_url.contains("api.pinference.ai");
 
     let is_non_standard = provider == "cerebras"
+        || provider == "runinfra"
+        || base_url.contains("runinfra.com")
         || base_url.contains("cerebras.ai")
         || provider == "xai"
         || base_url.contains("api.x.ai")
@@ -191,6 +200,10 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         },
         open_router_routing: None,
         vercel_gateway_routing: None,
+        reasoning_content_field: None,
+        require_finish_reason: false,
+        supports_reasoning_budget_tokens: false,
+        session_affinity_header_names: Vec::new(),
         zai_tool_stream: false,
         supports_strict_mode: !is_moonshot && !is_cloudflare_ai_gateway && !is_prime_inference,
         cache_control_format,
@@ -202,8 +215,36 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
 /// Resolve compat for a model: explicit `model.compat` fields override the
 /// detected defaults.
 pub fn get_compat(model: &Model) -> ResolvedCompat {
-    let detected = detect_compat(model);
-    let Some(compat) = model.compat_kind() else {
+    let mut detected = detect_compat(model);
+    let Some(raw) = model.compat.as_ref() else {
+        return detected;
+    };
+    detected.reasoning_content_field = raw
+        .raw
+        .get("reasoningField")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    detected.require_finish_reason = raw
+        .raw
+        .get("requireFinishReason")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    detected.supports_reasoning_budget_tokens = raw
+        .raw
+        .get("supportsReasoningBudgetTokens")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut raw = raw.clone();
+    if let Some(Value::Array(names)) = raw.raw.get("sendSessionAffinityHeaders") {
+        detected.session_affinity_header_names = names
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        raw.raw
+            .insert("sendSessionAffinityHeaders".into(), json!(false));
+    }
+    let Ok(compat) = raw.kind() else {
         return detected;
     };
     let crate::types::CompatKind::OpenAiCompletions(compat) = compat else {
@@ -211,6 +252,10 @@ pub fn get_compat(model: &Model) -> ResolvedCompat {
     };
     let compat = compat.as_ref();
     ResolvedCompat {
+        reasoning_content_field: detected.reasoning_content_field,
+        require_finish_reason: detected.require_finish_reason,
+        supports_reasoning_budget_tokens: detected.supports_reasoning_budget_tokens,
+        session_affinity_header_names: detected.session_affinity_header_names,
         supports_store: compat.supports_store.unwrap_or(detected.supports_store),
         supports_developer_role: compat
             .supports_developer_role
@@ -335,12 +380,36 @@ pub(crate) fn decode_reasoning_details(signature: Option<&str>) -> Option<Vec<Va
     Some(details.clone())
 }
 
+pub(crate) fn decode_chat_thinking_signature(signature: Option<&str>) -> Option<Value> {
+    let parsed: Value = serde_json::from_str(signature?).ok()?;
+    if parsed.get("type")?.as_str()? != CHAT_THINKING_SIGNATURE_TYPE
+        || parsed.get("signature")?.as_str()?.is_empty()
+        || parsed.get("signatureField")?.as_str()?.is_empty()
+        || parsed.get("reasoningField")?.as_str()?.is_empty()
+    {
+        return None;
+    }
+    Some(parsed)
+}
+
+pub(crate) fn encode_chat_thinking_signature(field: &str, signature: &str) -> String {
+    json!({"type": CHAT_THINKING_SIGNATURE_TYPE, "reasoningField": field,
+        "signatureField": "thinking_signature", "signature": signature})
+    .to_string()
+}
+
 /// Port of `streamSimpleOpenAICompletions`.
 pub fn stream_simple_openai_completions(
     model: &Model,
     context: &Context,
     options: Option<&SimpleStreamOptions>,
 ) -> AssistantMessageEventStream {
+    if model.provider == "openrouter" {
+        if let Some(options) = options.filter(|options| options.open_router_responses == Some(true))
+        {
+            return super::openrouter_responses::stream(model, context, options);
+        }
+    }
     let api_key = options
         .and_then(|options| options.base.api_key.clone())
         .or_else(|| get_env_api_key(&model.provider));
@@ -381,6 +450,17 @@ pub fn stream_simple_openai_completions(
         base,
         tool_choice: None,
         reasoning_effort,
+        reasoning_budget_tokens: options
+            .and_then(|options| options.thinking_budgets.as_ref())
+            .and_then(|budgets| match clamped_reasoning {
+                Some(ModelThinkingLevel::Minimal) => budgets.minimal,
+                Some(ModelThinkingLevel::Low) => budgets.low,
+                Some(ModelThinkingLevel::Medium) => budgets.medium,
+                Some(ModelThinkingLevel::High) => budgets.high,
+                Some(ModelThinkingLevel::Xhigh) => budgets.xhigh.or(budgets.high),
+                Some(ModelThinkingLevel::Max) => budgets.max.or(budgets.xhigh).or(budgets.high),
+                _ => None,
+            }),
         reasoning_enabled: if reasoning_specified {
             Some(clamped_reasoning != Some(ModelThinkingLevel::Off))
         } else {

@@ -12,6 +12,37 @@ use crate::providers::openai_codex_responses::websocket::OPENAI_BETA_RESPONSES_W
 
 pub const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
+const LOCAL_CODEX_BEARER_HEADER: &str = "x-prime-local-codex-bearer";
+
+pub(crate) fn uses_local_codex_bearer(
+    model: &crate::types::Model,
+    options: &crate::types::StreamOptions,
+) -> bool {
+    let header = options
+        .headers
+        .as_ref()
+        .and_then(|headers| {
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(LOCAL_CODEX_BEARER_HEADER))
+                .map(|(_, value)| value)
+        })
+        .or_else(|| {
+            model.headers.as_ref().and_then(|headers| {
+                headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(LOCAL_CODEX_BEARER_HEADER))
+                    .map(|(_, value)| value)
+            })
+        });
+    if header.map(String::as_str) != Some("1") {
+        return false;
+    }
+    reqwest::Url::parse(&resolve_codex_url(&model.base_url)).is_ok_and(|url| {
+        url.scheme() == "http"
+            && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+    })
+}
 
 /// Port of `resolveCodexUrl`.
 pub fn resolve_codex_url(base_url: &str) -> String {
@@ -86,6 +117,10 @@ pub fn build_sse_headers(
     }
     set_header(&mut headers, "Authorization", &format!("Bearer {token}"));
     set_header(&mut headers, "chatgpt-account-id", account_id);
+    headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case(LOCAL_CODEX_BEARER_HEADER)
+            && (!account_id.is_empty() || !name.eq_ignore_ascii_case("chatgpt-account-id"))
+    });
     set_header(&mut headers, "originator", "pi");
     set_header(&mut headers, "User-Agent", &platform_user_agent());
     set_header(&mut headers, "OpenAI-Beta", "responses=experimental");
@@ -126,6 +161,7 @@ pub fn build_websocket_headers(
     );
     set_header(&mut headers, "x-client-request-id", request_id);
     set_header(&mut headers, "session_id", request_id);
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case(LOCAL_CODEX_BEARER_HEADER));
     headers
 }
 

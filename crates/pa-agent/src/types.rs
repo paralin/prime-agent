@@ -51,6 +51,8 @@ pub enum ToolExecutionMode {
 pub enum StopReason {
     #[serde(rename = "stop")]
     Stop,
+    #[serde(rename = "unknown")]
+    Unknown,
     #[serde(rename = "length")]
     Length,
     #[serde(rename = "toolUse")]

@@ -206,7 +206,7 @@ async fn run_stream(
         .and_then(|options| options.interleaved_thinking)
         .unwrap_or(true);
     let use_fine_grained = should_use_fine_grained_tool_streaming_beta(model, context);
-    let (headers, is_oauth) = build_request_headers(
+    let (mut headers, is_oauth) = build_request_headers(
         model,
         &api_key,
         interleaved_thinking,
@@ -214,6 +214,7 @@ async fn run_stream(
         base_options.headers.as_ref(),
         base_options.session_id.as_deref(),
     );
+    crate::providers::conversation_headers::apply(&mut headers, model, &base_options);
 
     let (_retention, cache_control) = get_cache_control(model, base_options.cache_retention);
     let uses_anthropic_cache_pricing = has_standard_anthropic_cache_pricing(model);

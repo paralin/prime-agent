@@ -3,6 +3,7 @@
 pub mod anthropic;
 pub mod azure_openai_responses;
 pub mod bedrock;
+mod conversation_headers;
 pub mod faux;
 pub mod google;
 pub mod google_shared;
@@ -15,5 +16,8 @@ pub mod openai_responses;
 pub mod openai_responses_hooks;
 pub mod openai_responses_shared;
 pub mod openai_responses_stream;
+mod openrouter_responses;
 pub mod simple_options;
+#[cfg(test)]
+mod test_http;
 pub mod transform_messages;

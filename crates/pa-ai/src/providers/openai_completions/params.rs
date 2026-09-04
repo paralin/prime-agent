@@ -91,8 +91,39 @@ pub(crate) fn build_params(
         params.insert("tool_choice".into(), tool_choice.to_json());
     }
 
+    if compat.supports_reasoning_budget_tokens {
+        if let Some(budget) = options.reasoning_budget_tokens {
+            params.insert("reasoning_budget_tokens".into(), json!(budget));
+        }
+    }
     if supports_thinking(model) {
         match compat.thinking_format {
+            crate::types::ThinkingFormat::Merge => {
+                if let Some(budget) = options.reasoning_budget_tokens {
+                    params.insert(
+                        "thinking".into(),
+                        json!({"type":"enabled", "budget_tokens":budget}),
+                    );
+                } else if options.reasoning_enabled == Some(false)
+                    && !model
+                        .thinking_level_map
+                        .as_ref()
+                        .and_then(|map| map.get(&ModelThinkingLevel::Off))
+                        .is_some_and(Option::is_none)
+                {
+                    params.insert("thinking".into(), json!({"type":"disabled"}));
+                }
+                if let Some(effort) = options
+                    .reasoning_effort
+                    .filter(|_| compat.supports_reasoning_effort)
+                {
+                    let mapped = model
+                        .thinking_level_map_value(effort)
+                        .flatten()
+                        .map_or(effort.wire_name(), String::as_str);
+                    params.insert("reasoning_effort".into(), json!(mapped));
+                }
+            }
             crate::types::ThinkingFormat::Zai | crate::types::ThinkingFormat::Qwen => {
                 params.insert(
                     "enable_thinking".into(),
@@ -208,33 +239,32 @@ pub(crate) fn build_params(
         }
     }
 
-    if model.base_url.contains("openrouter.ai") {
-        if let Some(crate::types::CompatKind::OpenAiCompletions(compat)) = model.compat_kind() {
-            if let Some(routing) = &compat.as_ref().open_router_routing {
-                params.insert(
-                    "provider".into(),
-                    serde_json::to_value(routing).unwrap_or(Value::Null),
-                );
-            }
+    if model.provider == "openrouter" || model.base_url.contains("openrouter.ai") {
+        if let Some(session_id) = &options.base.session_id {
+            params.insert("session_id".into(), json!(session_id));
+        }
+        if let Some(routing) = &compat.open_router_routing {
+            params.insert(
+                "provider".into(),
+                serde_json::to_value(routing).unwrap_or(Value::Null),
+            );
         }
     }
 
     if model.base_url.contains("ai-gateway.vercel.sh") {
-        if let Some(crate::types::CompatKind::OpenAiCompletions(compat)) = model.compat_kind() {
-            if let Some(routing) = &compat.as_ref().vercel_gateway_routing {
-                let mut gateway_options = Map::new();
-                if let Some(only) = &routing.only {
-                    gateway_options.insert("only".into(), json!(only));
-                }
-                if let Some(order) = &routing.order {
-                    gateway_options.insert("order".into(), json!(order));
-                }
-                if !gateway_options.is_empty() {
-                    params.insert(
-                        "providerOptions".into(),
-                        json!({ "gateway": Value::Object(gateway_options) }),
-                    );
-                }
+        if let Some(routing) = &compat.vercel_gateway_routing {
+            let mut gateway_options = Map::new();
+            if let Some(only) = &routing.only {
+                gateway_options.insert("only".into(), json!(only));
+            }
+            if let Some(order) = &routing.order {
+                gateway_options.insert("order".into(), json!(order));
+            }
+            if !gateway_options.is_empty() {
+                params.insert(
+                    "providerOptions".into(),
+                    json!({ "gateway": Value::Object(gateway_options) }),
+                );
             }
         }
     }
@@ -339,6 +369,9 @@ pub(crate) fn build_headers(
     }
 
     if let Some(session_id) = cache_session_id {
+        for name in &compat.session_affinity_header_names {
+            headers.push((name.clone(), session_id.to_string()));
+        }
         if compat.send_session_affinity_headers {
             headers.push(("session_id".into(), session_id.to_string()));
             headers.push(("x-client-request-id".into(), session_id.to_string()));
@@ -354,7 +387,16 @@ pub(crate) fn build_headers(
     }
 
     headers.insert(0, ("Authorization".into(), format!("Bearer {api_key}")));
-    let _ = conversation_id;
+    if matches!(model.provider.as_str(), "opencode" | "opencode-go") {
+        if let Some(id) = conversation_id.map(str::trim).filter(|id| !id.is_empty()) {
+            if !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-opencode-session"))
+            {
+                headers.push(("x-opencode-session".into(), id.to_string()));
+            }
+        }
+    }
     headers
 }
 
@@ -364,6 +406,69 @@ mod tests {
     use crate::models::clamp_thinking_level;
     use crate::models_generated;
     use crate::types::{Message, StreamOptions, UserMessage, UserMessageContent};
+
+    #[test]
+    fn custom_affinity_names_keep_routing_and_caller_overrides() {
+        let mut model = models_generated::get_model("openrouter", "~anthropic/claude-fable-latest")
+            .unwrap()
+            .clone();
+        model.compat = Some(
+            serde_json::from_value(json!({
+                "sendSessionAffinityHeaders":["x-conversation"],
+                "supportsStore":false,
+                "openRouterRouting":{"order":["preferred"]}
+            }))
+            .unwrap(),
+        );
+        let compat = crate::providers::openai_completions::get_compat(&model);
+        assert!(!compat.supports_store);
+        let caller = HashMap::from([("X-Conversation".into(), "caller".into())]);
+        let headers = build_headers(
+            &model,
+            "key",
+            Some(&caller),
+            Some("generated"),
+            &compat,
+            None,
+        );
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("x-conversation"))
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["caller"]
+        );
+        let params = build_params(
+            &model,
+            &Context::default(),
+            None,
+            &compat,
+            CacheRetention::None,
+            None,
+        );
+        assert_eq!(params["provider"]["order"], json!(["preferred"]));
+    }
+
+    #[test]
+    fn reasoning_token_budget_is_independent_of_the_thinking_flag() {
+        let mut model = models_generated::get_model("openai", "gpt-4")
+            .unwrap()
+            .clone();
+        model.compat =
+            Some(serde_json::from_value(json!({"supportsReasoningBudgetTokens":true})).unwrap());
+        let mut options = OpenAICompletionsOptions::default();
+        options.reasoning_budget_tokens = Some(8192);
+        let params = build_params(
+            &model,
+            &Context::default(),
+            Some(&options),
+            &crate::providers::openai_completions::get_compat(&model),
+            CacheRetention::None,
+            None,
+        );
+        assert_eq!(params["reasoning_budget_tokens"], 8192);
+    }
 
     /// Port of the TS #2497 pin: the provider layer owns no Prime
     /// Inference team lookup — a prime-inference request with

@@ -413,6 +413,7 @@ pub fn instrument_convert_to_llm(
 /// The TS wire `stopReason` strings.
 fn stop_reason_string(reason: StopReason) -> String {
     match reason {
+        StopReason::Unknown => "unknown",
         StopReason::Stop => "stop",
         StopReason::Length => "length",
         StopReason::ToolUse => "toolUse",

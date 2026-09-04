@@ -15,6 +15,21 @@ fn resolve_provider(api: &str) -> Result<Arc<dyn crate::registry::Provider>, Pro
         .ok_or_else(|| ProviderError::Message(format!("No API provider registered for api: {api}")))
 }
 
+/// Request opaque replacement history from a provider that supports native compaction.
+///
+/// # Errors
+///
+/// Returns an error when the API has no native compaction operation or its request fails.
+pub async fn compact(
+    model: &Model,
+    context: &Context,
+    options: &crate::types::ProviderNativeCompactionOptions,
+) -> Result<crate::types::ProviderNativeCompactionResult, ProviderError> {
+    resolve_provider(&model.api)?
+        .compact(model, context, options)
+        .await
+}
+
 // ---------------------------------------------------------------------------
 // Combined-ceiling output clamp
 // ---------------------------------------------------------------------------

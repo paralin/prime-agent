@@ -55,6 +55,7 @@ fn faux_registration() -> pa_ai::faux::FauxProviderRegistration {
                 id: "compact-m".to_string(),
                 name: Some("Compact Model".to_string()),
                 reasoning: Some(false),
+                thinking_level_map: None,
                 input: Some(vec![pa_types::ai::ModelInput::Text]),
                 cost: None,
                 context_window: Some(1_000),

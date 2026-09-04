@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use pa_types::daemon::{
-    DaemonCommand, DaemonProtocolInfo, DaemonResponse, DAEMON_PROTOCOL_VERSION,
+    DaemonCommand, DaemonProtocolInfo, DaemonResponse, DAEMON_PROTOCOL_NAME,
+    DAEMON_PROTOCOL_VERSION,
 };
 use pa_types::platform::transport::{connect_blocking, BlockingTransportStream};
 use serde_json::json;
@@ -65,6 +66,7 @@ impl DaemonClient {
 
     fn connect_raw(socket_path: &Path) -> std::io::Result<Self> {
         let stream = connect_blocking(socket_path)?;
+        stream.set_read_timeout(READ_POLL)?;
         let writer = stream.try_clone_box()?;
         Ok(DaemonClient {
             socket_path: socket_path.to_path_buf(),
@@ -97,7 +99,7 @@ impl DaemonClient {
         let operation = Operation::Command(&command_type);
         let hello = self.wait_for_hello(HELLO_TIMEOUT_MS)?;
         let protocol = daemon_protocol(&hello)?;
-        if protocol.version < DAEMON_PROTOCOL_VERSION {
+        if protocol.name != DAEMON_PROTOCOL_NAME || protocol.version != DAEMON_PROTOCOL_VERSION {
             return Err(anyhow!(
                 "The running Prime Agent daemon does not support {command_type}."
             ));
@@ -179,10 +181,6 @@ impl DaemonClient {
         operation: Operation<'_>,
     ) -> Result<String> {
         loop {
-            self.reader
-                .get_mut()
-                .set_read_timeout(READ_POLL)
-                .map_err(|error| anyhow!("daemon socket error: {error}"))?;
             let mut line = String::new();
             let read = self.reader.read_line(&mut line);
             match read {
@@ -305,7 +303,7 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let mut writer = stream.try_clone().unwrap();
             let mut reader = BufReader::new(stream);
-            writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7},\"serverCapabilities\":[]}\n").unwrap();
+            writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":8},\"serverCapabilities\":[]}\n").unwrap();
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
@@ -336,6 +334,33 @@ mod tests {
     }
 
     #[test]
+    fn new_client_rejects_old_and_future_daemons_before_sending() {
+        for version in [DAEMON_PROTOCOL_VERSION - 1, DAEMON_PROTOCOL_VERSION + 1] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let socket = dir.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let hello = json!({"type":"daemon_hello", "protocol": {
+                    "name":DAEMON_PROTOCOL_NAME, "version":version
+                }});
+                writeln!(stream, "{hello}").unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                assert_eq!(reader.read_line(&mut request).unwrap(), 0);
+            });
+            let mut client = DaemonClient::connect(&socket).unwrap();
+            let error = client.request(list_command("test")).unwrap_err();
+            assert!(error.to_string().contains("does not support list"));
+            drop(client);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
     fn socket_close_reports_daemon_closing_reason() {
         let dir = tempfile::TempDir::new().unwrap();
         let socket = dir.path().join("daemon.sock");
@@ -345,7 +370,7 @@ mod tests {
             let mut writer = stream.try_clone().unwrap();
             let mut reader = BufReader::new(stream);
             writer
-                .write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n")
+                .write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":8}}\n")
                 .unwrap();
             writer
                 .write_all(b"{\"type\":\"daemon_closing\",\"reason\":\"shutdown\"}\n")

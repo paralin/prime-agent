@@ -95,6 +95,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
             .get("type")
             .and_then(|value| value.as_str())
             .unwrap_or("");
+        validate_event_payload(event_type, event)?;
         let output_index = event
             .get("output_index")
             .and_then(serde_json::Value::as_u64);
@@ -505,9 +506,6 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 }
             }
             "response.output_item.done" => {
-                if let Some(index) = output_index {
-                    self.slots.remove(&index);
-                }
                 let item = event.get("item").cloned().unwrap_or(Value::Null);
                 let item_type = item
                     .get("type")
@@ -724,6 +722,9 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         }
                     }
                     _ => {}
+                }
+                if let Some(index) = output_index.or(self.current_output_index) {
+                    self.slots.remove(&index);
                 }
             }
             "response.completed" | "response.incomplete" => {
@@ -947,8 +948,164 @@ impl<'a> ResponsesStreamProcessor<'a> {
 
 fn map_responses_stop_reason(status: Option<&str>) -> StopReason {
     match status {
-        None | Some("completed" | "in_progress" | "queued") => StopReason::Stop,
+        None => StopReason::Unknown,
+        Some("completed" | "in_progress" | "queued") => StopReason::Stop,
         Some("incomplete") => StopReason::Length,
         Some(_) => StopReason::Error,
+    }
+}
+
+fn malformed(event_type: &str, detail: &str) -> ProviderError {
+    ProviderError::StreamFailure(StreamFailureError {
+        message: format!("Provider returned a malformed response ({event_type}): {detail}"),
+        info: StreamFailureInfo {
+            kind: StreamFailureKind::MalformedResponse,
+            provider_error_type: Some(event_type.into()),
+            ..StreamFailureInfo::unknown()
+        },
+    })
+}
+
+fn validate_event_payload(event_type: &str, event: &Value) -> Result<(), ProviderError> {
+    let object = |key: &str, detail: &str| -> Result<(), ProviderError> {
+        if event.get(key).is_some_and(Value::is_object) {
+            Ok(())
+        } else {
+            Err(malformed(event_type, detail))
+        }
+    };
+    match event_type {
+        "response.created" => object("response", "response.created carried no response"),
+        "response.output_item.added" => object("item", "output_item.added carried no item"),
+        "response.reasoning_summary_part.added" => object(
+            "part",
+            "reasoning_summary_part.added carried no summary part",
+        ),
+        "response.content_part.added" => {
+            object("part", "content_part.added carried no content part")
+        }
+        "response.function_call_arguments.done" => {
+            if event.get("arguments").and_then(Value::as_str).is_some() {
+                Ok(())
+            } else {
+                Err(malformed(
+                    event_type,
+                    "function_call_arguments.done carried no arguments",
+                ))
+            }
+        }
+        "response.output_item.done" => {
+            object("item", "output_item.done carried no item")?;
+            let item = &event["item"];
+            match item.get("type").and_then(Value::as_str) {
+                Some("reasoning") => {
+                    let summary =
+                        item.get("summary")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| {
+                                malformed(
+                                    event_type,
+                                    "output_item.done reasoning carried no summary",
+                                )
+                            })?;
+                    if summary
+                        .iter()
+                        .any(|part| part.get("text").and_then(Value::as_str).is_none())
+                    {
+                        return Err(malformed(
+                            event_type,
+                            "output_item.done reasoning summary contained a malformed part",
+                        ));
+                    }
+                    if let Some(content) = item.get("content") {
+                        if content.as_array().is_none_or(|parts| {
+                            parts
+                                .iter()
+                                .any(|part| part.get("text").and_then(Value::as_str).is_none())
+                        }) {
+                            return Err(malformed(
+                                event_type,
+                                "output_item.done reasoning content contained a malformed part",
+                            ));
+                        }
+                    }
+                }
+                Some("message") => {
+                    let content =
+                        item.get("content")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| {
+                                malformed(event_type, "output_item.done message carried no content")
+                            })?;
+                    if content
+                        .iter()
+                        .any(|part| match part.get("type").and_then(Value::as_str) {
+                            Some("output_text") => {
+                                part.get("text").and_then(Value::as_str).is_none()
+                            }
+                            Some("refusal") => {
+                                part.get("refusal").and_then(Value::as_str).is_none()
+                            }
+                            _ => true,
+                        })
+                    {
+                        return Err(malformed(
+                            event_type,
+                            "output_item.done message content contained a malformed part",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_null_boundaries_with_classified_errors() {
+        for (kind, key) in [
+            ("response.created", "response"),
+            ("response.output_item.added", "item"),
+            ("response.output_item.done", "item"),
+            ("response.reasoning_summary_part.added", "part"),
+            ("response.content_part.added", "part"),
+            ("response.function_call_arguments.done", "arguments"),
+        ] {
+            let mut event = json!({"type": kind});
+            event[key] = Value::Null;
+            let ProviderError::StreamFailure(failure) =
+                validate_event_payload(kind, &event).unwrap_err()
+            else {
+                panic!("expected classified error");
+            };
+            assert_eq!(failure.info.kind, StreamFailureKind::MalformedResponse);
+            assert_eq!(failure.info.provider_error_type.as_deref(), Some(kind));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_nested_members() {
+        for member in [
+            Value::Null,
+            json!("garbage"),
+            json!({"type": "output_text", "text": null}),
+            json!({"type": "unknown", "refusal": "no"}),
+        ] {
+            let event = json!({"item": {"type": "message", "content": [member]}});
+            assert!(validate_event_payload("response.output_item.done", &event).is_err());
+        }
+        for key in ["summary", "content"] {
+            for member in [Value::Null, json!("garbage"), json!({"text": null})] {
+                let mut event = json!({"item": {"type": "reasoning", "summary": []}});
+                event["item"][key] = json!([member]);
+                assert!(validate_event_payload("response.output_item.done", &event).is_err());
+            }
+        }
     }
 }

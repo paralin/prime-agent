@@ -48,7 +48,9 @@ use crate::utils_inner::json_parse::parse_json_with_repair;
 use crate::utils_inner::sse::SseDecoder;
 use crate::utils_inner::stream_failure::{record_stream_failure, ProviderError};
 
+mod compaction;
 mod errors;
+pub use compaction::compact_openai_codex_responses;
 pub(crate) mod request;
 pub(crate) mod session;
 pub(crate) mod websocket;
@@ -199,9 +201,14 @@ async fn run_stream(
         return Err(ProviderError::Aborted);
     }
 
-    let account_id = extract_account_id(&api_key).map_err(|message| {
-        ProviderError::Message(format!("Failed to extract accountId from token: {message}"))
-    })?;
+    let local_bearer = request::uses_local_codex_bearer(model, &options.base);
+    let account_id = if local_bearer {
+        String::new()
+    } else {
+        extract_account_id(&api_key).map_err(|message| {
+            ProviderError::Message(format!("Failed to extract accountId from token: {message}"))
+        })?
+    };
 
     let mut body = build_request_body(model, context, &options);
     if let Some(on_payload) = &options.base.on_payload {
@@ -227,7 +234,11 @@ async fn run_stream(
         &websocket_request_id,
     );
     let body_json = body.to_string();
-    let transport = options.base.transport.unwrap_or(Transport::Auto);
+    let transport = if local_bearer {
+        Transport::Sse
+    } else {
+        options.base.transport.unwrap_or(Transport::Auto)
+    };
     let websocket_disabled_for_session =
         transport != Transport::Sse && is_websocket_sse_fallback_active(session_id.as_deref());
     if websocket_disabled_for_session {
@@ -529,6 +540,7 @@ async fn run_websocket_attempt(
                     &OPENAI_TOOL_CALL_PROVIDERS,
                     ConvertResponsesMessagesOptions {
                         include_system_prompt: false,
+                        ..Default::default()
                     },
                 )
                 .into_iter()
@@ -653,6 +665,7 @@ fn build_request_body(
         &OPENAI_TOOL_CALL_PROVIDERS,
         ConvertResponsesMessagesOptions {
             include_system_prompt: false,
+            ..Default::default()
         },
     );
 
@@ -810,6 +823,14 @@ pub fn stream_simple_openai_codex_responses(
 pub struct OpenAICodexResponsesProvider;
 
 impl Provider for OpenAICodexResponsesProvider {
+    fn compact<'a>(
+        &'a self,
+        model: &'a Model,
+        context: &'a Context,
+        options: &'a crate::types::ProviderNativeCompactionOptions,
+    ) -> crate::types::NativeCompactionFuture<'a> {
+        Box::pin(compact_openai_codex_responses(model, context, options))
+    }
     fn api(&self) -> &str {
         API_OPENAI_CODEX_RESPONSES
     }

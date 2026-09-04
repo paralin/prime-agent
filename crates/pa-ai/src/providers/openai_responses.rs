@@ -44,9 +44,17 @@ fn resolve_cache_retention(cache_retention: Option<CacheRetention>) -> CacheRete
 }
 
 /// Resolved compat (`Required<OpenAIResponsesCompat>`).
+#[allow(clippy::struct_excessive_bools)] // Independent provider capabilities.
 pub struct ResolvedResponsesCompat {
     pub send_session_id_header: bool,
     pub supports_long_cache_retention: bool,
+    pub supports_store: bool,
+    pub supports_prompt_cache: bool,
+    pub supports_reasoning: bool,
+    pub supports_developer_role: bool,
+    pub supports_tools: bool,
+    pub requires_string_message_content: bool,
+    pub include_routing_metadata: bool,
 }
 
 pub fn get_responses_compat(model: &Model) -> ResolvedResponsesCompat {
@@ -60,6 +68,13 @@ pub fn get_responses_compat(model: &Model) -> ResolvedResponsesCompat {
             .ok()
     });
     ResolvedResponsesCompat {
+        supports_store: compat_flag(model, "supportsStore", true),
+        supports_prompt_cache: compat_flag(model, "supportsPromptCache", true),
+        supports_reasoning: compat_flag(model, "supportsReasoning", true),
+        supports_developer_role: compat_flag(model, "supportsDeveloperRole", true),
+        supports_tools: compat_flag(model, "supportsTools", true),
+        requires_string_message_content: compat_flag(model, "requiresStringMessageContent", false),
+        include_routing_metadata: compat_flag(model, "includeRoutingMetadata", false),
         send_session_id_header: compat
             .as_ref()
             .and_then(|c| c.send_session_id_header)
@@ -69,6 +84,15 @@ pub fn get_responses_compat(model: &Model) -> ResolvedResponsesCompat {
             .and_then(|c| c.supports_long_cache_retention)
             .unwrap_or(true),
     }
+}
+
+fn compat_flag(model: &Model, key: &str, default: bool) -> bool {
+    model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.raw.get(key))
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
 }
 
 fn get_prompt_cache_retention(
@@ -187,32 +211,86 @@ fn build_headers(
         }
     }
     headers.push(("Authorization".into(), format!("Bearer {api_key}")));
+    crate::providers::conversation_headers::apply(&mut headers, model, &options.base);
     headers
 }
 
+#[allow(clippy::too_many_lines)] // One request assembly matches the provider contract.
 fn build_params(model: &Model, context: &Context, options: &OpenAIResponsesOptions) -> Value {
-    let messages = convert_responses_messages(
+    let mut messages = convert_responses_messages(
         model,
         context,
         &OPENAI_TOOL_CALL_PROVIDERS,
-        ConvertResponsesMessagesOptions::include_system_prompt(),
+        ConvertResponsesMessagesOptions {
+            merge_gateway_tool_format: model
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.raw.get("mergeGatewayToolFormat"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ..ConvertResponsesMessagesOptions::include_system_prompt()
+        },
     );
 
     let cache_retention = resolve_cache_retention(options.base.cache_retention);
     let compat = get_responses_compat(model);
+    for message in &mut messages {
+        if !compat.supports_developer_role
+            && message.get("role").and_then(Value::as_str) == Some("developer")
+        {
+            message["role"] = json!("system");
+        }
+        if compat.requires_string_message_content {
+            if message.get("role").is_some() {
+                message["type"] = json!("message");
+            }
+            if let Some(parts) = message.get("content").and_then(Value::as_array) {
+                if parts
+                    .iter()
+                    .all(|part| part.get("text").and_then(Value::as_str).is_some())
+                {
+                    message["content"] = json!(parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n"));
+                    message["type"] = json!("message");
+                }
+            }
+        }
+    }
     let mut params = Map::new();
     params.insert("model".into(), json!(model.id));
     params.insert("input".into(), json!(messages));
     params.insert("stream".into(), json!(true));
-    if cache_retention != CacheRetention::None {
+    if compat.supports_prompt_cache && cache_retention != CacheRetention::None {
         if let Some(session_id) = &options.base.session_id {
             params.insert("prompt_cache_key".into(), json!(session_id));
         }
     }
-    if let Some(retention) = get_prompt_cache_retention(&compat, cache_retention) {
+    if let Some(retention) = get_prompt_cache_retention(&compat, cache_retention)
+        .filter(|_| compat.supports_prompt_cache)
+    {
         params.insert("prompt_cache_retention".into(), json!(retention));
     }
-    params.insert("store".into(), json!(false));
+    if compat.supports_store {
+        params.insert("store".into(), json!(false));
+    }
+    if compat.include_routing_metadata {
+        params.insert("include_routing_metadata".into(), json!(true));
+    }
+    if model.provider == "openrouter" {
+        if let Some(id) = &options.base.session_id {
+            params.insert("session_id".into(), json!(id));
+        }
+        if let Some(routing) = model
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.raw.get("openRouterRouting"))
+        {
+            params.insert("provider".into(), routing.clone());
+        }
+    }
 
     if let Some(max_tokens) = options.base.max_tokens {
         params.insert("max_output_tokens".into(), json!(max_tokens));
@@ -228,7 +306,7 @@ fn build_params(model: &Model, context: &Context, options: &OpenAIResponsesOptio
         );
     }
     if let Some(tools) = &context.tools {
-        if !tools.is_empty() {
+        if compat.supports_tools && !tools.is_empty() {
             params.insert(
                 "tools".into(),
                 json!(convert_responses_tools(
@@ -238,7 +316,7 @@ fn build_params(model: &Model, context: &Context, options: &OpenAIResponsesOptio
             );
         }
     }
-    if supports_thinking(model) {
+    if compat.supports_reasoning && supports_thinking(model) {
         if options.reasoning_effort.is_some() || options.reasoning_summary.is_some() {
             let effort = match options.reasoning_effort {
                 Some(effort) => model

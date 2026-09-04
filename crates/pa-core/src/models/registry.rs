@@ -119,6 +119,7 @@ fn xai_subscription_model(model: &Model) -> Model {
         OpenAiResponsesCompat {
             send_session_id_header: None,
             supports_long_cache_retention: Some(false),
+            ..Default::default()
         },
     )));
     adapted

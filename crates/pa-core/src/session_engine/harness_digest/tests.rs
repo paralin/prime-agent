@@ -314,6 +314,7 @@ async fn placement_rig(
                 id: "digest-placement-m".to_string(),
                 name: Some("Digest Placement Model".to_string()),
                 reasoning: Some(false),
+                thinking_level_map: None,
                 input: Some(vec![pa_types::ai::ModelInput::Text]),
                 cost: None,
                 context_window: Some(1_000),

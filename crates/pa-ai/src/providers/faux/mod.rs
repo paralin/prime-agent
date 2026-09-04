@@ -39,6 +39,7 @@ pub struct FauxModelDefinition {
     pub id: String,
     pub name: Option<String>,
     pub reasoning: Option<bool>,
+    pub thinking_level_map: Option<crate::types::ThinkingLevelMap>,
     pub input: Option<Vec<ModelInput>>,
     pub cost: Option<ModelCost>,
     pub context_window: Option<u64>,
@@ -720,6 +721,7 @@ pub struct RegisterFauxProviderOptions {
     pub api: Option<String>,
     pub provider: Option<String>,
     pub models: Option<Vec<FauxModelDefinition>>,
+    pub compact: Option<crate::types::NativeCompactionFunction>,
     pub tokens_per_second: Option<f64>,
     pub token_size_min: Option<usize>,
     pub token_size_max: Option<usize>,
@@ -737,9 +739,28 @@ pub fn register_faux_provider(options: RegisterFauxProviderOptions) -> FauxProvi
         min_token_size: usize,
         max_token_size: usize,
         tokens_per_second: Option<f64>,
+        compact: Option<crate::types::NativeCompactionFunction>,
     }
 
     impl Provider for FauxStream {
+        fn compact<'a>(
+            &'a self,
+            model: &'a Model,
+            context: &'a Context,
+            options: &'a crate::types::ProviderNativeCompactionOptions,
+        ) -> crate::types::NativeCompactionFuture<'a> {
+            match &self.compact {
+                Some(compact) => compact(model, context, options),
+                None => Box::pin(async move {
+                    Err(crate::utils_inner::stream_failure::ProviderError::Message(
+                        format!(
+                            "API provider does not support native compaction: {}",
+                            model.api
+                        ),
+                    ))
+                }),
+            }
+        }
         fn api(&self) -> &str {
             &self.api
         }
@@ -917,6 +938,7 @@ pub fn register_faux_provider(options: RegisterFauxProviderOptions) -> FauxProvi
             id: DEFAULT_MODEL_ID.to_string(),
             name: Some(DEFAULT_MODEL_NAME.to_string()),
             reasoning: Some(false),
+            thinking_level_map: None,
             input: Some(vec![ModelInput::Text, ModelInput::Image]),
             cost: None,
             context_window: Some(128_000),
@@ -935,7 +957,7 @@ pub fn register_faux_provider(options: RegisterFauxProviderOptions) -> FauxProvi
             provider: provider_name.clone(),
             base_url: DEFAULT_BASE_URL.to_string(),
             reasoning: definition.reasoning.unwrap_or(false),
-            thinking_level_map: None,
+            thinking_level_map: definition.thinking_level_map.clone(),
             input: definition
                 .input
                 .clone()
@@ -956,6 +978,7 @@ pub fn register_faux_provider(options: RegisterFauxProviderOptions) -> FauxProvi
         min_token_size: min,
         max_token_size: max,
         tokens_per_second,
+        compact: options.compact,
     };
     register_api_provider(Arc::new(stream_impl), Some(&source_id));
 
@@ -995,3 +1018,6 @@ pub mod script;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod native_compaction_tests;

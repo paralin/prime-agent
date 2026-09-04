@@ -18,8 +18,8 @@ use crate::providers::openai_completions::errors::{openai_http_error, openrouter
 use crate::providers::openai_completions::get_compat_cache_control;
 use crate::providers::openai_completions::params::{build_headers, build_params};
 use crate::providers::openai_completions::{
-    encode_reasoning_details, get_compat, resolve_cache_retention, OpenAICompletionsOptions,
-    REASONING_FIELDS,
+    encode_chat_thinking_signature, encode_reasoning_details, get_compat, resolve_cache_retention,
+    OpenAICompletionsOptions, REASONING_FIELDS,
 };
 use crate::providers::openai_responses_hooks::apply_service_tier_pricing;
 use crate::types::{
@@ -44,6 +44,7 @@ struct StreamingState {
     next_reasoning_details_index: u64,
     reasoning_details_block: Option<usize>,
     response_service_tier: Option<String>,
+    saw_finish_reason: bool,
 }
 
 impl StreamingState {
@@ -59,6 +60,7 @@ impl StreamingState {
             next_reasoning_details_index: 0,
             reasoning_details_block: None,
             response_service_tier: None,
+            saw_finish_reason: false,
         }
     }
 
@@ -206,6 +208,30 @@ fn handle_chunk(
     if !chunk.is_object() {
         return;
     }
+    if let Some(warnings) = chunk.get("warnings").and_then(Value::as_array) {
+        for warning in warnings {
+            if warning.get("code").and_then(Value::as_str).is_some()
+                && warning.get("message").and_then(Value::as_str).is_some()
+            {
+                state.output.diagnostics.get_or_insert_with(Vec::new).push(
+                    crate::types::AssistantMessageDiagnostic {
+                        type_: "provider_warning".into(),
+                        timestamp: crate::utils_inner::diagnostics::now_ms(),
+                        error: serde_json::from_value(
+                            json!({"code":warning["code"], "message":warning["message"]}),
+                        )
+                        .ok(),
+                        details: warning
+                            .get("detail")
+                            .filter(|detail| detail.is_object())
+                            .map(|detail| {
+                                serde_json::Map::from_iter([("detail".into(), detail.clone())])
+                            }),
+                    },
+                );
+            }
+        }
+    }
     if let Some(id) = chunk.get("id").and_then(|value| value.as_str()) {
         if state.output.response_id.is_none() {
             state.output.response_id = Some(id.to_string());
@@ -246,6 +272,10 @@ fn handle_chunk(
     }
 
     if let Some(finish_reason) = choice.get("finish_reason").and_then(|value| value.as_str()) {
+        if finish_reason.is_empty() {
+            return;
+        }
+        state.saw_finish_reason = true;
         let (stop_reason, error_message) = map_stop_reason(finish_reason);
         state.output.stop_reason = stop_reason;
         if error_message.is_some() {
@@ -276,7 +306,13 @@ fn handle_chunk(
     // or reasoning (other openai compatible endpoints). Use the first
     // non-empty reasoning field to avoid duplication.
     let mut found_reasoning_field: Option<(&str, &str)> = None;
-    for field in REASONING_FIELDS {
+    let compat = get_compat(model);
+    for field in compat
+        .reasoning_content_field
+        .as_deref()
+        .into_iter()
+        .chain(REASONING_FIELDS)
+    {
         if let Some(value) = delta.get(field).and_then(|value| value.as_str()) {
             if !value.is_empty() {
                 found_reasoning_field = Some((field, value));
@@ -294,6 +330,31 @@ fn handle_chunk(
             delta: reasoning_delta.to_string(),
             partial: state.output.clone(),
         });
+    }
+    if let Some(signature) = delta
+        .get("thinking_signature")
+        .and_then(Value::as_str)
+        .filter(|signature| !signature.is_empty())
+    {
+        let field = found_reasoning_field.map_or_else(
+            || {
+                compat
+                    .reasoning_content_field
+                    .as_deref()
+                    .unwrap_or("reasoning_content")
+            },
+            |(field, _)| field,
+        );
+        let index = state.ensure_thinking_block(field, writer);
+        if let Some(AssistantContent::Thinking(thinking)) = state.output.content.get_mut(index) {
+            let recorded_field = thinking
+                .thinking_signature
+                .as_deref()
+                .filter(|field| !field.starts_with('{'))
+                .unwrap_or(field);
+            thinking.thinking_signature =
+                Some(encode_chat_thinking_signature(recorded_field, signature));
+        }
     }
 
     // Tool calls.
@@ -485,7 +546,7 @@ pub fn stream_openai_completions(
             response_id: None,
             diagnostics: None,
             usage: Usage::default(),
-            stop_reason: StopReason::Stop,
+            stop_reason: StopReason::Unknown,
             stop_reason_raw: None,
             error_message: None,
             timestamp: crate::utils_inner::diagnostics::now_ms(),
@@ -580,7 +641,7 @@ async fn run_stream(
     }
 
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
-    let headers = build_headers(
+    let mut headers = build_headers(
         model,
         &api_key,
         base_options.headers.as_ref(),
@@ -588,6 +649,7 @@ async fn run_stream(
         &compat,
         base_options.session_id.as_deref(),
     );
+    crate::providers::conversation_headers::apply(&mut headers, model, &base_options);
 
     let mut response: HttpResponse = send(RequestOptions {
         method: reqwest::Method::POST,
@@ -619,11 +681,12 @@ async fn run_stream(
     // surfaces verbatim as the assistant message's error message.
     if !(200..300).contains(&response.status) {
         let body = response.read_all_text().await.unwrap_or_default();
-        return Err(openai_http_error(
-            response.status,
-            &body,
-            response.headers.clone(),
-        ));
+        let mut error = openai_http_error(response.status, &body, response.headers.clone());
+        crate::providers::openai_completions::errors::annotate_retry_delay(
+            &mut error,
+            base_options.max_retry_delay_ms.unwrap_or(60_000),
+        );
+        return Err(error);
     }
 
     writer.push(AssistantMessageEvent::Start {
@@ -649,12 +712,28 @@ async fn run_stream(
         let events = decoder.push_text(&chunk);
         for event in &events {
             if let Some(chunk) = parse_sse_event_data(event) {
+                if let Err(error) =
+                    validate_chunk_boundary(&chunk, &state, compat.require_finish_reason)
+                {
+                    encode_reasoning_details_signature(&mut state);
+                    settle_partial_tool_calls(&mut state);
+                    *output = state.output;
+                    return Err(error);
+                }
                 handle_chunk(&chunk, model, cache_write_cost, &mut state, writer);
             }
         }
     }
     for event in decoder.finish() {
         if let Some(chunk) = parse_sse_event_data(&event) {
+            if let Err(error) =
+                validate_chunk_boundary(&chunk, &state, compat.require_finish_reason)
+            {
+                encode_reasoning_details_signature(&mut state);
+                settle_partial_tool_calls(&mut state);
+                *output = state.output;
+                return Err(error);
+            }
             handle_chunk(&chunk, model, cache_write_cost, &mut state, writer);
         }
     }
@@ -669,8 +748,10 @@ async fn run_stream(
     }
 
     encode_reasoning_details_signature(&mut state);
+    let validation = validate_stream_end(&state, compat.require_finish_reason);
     finish_blocks(&mut state, writer);
     *output = state.output;
+    validation?;
 
     if base_options
         .signal
@@ -694,6 +775,48 @@ async fn run_stream(
     Ok(())
 }
 
+fn validate_chunk_boundary(
+    chunk: &Value,
+    state: &StreamingState,
+    required: bool,
+) -> Result<(), ProviderError> {
+    if required && state.saw_finish_reason {
+        if let Some(delta) = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+            .and_then(Value::as_object)
+        {
+            if delta.iter().any(|(key, value)| {
+                key != "role"
+                    && match value {
+                        Value::String(text) => !text.is_empty(),
+                        Value::Array(items) => !items.is_empty(),
+                        _ => false,
+                    }
+            }) {
+                return Err(ProviderError::Message(
+                    "OpenAI Chat received content after the finish reason".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_stream_end(state: &StreamingState, required: bool) -> Result<(), ProviderError> {
+    if required && !state.saw_finish_reason {
+        return Err(ProviderError::Message(
+            "OpenAI Chat stream ended without finish_reason".into(),
+        ));
+    }
+    if required && state.output.content.iter().any(|block| matches!(block, AssistantContent::ToolCall(call) if call.id.is_empty() || call.name.is_empty())) {
+        return Err(ProviderError::Message("OpenAI Chat tool call delta is missing id or name".into()));
+    }
+    Ok(())
+}
+
 /// Parse the JSON payload of an SSE event; `None` for `[DONE]` and comments.
 #[cfg(test)]
 #[path = "stream_bench.rs"]
@@ -714,6 +837,121 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn strict_stream_rejects_missing_finish_and_preserves_partial_text() {
+        let addr = serve_sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: [DONE]\n\n"
+                .into(),
+        )
+        .await;
+        let mut model = completions_model("m", "merge", 0.0, 0.0);
+        model["baseUrl"] = json!(format!("http://{addr}"));
+        model["compat"] = json!({"requireFinishReason": true});
+        let model: Model = serde_json::from_value(model).unwrap();
+        let options = OpenAICompletionsOptions::from_base(crate::types::StreamOptions {
+            api_key: Some("test".into()),
+            ..Default::default()
+        });
+        let message = stream_openai_completions(&model, &Context::default(), Some(&options))
+            .result()
+            .await;
+        assert_eq!(message.stop_reason, StopReason::Error);
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("OpenAI Chat stream ended without finish_reason")
+        );
+        assert!(
+            matches!(&message.content[0], AssistantContent::Text(text) if text.text == "partial")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_finish_is_unknown_for_permissive_transports() {
+        let message = stream_final_message(
+            completions_model("m", "test", 0.0, 0.0),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: [DONE]\n\n"
+                .into(),
+        )
+        .await;
+        assert_eq!(message.stop_reason, StopReason::Unknown);
+        assert!(
+            matches!(&message.content[0], AssistantContent::Text(text) if text.text == "partial")
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_reasoning_and_signature_survive_stream_and_replay() {
+        let mut model = completions_model("m", "merge", 0.0, 0.0);
+        model["reasoning"] = json!(true);
+        model["baseUrl"] = json!("http://localhost");
+        model["compat"] = json!({"reasoningField": "trace", "requireFinishReason": true});
+        let body = "data: {\"warnings\":[{\"code\":\"ignored\",\"message\":\"budget ignored\"}],\"choices\":[{\"delta\":{\"trace\":\"think\",\"thinking_signature\":\"signed\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let message = stream_final_message(model.clone(), body.into()).await;
+        assert_eq!(
+            message.diagnostics.as_ref().unwrap()[0].type_,
+            "provider_warning"
+        );
+        let model: Model = serde_json::from_value(model).unwrap();
+        let replay = crate::providers::openai_completions::convert::convert_messages(
+            &model,
+            &Context {
+                messages: vec![crate::types::Message::Assistant(message)],
+                ..Default::default()
+            },
+            &get_compat(&model),
+        );
+        assert_eq!(replay[0]["trace"], json!("think"));
+        assert_eq!(replay[0]["thinking_signature"], json!("signed"));
+        assert_eq!(replay[0]["content"], json!("answer"));
+    }
+
+    #[tokio::test]
+    async fn signature_only_thinking_is_preserved_in_replay() {
+        let mut model = completions_model("m", "merge", 0.0, 0.0);
+        model["baseUrl"] = json!("http://localhost");
+        let message = stream_final_message(model.clone(), "data: {\"choices\":[{\"delta\":{\"thinking_signature\":\"opaque\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()).await;
+        let model: Model = serde_json::from_value(model).unwrap();
+        let replay = crate::providers::openai_completions::convert::convert_messages(
+            &model,
+            &Context {
+                messages: vec![crate::types::Message::Assistant(message)],
+                ..Default::default()
+            },
+            &get_compat(&model),
+        );
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0]["thinking_signature"], "opaque");
+    }
+
+    #[tokio::test]
+    async fn strict_stream_rejects_content_after_finish() {
+        let addr = serve_sse("data: {\"choices\":[{\"delta\":{\"content\":\"first\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n".into()).await;
+        let mut model = completions_model("m", "merge", 0.0, 0.0);
+        model["baseUrl"] = json!(format!("http://{addr}"));
+        model["compat"] = json!({"requireFinishReason": true});
+        let model: Model = serde_json::from_value(model).unwrap();
+        let message = stream_openai_completions(
+            &model,
+            &Context::default(),
+            Some(&OpenAICompletionsOptions::from_base(
+                crate::types::StreamOptions {
+                    api_key: Some("test".into()),
+                    ..Default::default()
+                },
+            )),
+        )
+        .result()
+        .await;
+        assert_eq!(message.stop_reason, StopReason::Error);
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("OpenAI Chat received content after the finish reason")
+        );
+        assert!(
+            matches!(&message.content[0], AssistantContent::Text(text) if text.text == "first")
+        );
+    }
 
     // The thinking-channel pins (the two provider envelopes) live in
     // their own child module with this file's test harness.

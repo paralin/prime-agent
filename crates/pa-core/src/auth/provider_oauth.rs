@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use pa_ai::oauth::{
     refresh_anthropic_token, refresh_github_copilot_token, refresh_openai_codex_token,
-    refresh_xai_token, CodexHttp, ProviderHttp, ReqwestCodexHttp, ReqwestProviderHttp,
+    refresh_xai_token_at_endpoint, CodexHttp, ProviderHttp, ReqwestCodexHttp, ReqwestProviderHttp,
 };
 
 use crate::auth::types::{AuthCredential, AuthStorageData};
@@ -83,6 +83,7 @@ impl ProviderOAuth {
         let AuthCredential::Oauth {
             refresh: Some(refresh_token),
             enterprise_url,
+            token_endpoint,
             ..
         } = credential
         else {
@@ -92,6 +93,7 @@ impl ProviderOAuth {
         let provider_http = Arc::clone(&self.provider_http);
         let refresh_token = refresh_token.clone();
         let enterprise_url = enterprise_url.clone();
+        let token_endpoint = token_endpoint.clone();
         let provider_id = provider_id.to_string();
         std::thread::Builder::new()
             .name("provider-oauth-refresh".to_string())
@@ -164,7 +166,11 @@ impl ProviderOAuth {
                     }
                     XAI_PROVIDER_ID => {
                         let credentials = runtime
-                            .block_on(refresh_xai_token(provider_http.as_ref(), &refresh_token))
+                            .block_on(refresh_xai_token_at_endpoint(
+                                provider_http.as_ref(),
+                                &refresh_token,
+                                token_endpoint.as_deref(),
+                            ))
                             .ok()?;
                         Some(AuthCredential::Oauth {
                             access: credentials.access,
@@ -173,7 +179,7 @@ impl ProviderOAuth {
                             account_id: None,
                             enterprise_url: None,
                             endpoint: None,
-                            token_endpoint: None,
+                            token_endpoint: Some(credentials.token_endpoint),
                             client_id: None,
                             resource: None,
                             issuer: None,
@@ -338,7 +344,7 @@ mod tests {
                 .to_string(),
             },
         );
-        let mut providers = HashMap::new();
+        let mut providers = HashMap::from([("https://auth.x.ai/.well-known/openid-configuration".to_string(), ProviderHttpResponse { status: 200, body: r#"{"authorization_endpoint":"https://auth.x.ai/oauth2/auth","token_endpoint":"https://auth.x.ai/oauth2/token"}"#.to_string() })]);
         providers.insert(
             "https://platform.claude.com/v1/oauth/token".to_string(),
             ProviderHttpResponse {
@@ -369,7 +375,7 @@ mod tests {
                 body: serde_json::json!({
                     "access_token": "grok-access",
                     "refresh_token": "grok-refresh",
-                    "expires_in": 3600,
+                    "expires_in": 21600,
                 })
                 .to_string(),
             },
@@ -477,13 +483,20 @@ mod tests {
         assert_eq!(api_key, "grok-access");
         let stored = auth.get_all().credential(XAI_PROVIDER_ID).unwrap();
         let AuthCredential::Oauth {
-            refresh, expires, ..
+            refresh,
+            expires,
+            token_endpoint,
+            ..
         } = stored
         else {
             panic!("the stored credential is OAuth");
         };
         assert_eq!(refresh.as_deref(), Some("grok-refresh"));
         assert!(expires > 1, "the fresh expiry landed");
+        assert_eq!(
+            token_endpoint.as_deref(),
+            Some("https://auth.x.ai/oauth2/token")
+        );
     }
 
     #[test]

@@ -28,12 +28,15 @@ const SCOPE: &str = "openid profile email offline_access grok-cli:access api:acc
 /// TS `DEVICE_CODE_URL`.
 const DEVICE_CODE_URL: &str = "https://auth.x.ai/oauth2/device/code";
 /// TS `TOKEN_URL`.
+#[cfg(test)]
 const TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
 /// TS `REQUEST_TIMEOUT_MS` (the per-request bound).
 pub const REQUEST_TIMEOUT_MS: u64 = 30_000;
-/// TS `REFRESH_SKEW_MS` (the credential's expiry skew, capped at half
-/// the token's lifetime).
-const REFRESH_SKEW_MS: i64 = 5 * 60 * 1000;
+/// Proactive refresh skew for tokens lasting more than 45 minutes.
+const REFRESH_SKEW_MS: i64 = 60 * 60 * 1000;
+const SHORT_TOKEN_SKEW_MS: i64 = 2 * 60 * 1000;
+const SHORT_TOKEN_THRESHOLD_MS: i64 = 45 * 60 * 1000;
+const DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
 /// The device poll's default interval (TS: 5000 when the response
 /// carries none).
 const DEFAULT_POLL_INTERVAL_MS: u64 = 5000;
@@ -55,9 +58,9 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub struct XaiCredentials {
     pub access: String,
     pub refresh: String,
-    /// Wall-clock epoch milliseconds (TS `Date.now() + lifetime -
-    /// min(REFRESH_SKEW_MS, lifetime / 2)`).
+    /// Wall-clock epoch milliseconds after the proactive refresh skew.
     pub expires: i64,
+    pub token_endpoint: String,
 }
 
 /// One endpoint response (TS `OAuthResponse`: the status plus the
@@ -87,6 +90,7 @@ pub async fn login_xai(
     if ui.is_cancelled() {
         return Err(LOGIN_CANCELLED.to_string());
     }
+    let token_endpoint = discover_token_endpoint(http, ui, REQUEST_TIMEOUT_MS).await?;
     let response = post_form(
         http,
         ui,
@@ -104,15 +108,21 @@ pub async fn login_xai(
     }
     let device_code = required_string(&response.body, "device_code")?;
     let user_code = required_string(&response.body, "user_code")?;
-    if user_code.is_empty()
-        || !user_code
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    if !user_code
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
     {
         return Err("Invalid xAI OAuth response field: user_code".to_string());
     }
     let verification_uri_raw = required_string(&response.body, "verification_uri")?;
-    let url = verification_uri(&verification_uri_raw)?;
+    let url = verification_uri(
+        response
+            .body
+            .get("verification_uri_complete")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&verification_uri_raw),
+    )?;
     let expires_in = positive_seconds(response.body.get("expires_in"))?;
     // expires_in is positive_seconds' filtered positive second count; u64 is Duration's unit.
     #[allow(clippy::cast_sign_loss)]
@@ -128,6 +138,7 @@ pub async fn login_xai(
             ((seconds * 1000.0) as u64).max(1000)
         });
     ui.on_auth(&url, Some(&format!("Enter code: {user_code}")));
+    ui.on_progress("Waiting for xAI authorization...");
 
     while std::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -141,7 +152,7 @@ pub async fn login_xai(
         let token = post_form(
             http,
             ui,
-            TOKEN_URL,
+            &token_endpoint,
             &[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("client_id", XAI_CLIENT_ID),
@@ -151,7 +162,7 @@ pub async fn login_xai(
         )
         .await?;
         if token.ok {
-            return credentials_from_response(&token.body, None);
+            return credentials_from_response(&token.body, None, &token_endpoint);
         }
         match token.body.get("error").and_then(serde_json::Value::as_str) {
             Some("authorization_pending") => {}
@@ -190,22 +201,106 @@ pub async fn refresh_xai_token(
     http: &dyn ProviderHttp,
     refresh_token: &str,
 ) -> Result<XaiCredentials, String> {
+    refresh_xai_token_at_endpoint(http, refresh_token, None).await
+}
+
+/// Refresh using a saved discovery endpoint, or discover it for older credentials.
+///
+/// # Errors
+/// Returns an error for untrusted endpoints or failed discovery and refresh requests.
+pub async fn refresh_xai_token_at_endpoint(
+    http: &dyn ProviderHttp,
+    refresh_token: &str,
+    stored_endpoint: Option<&str>,
+) -> Result<XaiCredentials, String> {
+    let started = std::time::Instant::now();
+    let token_endpoint = match stored_endpoint {
+        Some(endpoint) => trusted_endpoint(endpoint, "token_endpoint")?,
+        None => discover_token_endpoint(http, &NoCancel, REFRESH_TIMEOUT_MS).await?,
+    };
+    let remaining = Duration::from_millis(REFRESH_TIMEOUT_MS).saturating_sub(started.elapsed());
+    let timeout_ms = u64::try_from(remaining.as_millis()).unwrap_or(REFRESH_TIMEOUT_MS);
+    if timeout_ms == 0 {
+        return Err("xAI OAuth request timed out. Try signing in again.".to_string());
+    }
     let response = post_form(
         http,
         &NoCancel,
-        TOKEN_URL,
+        &token_endpoint,
         &[
             ("grant_type", "refresh_token"),
             ("client_id", XAI_CLIENT_ID),
             ("refresh_token", refresh_token),
         ],
-        REFRESH_TIMEOUT_MS,
+        timeout_ms,
     )
     .await?;
     if !response.ok {
         return Err(request_failure("token refresh", &response));
     }
-    credentials_from_response(&response.body, Some(refresh_token))
+    credentials_from_response(&response.body, Some(refresh_token), &token_endpoint)
+}
+
+async fn discover_token_endpoint(
+    http: &dyn ProviderHttp,
+    ui: &dyn OAuthLoginUi,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    if ui.is_cancelled() {
+        return Err(LOGIN_CANCELLED.to_string());
+    }
+    let response = http
+        .request(
+            ProviderHttpRequest {
+                method: ProviderHttpMethod::Get,
+                url: DISCOVERY_URL.to_string(),
+                headers: vec![("Accept".to_string(), "application/json".to_string())],
+                body: None,
+                follow_redirects: false,
+            },
+            timeout_ms,
+        )
+        .await
+        .map_err(|_| {
+            "xAI OAuth request failed. Check your connection and try again.".to_string()
+        })?;
+    if ui.is_cancelled() {
+        return Err(LOGIN_CANCELLED.to_string());
+    }
+    if !response.ok() {
+        return Err(format!(
+            "xAI OAuth discovery failed with HTTP {}",
+            response.status
+        ));
+    }
+    let body: serde_json::Value = serde_json::from_str(&response.body)
+        .map_err(|_| "xAI OAuth discovery returned invalid JSON".to_string())?;
+    for field in ["authorization_endpoint", "token_endpoint"] {
+        let value = body
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("xAI OAuth discovery is missing {field}"))?;
+        trusted_endpoint(value, field)?;
+    }
+    trusted_endpoint(
+        body["token_endpoint"].as_str().expect("validated endpoint"),
+        "token_endpoint",
+    )
+}
+
+fn trusted_endpoint(raw: &str, field: &str) -> Result<String, String> {
+    let url =
+        Url::parse(raw).map_err(|_| format!("xAI OAuth discovery returned an invalid {field}"))?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !url
+            .host_str()
+            .is_some_and(|host| host == "x.ai" || host.ends_with(".x.ai"))
+    {
+        return Err(format!("xAI OAuth discovery returned an untrusted {field}"));
+    }
+    Ok(url.to_string())
 }
 
 /// A surface that never cancels (the refresh runs detached from any
@@ -306,10 +401,11 @@ fn request_failure(action: &str, response: &XaiResponse) -> String {
 }
 
 /// TS `credentialsFromResponse`: the validated fields and the expiry
-/// arithmetic (`lifetime - min(5 minutes, lifetime / 2)`).
+/// arithmetic with proactive refresh for short and long token lifetimes.
 fn credentials_from_response(
     body: &serde_json::Map<String, serde_json::Value>,
     previous_refresh: Option<&str>,
+    token_endpoint: &str,
 ) -> Result<XaiCredentials, String> {
     let access = required_string(body, "access_token")?;
     let refresh = match body.get("refresh_token") {
@@ -324,14 +420,18 @@ fn credentials_from_response(
     };
     let lifetime_ms = positive_seconds(body.get("expires_in").or(Some(&serde_json::json!(3600))))?
         .saturating_mul(1000);
+    let skew_ms = if lifetime_ms <= SHORT_TOKEN_THRESHOLD_MS {
+        SHORT_TOKEN_SKEW_MS
+    } else {
+        REFRESH_SKEW_MS
+    };
     Ok(XaiCredentials {
+        token_endpoint: token_endpoint.to_string(),
         access,
         refresh,
         // Saturating: a hostile `expires_in` must not overflow the sum
         // (the NaN/inf gate already answered the field error).
-        expires: now_ms()
-            .saturating_add(lifetime_ms)
-            .saturating_sub(REFRESH_SKEW_MS.min(lifetime_ms / 2)),
+        expires: now_ms().saturating_add(lifetime_ms.saturating_sub(skew_ms).max(0)),
     })
 }
 
@@ -421,7 +521,13 @@ mod tests {
     impl ScriptedHttp {
         fn new() -> Self {
             ScriptedHttp {
-                queued: Mutex::new(HashMap::new()),
+                queued: Mutex::new(HashMap::from([(
+                    DISCOVERY_URL.to_string(),
+                    VecDeque::from([Self::entry(
+                        200,
+                        r#"{"authorization_endpoint":"https://auth.x.ai/oauth2/auth","token_endpoint":"https://auth.x.ai/oauth2/token"}"#,
+                    )]),
+                )])),
                 requests: Mutex::new(Vec::new()),
             }
         }
@@ -544,6 +650,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn proactive_refresh_preserves_short_lived_tokens() {
+        for (seconds, usable_ms) in [(900, 780_000), (21_600, 18_000_000), (60, 0)] {
+            let before = now_ms();
+            let credentials = credentials_from_response(
+                serde_json::json!({"access_token": "access", "refresh_token": "refresh", "expires_in": seconds}).as_object().unwrap(),
+                None, TOKEN_URL,
+            ).unwrap();
+            assert!(credentials.expires >= before + usable_ms);
+            assert!(credentials.expires <= now_ms() + usable_ms);
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_selects_and_persists_the_token_endpoint() {
+        let endpoint = "https://auth.x.ai/custom/token";
+        let http = ScriptedHttp::new().queue(DISCOVERY_URL, vec![ScriptedHttp::entry(200,
+            r#"{"authorization_endpoint":"https://auth.x.ai/oauth2/auth","token_endpoint":"https://auth.x.ai/custom/token"}"#)])
+            .queue(endpoint, vec![ScriptedHttp::entry(200, r#"{"access_token":"new","expires_in":900}"#)]);
+        let credentials = refresh_xai_token(&http, "old-refresh").await.unwrap();
+        assert_eq!(credentials.token_endpoint, endpoint);
+        assert_eq!(credentials.refresh, "old-refresh");
+        assert_eq!(
+            http.bodies_for(DISCOVERY_URL)[0].method,
+            ProviderHttpMethod::Get
+        );
+        assert_eq!(http.bodies_for(endpoint).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn login_uses_the_complete_verification_uri() {
+        let http = ScriptedHttp::new()
+            .queue(DEVICE_CODE_URL, vec![ScriptedHttp::entry(200,
+                r#"{"device_code":"device","user_code":"CODE-1","verification_uri":"https://auth.x.ai/activate","verification_uri_complete":"https://auth.x.ai/activate?code=CODE-1","expires_in":900,"interval":1}"#)])
+            .queue(TOKEN_URL, vec![ScriptedHttp::entry(200,
+                r#"{"access_token":"access","refresh_token":"refresh","expires_in":900}"#)]);
+        let ui = ScriptedUi::new();
+        login_xai(&http, &ui).await.unwrap();
+        assert_eq!(
+            ui.captured_auth(),
+            (
+                "https://auth.x.ai/activate?code=CODE-1".to_string(),
+                Some("Enter code: CODE-1".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_untrusted_endpoints_are_rejected_before_sending_credentials() {
+        let http = ScriptedHttp::new();
+        for endpoint in [
+            "https://attacker.example/token",
+            "https://x.ai.attacker.example/token",
+            "http://auth.x.ai/token",
+            "https://user:password@auth.x.ai/token",
+        ] {
+            let error = refresh_xai_token_at_endpoint(&http, "secret", Some(endpoint))
+                .await
+                .unwrap_err();
+            assert!(error.contains("untrusted token_endpoint"));
+        }
+        assert!(http.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn saved_endpoints_skip_discovery_and_refresh_rotates_tokens() {
+        let http = ScriptedHttp::new().queue(
+            TOKEN_URL,
+            vec![ScriptedHttp::entry(
+                200,
+                r#"{"access_token":"new","refresh_token":"rotated","expires_in":900}"#,
+            )],
+        );
+        let credentials = refresh_xai_token_at_endpoint(&http, "old", Some(TOKEN_URL))
+            .await
+            .unwrap();
+        assert_eq!(credentials.refresh, "rotated");
+        assert!(http.bodies_for(DISCOVERY_URL).is_empty());
+        assert_eq!(credentials.token_endpoint, TOKEN_URL);
+    }
+
     #[tokio::test]
     async fn the_happy_flow_resolves_the_credentials() {
         let http = ScriptedHttp::new()
@@ -562,14 +749,14 @@ mod tests {
         let credentials = login_xai(&http, &ui).await.unwrap();
         assert_eq!(credentials.access, "grok-access");
         assert_eq!(credentials.refresh, "grok-refresh");
-        // TS: expires = now + lifetime - min(5 minutes, lifetime / 2).
+        // A one-hour token reaches its proactive refresh threshold immediately.
         // Epoch millis fit i64; the assertion's tolerance covers the cast convention.
         #[allow(clippy::cast_possible_truncation)]
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let skew = (credentials.expires - now - (3600 * 1000 - 300_000)).abs();
+        let skew = (credentials.expires - now).abs();
         assert!(skew < 10_000, "the expiry arithmetic: {skew}");
         // The device request carries the TS body (scope + referrer).
         let device = &http.bodies_for(DEVICE_CODE_URL)[0];
@@ -620,7 +807,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let skew = (credentials.expires - now - (3600 * 1000 - 300_000)).abs();
+        let skew = (credentials.expires - now).abs();
         assert!(skew < 10_000, "the default lifetime: {skew}");
     }
 
@@ -803,14 +990,14 @@ mod tests {
         assert_eq!(credentials.access, "grok-fresh");
         // The endpoint omitted a refresh token: the prior one stays.
         assert_eq!(credentials.refresh, "grok-old");
-        // The lifetime is capped: min(5 minutes, lifetime / 2) = 300s.
+        // Short-lived tokens refresh two minutes before expiry.
         // Epoch millis fit i64; the assertion's tolerance covers the cast convention.
         #[allow(clippy::cast_possible_truncation)]
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let skew = (credentials.expires - now - (600 * 1000 - 300_000)).abs();
+        let skew = (credentials.expires - now - (600 * 1000 - 120_000)).abs();
         assert!(skew < 10_000, "the capped skew: {skew}");
         let body = http.bodies_for(TOKEN_URL)[0].body.clone().unwrap();
         assert!(body.contains("grant_type=refresh_token"));

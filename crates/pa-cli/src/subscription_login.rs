@@ -250,7 +250,7 @@ pub(crate) async fn run_xai_login(
             account_id: None,
             enterprise_url: None,
             endpoint: None,
-            token_endpoint: None,
+            token_endpoint: Some(credentials.token_endpoint),
             client_id: None,
             resource: None,
             issuer: None,
@@ -422,7 +422,7 @@ mod tests {
 
     /// The xAI happy flow's scripted endpoints.
     fn xai_http() -> ScriptedHttp {
-        ScriptedHttp::new()
+        ScriptedHttp::new().queue("https://auth.x.ai/.well-known/openid-configuration", vec![ScriptedHttp::entry(200, r#"{"authorization_endpoint":"https://auth.x.ai/oauth2/auth","token_endpoint":"https://auth.x.ai/oauth2/token"}"#)])
             .queue(
                 "https://auth.x.ai/oauth2/device/code",
                 vec![ScriptedHttp::entry(
@@ -434,7 +434,7 @@ mod tests {
                 "https://auth.x.ai/oauth2/token",
                 vec![ScriptedHttp::entry(
                     200,
-                    r#"{"access_token":"grok-access","refresh_token":"grok-refresh","expires_in":3600}"#,
+                    r#"{"access_token":"grok-access","refresh_token":"grok-refresh","expires_in":21600}"#,
                 )],
             )
     }
@@ -509,16 +509,16 @@ mod tests {
         assert_eq!(stored["type"], "oauth");
         assert_eq!(stored["access"], "grok-access");
         assert_eq!(stored["refresh"], "grok-refresh");
-        // The expiry is `now + expires_in * 1000 - 5 minutes` (TS's
-        // convention).
+        assert_eq!(stored["tokenEndpoint"], "https://auth.x.ai/oauth2/token");
+        // Six-hour tokens refresh one hour before expiry.
         let expires = stored["expires"].as_i64().expect("the expiry is numeric");
         let after_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
         assert!(
-            expires >= before_ms + 3_600_000 - 300_000 && expires <= after_ms + 3_600_000 - 300_000,
-            "the expiry lands one hour minus the skew out: {expires} vs {before_ms}..{after_ms}"
+            expires >= before_ms + 18_000_000 && expires <= after_ms + 18_000_000,
+            "the expiry lands five hours out: {expires} vs {before_ms}..{after_ms}"
         );
         let mut auth = AuthStorage::create(&agent);
         assert_eq!(auth.get_api_key("xai"), Some("grok-access".to_string()));

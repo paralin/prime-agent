@@ -43,7 +43,8 @@ pub use provider_http::{
 };
 pub use types::{OAuthLoginUi, OAuthPrompt};
 pub use xai::{
-    login_xai, refresh_xai_token, XaiCredentials, LOGIN_CANCELLED as XAI_LOGIN_CANCELLED,
+    login_xai, refresh_xai_token, refresh_xai_token_at_endpoint, XaiCredentials,
+    LOGIN_CANCELLED as XAI_LOGIN_CANCELLED,
 };
 
 use std::future::Future;

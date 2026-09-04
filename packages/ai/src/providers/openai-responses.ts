@@ -8,7 +8,7 @@ import type {
 	CacheRetention,
 	Context,
 	Model,
-	OpenAIResponsesCompat,
+	OpenRouterRouting,
 	SimpleStreamOptions,
 	StreamFunction,
 	StreamOptions,
@@ -16,6 +16,8 @@ import type {
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
+import { getOpenCodeSessionHeaders } from "../utils/opencode-headers.js";
+import { getOpenRouterHeaders } from "../utils/openrouter-headers.js";
 import {
 	formatStreamFailureMessage,
 	recordStreamFailure,
@@ -26,7 +28,7 @@ import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copi
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
 import { buildBaseOptions } from "./simple-options.js";
 
-const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
+const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode", "openrouter", "xai"]);
 
 /**
  * Resolve cache retention preference.
@@ -42,15 +44,36 @@ function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention 
 	return "short";
 }
 
-function getCompat(model: Model<"openai-responses">): Required<OpenAIResponsesCompat> {
+interface ResolvedOpenAIResponsesCompat {
+	sendSessionIdHeader: boolean;
+	supportsStore: boolean;
+	supportsPromptCache: boolean;
+	supportsReasoning: boolean;
+	supportsDeveloperRole: boolean;
+	supportsTools: boolean;
+	requiresStringMessageContent: boolean;
+	includeRoutingMetadata: boolean;
+	supportsLongCacheRetention: boolean;
+	openRouterRouting?: OpenRouterRouting;
+}
+
+function getCompat(model: Model<"openai-responses">): ResolvedOpenAIResponsesCompat {
 	return {
 		sendSessionIdHeader: model.compat?.sendSessionIdHeader ?? true,
+		supportsStore: model.compat?.supportsStore ?? true,
+		supportsPromptCache: model.compat?.supportsPromptCache ?? true,
+		supportsReasoning: model.compat?.supportsReasoning ?? true,
+		supportsDeveloperRole: model.compat?.supportsDeveloperRole ?? true,
+		supportsTools: model.compat?.supportsTools ?? true,
+		requiresStringMessageContent: model.compat?.requiresStringMessageContent ?? false,
+		includeRoutingMetadata: model.compat?.includeRoutingMetadata ?? false,
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
+		openRouterRouting: model.compat?.openRouterRouting,
 	};
 }
 
 function getPromptCacheRetention(
-	compat: Required<OpenAIResponsesCompat>,
+	compat: ResolvedOpenAIResponsesCompat,
 	cacheRetention: CacheRetention,
 ): "24h" | undefined {
 	return cacheRetention === "long" && compat.supportsLongCacheRetention ? "24h" : undefined;
@@ -92,7 +115,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
-			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId);
+			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId, options?.sessionId);
 			let params = buildParams(model, context, options);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
@@ -166,6 +189,7 @@ function createClient(
 	apiKey?: string,
 	optionsHeaders?: Record<string, string>,
 	sessionId?: string,
+	conversationId?: string,
 ) {
 	if (!apiKey) {
 		if (!process.env.OPENAI_API_KEY) {
@@ -178,6 +202,10 @@ function createClient(
 
 	const compat = getCompat(model);
 	const headers = { ...model.headers };
+	if (model.provider === "openrouter") {
+		Object.assign(headers, getOpenRouterHeaders());
+	}
+	Object.assign(headers, getOpenCodeSessionHeaders(model.provider, conversationId));
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
 		const copilotHeaders = buildCopilotDynamicHeaders({
@@ -193,7 +221,6 @@ function createClient(
 		}
 		headers["x-client-request-id"] = sessionId;
 	}
-
 	if (optionsHeaders) {
 		Object.assign(headers, optionsHeaders);
 	}
@@ -215,18 +242,28 @@ function createClient(
 	});
 }
 
-function buildParams(model: Model<"openai-responses">, context: Context, options?: OpenAIResponsesOptions) {
-	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS);
+export function buildParams(model: Model<"openai-responses">, context: Context, options?: OpenAIResponsesOptions) {
+	const compat = getCompat(model);
+	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
+		systemRole: compat.supportsDeveloperRole ? undefined : "system",
+		requiresStringMessageContent: compat.requiresStringMessageContent,
+	});
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
-	const compat = getCompat(model);
-	const params: ResponseCreateParamsStreaming = {
+	const params: ResponseCreateParamsStreaming & {
+		session_id?: string;
+		provider?: OpenRouterRouting;
+		include_routing_metadata?: boolean;
+	} = {
 		model: model.id,
 		input: messages,
 		stream: true,
-		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
-		prompt_cache_retention: getPromptCacheRetention(compat, cacheRetention),
-		store: false,
+		prompt_cache_key: compat.supportsPromptCache && cacheRetention !== "none" ? options?.sessionId : undefined,
+		prompt_cache_retention: compat.supportsPromptCache ? getPromptCacheRetention(compat, cacheRetention) : undefined,
+		session_id: model.provider === "openrouter" ? options?.sessionId : undefined,
+		provider: model.provider === "openrouter" ? compat.openRouterRouting : undefined,
+		store: compat.supportsStore ? false : undefined,
+		include_routing_metadata: compat.includeRoutingMetadata || undefined,
 	};
 
 	if (options?.maxTokens) {
@@ -237,15 +274,16 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		params.temperature = options?.temperature;
 	}
 
-	if (options?.serviceTier !== undefined) {
+	// GitHub Copilot rejects service_tier with a 400 invalid_request_error.
+	if (options?.serviceTier !== undefined && model.provider !== "github-copilot") {
 		params.service_tier = options.serviceTier;
 	}
 
-	if (context.tools && context.tools.length > 0) {
+	if (compat.supportsTools && context.tools && context.tools.length > 0) {
 		params.tools = convertResponsesTools(context.tools);
 	}
 
-	if (model.reasoning) {
+	if (model.reasoning && compat.supportsReasoning) {
 		if (options?.reasoningEffort || options?.reasoningSummary) {
 			const effort = options?.reasoningEffort
 				? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)

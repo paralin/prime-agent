@@ -25,6 +25,8 @@ const compat = {
 	supportsStore: true,
 	supportsDeveloperRole: true,
 	supportsReasoningEffort: true,
+	supportsReasoningBudgetTokens: false,
+	requireFinishReason: false,
 	supportsUsageInStreaming: true,
 	maxTokensField: "max_completion_tokens",
 	requiresToolResultName: false,
@@ -39,8 +41,9 @@ const compat = {
 	cacheControlFormat: undefined,
 	sendSessionAffinityHeaders: false,
 	supportsLongCacheRetention: true,
-} satisfies Required<Omit<OpenAICompletionsCompat, "cacheControlFormat">> & {
+} satisfies Required<Omit<OpenAICompletionsCompat, "cacheControlFormat" | "reasoningField">> & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
+	reasoningField?: OpenAICompletionsCompat["reasoningField"];
 };
 
 function buildModel(baseUrl = "http://127.0.0.1:1"): Model<"openai-completions"> {

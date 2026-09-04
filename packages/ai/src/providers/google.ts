@@ -20,6 +20,7 @@ import type {
 	ToolCall,
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
+import { getOpenCodeSessionHeaders } from "../utils/opencode-headers.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import {
 	formatStreamFailureMessage,
@@ -77,7 +78,7 @@ export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions>
 
 		try {
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
-			const client = createClient(model, apiKey, options?.headers);
+			const client = createClient(model, apiKey, options?.headers, options?.sessionId);
 			let params = buildParams(model, context, options);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
@@ -324,14 +325,16 @@ function createClient(
 	model: Model<"google-generative-ai">,
 	apiKey?: string,
 	optionsHeaders?: Record<string, string>,
+	conversationId?: string,
 ): GoogleGenAI {
 	const httpOptions: { baseUrl?: string; apiVersion?: string; headers?: Record<string, string> } = {};
 	if (model.baseUrl) {
 		httpOptions.baseUrl = model.baseUrl;
 		httpOptions.apiVersion = ""; // baseUrl already includes version path, don't append
 	}
-	if (model.headers || optionsHeaders) {
-		httpOptions.headers = { ...model.headers, ...optionsHeaders };
+	const openCodeHeaders = getOpenCodeSessionHeaders(model.provider, conversationId);
+	if (model.headers || optionsHeaders || Object.keys(openCodeHeaders).length > 0) {
+		httpOptions.headers = { ...model.headers, ...openCodeHeaders, ...optionsHeaders };
 	}
 
 	return new GoogleGenAI({

@@ -1166,6 +1166,56 @@ describe("openai-completions tool_choice", () => {
 		expect((payload as { reasoning?: unknown }).reasoning).toEqual({ effort: "high" });
 	});
 
+	it("sends configured reasoning token budgets to compatible servers", async () => {
+		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
+		const model = {
+			...baseModel,
+			api: "openai-completions" as const,
+			reasoning: true,
+			thinkingLevelMap: { xhigh: "xhigh" },
+			compat: {
+				thinkingFormat: "qwen-chat-template" as const,
+				supportsReasoningBudgetTokens: true,
+			},
+		};
+		let payload: unknown;
+
+		await streamSimple(
+			model,
+			{ messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
+			{
+				apiKey: "test",
+				reasoning: "xhigh",
+				thinkingBudgets: { xhigh: 24576 },
+				onPayload: (params: unknown) => {
+					payload = params;
+				},
+			},
+		).result();
+
+		const params = payload as {
+			reasoning_budget_tokens?: number;
+			chat_template_kwargs?: { enable_thinking?: boolean };
+		};
+		expect(params.reasoning_budget_tokens).toBe(24576);
+		expect(params.chat_template_kwargs?.enable_thinking).toBe(true);
+
+		payload = undefined;
+		await streamSimple(
+			{ ...model, compat: { thinkingFormat: "qwen-chat-template" } },
+			{ messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
+			{
+				apiKey: "test",
+				reasoning: "xhigh",
+				thinkingBudgets: { xhigh: 24576 },
+				onPayload: (next: unknown) => {
+					payload = next;
+				},
+			},
+		).result();
+		expect((payload as { reasoning_budget_tokens?: number }).reasoning_budget_tokens).toBeUndefined();
+	});
+
 	it("uses enabled toggles when an OpenRouter model has no effort selector", async () => {
 		const baseModel = getModel("openrouter", "deepseek/deepseek-r1")!;
 		const model = {

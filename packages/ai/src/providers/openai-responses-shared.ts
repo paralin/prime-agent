@@ -31,7 +31,7 @@ import type { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { classifyStreamFailure, StreamFailureError } from "../utils/stream-failure.js";
+import { classifyStreamFailure, StreamFailureError, streamFailureMessage } from "../utils/stream-failure.js";
 import { transformMessages } from "./transform-messages.js";
 
 function encodeTextSignatureV1(id: string, phase?: TextSignatureV1["phase"]): string {
@@ -74,6 +74,9 @@ export interface OpenAIResponsesStreamOptions {
 
 export interface ConvertResponsesMessagesOptions {
 	includeSystemPrompt?: boolean;
+	systemRole?: "developer" | "system";
+	requiresStringMessageContent?: boolean;
+	mergeGatewayToolFormat?: boolean;
 }
 
 export interface ConvertResponsesToolsOptions {
@@ -117,8 +120,9 @@ export function convertResponsesMessages<TApi extends Api>(
 
 	const includeSystemPrompt = options?.includeSystemPrompt ?? true;
 	if (includeSystemPrompt && context.systemPrompt) {
-		const role = model.reasoning ? "developer" : "system";
+		const role = options?.systemRole ?? (model.reasoning ? "developer" : "system");
 		messages.push({
+			type: options?.requiresStringMessageContent ? "message" : undefined,
 			role,
 			content: sanitizeSurrogates(context.systemPrompt),
 		});
@@ -127,10 +131,20 @@ export function convertResponsesMessages<TApi extends Api>(
 	let msgIndex = 0;
 	for (const msg of transformedMessages) {
 		if (msg.role === "user") {
+			if (
+				msg.providerPayload?.type === "openaiResponsesHistory" &&
+				msg.providerPayload.provider === model.provider
+			) {
+				messages.push(...(msg.providerPayload.items as unknown as ResponseInput));
+				continue;
+			}
 			if (typeof msg.content === "string") {
 				messages.push({
+					type: options?.requiresStringMessageContent ? "message" : undefined,
 					role: "user",
-					content: [{ type: "input_text", text: sanitizeSurrogates(msg.content) }],
+					content: options?.requiresStringMessageContent
+						? sanitizeSurrogates(msg.content)
+						: [{ type: "input_text", text: sanitizeSurrogates(msg.content) }],
 				});
 			} else {
 				const content: ResponseInputContent[] = msg.content.map((item): ResponseInputContent => {
@@ -147,12 +161,35 @@ export function convertResponsesMessages<TApi extends Api>(
 					} satisfies ResponseInputImage;
 				});
 				if (content.length === 0) continue;
+				const stringContent = options?.requiresStringMessageContent
+					? content.every((item) => item.type === "input_text")
+						? content.map((item) => item.text).join("\n")
+						: undefined
+					: undefined;
 				messages.push({
+					type: options?.requiresStringMessageContent ? "message" : undefined,
 					role: "user",
-					content,
+					content: stringContent ?? content,
 				});
 			}
 		} else if (msg.role === "assistant") {
+			if (options?.mergeGatewayToolFormat) {
+				const content: Array<Record<string, unknown>> = [];
+				for (const block of msg.content) {
+					if (block.type === "text" && block.text) {
+						content.push({ type: "text", text: sanitizeSurrogates(block.text) });
+					} else if (block.type === "thinking" && block.thinking) {
+						content.push({ type: "thinking", thinking: sanitizeSurrogates(block.thinking) });
+					} else if (block.type === "toolCall") {
+						content.push({ type: "tool_use", id: block.id, name: block.name, input: block.arguments });
+					}
+				}
+				if (content.length > 0) {
+					messages.push({ type: "message", role: "assistant", content } as unknown as ResponseInput[number]);
+				}
+				msgIndex++;
+				continue;
+			}
 			const output: ResponseInput = [];
 			const assistantMsg = msg as AssistantMessage;
 			const isDifferentModel =
@@ -208,6 +245,19 @@ export function convertResponsesMessages<TApi extends Api>(
 			if (output.length === 0) continue;
 			messages.push(...output);
 		} else if (msg.role === "toolResult") {
+			if (options?.mergeGatewayToolFormat) {
+				const content = msg.content
+					.filter((block): block is TextContent => block.type === "text")
+					.map((block) => block.text)
+					.join("\n");
+				messages.push({
+					type: "tool_result",
+					tool_use_id: msg.toolCallId,
+					content: sanitizeSurrogates(content),
+				} as unknown as ResponseInput[number]);
+				msgIndex++;
+				continue;
+			}
 			const textResult = msg.content
 				.filter((c): c is TextContent => c.type === "text")
 				.map((c) => c.text)
@@ -279,9 +329,18 @@ export async function processResponsesStream<TApi extends Api>(
 
 	for await (const event of openaiStream) {
 		if (event.type === "response.created") {
-			output.responseId = event.response.id;
+			const response = event.response;
+			if (!response || typeof response !== "object") {
+				const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+				throw new StreamFailureError(streamFailureMessage(info, "response.created carried no response"), info);
+			}
+			output.responseId = response.id;
 		} else if (event.type === "response.output_item.added") {
 			const item = event.item;
+			if (!item || typeof item !== "object") {
+				const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+				throw new StreamFailureError(streamFailureMessage(info, "output_item.added carried no item"), info);
+			}
 			if (item.type === "reasoning") {
 				currentItem = item;
 				currentBlock = { type: "thinking", thinking: "" };
@@ -307,6 +366,13 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.reasoning_summary_part.added") {
 			if (currentItem && currentItem.type === "reasoning") {
 				currentItem.summary = currentItem.summary || [];
+				if (!event.part || typeof event.part !== "object") {
+					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+					throw new StreamFailureError(
+						streamFailureMessage(info, "reasoning_summary_part.added carried no summary part"),
+						info,
+					);
+				}
 				currentItem.summary.push(event.part);
 			}
 		} else if (event.type === "response.reasoning_summary_text.delta") {
@@ -352,6 +418,13 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.content_part.added") {
 			if (currentItem?.type === "message") {
 				currentItem.content = currentItem.content || [];
+				if (!event.part || typeof event.part !== "object") {
+					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+					throw new StreamFailureError(
+						streamFailureMessage(info, "content_part.added carried no content part"),
+						info,
+					);
+				}
 				if (event.part.type === "output_text" || event.part.type === "refusal") {
 					currentItem.content.push(event.part);
 				}
@@ -403,6 +476,13 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.function_call_arguments.done") {
 			if (currentItem?.type === "function_call" && currentBlock?.type === "toolCall") {
+				if (typeof event.arguments !== "string") {
+					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+					throw new StreamFailureError(
+						streamFailureMessage(info, "function_call_arguments.done carried no arguments"),
+						info,
+					);
+				}
 				const previousPartialJson = currentBlock.partialJson;
 				currentBlock.partialJson = event.arguments;
 				currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
@@ -421,9 +501,38 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.output_item.done") {
 			const item = event.item;
+			if (!item || typeof item !== "object") {
+				const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+				throw new StreamFailureError(streamFailureMessage(info, "output_item.done carried no item"), info);
+			}
 
 			if (item.type === "reasoning" && currentBlock?.type === "thinking") {
-				const summaryText = item.summary?.map((s) => s.text).join("\n\n") || "";
+				if (!Array.isArray(item.summary)) {
+					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+					throw new StreamFailureError(
+						streamFailureMessage(info, "output_item.done reasoning carried no summary"),
+						info,
+					);
+				}
+				if (item.summary.some((part) => !part || typeof part !== "object" || typeof part.text !== "string")) {
+					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+					throw new StreamFailureError(
+						streamFailureMessage(info, "output_item.done reasoning summary contained a malformed part"),
+						info,
+					);
+				}
+				if (
+					item.content !== undefined &&
+					(!Array.isArray(item.content) ||
+						item.content.some((part) => !part || typeof part !== "object" || typeof part.text !== "string"))
+				) {
+					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+					throw new StreamFailureError(
+						streamFailureMessage(info, "output_item.done reasoning content contained a malformed part"),
+						info,
+					);
+				}
+				const summaryText = item.summary.map((s) => s.text).join("\n\n") || "";
 				const contentText = item.content?.map((c) => c.text).join("\n\n") || "";
 				currentBlock.thinking = summaryText || contentText || currentBlock.thinking;
 				currentBlock.thinkingSignature = JSON.stringify(item);
@@ -435,6 +544,31 @@ export async function processResponsesStream<TApi extends Api>(
 				});
 				currentBlock = null;
 			} else if (item.type === "message" && currentBlock?.type === "text") {
+				if (!Array.isArray(item.content)) {
+					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+					throw new StreamFailureError(
+						streamFailureMessage(info, "output_item.done message carried no content"),
+						info,
+					);
+				}
+				if (
+					item.content.some(
+						(part) =>
+							!part ||
+							typeof part !== "object" ||
+							(part.type === "output_text"
+								? typeof part.text !== "string"
+								: part.type === "refusal"
+									? typeof part.refusal !== "string"
+									: true),
+					)
+				) {
+					const info = { kind: "malformed_response", providerErrorType: event.type } as const;
+					throw new StreamFailureError(
+						streamFailureMessage(info, "output_item.done message content contained a malformed part"),
+						info,
+					);
+				}
 				currentBlock.text = item.content.map((c) => (c.type === "output_text" ? c.text : c.refusal)).join("");
 				currentBlock.textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
 				stream.push({
@@ -523,7 +657,7 @@ export async function processResponsesStream<TApi extends Api>(
 }
 
 function mapStopReason(status: OpenAI.Responses.ResponseStatus | undefined): StopReason {
-	if (!status) return "stop";
+	if (!status) return "unknown";
 	switch (status) {
 		case "completed":
 			return "stop";

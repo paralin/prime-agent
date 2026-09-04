@@ -6,11 +6,13 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ProviderNativeCompactionFunction,
 	SimpleStreamOptions,
 	StreamFunction,
 	StreamOptions,
 	TextContent,
 	ThinkingContent,
+	ThinkingLevelMap,
 	ToolCall,
 	ToolResultMessage,
 	Usage,
@@ -38,6 +40,7 @@ export interface FauxModelDefinition {
 	id: string;
 	name?: string;
 	reasoning?: boolean;
+	thinkingLevelMap?: ThinkingLevelMap;
 	input?: ("text" | "image")[];
 	cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	contextWindow?: number;
@@ -106,6 +109,7 @@ export interface RegisterFauxProviderOptions {
 	api?: string;
 	provider?: string;
 	models?: FauxModelDefinition[];
+	compact?: ProviderNativeCompactionFunction<string>;
 	tokensPerSecond?: number;
 	tokenSize?: {
 		min?: number;
@@ -422,6 +426,7 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 		provider,
 		baseUrl: DEFAULT_BASE_URL,
 		reasoning: definition.reasoning ?? false,
+		thinkingLevelMap: definition.thinkingLevelMap,
 		input: definition.input ?? ["text", "image"],
 		cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: definition.contextWindow ?? 128000,
@@ -467,7 +472,7 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 	const streamSimple: StreamFunction<string, SimpleStreamOptions> = (streamModel, context, streamOptions) =>
 		stream(streamModel, context, streamOptions);
 
-	registerApiProvider({ api, stream, streamSimple }, sourceId);
+	registerApiProvider({ api, stream, streamSimple, compact: options.compact }, sourceId);
 
 	function getModel(): Model<string>;
 	function getModel(requestedModelId: string): Model<string> | undefined;

@@ -31,6 +31,7 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.js";
+import { getOpenCodeSessionHeaders } from "../utils/opencode-headers.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import {
 	classifyStreamFailure,
@@ -503,6 +504,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					shouldUseFineGrainedToolStreamingBeta(model, context),
 					options?.headers,
 					copilotDynamicHeaders,
+					options?.sessionId,
 				);
 				client = created.client;
 				isOAuth = created.isOAuthToken;
@@ -847,7 +849,12 @@ function createClient(
 	useFineGrainedToolStreamingBeta: boolean,
 	optionsHeaders?: Record<string, string>,
 	dynamicHeaders?: Record<string, string>,
+	conversationId?: string,
 ): { client: Anthropic; isOAuthToken: boolean } {
+	optionsHeaders = {
+		...getOpenCodeSessionHeaders(model.provider, conversationId),
+		...optionsHeaders,
+	};
 	// Adaptive thinking models (Opus 4.6, Sonnet 4.6) have interleaved thinking built-in.
 	// The beta header is deprecated on Opus 4.6 and redundant on Sonnet 4.6, so skip it.
 	const needsInterleavedBeta = interleavedThinking && !supportsAdaptiveThinking(model.id);

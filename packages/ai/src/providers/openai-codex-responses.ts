@@ -28,6 +28,8 @@ import type {
 	AssistantMessage,
 	Context,
 	Model,
+	ProviderNativeCompactionOptions,
+	ProviderNativeCompactionResult,
 	SimpleStreamOptions,
 	StreamFunction,
 	StreamOptions,
@@ -44,11 +46,13 @@ import { convertResponsesMessages, convertResponsesTools, processResponsesStream
 import { buildBaseOptions } from "./simple-options.js";
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
+export const OPENAI_CODEX_COMPACTION_TIMEOUT_MS = 180_000;
 const JWT_CLAIM_PATH = "https://api.openai.com/auth" as const;
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
+const LOCAL_CODEX_BEARER_HEADER = "x-prime-local-codex-bearer";
 
 const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 	"completed",
@@ -64,6 +68,29 @@ export interface OpenAICodexResponsesOptions extends StreamOptions {
 	reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	textVerbosity?: "low" | "medium" | "high";
+}
+
+export type OpenAICodexCompactionOptions = ProviderNativeCompactionOptions;
+
+export type OpenAICodexCompactionItem =
+	| (Record<string, unknown> & { type: "compaction"; encrypted_content: string })
+	| (Record<string, unknown> & { type: "compaction_summary"; encrypted_content: string });
+
+export interface OpenAICodexCompactionResult extends ProviderNativeCompactionResult {
+	compactionItem: OpenAICodexCompactionItem;
+}
+
+export class OpenAICodexCompactionHttpError extends Error {
+	readonly status: number;
+	readonly responseBody: string;
+
+	constructor(status: number, statusText: string, responseBody: string) {
+		const details = responseBody ? `: ${responseBody}` : "";
+		super(`OpenAI Codex compaction failed (${status} ${statusText})${details}`);
+		this.name = "OpenAICodexCompactionHttpError";
+		this.status = status;
+		this.responseBody = responseBody;
+	}
 }
 
 type CodexResponseStatus = "completed" | "incomplete" | "failed" | "cancelled" | "queued" | "in_progress";
@@ -140,7 +167,8 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				throw new Error(`No API key for provider: ${model.provider}`);
 			}
 
-			const accountId = extractAccountId(apiKey);
+			const localBearer = usesLocalCodexBearer(model.baseUrl, model.headers, options?.headers);
+			const accountId = localBearer ? undefined : extractAccountId(apiKey);
 			let body = buildRequestBody(model, context, options);
 			const nextBody = await options?.onPayload?.(body, model);
 			if (nextBody !== undefined) {
@@ -156,7 +184,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				websocketRequestId,
 			);
 			const bodyJson = JSON.stringify(body);
-			const transport = options?.transport || "auto";
+			const transport = localBearer ? "sse" : options?.transport || "auto";
 			const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(options?.sessionId);
 			if (websocketDisabledForSession) {
 				recordWebSocketSseFallback(options?.sessionId);
@@ -183,7 +211,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					}
 					stream.push({
 						type: "done",
-						reason: output.stopReason as "stop" | "length" | "toolUse",
+						reason: output.stopReason as "stop" | "length" | "toolUse" | "unknown",
 						message: output,
 					});
 					stream.end();
@@ -279,7 +307,11 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				throw new Error("Request was aborted");
 			}
 
-			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
+			stream.push({
+				type: "done",
+				reason: output.stopReason as "stop" | "length" | "toolUse" | "unknown",
+				message: output,
+			});
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) {
@@ -315,6 +347,102 @@ export const streamSimpleOpenAICodexResponses: StreamFunction<"openai-codex-resp
 		reasoningEffort,
 	} satisfies OpenAICodexResponsesOptions);
 };
+
+export const compactOpenAICodexResponses = async (
+	model: Model<"openai-codex-responses">,
+	context: Context,
+	options: OpenAICodexCompactionOptions,
+): Promise<OpenAICodexCompactionResult> => {
+	const apiKey = options.apiKey || getEnvApiKey(model.provider) || "";
+	if (!apiKey) {
+		throw new Error(`No API key for provider: ${model.provider}`);
+	}
+
+	const localBearer = usesLocalCodexBearer(model.baseUrl, model.headers, options.headers);
+	const accountId = localBearer ? undefined : extractAccountId(apiKey);
+	const input = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
+		includeSystemPrompt: false,
+	});
+	let v2Body: unknown = {
+		model: model.id,
+		input: [...input, { type: "compaction_trigger" }],
+		instructions: options.instructions,
+		store: false,
+		stream: true,
+	};
+	const nextV2Body = await options.onPayload?.(v2Body, model);
+	if (nextV2Body !== undefined) v2Body = nextV2Body;
+
+	const headers = buildSSEHeaders(model.headers, options.headers, accountId, apiKey, options.sessionId);
+	const requestTimeout = createRequestTimeout(options.signal, options.timeoutMs);
+	try {
+		requestTimeout.signal.throwIfAborted();
+		try {
+			const response = await fetch(resolveCodexUrl(model.baseUrl), {
+				method: "POST",
+				headers,
+				body: JSON.stringify(v2Body),
+				signal: requestTimeout.signal,
+			});
+			await options.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+
+			if (!response.ok) {
+				const responseBody = await response.text().catch(() => "");
+				throw new OpenAICodexCompactionHttpError(response.status, response.statusText, responseBody);
+			}
+
+			return await parseCodexCompactionV2Stream(response, model.provider, input);
+		} catch (error) {
+			if (requestTimeout.signal.aborted) throw error;
+		}
+
+		let v1Body: unknown = {
+			model: model.id,
+			input,
+			instructions: options.instructions,
+		};
+		const nextV1Body = await options.onPayload?.(v1Body, model);
+		if (nextV1Body !== undefined) v1Body = nextV1Body;
+
+		const v1Headers = new Headers(headers);
+		v1Headers.delete("accept");
+		const response = await fetch(resolveCodexCompactionUrl(model.baseUrl), {
+			method: "POST",
+			headers: v1Headers,
+			body: JSON.stringify(v1Body),
+			signal: requestTimeout.signal,
+		});
+		await options.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+
+		if (!response.ok) {
+			const responseBody = await response.text().catch(() => "");
+			throw new OpenAICodexCompactionHttpError(response.status, response.statusText, responseBody);
+		}
+
+		const data = (await response.json()) as { output?: unknown } | undefined;
+		const output = data?.output;
+		if (!Array.isArray(output)) {
+			throw new Error("OpenAI Codex compaction response missing output array");
+		}
+
+		const compactionItem = output.at(-1);
+		if (!isOpenAICodexCompactionItem(compactionItem)) {
+			throw new Error("OpenAI Codex compaction response missing final compaction item");
+		}
+
+		return {
+			provider: model.provider,
+			replacementHistory: output.filter(isOpenAICodexReplacementHistoryItem),
+			compactionItem,
+		};
+	} finally {
+		requestTimeout.dispose();
+	}
+};
+
+// ============================================================================
+// Request Building
+// ============================================================================
 
 function buildRequestBody(
 	model: Model<"openai-codex-responses">,
@@ -412,6 +540,148 @@ function resolveCodexUrl(baseUrl?: string): string {
 	if (normalized.endsWith("/codex/responses")) return normalized;
 	if (normalized.endsWith("/codex")) return `${normalized}/responses`;
 	return `${normalized}/codex/responses`;
+}
+
+function resolveCodexCompactionUrl(baseUrl?: string): string {
+	return `${resolveCodexUrl(baseUrl)}/compact`;
+}
+
+function isOpenAICodexCompactionItem(item: unknown): item is OpenAICodexCompactionItem {
+	if (!item || typeof item !== "object") return false;
+	const candidate = item as Record<string, unknown>;
+	return (
+		(candidate.type === "compaction" || candidate.type === "compaction_summary") &&
+		typeof candidate.encrypted_content === "string" &&
+		candidate.encrypted_content.length > 0
+	);
+}
+
+function isOpenAICodexReplacementHistoryItem(item: unknown): item is Record<string, unknown> {
+	if (!item || typeof item !== "object") return false;
+	const candidate = item as Record<string, unknown>;
+	if (isOpenAICodexCompactionItem(candidate)) return true;
+	return candidate.type === "message" && (candidate.role === "user" || candidate.role === "assistant");
+}
+
+async function parseCodexCompactionV2Stream(
+	response: Response,
+	provider: OpenAICodexCompactionResult["provider"],
+	input: ResponseInput,
+): Promise<OpenAICodexCompactionResult> {
+	const compactionItems: OpenAICodexCompactionItem[] = [];
+	let completed = false;
+
+	for await (const event of parseSSE(response)) {
+		const type = typeof event.type === "string" ? event.type : "";
+		if (type === "error") {
+			const message = typeof event.message === "string" ? event.message : "";
+			throw new Error(`OpenAI Codex compaction stream failed${message ? `: ${message}` : ""}`);
+		}
+		if (type === "response.failed" || type === "response.incomplete") {
+			const message = (event.response as { error?: { message?: unknown } } | undefined)?.error?.message;
+			throw new Error(`OpenAI Codex compaction stream failed${typeof message === "string" ? `: ${message}` : ""}`);
+		}
+		if (type === "response.completed" || type === "response.done") {
+			completed = true;
+			break;
+		}
+		if (type === "response.output_item.done" && isOpenAICodexCompactionItem(event.item)) {
+			compactionItems.push(event.item);
+		}
+	}
+
+	if (!completed) {
+		throw new Error("OpenAI Codex compaction stream closed before response.completed");
+	}
+	if (compactionItems.length !== 1) {
+		throw new Error(`OpenAI Codex compaction expected one output item, received ${compactionItems.length}`);
+	}
+
+	const compactionItem = compactionItems[0];
+	return {
+		provider,
+		replacementHistory: [...retainCodexCompactionV2Messages(input), compactionItem],
+		compactionItem,
+	};
+}
+
+function retainCodexCompactionV2Messages(input: ResponseInput): Array<Record<string, unknown>> {
+	const retained: Array<Record<string, unknown>> = [];
+	for (const item of input) {
+		if (!item || typeof item !== "object") continue;
+		const candidate = item as unknown as Record<string, unknown>;
+		if ((candidate.type === undefined || candidate.type === "message") && candidate.role === "user") {
+			retained.push(candidate);
+		}
+	}
+
+	let remainingTextCharacters = 64_000 * 4;
+	const result: Array<Record<string, unknown>> = [];
+	for (let index = retained.length - 1; index >= 0 && remainingTextCharacters > 0; index--) {
+		const item = retained[index];
+		const textCharacters = codexCompactionV2MessageTextCharacters(item);
+		const budgetCharacters = Math.max(4, textCharacters);
+		if (budgetCharacters <= remainingTextCharacters) {
+			result.unshift(item);
+			remainingTextCharacters -= budgetCharacters;
+			continue;
+		}
+		result.unshift(truncateCodexCompactionV2MessageText(item, remainingTextCharacters));
+		remainingTextCharacters = 0;
+	}
+	return result;
+}
+
+function codexCompactionV2MessageTextCharacters(item: Record<string, unknown>): number {
+	if (!Array.isArray(item.content)) return 0;
+	return item.content.reduce((total, part) => {
+		if (!part || typeof part !== "object") return total;
+		const text = (part as Record<string, unknown>).text;
+		return total + (typeof text === "string" ? text.length : 0);
+	}, 0);
+}
+
+function truncateCodexCompactionV2MessageText(
+	item: Record<string, unknown>,
+	maxTextCharacters: number,
+): Record<string, unknown> {
+	const copy = JSON.parse(JSON.stringify(item)) as Record<string, unknown>;
+	if (!Array.isArray(copy.content)) return copy;
+	let remainingTextCharacters = maxTextCharacters;
+	copy.content = copy.content.flatMap((part) => {
+		if (!part || typeof part !== "object") return [part];
+		const candidate = part as Record<string, unknown>;
+		if (typeof candidate.text !== "string") return [part];
+		if (remainingTextCharacters === 0) return [];
+		const text = candidate.text.slice(0, remainingTextCharacters);
+		remainingTextCharacters -= text.length;
+		return text.length > 0 ? [{ ...candidate, text }] : [];
+	});
+	return copy;
+}
+
+function createRequestTimeout(
+	callerSignal: AbortSignal | undefined,
+	timeoutMs: number | undefined,
+): { signal: AbortSignal; dispose: () => void } {
+	const controller = new AbortController();
+	const requestTimeoutMs = timeoutMs && timeoutMs > 0 ? timeoutMs : OPENAI_CODEX_COMPACTION_TIMEOUT_MS;
+	const onCallerAbort = () => controller.abort(callerSignal?.reason);
+
+	if (callerSignal?.aborted) onCallerAbort();
+	else callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+
+	const timer = setTimeout(() => {
+		controller.abort(new Error(`OpenAI Codex compaction request timed out after ${requestTimeoutMs}ms`));
+	}, requestTimeoutMs);
+
+	return {
+		signal: controller.signal,
+		dispose: () => {
+			clearTimeout(timer);
+			callerSignal?.removeEventListener("abort", onCallerAbort);
+		},
+	};
 }
 
 function resolveCodexWebSocketUrl(baseUrl?: string): string {
@@ -1212,6 +1482,25 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 	return { message, friendlyMessage };
 }
 
+// ============================================================================
+// Auth & Headers
+// ============================================================================
+
+function usesLocalCodexBearer(
+	baseUrl: string | undefined,
+	modelHeaders: Record<string, string> | undefined,
+	requestHeaders: Record<string, string> | undefined,
+): boolean {
+	const configured = requestHeaders?.[LOCAL_CODEX_BEARER_HEADER] ?? modelHeaders?.[LOCAL_CODEX_BEARER_HEADER];
+	if (configured !== "1") return false;
+
+	const url = new URL(resolveCodexUrl(baseUrl));
+	return (
+		url.protocol === "http:" &&
+		(url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost")
+	);
+}
+
 function extractAccountId(token: string): string {
 	try {
 		const parts = token.split(".");
@@ -1235,15 +1524,17 @@ function createCodexRequestId(): string {
 function buildBaseCodexHeaders(
 	initHeaders: Record<string, string> | undefined,
 	additionalHeaders: Record<string, string> | undefined,
-	accountId: string,
+	accountId: string | undefined,
 	token: string,
 ): Headers {
 	const headers = new Headers(initHeaders);
 	for (const [key, value] of Object.entries(additionalHeaders || {})) {
 		headers.set(key, value);
 	}
+	headers.delete(LOCAL_CODEX_BEARER_HEADER);
 	headers.set("Authorization", `Bearer ${token}`);
-	headers.set("chatgpt-account-id", accountId);
+	if (accountId) headers.set("chatgpt-account-id", accountId);
+	else headers.delete("chatgpt-account-id");
 	headers.set("originator", "pi");
 	const userAgent = _os ? `pi (${_os.platform()} ${_os.release()}; ${_os.arch()})` : "pi (browser)";
 	headers.set("User-Agent", userAgent);
@@ -1253,7 +1544,7 @@ function buildBaseCodexHeaders(
 function buildSSEHeaders(
 	initHeaders: Record<string, string> | undefined,
 	additionalHeaders: Record<string, string> | undefined,
-	accountId: string,
+	accountId: string | undefined,
 	token: string,
 	sessionId?: string,
 ): Headers {
@@ -1273,7 +1564,7 @@ function buildSSEHeaders(
 function buildWebSocketHeaders(
 	initHeaders: Record<string, string> | undefined,
 	additionalHeaders: Record<string, string> | undefined,
-	accountId: string,
+	accountId: string | undefined,
 	token: string,
 	requestId: string,
 ): Headers {

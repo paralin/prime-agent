@@ -61,6 +61,8 @@ export interface ThinkingBudgets {
 	low?: number;
 	medium?: number;
 	high?: number;
+	xhigh?: number;
+	max?: number;
 }
 
 // Base options all providers share
@@ -141,12 +143,46 @@ export interface StreamOptions {
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
 
+/** Options for a provider-native conversation compaction request. */
+export interface ProviderNativeCompactionOptions extends StreamOptions {
+	instructions: string;
+}
+
+/** An opaque provider-native compaction item suitable for replay by the same provider. */
+export type ProviderNativeCompactionItem = Record<string, unknown> & {
+	type: "compaction" | "compaction_summary";
+};
+
+/** Replacement provider-native history returned by a compaction operation. */
+export interface ProviderNativeCompactionResult {
+	provider: Provider;
+	replacementHistory: Array<Record<string, unknown>>;
+	compactionItem: ProviderNativeCompactionItem;
+}
+
+/** Provider-native OpenAI Responses history replayed before ordinary context messages. */
+export interface OpenAIResponsesHistoryPayload {
+	type: "openaiResponsesHistory";
+	provider: Provider;
+	items: Array<Record<string, unknown>>;
+}
+
+export type ProviderPayload = OpenAIResponsesHistoryPayload;
+
+/** Optional provider operation for replacing a context with provider-native compacted history. */
+export type ProviderNativeCompactionFunction<
+	TApi extends Api = Api,
+	TOptions extends ProviderNativeCompactionOptions = ProviderNativeCompactionOptions,
+> = (model: Model<TApi>, context: Context, options: TOptions) => Promise<ProviderNativeCompactionResult>;
+
 // Unified options with reasoning passed to streamSimple() and completeSimple()
 export interface SimpleStreamOptions extends StreamOptions {
 	/** Explicit model reasoning selection. Omit to preserve the provider default. */
 	reasoning?: ModelThinkingLevel;
 	/** Custom token budgets for thinking levels (token-based providers only) */
 	thinkingBudgets?: ThinkingBudgets;
+	/** Prefer OpenRouter's stateless Responses transport, with a pre-stream Chat fallback. */
+	openRouterResponses?: boolean;
 }
 
 // Generic StreamFunction with typed options.
@@ -214,11 +250,13 @@ export interface Usage {
 	};
 }
 
-export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
+export type StopReason = "stop" | "length" | "toolUse" | "unknown" | "error" | "aborted";
 
 export interface UserMessage {
 	role: "user";
 	content: string | (TextContent | ImageContent)[];
+	/** Opaque provider-native history used only when the active provider matches. */
+	providerPayload?: ProviderPayload;
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
@@ -283,7 +321,7 @@ export type AssistantMessageEvent =
 	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
-	| { type: "done"; reason: Extract<StopReason, "stop" | "length" | "toolUse">; message: AssistantMessage }
+	| { type: "done"; reason: Extract<StopReason, "stop" | "length" | "toolUse" | "unknown">; message: AssistantMessage }
 	| { type: "error"; reason: Extract<StopReason, "aborted" | "error">; error: AssistantMessage };
 
 /**
@@ -291,12 +329,18 @@ export type AssistantMessageEvent =
  * Use this to override URL-based auto-detection for custom providers.
  */
 export interface OpenAICompletionsCompat {
+	/** Provider field that carries streamed and replayed reasoning text. Default: auto-detected from the response. */
+	reasoningField?: string;
+	/** Whether a stream must include a terminal finish reason. Default: false. */
+	requireFinishReason?: boolean;
 	/** Whether the provider supports the `store` field. Default: auto-detected from URL. */
 	supportsStore?: boolean;
 	/** Whether the provider supports the `developer` role (vs `system`). Default: auto-detected from URL. */
 	supportsDeveloperRole?: boolean;
 	/** Whether the provider supports `reasoning_effort`. Default: auto-detected from URL. */
 	supportsReasoningEffort?: boolean;
+	/** Whether the provider supports llama.cpp-style `reasoning_budget_tokens`. Default: false. */
+	supportsReasoningBudgetTokens?: boolean;
 	/** Whether the provider supports `stream_options: { include_usage: true }` for token usage in streaming responses. Default: true. */
 	supportsUsageInStreaming?: boolean;
 	/** Which field to use for max tokens. Default: auto-detected from URL. */
@@ -309,8 +353,8 @@ export interface OpenAICompletionsCompat {
 	requiresThinkingAsText?: boolean;
 	/** Whether all replayed assistant messages must include an empty reasoning_content field when reasoning is enabled. Default: auto-detected from URL. */
 	requiresReasoningContentOnAssistantMessages?: boolean;
-	/** Format for reasoning/thinking parameter. "openai" uses reasoning_effort, "openrouter" uses reasoning: { effort }, "deepseek" uses thinking: { type } plus reasoning_effort, "zai" uses top-level enable_thinking: boolean, "qwen" uses top-level enable_thinking: boolean, and "qwen-chat-template" uses chat_template_kwargs.enable_thinking. Default: "openai". */
-	thinkingFormat?: "openai" | "openrouter" | "deepseek" | "zai" | "qwen" | "qwen-chat-template";
+	/** Format for reasoning/thinking parameters. "openai" uses reasoning_effort, "merge" uses Gateway thinking budgets plus reasoning_effort, "openrouter" uses reasoning: { effort }, "deepseek" uses thinking: { type } plus reasoning_effort, "zai" uses top-level enable_thinking: boolean, "qwen" uses top-level enable_thinking: boolean, and "qwen-chat-template" uses chat_template_kwargs.enable_thinking. Default: "openai". */
+	thinkingFormat?: "openai" | "merge" | "openrouter" | "deepseek" | "zai" | "qwen" | "qwen-chat-template";
 	/** OpenRouter-specific routing preferences. Only used when baseUrl points to OpenRouter. */
 	openRouterRouting?: OpenRouterRouting;
 	/** Vercel AI Gateway routing preferences. Only used when baseUrl points to Vercel AI Gateway. */
@@ -321,8 +365,8 @@ export interface OpenAICompletionsCompat {
 	supportsStrictMode?: boolean;
 	/** Cache control convention for prompt caching. "anthropic" applies Anthropic-style `cache_control` markers to the system prompt, last tool definition, and last user/assistant text content. */
 	cacheControlFormat?: "anthropic";
-	/** Whether to send known session-affinity headers (`session_id`, `x-client-request-id`, `x-session-affinity`) from `options.sessionId` when caching is enabled. Default: false. */
-	sendSessionAffinityHeaders?: boolean;
+	/** Whether to send the default session-affinity headers, or the exact header names to send, from `options.sessionId` when caching is enabled. Default: false. */
+	sendSessionAffinityHeaders?: boolean | readonly string[];
 	/** Whether the provider supports long prompt cache retention (`prompt_cache_retention: "24h"` or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true. */
 	supportsLongCacheRetention?: boolean;
 }
@@ -331,8 +375,24 @@ export interface OpenAICompletionsCompat {
 export interface OpenAIResponsesCompat {
 	/** Whether to send the OpenAI `session_id` cache-affinity header from `options.sessionId` when caching is enabled. Default: true. */
 	sendSessionIdHeader?: boolean;
+	/** Whether the provider supports the `store` field. Default: true. */
+	supportsStore?: boolean;
+	/** Whether the provider supports prompt cache request fields. Default: true. */
+	supportsPromptCache?: boolean;
+	/** Whether the provider supports the `reasoning` and encrypted-reasoning request fields. Default: true. */
+	supportsReasoning?: boolean;
+	/** Whether the provider supports the `developer` input role. Default: true. */
+	supportsDeveloperRole?: boolean;
+	/** Whether the provider supports function tools. Default: true. */
+	supportsTools?: boolean;
+	/** Whether text messages require string content instead of typed content parts. Default: false. */
+	requiresStringMessageContent?: boolean;
+	/** Whether to request provider routing metadata. Default: false. */
+	includeRoutingMetadata?: boolean;
 	/** Whether the provider supports `prompt_cache_retention: "24h"`. Default: true. */
 	supportsLongCacheRetention?: boolean;
+	/** OpenRouter-specific routing preferences for Responses requests. */
+	openRouterRouting?: OpenRouterRouting;
 }
 
 /** Compatibility settings for Anthropic Messages-compatible APIs. */

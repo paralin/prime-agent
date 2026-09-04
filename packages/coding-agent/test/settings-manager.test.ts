@@ -1,8 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SettingsManager } from "../src/core/settings-manager.js";
+
+const SETTINGS_WATCH_READY_MS = 25;
+const SETTINGS_WATCH_SETTLE_MS = 250;
 
 describe("SettingsManager", () => {
 	const testDir = join(process.cwd(), "test-settings-tmp");
@@ -21,6 +24,72 @@ describe("SettingsManager", () => {
 		if (existsSync(testDir)) {
 			rmSync(testDir, { recursive: true });
 		}
+	});
+
+	describe("file watching", () => {
+		it("reloads global model roles and other settings after an external edit", async () => {
+			const settingsPath = join(agentDir, "settings.yml");
+			writeFileSync(
+				settingsPath,
+				`defaultThinkingLevel: low
+openRouter:
+  responses: false
+modelRoles:
+  task: provider/old:low
+`,
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			await new Promise((resolve) => setTimeout(resolve, SETTINGS_WATCH_READY_MS));
+
+			writeFileSync(
+				settingsPath,
+				`defaultThinkingLevel: high
+openRouter:
+  responses: true
+modelRoles:
+  task: provider/new:high
+`,
+			);
+
+			await vi.waitFor(() => {
+				expect(manager.getDefaultThinkingLevel()).toBe("high");
+				expect(manager.getOpenRouterResponses()).toBe(true);
+				expect(manager.getModelRole("task")).toBe("provider/new:high");
+			});
+			manager.dispose();
+		});
+
+		it("reloads project settings after an atomic file replacement", async () => {
+			const projectSettingsDir = join(projectDir, ".prime", "agent");
+			const settingsPath = join(projectSettingsDir, "settings.json");
+			const replacementPath = join(projectSettingsDir, "settings.next.json");
+			writeFileSync(settingsPath, JSON.stringify({ modelRoles: { review: "provider/old" } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			await new Promise((resolve) => setTimeout(resolve, SETTINGS_WATCH_READY_MS));
+
+			writeFileSync(replacementPath, JSON.stringify({ modelRoles: { review: "provider/new:medium" } }));
+			renameSync(replacementPath, settingsPath);
+
+			await vi.waitFor(() => expect(manager.getModelRole("review")).toBe("provider/new:medium"));
+			manager.dispose();
+		});
+
+		it("keeps runtime overrides across watched reloads and stops after disposal", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ defaultProvider: "file-old", theme: "dark" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			await new Promise((resolve) => setTimeout(resolve, SETTINGS_WATCH_READY_MS));
+			manager.applyOverrides({ defaultProvider: "runtime" });
+
+			writeFileSync(settingsPath, JSON.stringify({ defaultProvider: "file-new", theme: "light" }));
+			await vi.waitFor(() => expect(manager.getTheme()).toBe("light"));
+			expect(manager.getDefaultProvider()).toBe("runtime");
+
+			manager.dispose();
+			writeFileSync(settingsPath, JSON.stringify({ defaultProvider: "ignored", theme: "midnight" }));
+			await new Promise((resolve) => setTimeout(resolve, SETTINGS_WATCH_SETTLE_MS));
+			expect(manager.getTheme()).toBe("light");
+		});
 	});
 
 	describe("preserves externally added settings", () => {
@@ -492,6 +561,182 @@ describe("SettingsManager", () => {
 			});
 		});
 	});
+	describe("model roles", () => {
+		it("merges project roles over global roles and returns defensive copies", async () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ modelRoles: { luna: "openai-codex/gpt-5.6-luna:high", task: "global/task" } }),
+			);
+			writeFileSync(
+				join(projectDir, ".prime", "agent", "settings.json"),
+				JSON.stringify({ modelRoles: { task: ["project/missing", "project/task:max"] } }),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getModelRoles()).toEqual({
+				luna: "openai-codex/gpt-5.6-luna:high",
+				task: ["project/missing", "project/task:max"],
+			});
+			const task = manager.getModelRole("task") as string[];
+			task.push("mutated/outside");
+			expect(manager.getModelRole("task")).toEqual(["project/missing", "project/task:max"]);
+
+			manager.setModelRoles({ deepseek: "openrouter/deepseek/deepseek-v4-flash-0731:max" });
+			await manager.flush();
+			expect(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8")).modelRoles).toEqual({
+				deepseek: "openrouter/deepseek/deepseek-v4-flash-0731:max",
+			});
+		});
+
+		it("loads interchangeable YAML settings and preserves their format when saving roles", async () => {
+			const globalPath = join(agentDir, "settings.yml");
+			const projectPath = join(projectDir, ".prime", "agent", "settings.yaml");
+			writeFileSync(
+				globalPath,
+				`modelRoles:
+  copilot-grok: github-copilot/grok-4.5:high
+  task: global/task:low
+`,
+			);
+			writeFileSync(
+				projectPath,
+				`modelRoles:
+  task: project/task:max
+`,
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getModelRoles()).toEqual({
+				"copilot-grok": "github-copilot/grok-4.5:high",
+				task: "project/task:max",
+			});
+			manager.setModelRoles({ "copilot-grok": "github-copilot/grok-4.5:high" });
+			await manager.flush();
+
+			const saved = readFileSync(globalPath, "utf8");
+			expect(saved).toContain("modelRoles:");
+			expect(saved).toContain("copilot-grok: github-copilot/grok-4.5:high");
+			expect(existsSync(join(agentDir, "settings.json"))).toBe(false);
+		});
+
+		it("rejects ambiguous JSON and YAML settings files without overwriting either", async () => {
+			const jsonPath = join(agentDir, "settings.json");
+			const yamlPath = join(agentDir, "settings.yml");
+			writeFileSync(jsonPath, JSON.stringify({ theme: "dark" }));
+			writeFileSync(yamlPath, "theme: light\n");
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.drainErrors("global")[0]?.error.message).toContain("Multiple settings files");
+			manager.setDefaultThinkingLevel("high");
+			await manager.flush();
+			expect(readFileSync(jsonPath, "utf8")).toBe(JSON.stringify({ theme: "dark" }));
+			expect(readFileSync(yamlPath, "utf8")).toBe("theme: light\n");
+		});
+	});
+
+	describe("Claude Code runtime", () => {
+		it("merges the non-secret executable setting with project precedence", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ claudeCode: { executable: "/global/claude" } }),
+			);
+			writeFileSync(
+				join(projectDir, ".prime", "agent", "settings.json"),
+				JSON.stringify({ claudeCode: { executable: "/project/claude" } }),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getClaudeCodeExecutable()).toBe("/project/claude");
+		});
+
+		it("treats an empty executable as unavailable", () => {
+			const manager = SettingsManager.inMemory({ claudeCode: { executable: "  " } });
+			expect(manager.getClaudeCodeExecutable()).toBeUndefined();
+		});
+	});
+
+	describe("OpenRouter Responses transport", () => {
+		it("defaults to Chat Completions and accepts an explicit opt-in", () => {
+			expect(SettingsManager.inMemory().getOpenRouterResponses()).toBe(false);
+			expect(SettingsManager.inMemory({ openRouter: { responses: true } }).getOpenRouterResponses()).toBe(true);
+		});
+	});
+
+	describe("provider-native compaction", () => {
+		it("defaults to enabled and accepts an explicit opt-out", () => {
+			const defaultManager = SettingsManager.create(projectDir, agentDir);
+			expect(defaultManager.getCompactionNative()).toBe(true);
+			expect(defaultManager.getCompactionSettings().native).toBe(true);
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ compaction: { native: false } }));
+			const disabledManager = SettingsManager.create(projectDir, agentDir);
+			expect(disabledManager.getCompactionNative()).toBe(false);
+			expect(disabledManager.getCompactionSettings().native).toBe(false);
+		});
+	});
+
+	describe("RLM service-tier allowlist", () => {
+		it("defaults to the configured default service tier and accepts an explicit array", () => {
+			expect(SettingsManager.inMemory().getRlmAllowedServiceTiers()).toEqual(["default"]);
+			expect(SettingsManager.inMemory({ defaultServiceTier: "flex" }).getRlmAllowedServiceTiers()).toEqual(["flex"]);
+			expect(
+				SettingsManager.inMemory({
+					rlmAllowedServiceTiers: ["default", "priority"],
+				}).getRlmAllowedServiceTiers(),
+			).toEqual(["default", "priority"]);
+		});
+	});
+
+	describe("RLM Act depth settings", () => {
+		it("defaults the maximum to one and accepts a non-negative integer", () => {
+			expect(SettingsManager.inMemory().getRlmActMaxDepth()).toBe(1);
+			expect(SettingsManager.inMemory({ rlmActMaxDepth: 2 }).getRlmActMaxDepth()).toBe(2);
+			expect(SettingsManager.inMemory({ rlmActMaxDepth: 0 }).getRlmActMaxDepth()).toBe(0);
+		});
+
+		it.each([-1, 1.5])("rejects invalid maximum %s", (rlmActMaxDepth) => {
+			const manager = SettingsManager.inMemory({ rlmActMaxDepth });
+			expect(() => manager.getRlmActMaxDepth()).toThrow("rlmActMaxDepth must be a non-negative integer");
+		});
+
+		it("keeps a scalar default at Act depth one only", () => {
+			const manager = SettingsManager.inMemory({ rlmActDefaultModel: "  @luna  " });
+			expect(manager.getRlmActDefaultModel(1)).toBe("@luna");
+			expect(manager.getRlmActDefaultModel(2)).toBeUndefined();
+		});
+
+		it("normalizes ordered array defaults by Act depth", () => {
+			const manager = SettingsManager.inMemory({
+				rlmActDefaultModel: ["  @luna  ", "  @deepseek  "],
+			});
+			expect(manager.getRlmActDefaultModel(1)).toBe("@luna");
+			expect(manager.getRlmActDefaultModel(2)).toBe("@deepseek");
+			expect(manager.getRlmActDefaultModel(3)).toBeUndefined();
+			expect(SettingsManager.inMemory({ rlmActDefaultModel: [] }).getRlmActDefaultModel(1)).toBeUndefined();
+		});
+
+		it("rejects invalid array entries", () => {
+			const empty = SettingsManager.inMemory({ rlmActDefaultModel: ["@luna", "  "] });
+			expect(() => empty.getRlmActDefaultModel(2)).toThrow("rlmActDefaultModel entries must be non-empty strings");
+			const nonString = SettingsManager.inMemory({
+				rlmActDefaultModel: ["@luna", 42] as unknown as string[],
+			});
+			expect(() => nonString.getRlmActDefaultModel(2)).toThrow(
+				"rlmActDefaultModel entries must be non-empty strings",
+			);
+		});
+
+		it("loads ordered Act defaults from YAML", () => {
+			writeFileSync(
+				join(agentDir, "settings.yml"),
+				'rlmActMaxDepth: 2\nrlmActDefaultModel:\n  - "@luna"\n  - "@deepseek"\n',
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getRlmActMaxDepth()).toBe(2);
+			expect(manager.getRlmActDefaultModel(1)).toBe("@luna");
+			expect(manager.getRlmActDefaultModel(2)).toBe("@deepseek");
+		});
+	});
+
 	describe("idle worker eviction", () => {
 		it("defaults to 90 minutes and treats none as off", () => {
 			const manager = SettingsManager.create(projectDir, agentDir);

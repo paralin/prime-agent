@@ -1,10 +1,19 @@
 import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, type FSWatcher, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
+import {
+	isSettingsFileName,
+	parseSettingsDocument,
+	resolveSettingsFile,
+	type SettingsFileFormat,
+	stringifySettingsDocument,
+} from "../settings-files.js";
+import { closeWatcher, FS_WATCH_RETRY_DELAY_MS, watchWithErrorHandler } from "../utils/fs-watch.js";
 
+const SETTINGS_RELOAD_DEBOUNCE_MS = 100;
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
 
@@ -12,7 +21,34 @@ export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
+	/**
+	 * Absolute context-token count that starts auto compaction, overriding the
+	 * contextWindow - reserveTokens heuristic. Useful for large-context models
+	 * (for example 256000 on a 1M-token window).
+	 */
+	triggerContextTokens?: number;
 	agentCallable?: boolean; // default: true - expose the compact skill so the model can request compaction
+	native?: boolean; // default: true - prefer provider-native compaction when the active API supports it
+	/**
+	 * default: provider-native compaction when supported, local summarization otherwise.
+	 * scratch-handoff: scratch handoff for every ordinary boundary.
+	 * native-or-scratch: provider-native compaction when supported, scratch handoff
+	 * (requires scratchHandoff.enabled) otherwise.
+	 */
+	strategy?: "default" | "scratch-handoff" | "native-or-scratch";
+}
+
+export interface ScratchHandoffSettings {
+	enabled?: boolean; // default: false - lazy per-session org checkpoints and continuity instructions
+	rootDir?: string; // default: "agent" - directory for per-session checkpoint files
+}
+
+export interface SessionElapsedTimeSettings {
+	enabled?: boolean; // default: false - expose quantized session time to the provider system prompt
+}
+
+export interface AgentsViewUsageSettings {
+	enabled?: boolean; // default: false - show token and estimated cost totals in agents list rows
 }
 
 export interface BranchSummarySettings {
@@ -58,6 +94,8 @@ export interface ThinkingBudgetsSettings {
 	low?: number;
 	medium?: number;
 	high?: number;
+	xhigh?: number;
+	max?: number;
 }
 
 export type MermaidRenderingMode = "off" | "final" | "streaming";
@@ -75,7 +113,18 @@ export interface WarningSettings {
 	anthropicExtraUsage?: boolean; // default: true
 }
 
+export interface ClaudeCodeSettings {
+	/** Claude Code executable used by the external RLM runtime. Authentication remains executable-owned. */
+	executable?: string;
+}
+
+export interface OpenRouterSettings {
+	/** Prefer the stateless Responses API for OpenRouter requests. Default: false. */
+	responses?: boolean;
+}
+
 export type TransportSetting = Transport;
+export type ModelRoleSelector = string | string[];
 
 /**
  * Package source for npm/git packages.
@@ -136,13 +185,27 @@ export interface Settings {
 	recentModels?: string[]; // "provider/id" keys, most-recently-used first
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	defaultServiceTier?: ServiceTier;
+	/** Service tiers that rlm(...) may request explicitly; defaults to defaultServiceTier. */
+	rlmAllowedServiceTiers?: ServiceTier[];
+	/** Maximum synchronous Act depth; Sol is depth 0 and the default is 1. */
+	rlmActMaxDepth?: number;
+	/** Native model selector for Act depth 1, or ordered selectors indexed by Act depth. */
+	rlmActDefaultModel?: string | string[];
+	/** Ordered Codex CLI homes whose auth.json credentials rotate daemon-wide on exhaustion. */
+	codexHomes?: string[];
 	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 2
+	modelRoles?: Record<string, ModelRoleSelector>;
+	claudeCode?: ClaudeCodeSettings;
+	openRouter?: OpenRouterSettings;
 	idleEvictionMinutes?: number | "off"; // global daemon policy; default: 90
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
 	theme?: string;
 	compaction?: CompactionSettings;
+	scratchHandoff?: ScratchHandoffSettings;
+	sessionElapsedTime?: SessionElapsedTimeSettings;
+	agentsViewUsage?: AgentsViewUsageSettings;
 	autoRefine?: AutoRefineSettings;
 	agentTraces?: AgentTracesSettings;
 	telemetry?: TelemetrySettings;
@@ -216,6 +279,8 @@ export type SettingsScope = "global" | "project";
 
 export interface SettingsStorage {
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
+	getFormat?(scope: SettingsScope): SettingsFileFormat;
+	watch?(onChange: () => void): () => void;
 }
 
 export interface SettingsError {
@@ -224,12 +289,65 @@ export interface SettingsError {
 }
 
 export class FileSettingsStorage implements SettingsStorage {
-	private globalSettingsPath: string;
-	private projectSettingsPath: string;
+	private readonly globalSettingsDirectory: string;
+	private readonly projectSettingsDirectory: string;
 
 	constructor(cwd: string, agentDir: string) {
-		this.globalSettingsPath = join(agentDir, "settings.json");
-		this.projectSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
+		this.globalSettingsDirectory = agentDir;
+		this.projectSettingsDirectory = join(cwd, CONFIG_DIR_NAME);
+	}
+
+	private settingsFile(scope: SettingsScope) {
+		return resolveSettingsFile(scope === "global" ? this.globalSettingsDirectory : this.projectSettingsDirectory);
+	}
+
+	getFormat(scope: SettingsScope): SettingsFileFormat {
+		return this.settingsFile(scope).format;
+	}
+
+	watch(onChange: () => void): () => void {
+		const directories = [...new Set([this.globalSettingsDirectory, this.projectSettingsDirectory])];
+		const stops = directories.map((directory) => {
+			let watcher: FSWatcher | null = null;
+			let retryTimer: NodeJS.Timeout | undefined;
+			let stopped = false;
+
+			const start = () => {
+				if (stopped) return;
+				watcher = watchWithErrorHandler(
+					directory,
+					(_eventType, filename) => {
+						if (filename === null || isSettingsFileName(filename)) onChange();
+					},
+					() => {
+						closeWatcher(watcher);
+						watcher = null;
+						if (!stopped && retryTimer === undefined) {
+							retryTimer = setTimeout(() => {
+								retryTimer = undefined;
+								start();
+							}, FS_WATCH_RETRY_DELAY_MS);
+							retryTimer.unref();
+						}
+					},
+				);
+				if (watcher) {
+					watcher.unref();
+					onChange();
+				}
+			};
+
+			start();
+			return () => {
+				stopped = true;
+				if (retryTimer) clearTimeout(retryTimer);
+				closeWatcher(watcher);
+			};
+		});
+
+		return () => {
+			for (const stop of stops) stop();
+		};
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {
@@ -272,16 +390,16 @@ export class FileSettingsStorage implements SettingsStorage {
 	}
 
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
-		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
+		const settingsFile = this.settingsFile(scope);
+		const path = settingsFile.path;
 		const dir = dirname(path);
 
 		let release: (() => void) | undefined;
 		try {
-			const fileExists = existsSync(path);
-			if (fileExists) {
+			if (settingsFile.exists) {
 				release = this.acquireLockSyncWithRetry(path);
 			}
-			const current = fileExists ? readFileSync(path, "utf-8") : undefined;
+			const current = settingsFile.exists ? readFileSync(path, "utf-8") : undefined;
 			const next = fn(current);
 			if (next !== undefined) {
 				if (!existsSync(dir)) {
@@ -327,8 +445,10 @@ export class SettingsManager {
 	private storage: SettingsStorage;
 	private globalSettings: Settings;
 	private projectSettings: Settings;
-	private settings: Settings;
+	private settings: Settings = {};
 	private runtimeOverrides: Settings = {};
+	private stopWatching: (() => void) | undefined;
+	private reloadTimer: NodeJS.Timeout | undefined;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
 	private modifiedProjectFields = new Set<keyof Settings>(); // Track project fields modified during session
@@ -352,7 +472,48 @@ export class SettingsManager {
 		this.globalSettingsLoadError = globalLoadError;
 		this.projectSettingsLoadError = projectLoadError;
 		this.errors = [...initialErrors];
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.recordCodexHomesProjectOverride();
+		this.refreshMergedSettings();
+		this.stopWatching = this.storage.watch?.(() => this.scheduleReload());
+	}
+
+	private recordCodexHomesProjectOverride(): void {
+		if (
+			this.projectSettings.codexHomes !== undefined &&
+			!this.errors.some(
+				(entry) => entry.scope === "project" && entry.error.message.startsWith("codexHomes is global-only"),
+			)
+		) {
+			this.errors.push({
+				scope: "project",
+				error: new Error("codexHomes is global-only because its rotation state is shared by the daemon"),
+			});
+		}
+	}
+
+	private scheduleReload(): void {
+		if (this.reloadTimer) clearTimeout(this.reloadTimer);
+		this.reloadTimer = setTimeout(() => {
+			this.reloadTimer = undefined;
+			void this.reload();
+		}, SETTINGS_RELOAD_DEBOUNCE_MS);
+		this.reloadTimer.unref();
+	}
+
+	private refreshMergedSettings(): void {
+		this.settings = deepMergeSettings(
+			deepMergeSettings(this.globalSettings, this.projectSettings),
+			this.runtimeOverrides,
+		);
+	}
+
+	dispose(): void {
+		if (this.reloadTimer) {
+			clearTimeout(this.reloadTimer);
+			this.reloadTimer = undefined;
+		}
+		this.stopWatching?.();
+		this.stopWatching = undefined;
 	}
 
 	/** Create a SettingsManager that loads from files */
@@ -401,8 +562,7 @@ export class SettingsManager {
 		if (!content) {
 			return {};
 		}
-		const settings = JSON.parse(content);
-		return SettingsManager.migrateSettings(settings);
+		return SettingsManager.migrateSettings(parseSettingsDocument(content));
 	}
 
 	private static tryLoadFromStorage(
@@ -520,13 +680,14 @@ export class SettingsManager {
 			this.recordError("project", projectLoad.error);
 		}
 
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.recordCodexHomesProjectOverride();
+		this.refreshMergedSettings();
 	}
 
 	/** Apply additional overrides on top of current settings */
 	applyOverrides(overrides: Partial<Settings>): void {
 		this.runtimeOverrides = deepMergeSettings(this.runtimeOverrides, overrides);
-		this.settings = deepMergeSettings(this.settings, overrides);
+		this.refreshMergedSettings();
 	}
 
 	/** Mark a global field as modified during this session */
@@ -593,9 +754,7 @@ export class SettingsManager {
 		modifiedNestedFields: Map<keyof Settings, Set<string>>,
 	): void {
 		this.storage.withLock(scope, (current) => {
-			const currentFileSettings = current
-				? SettingsManager.migrateSettings(JSON.parse(current) as Record<string, unknown>)
-				: {};
+			const currentFileSettings = current ? SettingsManager.migrateSettings(parseSettingsDocument(current)) : {};
 			const mergedSettings: Settings = { ...currentFileSettings };
 			for (const field of modifiedFields) {
 				const value = snapshotSettings[field];
@@ -613,12 +772,15 @@ export class SettingsManager {
 				}
 			}
 
-			return JSON.stringify(mergedSettings, null, 2);
+			return stringifySettingsDocument(
+				mergedSettings as Record<string, unknown>,
+				this.storage.getFormat?.(scope) ?? "json",
+			);
 		});
 	}
 
 	private save(): void {
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.refreshMergedSettings();
 
 		if (this.globalSettingsLoadError) {
 			this.recordError(
@@ -641,7 +803,8 @@ export class SettingsManager {
 
 	private saveProjectSettings(settings: Settings): void {
 		this.projectSettings = structuredClone(settings);
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.recordCodexHomesProjectOverride();
+		this.refreshMergedSettings();
 
 		if (this.projectSettingsLoadError) {
 			this.recordError(
@@ -790,8 +953,79 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getRlmAllowedServiceTiers(): ServiceTier[] {
+		return this.settings.rlmAllowedServiceTiers
+			? [...this.settings.rlmAllowedServiceTiers]
+			: [this.getDefaultServiceTier()];
+	}
+
+	getRlmActMaxDepth(): number {
+		const maxDepth = this.settings.rlmActMaxDepth ?? 1;
+		if (!Number.isSafeInteger(maxDepth) || maxDepth < 0) {
+			throw new Error("rlmActMaxDepth must be a non-negative integer");
+		}
+		return maxDepth;
+	}
+
+	getRlmActDefaultModel(depth = 1): string | undefined {
+		if (!Number.isSafeInteger(depth) || depth < 1) {
+			throw new Error("Act depth must be a positive integer");
+		}
+		const configured = this.settings.rlmActDefaultModel;
+		if (configured === undefined) return undefined;
+		if (typeof configured === "string") {
+			return depth === 1 ? configured.trim() || undefined : undefined;
+		}
+		if (!Array.isArray(configured)) {
+			throw new Error("rlmActDefaultModel must be a string or array of strings");
+		}
+		const models = configured.map((model) => {
+			if (typeof model !== "string" || !model.trim()) {
+				throw new Error("rlmActDefaultModel entries must be non-empty strings");
+			}
+			return model.trim();
+		});
+		return models[depth - 1];
+	}
+
+	getCodexHomes(): string[] {
+		const configured = this.globalSettings.codexHomes ?? [];
+		if (!Array.isArray(configured)) {
+			throw new Error("codexHomes must be an array of directory paths");
+		}
+		return configured.map((home) => {
+			if (typeof home !== "string" || !home.trim()) {
+				throw new Error("codexHomes entries must be non-empty strings");
+			}
+			return home.trim();
+		});
+	}
+
 	getRlmMaxDepth(): number | undefined {
 		return this.globalSettings.rlmMaxDepth;
+	}
+
+	getModelRoles(): Record<string, ModelRoleSelector> {
+		return structuredClone(this.settings.modelRoles ?? {});
+	}
+
+	getModelRole(role: string): ModelRoleSelector | undefined {
+		return structuredClone(this.settings.modelRoles?.[role]);
+	}
+
+	getClaudeCodeExecutable(): string | undefined {
+		const executable = this.settings.claudeCode?.executable?.trim();
+		return executable || undefined;
+	}
+
+	getOpenRouterResponses(): boolean {
+		return this.settings.openRouter?.responses ?? false;
+	}
+
+	setModelRoles(modelRoles: Record<string, ModelRoleSelector>): void {
+		this.globalSettings.modelRoles = structuredClone(modelRoles);
+		this.markModified("modelRoles");
+		this.save();
 	}
 
 	setRlmMaxDepth(maxDepth: number): void {
@@ -851,6 +1085,14 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getSessionElapsedTimeEnabled(): boolean {
+		return this.settings.sessionElapsedTime?.enabled ?? false;
+	}
+
+	getAgentsViewUsageEnabled(): boolean {
+		return this.settings.agentsViewUsage?.enabled ?? false;
+	}
+
 	getTelemetryEnabled(): boolean {
 		const globalEnabled = this.globalSettings.telemetry?.enabled ?? true;
 		const projectEnabled = this.projectSettings.telemetry?.enabled ?? true;
@@ -890,15 +1132,45 @@ export class SettingsManager {
 		return this.settings.compaction?.keepRecentTokens ?? 20000;
 	}
 
+	getCompactionTriggerContextTokens(): number | undefined {
+		const value = this.settings.compaction?.triggerContextTokens;
+		return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+	}
+
 	getCompactionAgentCallable(): boolean {
 		return this.settings.compaction?.agentCallable ?? true;
 	}
 
-	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
+	getCompactionNative(): boolean {
+		return this.settings.compaction?.native ?? true;
+	}
+
+	getCompactionStrategy(): "default" | "scratch-handoff" | "native-or-scratch" {
+		return this.settings.compaction?.strategy ?? "default";
+	}
+
+	getScratchHandoffSettings(): { enabled: boolean; rootDir: string } {
+		return {
+			enabled: this.settings.scratchHandoff?.enabled ?? false,
+			rootDir: this.settings.scratchHandoff?.rootDir?.trim() || "agent",
+		};
+	}
+
+	getCompactionSettings(): {
+		enabled: boolean;
+		reserveTokens: number;
+		keepRecentTokens: number;
+		triggerContextTokens: number | undefined;
+		native: boolean;
+		strategy: "default" | "scratch-handoff" | "native-or-scratch";
+	} {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
+			triggerContextTokens: this.getCompactionTriggerContextTokens(),
+			native: this.getCompactionNative(),
+			strategy: this.getCompactionStrategy(),
 		};
 	}
 

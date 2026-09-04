@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Preserved pre-compaction scrollback when reopening scratch-compacted sessions and collapsed scratch checkpoints into expandable events.
 - Added draft-first scratch closeout guidance and surfaced closeout failures without discarding the original context.
 - Fixed Merge auto-compaction to use the same local context estimate as the usage display.
 - Fixed scratch handoff accepting output-exhausted closeouts and losing snapshot source across generations; disclosed image-history omissions.

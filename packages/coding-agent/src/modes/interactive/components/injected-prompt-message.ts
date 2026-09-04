@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-tui";
 import {
 	SCRATCH_HANDOFF_CLOSEOUT_CUSTOM_TYPE,
+	SCRATCH_HANDOFF_READ_CUSTOM_TYPE,
 	type ScratchHandoffCloseoutDetails,
 } from "../../../core/compaction/scratch-handoff.js";
 import { ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE } from "../../../core/english-output-nudge.js";
@@ -47,6 +48,7 @@ export function isInjectedPromptMessage(message: AgentMessage): message is Injec
 			message.customType === TOOL_ERROR_NUDGE_CUSTOM_TYPE ||
 			message.customType === ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE ||
 			message.customType === SCRATCH_HANDOFF_CLOSEOUT_CUSTOM_TYPE ||
+			message.customType === SCRATCH_HANDOFF_READ_CUSTOM_TYPE ||
 			message.customType === GOAL_CONTEXT_CUSTOM_TYPE ||
 			message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE ||
 			message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE ||
@@ -135,6 +137,11 @@ export class InjectedPromptMessageComponent extends Container {
 	}
 
 	private headerText(): string {
+		if (this.message.customType === SCRATCH_HANDOFF_READ_CUSTOM_TYPE) {
+			const details = this.message.details as { path?: string } | undefined;
+			const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;
+			return `${theme.fg("accent", "◆")} ${theme.fg("muted", "Scratch compacted")}${theme.fg("dim", ` · ${details?.path ?? "checkpoint"}${hint}`)}`;
+		}
 		if (this.message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE) {
 			return this.heartbeatHeaderText();
 		}

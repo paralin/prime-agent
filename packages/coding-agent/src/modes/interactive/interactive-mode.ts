@@ -278,6 +278,7 @@ import {
 	WORKING_ICON_INTERVAL_MS,
 	workingIconFrame,
 } from "./theme/working-icon.js";
+import { buildTranscriptHistory } from "./transcript-history.js";
 
 interface Expandable {
 	setExpanded(expanded: boolean): void;
@@ -6738,6 +6739,21 @@ export class InteractiveMode {
 			limitTranscript?: boolean;
 		} = {},
 	): Promise<void> {
+		const hasScratchHandoff = sessionContext.messages.some(
+			(message) => message.role === "user" && this.getUserMessageText(message).includes("<scratch-handoff-file "),
+		);
+		if (hasScratchHandoff) {
+			try {
+				const history = await this.agentConnection.getSessionTree();
+				sessionContext = {
+					...sessionContext,
+					messages: buildTranscriptHistory(history.tree, history.leafId, sessionContext.messages),
+				};
+				options = { ...options, limitTranscript: false };
+			} catch {
+				this.showWarning("Could not load pre-compaction history; showing current context.");
+			}
+		}
 		this.resetPendingToolState();
 		// The rebuild recomputes every elapsed label from the transcript, so the
 		// interval gate starts clean for deterministic replay.

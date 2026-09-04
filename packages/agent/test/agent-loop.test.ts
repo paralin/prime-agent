@@ -4,12 +4,13 @@ import {
 	EventStream,
 	type Message,
 	type Model,
+	type StopReason,
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 import { agentLoop, agentLoopContinue, runAgentLoop } from "../src/agent-loop.js";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.js";
+import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool, StreamFn } from "../src/types.js";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
@@ -108,7 +109,171 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter((m) => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
 
+/**
+ * A stream response that emits the given events and then hangs forever,
+ * simulating a provider connection that stalls mid-response.
+ */
+function stallingStream(events: AssistantMessageEvent[]): Awaited<ReturnType<StreamFn>> {
+	const forever = new Promise<never>(() => undefined);
+	async function* iterate(): AsyncGenerator<AssistantMessageEvent> {
+		for (const event of events) {
+			yield event;
+		}
+		await forever;
+	}
+	return {
+		[Symbol.asyncIterator]: () => iterate(),
+		result: (): Promise<AssistantMessage> => forever,
+	} as unknown as Awaited<ReturnType<StreamFn>>;
+}
+
 describe("agentLoop with AgentMessage", () => {
+	it("continues after an unknown provider finish reason", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const responses = [
+			createAssistantMessage([{ type: "thinking", thinking: "partial" }], "unknown"),
+			createAssistantMessage([{ type: "text", text: "complete" }], "stop"),
+		];
+		let callCount = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			const message = responses[callCount++];
+			if (!message) throw new Error("unexpected provider call");
+			queueMicrotask(() =>
+				stream.push({
+					type: "done",
+					reason: message.stopReason as Extract<StopReason, "stop" | "length" | "toolUse" | "unknown">,
+					message,
+				}),
+			);
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Finish the answer")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter },
+			vi.fn(),
+			undefined,
+			streamFn,
+		);
+
+		expect(callCount).toBe(2);
+		expect(messages.filter((message) => message.role === "assistant")).toEqual(responses);
+	});
+
+	it("aborts and retries when the provider stream stalls, then succeeds", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const successMessage = createAssistantMessage([{ type: "text", text: "complete" }]);
+		let callCount = 0;
+		const events: AgentEvent[] = [];
+		const streamFn = () => {
+			callCount += 1;
+			if (callCount === 1) {
+				const partial = createAssistantMessage([{ type: "text", text: "partial" }]);
+				return stallingStream([
+					{ type: "start", partial },
+					{ type: "text_delta", contentIndex: 0, delta: "partial", partial },
+				]);
+			}
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: successMessage }));
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Hello")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter, streamStallTimeoutMs: 20 },
+			(event) => {
+				events.push(event);
+			},
+			undefined,
+			streamFn,
+		);
+
+		expect(callCount).toBe(2);
+		const assistants = messages.filter((message) => message.role === "assistant");
+		expect(assistants).toEqual([successMessage]);
+		// The abandoned partial never finalizes; only the retry does.
+		const assistantEnds = events.filter(
+			(event) => event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(assistantEnds.length).toBe(1);
+		const assistantStarts = events.filter(
+			(event) => event.type === "message_start" && event.message.role === "assistant",
+		);
+		expect(assistantStarts.length).toBe(2);
+	});
+
+	it("aborts and retries when establishing the provider stream hangs", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const successMessage = createAssistantMessage([{ type: "text", text: "complete" }]);
+		let callCount = 0;
+		const streamFn = () => {
+			callCount += 1;
+			if (callCount === 1) {
+				return new Promise<Awaited<ReturnType<StreamFn>>>(() => undefined);
+			}
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: successMessage }));
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Hello")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter, streamStallTimeoutMs: 20 },
+			vi.fn(),
+			undefined,
+			streamFn,
+		);
+
+		expect(callCount).toBe(2);
+		const assistants = messages.filter((message) => message.role === "assistant");
+		expect(assistants).toEqual([successMessage]);
+	});
+
+	it("surfaces an error message after repeated stream stalls", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		let callCount = 0;
+		const streamFn = () => {
+			callCount += 1;
+			return stallingStream([]);
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Hello")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter, streamStallTimeoutMs: 10 },
+			vi.fn(),
+			undefined,
+			streamFn,
+		);
+
+		expect(callCount).toBe(3);
+		const assistants = messages.filter((message) => message.role === "assistant");
+		expect(assistants.length).toBe(1);
+		expect(assistants[0]?.stopReason).toBe("error");
+		expect(assistants[0]?.errorMessage).toContain("No model output");
+	});
+
 	it("should preserve a terminal response when abort fires after done", async () => {
 		const context: AgentContext = {
 			systemPrompt: "You are helpful.",
@@ -238,6 +403,79 @@ describe("agentLoop with AgentMessage", () => {
 					event.message.stopReason === "aborted",
 			),
 		).toBe(false);
+	});
+
+	it("preserves the terminal response when result() rejects with the raw abort reason", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const controller = new AbortController();
+		const finalMessage = createAssistantMessage([{ type: "text", text: "complete" }]);
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			Object.defineProperty(stream, "result", {
+				value: () => {
+					controller.abort();
+					return Promise.reject(controller.signal.reason);
+				},
+			});
+			queueMicrotask(() => {
+				stream.push({ type: "done", reason: "stop", message: finalMessage });
+			});
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Hello")],
+			context,
+			config,
+			vi.fn(),
+			controller.signal,
+			streamFn,
+		);
+
+		const assistants = messages.filter((message) => message.role === "assistant");
+		expect(assistants).toEqual([finalMessage]);
+	});
+
+	it("fails over with an error when the stream completes but result() never settles", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		let callCount = 0;
+		const streamFn = () => {
+			callCount += 1;
+			const forever = new Promise<never>(() => undefined);
+			return {
+				[Symbol.asyncIterator]: () => ({
+					next: async () => ({ done: true, value: undefined as never }),
+				}),
+				result: (): Promise<AssistantMessage> => forever,
+			} as unknown as Awaited<ReturnType<StreamFn>>;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Hello")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter, streamStallTimeoutMs: 15 },
+			vi.fn(),
+			undefined,
+			streamFn,
+		);
+
+		expect(callCount).toBe(3);
+		const assistants = messages.filter((message) => message.role === "assistant");
+		expect(assistants.length).toBe(1);
+		expect(assistants[0]?.stopReason).toBe("error");
+		expect(assistants[0]?.errorMessage).toContain("No model output");
 	});
 
 	it("should return an aborted assistant when abort fires before the stream starts", async () => {
@@ -1962,5 +2200,508 @@ describe("agentLoopContinue with AgentMessage", () => {
 		const messages = await stream.result();
 		expect(messages.length).toBe(1);
 		expect(messages[0].role).toBe("assistant");
+	});
+});
+
+describe("agent loop incomplete-response continuation", () => {
+	const emptyContext = (): AgentContext => ({
+		systemPrompt: "You are helpful.",
+		messages: [],
+		tools: [],
+	});
+
+	function recordedStreamFn(
+		responses: AssistantMessage[],
+		callCount: { value: number },
+		seenContexts: Message[][] = [],
+	): StreamFn {
+		return (_model, llmContext) => {
+			callCount.value += 1;
+			seenContexts.push(llmContext.messages);
+			const stream = new MockAssistantStream();
+			const message = responses[callCount.value - 1];
+			if (!message) throw new Error("unexpected provider call");
+			queueMicrotask(() => {
+				if (message.stopReason === "error" || message.stopReason === "aborted") {
+					stream.push({ type: "error", reason: message.stopReason, error: message });
+				} else {
+					stream.push({
+						type: "done",
+						reason: message.stopReason as Extract<StopReason, "stop" | "length" | "toolUse" | "unknown">,
+						message,
+					});
+				}
+			});
+			return stream;
+		};
+	}
+
+	it("continues immediately in the same turn and replays the partial assistant context", async () => {
+		const context = emptyContext();
+		const partial = createAssistantMessage([{ type: "thinking", thinking: "partial" }], "unknown");
+		const complete = createAssistantMessage([{ type: "text", text: "complete" }], "stop");
+		const callCount = { value: 0 };
+		const seenContexts: Message[][] = [];
+		const events: AgentEvent[] = [];
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Finish the answer")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter },
+			(event) => {
+				events.push(event);
+			},
+			undefined,
+			recordedStreamFn([partial, complete], callCount, seenContexts),
+		);
+
+		expect(callCount.value).toBe(2);
+		expect(messages.filter((message) => message.role === "assistant")).toEqual([partial, complete]);
+		const replayedAssistant = seenContexts[1]?.filter((message) => message.role === "assistant") ?? [];
+		expect(replayedAssistant).toHaveLength(1);
+		expect(replayedAssistant[0]).toBe(partial);
+		const turnStarts = events.filter((event) => event.type === "turn_start").length;
+		expect(turnStarts).toBe(2);
+	});
+
+	it.each([
+		["empty", []],
+		["thinking-only", [{ type: "thinking" as const, thinking: "partial" }]],
+	])("continues after an explicit stop with %s content", async (_name, content) => {
+		const context = emptyContext();
+		const partial = createAssistantMessage(content, "stop");
+		const complete = createAssistantMessage([{ type: "text", text: "complete" }], "stop");
+		const callCount = { value: 0 };
+		const seenContexts: Message[][] = [];
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Finish the answer")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter },
+			vi.fn(),
+			undefined,
+			recordedStreamFn([partial, complete], callCount, seenContexts),
+		);
+
+		expect(callCount.value).toBe(2);
+		expect(messages.filter((message) => message.role === "assistant")).toEqual([partial, complete]);
+		expect(seenContexts[1]?.filter((message) => message.role === "assistant")).toEqual([partial]);
+	});
+
+	it("continues after a length stop that exhausts output on thinking", async () => {
+		const context = emptyContext();
+		const partial = createAssistantMessage([{ type: "thinking", thinking: "partial" }], "length");
+		partial.usage.output = 32_000;
+		const complete = createAssistantMessage([{ type: "text", text: "complete" }], "stop");
+		const callCount = { value: 0 };
+		const seenContexts: Message[][] = [];
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Finish the answer")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter },
+			vi.fn(),
+			undefined,
+			recordedStreamFn([partial, complete], callCount, seenContexts),
+		);
+
+		expect(callCount.value).toBe(2);
+		expect(messages.filter((message) => message.role === "assistant")).toEqual([partial, complete]);
+		expect(seenContexts[1]?.filter((message) => message.role === "assistant")).toEqual([partial]);
+	});
+
+	it("stops after a reasoning-exhausted warning instead of retrying the same budget", async () => {
+		const context = emptyContext();
+		const exhausted = createAssistantMessage([{ type: "thinking", thinking: "partial" }], "length");
+		exhausted.diagnostics = [
+			{
+				type: "provider_warning",
+				timestamp: 0,
+				error: {
+					code: "reasoning_exhausted",
+					message: "the model spent its whole thinking budget and returned no answer",
+				},
+			},
+		];
+		const callCount = { value: 0 };
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Finish the answer")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter },
+			vi.fn(),
+			undefined,
+			recordedStreamFn([exhausted], callCount),
+		);
+
+		expect(callCount.value).toBe(1);
+		const last = messages.at(-1);
+		if (last?.role !== "assistant") throw new Error("expected assistant message");
+		expect(last.stopReason).toBe("error");
+		expect(last.errorMessage).toContain("increase the output budget or lower the reasoning effort");
+	});
+
+	it("stops with an observable error after too many consecutive incomplete responses", async () => {
+		const context = emptyContext();
+		const responses = [
+			createAssistantMessage([{ type: "thinking", thinking: "one" }], "unknown"),
+			createAssistantMessage([{ type: "thinking", thinking: "two" }], "unknown"),
+			createAssistantMessage([{ type: "thinking", thinking: "three" }], "unknown"),
+			createAssistantMessage([{ type: "text", text: "never reached" }], "stop"),
+		];
+		const callCount = { value: 0 };
+		const events: AgentEvent[] = [];
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Finish the answer")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter },
+			(event) => {
+				events.push(event);
+			},
+			undefined,
+			recordedStreamFn(responses, callCount),
+		);
+
+		expect(callCount.value).toBe(3);
+		const last = messages.at(-1);
+		expect(last?.role).toBe("assistant");
+		if (last?.role !== "assistant") throw new Error("expected assistant message");
+		expect(last.stopReason).toBe("error");
+		expect(last.errorMessage).toContain("consecutive");
+		const agentEnd = events.filter((event) => event.type === "agent_end").at(-1);
+		expect(agentEnd?.type).toBe("agent_end");
+		if (agentEnd?.type !== "agent_end") throw new Error("expected agent_end");
+		expect(agentEnd.messages.at(-1)).toBe(last);
+	});
+
+	it("resets the consecutive-unknown counter after a real terminal response", async () => {
+		const context = emptyContext();
+		// Two unknowns, a real stop (resets the counter), then three more
+		// unknowns: without the reset the third post-stop unknown would exhaust
+		// the cap one response early, and without the cap the loop would run
+		// past the recorded responses.
+		const responses = [
+			createAssistantMessage([{ type: "thinking", thinking: "one" }], "unknown"),
+			createAssistantMessage([{ type: "thinking", thinking: "two" }], "unknown"),
+			createAssistantMessage([{ type: "text", text: "done" }], "stop"),
+			createAssistantMessage([{ type: "thinking", thinking: "three" }], "unknown"),
+			createAssistantMessage([{ type: "thinking", thinking: "four" }], "unknown"),
+			createAssistantMessage([{ type: "thinking", thinking: "five" }], "unknown"),
+			// Guard: a seventh provider call means the loop ran past the cap.
+			createAssistantMessage([{ type: "text", text: "never reached" }], "stop"),
+		];
+		const callCount = { value: 0 };
+		let followUpsIssued = 0;
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Finish the answer")],
+			context,
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				getFollowUpMessages: async () => {
+					followUpsIssued += 1;
+					return followUpsIssued === 1 ? [createUserMessage("Go again")] : [];
+				},
+			},
+			vi.fn(),
+			undefined,
+			recordedStreamFn(responses, callCount),
+		);
+
+		expect(callCount.value).toBe(6);
+		const last = messages.at(-1);
+		expect(last?.role).toBe("assistant");
+		if (last?.role !== "assistant") throw new Error("expected assistant message");
+		expect(last.stopReason).toBe("error");
+		expect(last.errorMessage).toContain("consecutive");
+	});
+
+	it.each(["stop", "length", "error", "aborted"] as const)(
+		"does not continue after a %s terminal response",
+		async (stopReason) => {
+			const context = emptyContext();
+			const final = createAssistantMessage([{ type: "text", text: "final" }], stopReason);
+			const callCount = { value: 0 };
+
+			const messages = await runAgentLoop(
+				[createUserMessage("Hello")],
+				context,
+				{ model: createModel(), convertToLlm: identityConverter },
+				vi.fn(),
+				undefined,
+				recordedStreamFn([final], callCount),
+			);
+
+			expect(callCount.value).toBe(1);
+			expect(messages.filter((message) => message.role === "assistant")).toEqual([final]);
+		},
+	);
+
+	it("cancels the stream and errors when one sentence repeats past the threshold", async () => {
+		const context = emptyContext();
+		const callCount = { value: 0 };
+		const events: AgentEvent[] = [];
+		const repeatedSentence = "The roadmap file lives at the repository root. ";
+		const loopingMessage = createAssistantMessage([{ type: "text", text: repeatedSentence.repeat(6) }], "stop");
+		const finalMessage = createAssistantMessage([{ type: "text", text: "never reached" }], "stop");
+
+		const streamFn = (): MockAssistantStream => {
+			const stream = new MockAssistantStream();
+			callCount.value += 1;
+			const message = callCount.value === 1 ? loopingMessage : finalMessage;
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: { ...message, content: [] } });
+				stream.push({
+					type: "text_start",
+					contentIndex: 0,
+					partial: { ...message, content: [{ type: "text", text: "" }] },
+				});
+				// Stream the repeated text in sentence-sized deltas like a real provider.
+				let text = "";
+				for (let i = 0; i < 6; i++) {
+					text += repeatedSentence;
+					stream.push({
+						type: "text_delta",
+						contentIndex: 0,
+						delta: repeatedSentence,
+						partial: { ...message, content: [{ type: "text", text }] },
+					});
+				}
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Find the roadmap")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter },
+			(event) => {
+				events.push(event);
+			},
+			undefined,
+			streamFn,
+		);
+
+		// One provider call: the loop cancelled the request instead of retrying into the loop.
+		expect(callCount.value).toBe(1);
+		const last = messages.at(-1);
+		if (last?.role !== "assistant") throw new Error("expected assistant message");
+		expect(last.stopReason).toBe("error");
+		expect(last.errorMessage).toContain("Repetition loop");
+		expect(last.diagnostics?.some((diagnostic) => diagnostic.type === "agent_repetition_loop")).toBe(true);
+		// The loop stopped the turn; no further provider call consumed "never reached".
+		expect(messages.filter((message) => message.role === "assistant")).toHaveLength(1);
+	});
+
+	it("blocks the third consecutive identical tool call batch", async () => {
+		const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "already read" }], details: {} }));
+		const context: AgentContext = {
+			systemPrompt: "Use tools.",
+			messages: [],
+			tools: [
+				{
+					name: "read",
+					label: "read",
+					description: "Read a file",
+					parameters: Type.Object({ path: Type.String(), mode: Type.String() }),
+					execute,
+				},
+			],
+		};
+		let callCount = 0;
+		const streamFn = (): MockAssistantStream => {
+			callCount += 1;
+			const message = createAssistantMessage(
+				[
+					{
+						type: "toolCall",
+						id: `call_${callCount}`,
+						name: "read",
+						arguments: callCount === 2 ? { mode: "text", path: "config" } : { path: "config", mode: "text" },
+					},
+				],
+				"toolUse",
+			);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: "toolUse", message }));
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Read config once")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter },
+			vi.fn(),
+			undefined,
+			streamFn,
+		);
+
+		expect(callCount).toBe(3);
+		expect(execute).toHaveBeenCalledTimes(2);
+		const last = messages.at(-1);
+		if (last?.role !== "assistant") throw new Error("expected assistant message");
+		expect(last.stopReason).toBe("error");
+		expect(last.errorMessage).toContain("same tool call batch 3 times");
+		expect(last.diagnostics).toEqual(
+			expect.arrayContaining([expect.objectContaining({ type: "agent_repetition_loop" })]),
+		);
+	});
+
+	it("allows repeated tool calls when their results change", async () => {
+		let executionCount = 0;
+		const execute = vi.fn(async () => {
+			executionCount += 1;
+			return {
+				content: [{ type: "text" as const, text: executionCount === 1 ? "pending" : "ready" }],
+				details: {},
+			};
+		});
+		const context: AgentContext = {
+			systemPrompt: "Use tools.",
+			messages: [],
+			tools: [
+				{
+					name: "status",
+					label: "status",
+					description: "Read status",
+					parameters: Type.Object({ job: Type.String() }),
+					execute,
+				},
+			],
+		};
+		let callCount = 0;
+		const streamFn = (): MockAssistantStream => {
+			callCount += 1;
+			const message =
+				callCount <= 3
+					? createAssistantMessage(
+							[{ type: "toolCall", id: `call_${callCount}`, name: "status", arguments: { job: "build" } }],
+							"toolUse",
+						)
+					: createAssistantMessage([{ type: "text", text: "complete" }], "stop");
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: callCount <= 3 ? "toolUse" : "stop", message }));
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Wait for the build")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter },
+			vi.fn(),
+			undefined,
+			streamFn,
+		);
+
+		expect(callCount).toBe(4);
+		expect(execute).toHaveBeenCalledTimes(3);
+		expect(messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
+	it("does not trigger for varied sentences under the threshold", async () => {
+		const context = emptyContext();
+		const callCount = { value: 0 };
+		const sentences = [
+			"The parser reads the header first. ",
+			"Then it validates the checksum. ",
+			"Finally it returns the payload. ",
+		];
+		const message = createAssistantMessage([{ type: "text", text: sentences.join("") }], "stop");
+
+		const streamFn = (): MockAssistantStream => {
+			const stream = new MockAssistantStream();
+			callCount.value += 1;
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: { ...message, content: [] } });
+				stream.push({
+					type: "text_start",
+					contentIndex: 0,
+					partial: { ...message, content: [{ type: "text", text: "" }] },
+				});
+				let text = "";
+				sentences.forEach((sentence) => {
+					text += sentence;
+					stream.push({
+						type: "text_delta",
+						contentIndex: 0,
+						delta: sentence,
+						partial: { ...message, content: [{ type: "text", text }] },
+					});
+				});
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Summarize the parser")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter },
+			vi.fn(),
+			undefined,
+			streamFn,
+		);
+
+		expect(callCount.value).toBe(1);
+		const last = messages.at(-1);
+		if (last?.role !== "assistant") throw new Error("expected assistant message");
+		expect(last.stopReason).toBe("stop");
+	});
+
+	it("cancels a thought-trace loop streamed as thinking deltas", async () => {
+		const loopingText = ` But wait — actually could a legit assistant output 6 identical lines of code? Rarely. But is it a false positive risk?
+ Actually identical consecutive code lines doing the same thing is weird.
+
+ But wait — actually could a legit assistant output 6 identical lines of code? Rarely. But is it a false positive risk?
+ Actually identical consecutive code lines doing the same thing is weird.
+
+ But wait — actually could a legit assistant output 6 identical lines of code? Rarely. But is it a false positive risk?
+ Actually identical consecutive code lines doing the same thing is weird.`;
+		const context = emptyContext();
+		const callCount = { value: 0 };
+		const loopingMessage = createAssistantMessage([{ type: "thinking", thinking: loopingText }], "stop");
+		const streamFn = (): MockAssistantStream => {
+			const stream = new MockAssistantStream();
+			callCount.value += 1;
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: { ...loopingMessage, content: [] } });
+				stream.push({
+					type: "thinking_start",
+					contentIndex: 0,
+					partial: { ...loopingMessage, content: [{ type: "thinking", thinking: "" }] },
+				});
+				for (let i = 0; i < loopingText.length; i += 11) {
+					const chunk = loopingText.slice(i, i + 11);
+					stream.push({
+						type: "thinking_delta",
+						contentIndex: 0,
+						delta: chunk,
+						partial: {
+							...loopingMessage,
+							content: [{ type: "thinking", thinking: loopingText.slice(0, i + chunk.length) }],
+						},
+					});
+				}
+				stream.push({ type: "done", reason: "stop", message: loopingMessage });
+			});
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Do the task")],
+			context,
+			{ model: createModel(), convertToLlm: identityConverter },
+			vi.fn(),
+			undefined,
+			streamFn,
+		);
+		const last = messages.at(-1);
+		if (last?.role !== "assistant") throw new Error("expected assistant message");
+		expect(callCount.value).toBe(1);
+		expect(last.stopReason).toBe("error");
+		expect(last.diagnostics?.some((diagnostic) => diagnostic.type === "agent_repetition_loop")).toBe(true);
 	});
 });

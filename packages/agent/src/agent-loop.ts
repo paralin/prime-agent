@@ -7,11 +7,14 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type Context,
+	createAssistantMessageDiagnostic,
 	EventStream,
+	getLogger,
 	streamSimple,
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
+import { DEFAULT_REPETITION_THRESHOLD, RepetitionDetector } from "./repetition-detector.js";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -26,6 +29,143 @@ import type {
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 const ABORT_ERROR_MESSAGE = "Request was aborted";
+// Providers occasionally close a stream before producing final content: without
+// a finish reason, with an empty "stop" response, or after spending the output
+// limit entirely on thinking. Continuing the same turn usually lets the model
+// finish, but a provider that never finishes would loop forever, so consecutive
+// incomplete responses are capped.
+const MAX_CONSECUTIVE_INCOMPLETE_RESPONSES = 3;
+const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALL_BATCHES = 3;
+// Providers sometimes accept a request and then deliver no stream events at all:
+// a hung gateway or a silently dropped connection leaves the socket open while
+// the model produces nothing. Abort the request and retry after this window
+// without model output.
+const STREAM_STALL_TIMEOUT_MS = 180_000;
+// Some providers degenerate mid-stream: the model repeats one word, sentence,
+// paragraph, or thought-trace block indefinitely. Detect the loop while the
+// stream runs, cancel the provider request, and end the turn with an
+// `agent_repetition_loop` diagnostic so the session can recover instead of
+// retrying into the same loop.
+function repetitionLoopThreshold(config: AgentLoopConfig): number {
+	if (config.repetitionLoop?.enabled === false) return 0;
+	return config.repetitionLoop?.threshold ?? DEFAULT_REPETITION_THRESHOLD;
+}
+
+function finalizeRepetitionLoopMessage(
+	config: AgentLoopConfig,
+	partialMessage: AssistantMessage | null,
+	threshold: number,
+): AssistantMessage {
+	const errorMessage = `Repetition loop detected: the model repeated the same output ${threshold}+ times; the provider request was cancelled`;
+	return {
+		role: "assistant",
+		content: partialMessage ? cloneAssistantContent(partialMessage.content) : [{ type: "text", text: "" }],
+		api: partialMessage?.api ?? config.model.api,
+		provider: partialMessage?.provider ?? config.model.provider,
+		model: partialMessage?.model ?? config.model.id,
+		usage: cloneUsage(partialMessage?.usage ?? EMPTY_USAGE),
+		stopReason: "error",
+		errorMessage,
+		diagnostics: [createAssistantMessageDiagnostic("agent_repetition_loop", new Error(errorMessage), { threshold })],
+		timestamp: Date.now(),
+	};
+}
+
+function canonicalToolArguments(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+	if (Array.isArray(value)) {
+		return `[${value.map((item) => (item === undefined ? "null" : canonicalToolArguments(item))).join(",")}]`;
+	}
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record)
+		.filter((key) => record[key] !== undefined)
+		.sort()
+		.map((key) => `${JSON.stringify(key)}:${canonicalToolArguments(record[key])}`)
+		.join(",")}}`;
+}
+
+function toolCallBatchSignature(message: AssistantMessage): string | undefined {
+	const toolCalls = message.content.filter((content) => content.type === "toolCall");
+	if (toolCalls.length === 0) return undefined;
+	return toolCalls
+		.map((call) => `${call.name}:${canonicalToolArguments(call.arguments)}`)
+		.sort()
+		.join("\n");
+}
+
+class ToolCallRepetitionDetector {
+	private lastSignature: string | undefined;
+	private lastResultSignature: string | undefined;
+	private consecutiveBatches = 0;
+
+	observe(message: AssistantMessage): boolean {
+		const signature = toolCallBatchSignature(message);
+		if (!signature) {
+			this.lastSignature = undefined;
+			this.consecutiveBatches = 0;
+			return false;
+		}
+		if (signature === this.lastSignature) {
+			this.consecutiveBatches += 1;
+		} else {
+			this.lastSignature = signature;
+			this.consecutiveBatches = 1;
+		}
+		return this.consecutiveBatches >= MAX_CONSECUTIVE_IDENTICAL_TOOL_CALL_BATCHES;
+	}
+
+	observeResults(messages: ToolResultMessage[]): void {
+		const signature = canonicalToolArguments(
+			messages.map((message) => ({
+				toolName: message.toolName,
+				content: message.content,
+				isError: message.isError,
+			})),
+		);
+		if (this.lastResultSignature !== undefined && signature !== this.lastResultSignature) {
+			this.lastSignature = undefined;
+			this.consecutiveBatches = 0;
+		}
+		this.lastResultSignature = signature;
+	}
+
+	reset(): void {
+		this.lastSignature = undefined;
+		this.lastResultSignature = undefined;
+		this.consecutiveBatches = 0;
+	}
+}
+
+function hasReasoningExhaustedWarning(message: AssistantMessage): boolean {
+	return (
+		message.diagnostics?.some(
+			(diagnostic) => diagnostic.type === "provider_warning" && diagnostic.error?.code === "reasoning_exhausted",
+		) ?? false
+	);
+}
+
+function finalizeToolCallRepetitionMessage(message: AssistantMessage): AssistantMessage {
+	const errorMessage = `Repetition loop detected: the model repeated the same tool call batch ${MAX_CONSECUTIVE_IDENTICAL_TOOL_CALL_BATCHES} times; the repeated tools were not executed`;
+	return {
+		...message,
+		content: cloneAssistantContent(message.content),
+		usage: cloneUsage(message.usage),
+		stopReason: "error",
+		errorMessage,
+		diagnostics: [
+			...(message.diagnostics ?? []),
+			createAssistantMessageDiagnostic("agent_repetition_loop", new Error(errorMessage), {
+				threshold: MAX_CONSECUTIVE_IDENTICAL_TOOL_CALL_BATCHES,
+				kind: "tool_call_batch",
+			}),
+		],
+	};
+}
+
+// A provider that stalls on every attempt would retry forever, so cap the
+// retries and surface the failure as an error on the final response.
+const MAX_STREAM_STALL_RETRIES = 2;
+const stallLog = getLogger("agent.stream-stall");
 const EMPTY_USAGE: AssistantMessage["usage"] = {
 	input: 0,
 	output: 0,
@@ -97,6 +237,38 @@ function maybePromiseWithAbort<T>(
 	onAbort?: () => void,
 ): Promise<T> {
 	return raceWithAbort(Promise.resolve(operation), signal, onAbort);
+}
+
+class RepetitionLoopError extends Error {
+	constructor() {
+		super("Repetition loop detected");
+		this.name = "RepetitionLoopError";
+	}
+}
+
+class StreamStallError extends Error {
+	constructor(readonly timeoutMs: number) {
+		super(`No model output for ${Math.round(timeoutMs / 1000)}s`);
+		this.name = "StreamStallError";
+	}
+}
+
+/** Rejects with StreamStallError when the operation produces nothing within timeoutMs. */
+function raceWithStallTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new StreamStallError(timeoutMs)), timeoutMs);
+		timer.unref?.();
+		operation.then(
+			(value) => {
+				clearTimeout(timer);
+				resolve(value);
+			},
+			(error: unknown) => {
+				clearTimeout(timer);
+				reject(error);
+			},
+		);
+	});
 }
 
 function isAbortError(error: unknown): boolean {
@@ -310,6 +482,8 @@ async function runLoop(
 	streamFn?: StreamFn,
 ): Promise<void> {
 	let firstTurn = true;
+	let consecutiveIncompleteResponses = 0;
+	const toolCallRepetitionDetector = new ToolCallRepetitionDetector();
 	let lastTurn: Parameters<NonNullable<AgentLoopConfig["getContinuationMessages"]>>[0] | undefined;
 	let pendingMessages: AgentMessage[] = await pollMessagesUnlessAborted(config.getSteeringMessages, signal);
 
@@ -328,6 +502,7 @@ async function runLoop(
 			}
 
 			if (pendingMessages.length > 0) {
+				toolCallRepetitionDetector.reset();
 				for (const message of pendingMessages) {
 					await emit({ type: "message_start", message });
 					await emit({ type: "message_end", message });
@@ -337,7 +512,9 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn, (candidate) =>
+				toolCallRepetitionDetector.observe(candidate) ? finalizeToolCallRepetitionMessage(candidate) : candidate,
+			);
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -347,12 +524,48 @@ async function runLoop(
 			}
 
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
+			const hasFinalText = message.content.some((c) => c.type === "text" && c.text.trim().length > 0);
+			if (
+				message.stopReason === "length" &&
+				!hasFinalText &&
+				toolCalls.length === 0 &&
+				hasReasoningExhaustedWarning(message)
+			) {
+				message.stopReason = "error";
+				message.errorMessage =
+					"Provider exhausted the output budget on reasoning without producing an answer; increase the output budget or lower the reasoning effort";
+				await emit({ type: "turn_end", message, toolResults: [] });
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+			const incompleteResponse =
+				message.stopReason === "unknown" ||
+				((message.stopReason === "stop" || message.stopReason === "length") &&
+					!hasFinalText &&
+					toolCalls.length === 0);
+			if (incompleteResponse) {
+				// Continue the same turn so the model can finish, just as it does
+				// after tool use. Past the cap, stop without another provider call
+				// and surface the failure as an error on the final response.
+				consecutiveIncompleteResponses += 1;
+				if (consecutiveIncompleteResponses >= MAX_CONSECUTIVE_INCOMPLETE_RESPONSES) {
+					message.stopReason = "error";
+					message.errorMessage = `Provider closed ${MAX_CONSECUTIVE_INCOMPLETE_RESPONSES} consecutive streams without final content`;
+					await emit({ type: "turn_end", message, toolResults: [] });
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+				hasMoreToolCalls = true;
+			} else {
+				consecutiveIncompleteResponses = 0;
+				hasMoreToolCalls = false;
+			}
 
 			const toolResults: ToolResultMessage[] = [];
-			hasMoreToolCalls = false;
 			if (toolCalls.length > 0) {
 				const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
 				toolResults.push(...executedToolBatch.messages);
+				toolCallRepetitionDetector.observeResults(toolResults);
 				hasMoreToolCalls = !executedToolBatch.terminate;
 
 				for (const result of toolResults) {
@@ -454,21 +667,90 @@ async function streamAssistantResponse(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
+	finalizeMessage: (message: AssistantMessage) => AssistantMessage = (message) => message,
 ): Promise<AssistantMessage> {
+	const stallTimeoutMs = config.streamStallTimeoutMs ?? STREAM_STALL_TIMEOUT_MS;
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
-	const finishAbortedMessage = async () => {
-		const finalMessage = createAbortedAssistantMessage(config, partialMessage);
-		if (addedPartial) {
-			context.messages[context.messages.length - 1] = finalMessage;
-		} else {
-			context.messages.push(finalMessage);
-			await emit({ type: "message_start", message: { ...finalMessage } });
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return await streamAssistantAttempt(
+				context,
+				config,
+				signal,
+				emit,
+				streamFn,
+				stallTimeoutMs,
+				(partial, added) => {
+					partialMessage = partial;
+					addedPartial = added;
+				},
+				finalizeMessage,
+			);
+		} catch (error) {
+			if (error instanceof RepetitionLoopError) {
+				const threshold = repetitionLoopThreshold(config);
+				const finalMessage = finalizeRepetitionLoopMessage(config, addedPartial ? partialMessage : null, threshold);
+				if (addedPartial && context.messages.at(-1) === partialMessage) {
+					context.messages[context.messages.length - 1] = finalMessage;
+				} else {
+					context.messages.push(finalMessage);
+					await emit({ type: "message_start", message: { ...finalMessage } });
+				}
+				await emit({ type: "message_end", message: finalMessage });
+				return finalMessage;
+			}
+			if (!(error instanceof StreamStallError) || signal?.aborted) {
+				throw error;
+			}
+			stallLog.warn("provider stream stalled", {
+				provider: config.model.provider,
+				model: config.model.id,
+				attempt: attempt + 1,
+				maxAttempts: MAX_STREAM_STALL_RETRIES + 1,
+				timeoutMs: stallTimeoutMs,
+			});
+			if (attempt < MAX_STREAM_STALL_RETRIES) {
+				// Roll back the abandoned partial so the retry streams into a clean context.
+				if (addedPartial && context.messages.at(-1) === partialMessage) {
+					context.messages.pop();
+				}
+				continue;
+			}
+			const finalMessage = createAbortedAssistantMessage(config, addedPartial ? partialMessage : null);
+			finalMessage.stopReason = "error";
+			finalMessage.errorMessage = `${error.message}; gave up after ${attempt + 1} attempts`;
+			if (addedPartial && context.messages.at(-1) === partialMessage) {
+				context.messages[context.messages.length - 1] = finalMessage;
+			} else {
+				context.messages.push(finalMessage);
+				await emit({ type: "message_start", message: { ...finalMessage } });
+			}
+			await emit({ type: "message_end", message: finalMessage });
+			return finalMessage;
 		}
-		await emit({ type: "message_end", message: finalMessage });
-		return finalMessage;
-	};
+	}
+}
 
+async function streamAssistantAttempt(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFn: StreamFn | undefined,
+	stallTimeoutMs: number,
+	trackPartial: (partial: AssistantMessage | null, added: boolean) => void,
+	finalizeMessage: (message: AssistantMessage) => AssistantMessage,
+): Promise<AssistantMessage> {
+	// The provider request listens on a linked signal so a stall can abort the
+	// underlying HTTP connection while user cancellation keeps using `signal`.
+	const requestController = new AbortController();
+	const forwardAbort = () => requestController.abort();
+	if (signal?.aborted) {
+		requestController.abort();
+	} else {
+		signal?.addEventListener("abort", forwardAbort, { once: true });
+	}
 	try {
 		throwIfAborted(signal);
 		let messages = context.messages;
@@ -491,21 +773,91 @@ async function streamAssistantResponse(
 			tools: context.tools,
 		};
 
-		const response = await maybePromiseWithAbort(
-			streamFunction(config.model, llmContext, {
-				...config,
-				apiKey: resolvedApiKey,
+		try {
+			const response = await maybePromiseWithAbort(
+				raceWithStallTimeout(
+					Promise.resolve(
+						streamFunction(config.model, llmContext, {
+							...config,
+							apiKey: resolvedApiKey,
+							signal: requestController.signal,
+						}),
+					),
+					stallTimeoutMs,
+				),
 				signal,
-			}),
-			signal,
-		);
+			);
+			return await consumeAssistantStream(
+				response,
+				context,
+				config,
+				signal,
+				emit,
+				stallTimeoutMs,
+				trackPartial,
+				requestController,
+				finalizeMessage,
+			);
+		} catch (error) {
+			if (error instanceof StreamStallError) {
+				requestController.abort();
+			}
+			throw error;
+		}
+	} catch (error) {
+		if (signal?.aborted && isAbortError(error)) {
+			const finalMessage = createAbortedAssistantMessage(config, null);
+			context.messages.push(finalMessage);
+			await emit({ type: "message_start", message: { ...finalMessage } });
+			await emit({ type: "message_end", message: finalMessage });
+			return finalMessage;
+		}
+		throw error;
+	} finally {
+		signal?.removeEventListener("abort", forwardAbort);
+	}
+}
+
+/**
+ * Consumes one provider stream to completion. Rejects with StreamStallError when
+ * no stream events arrive within stallTimeoutMs; the caller decides whether to
+ * retry or surface the failure.
+ */
+async function consumeAssistantStream(
+	response: Awaited<ReturnType<StreamFn>>,
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	stallTimeoutMs: number,
+	trackPartial: (partial: AssistantMessage | null, added: boolean) => void,
+	requestController: AbortController,
+	finalizeMessage: (message: AssistantMessage) => AssistantMessage,
+): Promise<AssistantMessage> {
+	let partialMessage: AssistantMessage | null = null;
+	let addedPartial = false;
+	const repetitionThreshold = repetitionLoopThreshold(config);
+	const repetitionDetector = new RepetitionDetector(repetitionThreshold);
+	const finishAbortedMessage = async () => {
+		const finalMessage = createAbortedAssistantMessage(config, partialMessage);
+		if (addedPartial) {
+			context.messages[context.messages.length - 1] = finalMessage;
+		} else {
+			context.messages.push(finalMessage);
+			await emit({ type: "message_start", message: { ...finalMessage } });
+		}
+		await emit({ type: "message_end", message: finalMessage });
+		return finalMessage;
+	};
+
+	try {
 		const iterator = response[Symbol.asyncIterator]();
 		const closeIterator = () => {
 			void Promise.resolve(iterator.return?.()).catch(() => undefined);
 		};
 		while (true) {
 			const next = await raceWithAbort<IteratorResult<AssistantMessageEvent>>(
-				iterator.next(),
+				raceWithStallTimeout(iterator.next(), stallTimeoutMs),
 				signal,
 				closeIterator,
 			);
@@ -518,6 +870,7 @@ async function streamAssistantResponse(
 					partialMessage = event.partial;
 					context.messages.push(partialMessage);
 					addedPartial = true;
+					trackPartial(partialMessage, addedPartial);
 					await emit({ type: "message_start", message: { ...partialMessage } });
 					break;
 
@@ -530,6 +883,14 @@ async function streamAssistantResponse(
 				case "toolcall_start":
 				case "toolcall_delta":
 				case "toolcall_end":
+					if ((event.type === "text_delta" || event.type === "thinking_delta") && repetitionThreshold > 0) {
+						if (repetitionDetector.observeText(event.delta)) {
+							// Cancel the provider request first so the HTTP connection stops
+							// consuming output, then unwind with the dedicated error.
+							requestController.abort();
+							throw new RepetitionLoopError();
+						}
+					}
 					if (partialMessage) {
 						partialMessage = event.partial;
 						context.messages[context.messages.length - 1] = partialMessage;
@@ -545,12 +906,16 @@ async function streamAssistantResponse(
 				case "error": {
 					let finalMessage = getTerminalMessage(event);
 					try {
-						finalMessage = await maybePromiseWithAbort(response.result(), signal);
+						finalMessage = await maybePromiseWithAbort(
+							raceWithStallTimeout(response.result(), stallTimeoutMs),
+							signal,
+						);
 					} catch (error) {
 						if (!signal?.aborted || !isAbortError(error)) {
 							throw error;
 						}
 					}
+					finalMessage = finalizeMessage(finalMessage);
 					if (addedPartial) {
 						context.messages[context.messages.length - 1] = finalMessage;
 					} else {
@@ -565,7 +930,9 @@ async function streamAssistantResponse(
 			}
 		}
 
-		const finalMessage = await maybePromiseWithAbort(response.result(), signal);
+		const finalMessage = finalizeMessage(
+			await maybePromiseWithAbort(raceWithStallTimeout(response.result(), stallTimeoutMs), signal),
+		);
 		if (addedPartial) {
 			context.messages[context.messages.length - 1] = finalMessage;
 		} else {

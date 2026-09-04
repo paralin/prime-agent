@@ -119,6 +119,21 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
 
 	/**
+	 * Abort and retry the provider stream after this many milliseconds without
+	 * any stream event (default 180000). Past two retries the failure surfaces
+	 * as an error on the assistant message.
+	 */
+	streamStallTimeoutMs?: number;
+
+	/**
+	 * Detect a degenerate stream that repeats one output segment (sentence or
+	 * identical tool call) and cancel the provider request instead of running
+	 * until the output budget is exhausted. Defaults to enabled with a
+	 * threshold of 5 consecutive repeats.
+	 */
+	repetitionLoop?: { enabled?: boolean; threshold?: number };
+
+	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
 	 *
 	 * Each AgentMessage must be converted to a UserMessage, AssistantMessage, or ToolResultMessage

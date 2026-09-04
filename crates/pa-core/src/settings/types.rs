@@ -100,6 +100,9 @@ pub struct CompactionSettings {
     pub reserve_tokens: Option<u64>,
     pub keep_recent_tokens: Option<u64>,
     pub agent_callable: Option<bool>,
+    pub trigger_context_tokens: Option<f64>,
+    pub native: Option<bool>,
+    pub strategy: Option<CompactionStrategy>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -188,6 +191,8 @@ pub struct ImageSettings {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThinkingBudgetsSettings {
+    pub xhigh: Option<u64>,
+    pub max: Option<u64>,
     pub minimal: Option<u64>,
     pub low: Option<u64>,
     pub medium: Option<u64>,
@@ -293,6 +298,43 @@ pub enum McpServerConfig {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompactionStrategy {
+    Default,
+    ScratchHandoff,
+    NativeOrScratch,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchHandoffSettings {
+    pub enabled: Option<bool>,
+    pub root_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EnabledFeatureSettings {
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClaudeCodeSettings {
+    pub executable: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenRouterSettings {
+    pub responses: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ModelRoleSelector {
+    Single(String),
+    Ordered(Vec<String>),
+}
+
 /// The settings document: every known field optional; unknown keys preserved.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -308,6 +350,16 @@ pub struct Settings {
     pub default_thinking_level: Option<ThinkingLevelSetting>,
     pub default_service_tier: Option<String>,
     pub rlm_max_depth: Option<u64>,
+    pub rlm_allowed_service_tiers: Option<Vec<pa_types::ai::ServiceTier>>,
+    pub rlm_act_max_depth: Option<serde_json::Value>,
+    pub rlm_act_default_model: Option<serde_json::Value>,
+    pub codex_homes: Option<serde_json::Value>,
+    pub model_roles: Option<std::collections::BTreeMap<String, ModelRoleSelector>>,
+    pub claude_code: Option<ClaudeCodeSettings>,
+    pub open_router: Option<OpenRouterSettings>,
+    pub scratch_handoff: Option<ScratchHandoffSettings>,
+    pub session_elapsed_time: Option<EnabledFeatureSettings>,
+    pub agents_view_usage: Option<EnabledFeatureSettings>,
     /// `number | "off" | "none"`; raw JSON because the TS getter validates at
     /// access time.
     pub idle_eviction_minutes: Option<serde_json::Value>,

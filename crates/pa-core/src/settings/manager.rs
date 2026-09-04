@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use super::documents::{parse_settings_document, stringify_settings_document};
 use super::load::from_value_lenient;
 use super::merge::{deep_merge, migrate};
 use super::storage::{SettingsScope, SettingsStorage};
@@ -29,6 +30,7 @@ pub struct SettingsError {
 pub struct SettingsManager {
     storage: Arc<dyn SettingsStorage>,
     global: Settings,
+    saved_global: Settings,
     project: Settings,
     merged: Settings,
     runtime_overrides: Settings,
@@ -54,8 +56,9 @@ impl SettingsManager {
         let (project, _, project_load_error) =
             load_scope(storage.as_ref(), SettingsScope::Project, &mut errors);
         let merged = deep_merge(&global, &project);
-        Self {
+        let mut manager = Self {
             storage,
+            saved_global: global.clone(),
             global,
             project,
             merged,
@@ -64,7 +67,9 @@ impl SettingsManager {
             errors,
             global_load_error,
             project_load_error,
-        }
+        };
+        manager.refresh_merged();
+        manager
     }
 
     /// File-backed manager (agentDir + cwd/.prime/agent).
@@ -141,20 +146,41 @@ impl SettingsManager {
             load_scope(self.storage.as_ref(), SettingsScope::Global, &mut errors);
         let (project, _, project_load_error) =
             load_scope(self.storage.as_ref(), SettingsScope::Project, &mut errors);
+        self.saved_global = global.clone();
         self.global = global;
         self.project = project;
         self.global_raw = global_raw;
         self.global_load_error = global_load_error;
         self.project_load_error = project_load_error;
         self.errors = errors;
-        self.merged = deep_merge(&self.global, &self.project);
+        self.refresh_merged();
         Ok(())
+    }
+
+    fn refresh_merged(&mut self) {
+        self.merged = deep_merge(
+            &deep_merge(&self.global, &self.project),
+            &self.runtime_overrides,
+        );
+        if self.project.codex_homes.is_some()
+            && !self
+                .errors
+                .iter()
+                .any(|error| error.message.starts_with("codexHomes is global-only"))
+        {
+            self.errors.push(SettingsError {
+                scope: SettingsScope::Project,
+                message:
+                    "codexHomes is global-only because its rotation state is shared by the daemon"
+                        .into(),
+            });
+        }
     }
 
     /// Runtime overrides layered on top (CLI flags); not persisted.
     pub fn apply_overrides(&mut self, overrides: &Settings) {
-        self.merged = deep_merge(&self.merged, overrides);
         self.runtime_overrides = deep_merge(&self.runtime_overrides, overrides);
+        self.refresh_merged();
     }
 
     /// Mutable global settings for the setters in sibling modules (the
@@ -508,7 +534,7 @@ impl SettingsManager {
             "packages",
             &serde_json::Value::Array(packages),
         );
-        self.merged = deep_merge(&self.global, &self.project);
+        self.refresh_merged();
     }
 
     /// Replace the `packages` array in the project settings file.
@@ -519,7 +545,7 @@ impl SettingsManager {
             "packages",
             &serde_json::Value::Array(packages),
         );
-        self.merged = deep_merge(&self.global, &self.project);
+        self.refresh_merged();
     }
 
     /// Replace one resource-path array (`skills`/`prompts`/`themes`) in the
@@ -538,7 +564,7 @@ impl SettingsManager {
             field,
             &serde_json::Value::Array(array),
         );
-        self.merged = deep_merge(&self.global, &self.project);
+        self.refresh_merged();
     }
 
     /// Replace one resource-path array in the project settings file (TS
@@ -557,7 +583,7 @@ impl SettingsManager {
             field,
             &serde_json::Value::Array(array),
         );
-        self.merged = deep_merge(&self.global, &self.project);
+        self.refresh_merged();
     }
 
     /// Write one field into a scope's file, merging with the current on-disk
@@ -586,9 +612,19 @@ impl SettingsManager {
             });
             return;
         }
+        let format = match self.storage.format(scope) {
+            Ok(format) => format,
+            Err(error) => {
+                self.errors.push(SettingsError {
+                    scope,
+                    message: error.to_string(),
+                });
+                return;
+            }
+        };
         let result = self.storage.with_lock(scope, &mut |current| {
             let mut map: serde_json::Map<String, serde_json::Value> = current
-                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+                .and_then(|content| parse_settings_document(&content).ok())
                 .and_then(|value| match value {
                     serde_json::Value::Object(mut map) => {
                         super::merge::migrate(&mut map);
@@ -598,7 +634,7 @@ impl SettingsManager {
                 })
                 .unwrap_or_default();
             map.insert(field.to_string(), value.clone());
-            serde_json::to_string_pretty(&serde_json::Value::Object(map)).ok()
+            stringify_settings_document(&serde_json::Value::Object(map), format).ok()
         });
         if let Err(error) = result {
             self.errors.push(SettingsError {
@@ -960,13 +996,36 @@ impl SettingsManager {
     /// Write the global scope back (project scope is host-written, not
     /// user-set in this port), then re-derive the effective settings.
     fn save_global(&mut self) -> Result<()> {
-        let content = serde_json::to_string_pretty(&self.global)?;
+        if let Some(error) = &self.global_load_error {
+            anyhow::bail!("Global settings not saved: settings file failed to parse: {error}");
+        }
+        let format = self.storage.format(SettingsScope::Global)?;
+        let previous = serde_json::to_value(&self.saved_global)?;
+        let next = serde_json::to_value(&self.global)?;
+        let mut failure = None;
         self.storage
             .with_lock(SettingsScope::Global, &mut |current| {
-                let _ = current;
-                Some(content.clone())
+                let result = (|| -> Result<String> {
+                    let mut current = match current {
+                        Some(ref content) => parse_settings_document(content)?,
+                        None => serde_json::json!({}),
+                    };
+                    super::documents::apply_settings_delta(&mut current, &previous, &next);
+                    stringify_settings_document(&current, format)
+                })();
+                match result {
+                    Ok(content) => Some(content),
+                    Err(error) => {
+                        failure = Some(error);
+                        None
+                    }
+                }
             })?;
-        self.merged = deep_merge(&self.global, &self.project);
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        self.saved_global = self.global.clone();
+        self.refresh_merged();
         Ok(())
     }
 }
@@ -1022,7 +1081,7 @@ fn load_scope(
     let Some(content) = content else {
         return (Settings::default(), None, None);
     };
-    let value: serde_json::Value = match serde_json::from_str(&content) {
+    let value: serde_json::Value = match parse_settings_document(&content) {
         Ok(value) => value,
         Err(error) => {
             load_error = Some(error.to_string());

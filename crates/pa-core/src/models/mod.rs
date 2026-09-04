@@ -19,6 +19,10 @@ pub use catalog_chain::{
 pub use pa_models::RefreshTrigger;
 
 pub mod allowlist;
+pub mod runtime_roles;
+pub use runtime_roles::{
+    parse_rlm_runtime_candidate, resolve_rlm_role_candidates, RlmRuntimeCandidate, RlmRuntimeKind,
+};
 pub(crate) mod catalog_chain;
 pub(crate) mod custom;
 pub mod image_model_routing;

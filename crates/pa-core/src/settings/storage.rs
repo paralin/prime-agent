@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use super::documents::{resolve_settings_file, SettingsFileFormat};
 use anyhow::{anyhow, Result};
 
 /// The TS `CONFIG_DIR_NAME` (pkg.piConfig.configDir fallback).
@@ -48,9 +49,13 @@ pub trait SettingsStorage: Send + Sync {
     }
 
     /// # Errors
-    ///
-    /// Returns an error when the storage fails to lock, read, or write the
-    /// scope's settings file.
+    /// Returns an error when multiple settings documents exist in the scope.
+    fn format(&self, _scope: SettingsScope) -> Result<SettingsFileFormat> {
+        Ok(SettingsFileFormat::Json)
+    }
+
+    /// # Errors
+    /// Returns an error when the storage fails to lock, read, or write the scope's document.
     fn with_lock(
         &self,
         scope: SettingsScope,
@@ -80,11 +85,12 @@ impl FileSettingsStorage {
         }
     }
 
-    fn path(&self, scope: SettingsScope) -> &Path {
-        match scope {
+    fn path(&self, scope: SettingsScope) -> Result<PathBuf> {
+        let path = match scope {
             SettingsScope::Global => &self.global_path,
             SettingsScope::Project => &self.project_path,
-        }
+        };
+        resolve_settings_file(path.parent().unwrap_or_else(|| Path::new("."))).map(|value| value.0)
     }
 
     fn acquire_lock(path: &Path) -> Result<LockGuard> {
@@ -211,6 +217,14 @@ fn read_cache() -> &'static Mutex<HashMap<PathBuf, CachedRead>> {
 }
 
 impl SettingsStorage for FileSettingsStorage {
+    fn format(&self, scope: SettingsScope) -> Result<SettingsFileFormat> {
+        let path = match scope {
+            SettingsScope::Global => &self.global_path,
+            SettingsScope::Project => &self.project_path,
+        };
+        resolve_settings_file(path.parent().unwrap_or_else(|| Path::new("."))).map(|value| value.1)
+    }
+
     /// The consolidated read arm: on a cache hit, one `stat` and the cached
     /// content (no lock protocol at all — the TS session's own per-turn
     /// reads take no lock either); on a miss, the full locked protocol
@@ -220,7 +234,8 @@ impl SettingsStorage for FileSettingsStorage {
     /// write changes the stat identity, so the next read misses and
     /// re-reads fresh.
     fn read(&self, scope: SettingsScope) -> Result<Option<String>> {
-        let path = self.path(scope);
+        let document_path = self.path(scope)?;
+        let path = document_path.as_path();
         let _process_guard = process_lock(path);
         let now_identity = fs::metadata(path)
             .ok()
@@ -262,7 +277,8 @@ impl SettingsStorage for FileSettingsStorage {
         scope: SettingsScope,
         update: &mut dyn FnMut(Option<String>) -> Option<String>,
     ) -> Result<()> {
-        let path = self.path(scope);
+        let document_path = self.path(scope)?;
+        let path = document_path.as_path();
         let _process_guard = process_lock(path);
         let file_exists = path.exists();
         let mut held: Option<LockGuard> = None;

@@ -1,0 +1,1 @@
+- Added YAML settings, live reloads, model roles, Claude Code runtime selectors, provider transport preferences, Codex homes, and compaction configuration.

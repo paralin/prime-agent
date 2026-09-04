@@ -441,6 +441,22 @@ impl ModelRegistry {
         let mut built_in = self.load_built_in_models(&result, credentials.as_ref());
         built_in.extend(private_models.into_values());
         self.models = Self::merge_custom_models(built_in, result.models);
+        if let Some(seed) = self
+            .models
+            .iter()
+            .find(|model| model.provider == "merge-gateway")
+            .cloned()
+        {
+            let auth = self.get_api_key_and_headers(&seed, None);
+            if let Some(key) = auth.api_key.filter(|_| auth.ok) {
+                let cache_key =
+                    super::merge_gateway::cache_key(self.models_json_path.as_deref(), &key);
+                if let Some(discovered) = super::merge_gateway::cached(&cache_key) {
+                    self.models =
+                        Self::merge_custom_models(std::mem::take(&mut self.models), discovered);
+                }
+            }
+        }
         self.apply_subscription_model_adaptations();
     }
 
@@ -672,7 +688,51 @@ impl ModelRegistry {
             previous_models,
         )
         .await;
+        self.refresh_merge_gateway_models(super::merge_gateway::CATALOG_BASE_URL)
+            .await;
         self.get_available().into_iter().cloned().collect()
+    }
+
+    /// Models the authenticated Codex catalog currently permits to execute.
+    pub async fn get_executable_models(&mut self) -> Vec<Model> {
+        let models: Vec<_> = self.get_available().into_iter().cloned().collect();
+        let auth = models
+            .iter()
+            .find(|model| model.provider == "openai-codex")
+            .map(|seed| self.get_api_key_and_headers(seed, None));
+        let (key, headers) = auth.map_or((None, None), |auth| {
+            (auth.api_key.filter(|_| auth.ok), auth.headers)
+        });
+        super::codex_catalog::executable_models(models, key, headers.as_ref()).await
+    }
+
+    /// Refresh authenticated Merge Gateway routes, retaining bootstrap models on failure.
+    pub async fn refresh_merge_gateway_models(&mut self, base_url: &str) {
+        if is_offline_mode_enabled() {
+            return;
+        }
+        let Some(seed) = self
+            .models
+            .iter()
+            .find(|model| model.provider == "merge-gateway")
+            .cloned()
+        else {
+            return;
+        };
+        let auth = self.get_api_key_and_headers(&seed, None);
+        let Some(api_key) = auth.api_key.filter(|_| auth.ok) else {
+            return;
+        };
+        let key = super::merge_gateway::cache_key(self.models_json_path.as_deref(), &api_key);
+        if super::merge_gateway::fresh(&key) {
+            return;
+        }
+        if let Ok(models) =
+            super::merge_gateway::fetch_merge_gateway_models(base_url, &api_key, &self.models).await
+        {
+            super::merge_gateway::store(key, models.clone());
+            self.models = Self::merge_custom_models(std::mem::take(&mut self.models), models);
+        }
     }
 
     #[allow(clippy::too_many_lines)]

@@ -19,6 +19,8 @@ pub use catalog_chain::{
 pub use pa_models::RefreshTrigger;
 
 pub mod allowlist;
+pub mod codex_catalog;
+pub mod merge_gateway;
 pub mod runtime_roles;
 pub use runtime_roles::{
     parse_rlm_runtime_candidate, resolve_rlm_role_candidates, RlmRuntimeCandidate, RlmRuntimeKind,

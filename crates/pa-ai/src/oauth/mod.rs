@@ -24,6 +24,13 @@ mod provider_http;
 mod types;
 mod xai;
 
+/// Read the `ChatGPT` account claim used by Codex catalog requests.
+///
+/// # Errors
+/// Returns an error if the token is malformed or lacks an account claim.
+pub fn read_openai_codex_account_id(token: &str) -> Result<String, String> {
+    crate::providers::openai_codex_responses::request::extract_account_id(token)
+}
 pub use anthropic::{
     login_anthropic, refresh_anthropic_token, AnthropicCredentials,
     LOGIN_CANCELLED as ANTHROPIC_LOGIN_CANCELLED,

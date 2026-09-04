@@ -170,7 +170,14 @@ impl ModelCompat {
     /// deserialize into the compat struct its keys selected.
     pub fn kind(&self) -> Result<CompatKind, serde_json::Error> {
         let has_key = |keys: &[&str]| keys.iter().any(|k| self.raw.contains_key(*k));
-        let value = Value::Object(self.raw.clone());
+        let mut raw = self.raw.clone();
+        if raw
+            .get("sendSessionAffinityHeaders")
+            .is_some_and(Value::is_array)
+        {
+            raw.insert("sendSessionAffinityHeaders".to_string(), Value::Bool(false));
+        }
+        let value = Value::Object(raw);
         if has_key(ANTHROPIC_COMPAT_KEYS) {
             Ok(CompatKind::AnthropicMessages(serde_json::from_value(
                 value,
@@ -182,5 +189,25 @@ impl ModelCompat {
                 serde_json::from_value(value)?,
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::*;
+
+    #[test]
+    fn named_affinity_headers_keep_other_typed_compatibility_fields() {
+        let compat: ModelCompat = serde_json::from_value(serde_json::json!({
+            "thinkingFormat": "merge", "supportsReasoningEffort": true,
+            "sendSessionAffinityHeaders": ["x-session-affinity", "X-Session-Id"]
+        }))
+        .unwrap();
+        let CompatKind::OpenAiCompletions(view) = compat.kind().unwrap() else {
+            panic!("completions compat");
+        };
+        assert_eq!(view.thinking_format, Some(ThinkingFormat::Merge));
+        assert_eq!(view.supports_reasoning_effort, Some(true));
+        assert!(compat.raw["sendSessionAffinityHeaders"].is_array());
     }
 }

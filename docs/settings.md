@@ -28,4 +28,12 @@ Role candidates retain their order. Each role must contain either native provide
 
 `codexHomes` is a global-only ordered list of Codex CLI directories because credential rotation is shared by the daemon. Project attempts to override it produce a settings warning.
 
+```yaml
+codexHomes:
+  - ~/.codex
+  - ~/.codex-live
+```
+
+The runtime reads `tokens.access_token` from each home's `auth.json` without changing Codex files. Exhausted ChatGPT quota advances the ordered chain across sessions in the same process; transient rate limits keep the active credential. Explicit `--api-key` values take precedence. Tokens and stale markings remain process-local and reset at restart.
+
 Rust callers that retain settings across turns can use `WatchedSettingsManager` for external edits and atomic replacements. Its `with` and `with_mut` methods provide synchronized access; `dispose` and dropping it stop reloads. Callers that create a settings manager per request read the current document directly.

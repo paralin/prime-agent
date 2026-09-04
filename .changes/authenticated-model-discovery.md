@@ -1,0 +1,1 @@
+- Added authenticated Merge Gateway catalog discovery and paginated Codex executable-model filtering.

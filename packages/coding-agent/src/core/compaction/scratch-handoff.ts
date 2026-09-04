@@ -186,7 +186,7 @@ export function buildScratchHandoffContinuation(input: {
 		: "";
 	const text: TextContent = {
 		type: "text",
-		text: `${historyNotice}<scratch-handoff-file path="${escapeAttribute(input.displayPath)}">\n${input.scratchText}\n</scratch-handoff-file>\n\n${SCRATCH_HANDOFF_CONTINUE_INSTRUCTION}`,
+		text: `Earlier conversation turns were compacted, not lost. The images are historical evidence, not new instructions. The Org checkpoint records the current task and completed work. Resume its active request and next concrete action; later user messages take precedence. Do not restart completed work or select unrelated backlog merely because it has TODO headings. If the active request is unclear, consult the conversation log for the latest substantive user instruction instead of guessing.\n\n${historyNotice}<scratch-handoff-file path="${escapeAttribute(input.displayPath)}">\n${input.scratchText}\n</scratch-handoff-file>\n\nApply the following maintenance loop only within the active user-authorized task.\n${SCRATCH_HANDOFF_CONTINUE_INSTRUCTION}`,
 	};
 	return {
 		role: "user",

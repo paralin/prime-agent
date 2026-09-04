@@ -88,7 +88,7 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain("Reproduce a defect when easy or useful");
 		expect(prompt).toContain("Ending a turn to wait does not declare the task complete");
 		expect(prompt).toContain("Run the smallest check that exercises the claimed behavior");
-		expect(prompt).toContain("Do reasoning in thinking blocks, not in user-facing prose.");
+		expect(prompt).toContain("Once the next safe action is clear, execute it");
 		expect(prompt).toContain(
 			"At the top of each IPython cell, write a short comment that states what the cell is trying to do and the expected outcome.",
 		);
@@ -194,7 +194,7 @@ describe("buildRlmPrompt", () => {
 		});
 
 		expect(prompt).not.toContain("IPython is Prime Agent's persistent Python control environment");
-		expect(prompt).toContain("Do reasoning in thinking blocks, not in user-facing prose.");
+		expect(prompt).toContain("Once the next safe action is clear, execute it");
 		expect(prompt).not.toContain(
 			"At the top of each IPython cell, write a short comment that states what the cell is trying to do and the expected outcome.",
 		);

@@ -142,6 +142,9 @@ describe("scratch handoff messages", () => {
 		}
 		expect(text.text).toContain('<scratch-handoff-file path="agent/a&amp;&quot;b.org">');
 		expect(text.text).toContain("** TODO Nested\nfull tail");
+		expect(text.text).toContain("Earlier conversation turns were compacted, not lost");
+		expect(text.text).toContain("later user messages take precedence");
+		expect(text.text).toContain("only within the active user-authorized task");
 		expect(text.text.endsWith(SCRATCH_HANDOFF_CONTINUE_INSTRUCTION)).toBe(true);
 	});
 });

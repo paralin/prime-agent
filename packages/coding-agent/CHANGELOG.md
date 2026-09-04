@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Anchored scratch handoffs to the active user request and next action, separated historical evidence from instructions, and discouraged repeated deliberation.
 - Preserved pre-compaction scrollback when reopening scratch-compacted sessions and collapsed scratch checkpoints into expandable events.
 - Added draft-first scratch closeout guidance and surfaced closeout failures without discarding the original context.
 - Fixed Merge auto-compaction to use the same local context estimate as the usage display.

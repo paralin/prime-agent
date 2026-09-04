@@ -103,7 +103,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		"Reproduce a defect when easy or useful; fix it directly when source establishes the cause. Run the smallest check that exercises the claimed behavior. Add tests when they cover a meaningful regression, and reuse valid evidence while code and inputs are unchanged.",
 		"Before stopping, compare the result with the active request once. If a requirement remains unmet, take the next distinct action or report the blocker. Use the running program or the last relevant check as evidence.",
 		"When the requested work is complete, give the final answer. When only independently completing work or a needed decision remains, end the turn and wait for its notification or reply. Ending a turn to wait does not declare the task complete.",
-		"Do reasoning in thinking blocks, not in user-facing prose. Use assistant text for progress, results, and the next action.",
+		"Once the next safe action is clear, execute it rather than repeatedly planning the ideal response. Keep thinking focused on the immediate decision. If chronology or a fact is uncertain, make one bounded lookup or record the uncertainty; do not repeatedly reconstruct the conversation from memory. Use assistant text for concise progress and results.",
 		"Talk like a colleague who was not in the room. Use ordinary words: the running binary, the acceptance test, the user-facing UI, the reported bug.",
 		"",
 		...(depth === 0 ? [USER_PROGRESS_PROMPT, ""] : []),

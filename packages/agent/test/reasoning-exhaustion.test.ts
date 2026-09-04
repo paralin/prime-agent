@@ -2,11 +2,13 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	EventStream,
+	getModel,
 	type Message,
 	type Model,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
+import { transformMessages } from "../../ai/src/providers/transform-messages.js";
 import { runAgentLoop } from "../src/agent-loop.js";
 import type { AgentLoopConfig, StreamFn } from "../src/types.js";
 
@@ -47,6 +49,7 @@ function response(output: number, exhausted = true): AssistantMessage {
 }
 
 async function run(responses: AssistantMessage[], overrides: Partial<AgentLoopConfig> = {}) {
+	const persisted: Message[] = [];
 	const requests: { options: SimpleStreamOptions | undefined; messages: Message[] }[] = [];
 	const streamFn: StreamFn = (_model, context, options) => {
 		const message = responses[requests.length];
@@ -69,14 +72,43 @@ async function run(responses: AssistantMessage[], overrides: Partial<AgentLoopCo
 		[{ role: "user", content: "Answer the current question", timestamp: 0 }],
 		{ systemPrompt: "Answer the user", messages: [], tools: [] },
 		config,
-		() => {},
+		(event) => {
+			if (event.type === "message_end") persisted.push(JSON.parse(JSON.stringify(event.message)));
+		},
 		undefined,
 		streamFn,
 	);
-	return { requests, messages, config };
+	return { requests, messages, config, persisted };
 }
 
 describe("reasoning exhaustion recovery", () => {
+	it("classifies exhaustion before persistence and excludes it on replay", async () => {
+		const { persisted } = await run([response(32_000)]);
+		expect(persisted.at(-1)).toMatchObject({
+			stopReason: "error",
+			errorMessage: expect.stringContaining("reasoning"),
+		});
+		expect(transformMessages(persisted, model).map((message) => message.role)).toEqual(["user"]);
+	});
+
+	it("excludes legacy exhausted thinking on same-model and cross-model replay", () => {
+		const failed = response(32_000);
+		for (const target of [model, getModel("openai", "gpt-4o")]) {
+			expect(transformMessages([failed], target)).toEqual([]);
+		}
+		expect(failed.stopReason).toBe("length");
+	});
+
+	it("preserves useful partial answers and tool-associated reasoning", () => {
+		for (const content of [
+			{ type: "text" as const, text: "Partial answer" },
+			{ type: "toolCall" as const, id: "call", name: "read", arguments: {} },
+		]) {
+			const message = response(32_000);
+			message.content.push(content);
+			expect(transformMessages([message], model)[0]).toMatchObject({ content: message.content });
+		}
+	});
 	it("does not treat an unused local thinking budget as a provider output limit", async () => {
 		const partial = response(32_000);
 		const { requests, messages } = await run([partial, response(100, false)], { thinkingBudgets: { low: 1024 } });

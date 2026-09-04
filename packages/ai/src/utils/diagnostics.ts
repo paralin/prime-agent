@@ -1,3 +1,19 @@
+import type { AssistantMessage } from "../types.js";
+
+/** Identify failed reasoning-only responses, including legacy journals saved as length. */
+export function isReasoningExhaustedResponse(message: AssistantMessage): boolean {
+	return (
+		message.stopReason === "length" &&
+		!message.content.some(
+			(part) => part.type === "toolCall" || (part.type === "text" && part.text.trim().length > 0),
+		) &&
+		(message.diagnostics?.some(
+			(diagnostic) => diagnostic.type === "provider_warning" && diagnostic.error?.code === "reasoning_exhausted",
+		) ??
+			false)
+	);
+}
+
 export interface DiagnosticErrorInfo {
 	name?: string;
 	message: string;

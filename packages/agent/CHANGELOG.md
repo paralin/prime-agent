@@ -2,9 +2,9 @@
 
 ## [Unreleased]
 
+- Classified reasoning exhaustion before emitting the completed message so saved sessions retain the failure status.
 - Stopped on reasoning exhaustion without automatically increasing the output allowance or retrying the same context.
 - Stopped a third consecutive identical tool-call batch with unchanged results before executing it.
-- Continued the active turn when a provider exhausts its output limit on thinking without producing text or a tool call.
 
 ## [0.8.0] - 2026-08-21
 

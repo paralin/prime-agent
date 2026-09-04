@@ -10,6 +10,7 @@ import {
 	createAssistantMessageDiagnostic,
 	EventStream,
 	getLogger,
+	isReasoningExhaustedResponse,
 	streamSimple,
 	type ToolResultMessage,
 	validateToolArguments,
@@ -134,14 +135,6 @@ class ToolCallRepetitionDetector {
 		this.lastResultSignature = undefined;
 		this.consecutiveBatches = 0;
 	}
-}
-
-function hasReasoningExhaustedWarning(message: AssistantMessage): boolean {
-	return (
-		message.diagnostics?.some(
-			(diagnostic) => diagnostic.type === "provider_warning" && diagnostic.error?.code === "reasoning_exhausted",
-		) ?? false
-	);
 }
 
 function finalizeToolCallRepetitionMessage(message: AssistantMessage): AssistantMessage {
@@ -512,9 +505,19 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn, (candidate) =>
-				toolCallRepetitionDetector.observe(candidate) ? finalizeToolCallRepetitionMessage(candidate) : candidate,
-			);
+			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn, (candidate) => {
+				if (isReasoningExhaustedResponse(candidate)) {
+					return {
+						...candidate,
+						stopReason: "error",
+						errorMessage:
+							"Provider exhausted the output budget on reasoning without producing an answer; increase the output budget or lower the reasoning effort",
+					};
+				}
+				return toolCallRepetitionDetector.observe(candidate)
+					? finalizeToolCallRepetitionMessage(candidate)
+					: candidate;
+			});
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -525,19 +528,6 @@ async function runLoop(
 
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
 			const hasFinalText = message.content.some((c) => c.type === "text" && c.text.trim().length > 0);
-			if (
-				message.stopReason === "length" &&
-				!hasFinalText &&
-				toolCalls.length === 0 &&
-				hasReasoningExhaustedWarning(message)
-			) {
-				message.stopReason = "error";
-				message.errorMessage =
-					"Provider exhausted the output budget on reasoning without producing an answer; increase the output budget or lower the reasoning effort";
-				await emit({ type: "turn_end", message, toolResults: [] });
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
 			const incompleteResponse =
 				message.stopReason === "unknown" ||
 				((message.stopReason === "stop" || message.stopReason === "length") &&

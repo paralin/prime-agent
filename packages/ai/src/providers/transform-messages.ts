@@ -8,6 +8,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.js";
+import { isReasoningExhaustedResponse } from "../utils/diagnostics.js";
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
@@ -67,7 +68,11 @@ export function transformMessages<TApi extends Api>(
 	normalizeToolCallId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
 ): Message[] {
 	const toolCallIdMap = new Map<string, string>();
-	const imageAwareMessages = downgradeUnsupportedImages(messages, model);
+	// Filter before cross-model conversion can turn failed thinking into ordinary text.
+	const imageAwareMessages = downgradeUnsupportedImages(
+		messages.filter((message) => message.role !== "assistant" || !isReasoningExhaustedResponse(message)),
+		model,
+	);
 
 	const transformed = imageAwareMessages.map((msg) => {
 		if (msg.role === "user") {

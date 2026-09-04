@@ -48,5 +48,5 @@ pub fn is_reasoning_exhausted_response(message: &AssistantMessage) -> bool {
             crate::types::AssistantContent::Text(text) => !text.text.trim().is_empty(),
             crate::types::AssistantContent::Thinking(_) => false,
         })
-        && message.diagnostics.as_ref().is_some_and(|entries| entries.iter().any(|entry| entry.type_ == "provider_warning" && entry.error.as_ref().is_some_and(|error| error.code.as_deref() == Some("reasoning_exhausted"))))
+        && message.diagnostics.as_ref().is_some_and(|entries| entries.iter().any(|entry| entry.type_ == "provider_warning" && entry.error.as_ref().is_some_and(|error| matches!(error.code.as_ref(), Some(crate::types::DiagnosticCode::Str(code)) if code == "reasoning_exhausted"))))
 }

@@ -92,6 +92,7 @@ impl AgentSession {
         images: Vec<pa_agent::types::ImageContent>,
         options: PromptOptions,
     ) -> anyhow::Result<PromptOutcome> {
+        self.reasoning_recovery_attempted.store(false, std::sync::atomic::Ordering::Release);
         let expand = options.expand_prompt_templates.unwrap_or(true);
         // TS `_finishSubmissionNormalization` order: skill commands expand
         // first (`/skill:<name>` into its `<skill>` block), prompt templates

@@ -147,7 +147,10 @@ fn standard_message(message: &pa_agent::types::AgentMessage) -> Option<&pa_agent
 }
 
 /// The session-bound agent: admission rules + persistence over the loop.
+mod reasoning_recovery;
+
 pub struct AgentSession {
+    reasoning_recovery_attempted: std::sync::atomic::AtomicBool,
     agent: Arc<Agent>,
     session: Arc<tokio::sync::Mutex<SessionManager>>,
     prompt_templates: Vec<PromptTemplate>,
@@ -287,6 +290,7 @@ impl AgentSession {
             skill_telemetry: None,
             image_model_router: None,
             compaction_summary_sink: std::sync::Mutex::new(None),
+            reasoning_recovery_attempted: std::sync::atomic::AtomicBool::new(false),
             native_compaction: std::sync::atomic::AtomicBool::new(true),
             foreground,
             scratch_handoff: std::sync::RwLock::new(None),

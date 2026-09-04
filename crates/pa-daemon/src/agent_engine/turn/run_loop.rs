@@ -111,6 +111,16 @@ impl AgentSessionEngine {
                     return;
                 }
                 TurnResult::Error { error, assistant } => {
+                    let core = self.session.blocking_lock().clone();
+                    let target = self.provider_target.read().expect("provider target lock").clone();
+                    if let (Some(core), Some(target)) = (core, target) {
+                        match self.runtime.block_on(core.session.recover_reasoning_exhaustion(&target.model, target.api_key)) {
+                            Ok(true) => { overflow_retry = true; continue; }
+                            Ok(false) => {}
+                            Err(failure) => { emit(EngineEvent::Error { message: failure.to_string() }); return; }
+                        }
+                    }
+
                     // TS `_checkCompaction` Case 1 at `agent_end`: a
                     // context-overflow error triggers one compact-and-retry
                     // attempt before the run ends.

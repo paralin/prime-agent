@@ -208,6 +208,9 @@ impl TurnBoundary {
         api_key: Option<String>,
         global_harness_dir: PathBuf,
     ) -> Result<(), String> {
+        if engine.session.recover_reasoning_exhaustion(model, api_key.clone()).await.map_err(|error| error.to_string())? {
+            engine.session.agent().continue_run().await.map_err(|error| error.to_string())?;
+        }
         self.count_settled_turns(engine).await;
         self.consume_compact_auto_refine(
             engine,

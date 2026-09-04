@@ -1,5 +1,5 @@
 import { deflateSync } from "node:zlib";
-import type { ImageContent } from "@earendil-works/pi-ai";
+import { type ImageContent, isReasoningExhaustedResponse } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "./session-manager.js";
 
 const FRAME_WIDTH = 1280;
@@ -47,6 +47,12 @@ export function serializeSessionHistory(entries: readonly SessionEntry[]): strin
 				const text = contentText(message.content);
 				if (text) parts.push(`USER\n${text}`);
 			} else if (message.role === "assistant") {
+				if (
+					message.stopReason === "error" ||
+					message.stopReason === "aborted" ||
+					isReasoningExhaustedResponse(message)
+				)
+					continue;
 				const blocks: string[] = [];
 				for (const content of message.content) {
 					if (content.type === "text" && content.text) blocks.push(content.text);

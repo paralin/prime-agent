@@ -1333,6 +1333,9 @@ export class AgentSession {
 	private _compactionOperation: Promise<void> | undefined = undefined;
 	/** One recovery attempt per overflow; "reported" dedups the failure notice. */
 	private _overflowRecovery: "idle" | "attempted" | "reported" = "idle";
+	/** One scratch recovery per user run; closeout and automatic continuation do not reset it. */
+	private _reasoningRecoveryAttempted = false;
+	private _firstActionLatencyMs: number | undefined;
 	private _continueAfterThresholdCompaction = false;
 	private _pendingRequestedCompaction: { customInstructions?: string } | undefined;
 	private _pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
@@ -4009,6 +4012,10 @@ export class AgentSession {
 	}
 
 	private async _processAgentEvent(event: AgentEvent): Promise<void> {
+		if (event.type === "message_start" && event.message.role === "assistant") this._firstActionLatencyMs = undefined;
+		if (event.type === "message_update" && event.assistantMessageEvent.type === "toolcall_start") {
+			this._firstActionLatencyMs ??= Math.max(0, Date.now() - event.message.timestamp);
+		}
 		let clearedDispatchEnded = false;
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "toolResult") {
 			this._applyLateIpythonSentAgentMessages(event.message);
@@ -4048,6 +4055,7 @@ export class AgentSession {
 
 		if (event.type === "message_start" && startsAgentRun(event.message)) {
 			this._overflowRecovery = "idle";
+			if (event.message.role === "user" && !this._scratchCloseoutRunActive) this._reasoningRecoveryAttempted = false;
 		}
 
 		await this._emitExtensionEvent(event);
@@ -4069,6 +4077,37 @@ export class AgentSession {
 		this._emit(event);
 
 		if (event.type === "message_end") {
+			if (event.message.role === "assistant") {
+				const message = event.message;
+				const usage = message.usage;
+				const totalInput = usage.input + usage.cacheRead + usage.cacheWrite;
+				message.diagnostics = [
+					...(message.diagnostics ?? []),
+					{
+						type: "agent_request_metrics",
+						timestamp: Date.now(),
+						details: {
+							phase: this._scratchCloseoutRunActive
+								? "scratch_closeout"
+								: this._reasoningRecoveryAttempted
+									? "recovery"
+									: "normal",
+							durationMs: Math.max(0, Date.now() - message.timestamp),
+							firstToolCallMs: this._firstActionLatencyMs ?? null,
+							uncachedInputTokens: usage.input,
+							cacheReadTokens: usage.cacheRead,
+							cacheWriteTokens: usage.cacheWrite,
+							cacheReadRatio: totalInput > 0 ? usage.cacheRead / totalInput : null,
+							outputTokens: usage.output,
+							toolCalls: message.content.filter((part) => part.type === "toolCall").length,
+							thinkingChars: message.content.reduce(
+								(sum, part) => sum + (part.type === "thinking" ? part.thinking.length : 0),
+								0,
+							),
+						},
+					},
+				];
+			}
 			if (event.message.role === "custom") {
 				this.sessionManager.appendCustomMessageEntry(
 					event.message.customType,
@@ -9518,6 +9557,25 @@ export class AgentSession {
 		const assistantIsFromBeforeCompaction =
 			compactionTimestamp !== undefined && assistantMessage.timestamp <= compactionTimestamp;
 
+		if (this._isProviderReasoningExhausted(assistantMessage) && assistantMessage.stopReason === "error") {
+			if (
+				!queueAutonomousContinuation ||
+				assistantIsFromBeforeCompaction ||
+				!sameModel ||
+				!settings.enabled ||
+				!this._scratchHandoffRoute()
+			)
+				return false;
+			if (this._reasoningRecoveryAttempted) return false;
+			if (this._hasQueuedCompactCommand()) return false;
+			this._reasoningRecoveryAttempted = true;
+			this._pendingRequestedCompaction = {
+				customInstructions:
+					"Reasoning exhausted: save the active task checkpoint using the current model, then resume once from compacted context. Do not repeat completed actions.",
+			};
+			return await this._runAutoCompaction("requested", true);
+		}
+
 		// Case 1: Overflow - takes priority over a pending model request so the error
 		// strip + retry still happen; the compaction it runs consumes the request.
 		if (
@@ -9696,6 +9754,7 @@ export class AgentSession {
 		// Overflow stays excluded: a failed overflow recovery must not re-issue the overflowing request.
 		const resumeAfterFailure = () => {
 			if (
+				!willRetry &&
 				(reason === "requested" || reason === "threshold") &&
 				(shouldContinueAfterCompaction || this.agent.hasQueuedMessages() || this.hasPendingSessionWork)
 			) {

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Added one same-model scratch recovery after reasoning exhaustion, with no automatic retry after a failed checkpoint or a second exhaustion.
+- Added local request timing, cache usage, and recovery-phase diagnostics without remote telemetry.
+- Clarified that tool output is observation from the assistant's action, not a new user request, and excluded exhausted reasoning from new history snapshots.
 - Anchored scratch handoffs to the active user request and next action, separated historical evidence from instructions, and discouraged repeated deliberation.
 - Preserved pre-compaction scrollback when reopening scratch-compacted sessions and collapsed scratch checkpoints into expandable events.
 - Added draft-first scratch closeout guidance and surfaced closeout failures without discarding the original context.

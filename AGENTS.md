@@ -15,17 +15,22 @@
 - Check node_modules for external API type definitions instead of guessing
 - **NEVER use inline imports** - no `await import("./foo.js")`, no `import("pkg").Type` in type positions, no dynamic imports for types. Always use standard top-level imports.
 - NEVER remove or downgrade code to fix type errors from outdated dependencies; upgrade the dependency instead
-- Always ask before removing functionality or code that appears to be intentional
-- Do not preserve backward compatibility unless the user explicitly asks for it
+- Remove intentional functionality only when the requested change or governing
+  design makes it obsolete.
+- Preserve compatibility when required by the daemon protocol, a public API,
+  stored data, or an explicit user requirement. Otherwise prefer a clean break.
 - Never hardcode key checks with, eg. `matchesKey(keyData, "ctrl+x")`. All keybindings must be configurable. Add default to matching object (`DEFAULT_EDITOR_KEYBINDINGS` or `DEFAULT_APP_KEYBINDINGS`)
 - NEVER modify `packages/ai/src/models.generated.ts` directly. Update `packages/ai/scripts/generate-models.ts` instead.
+- `npm run build` frequently refreshes `packages/ai/src/models.generated.ts` as upstream model catalogs change. Leave that generated-only drift unstaged during unrelated work, then commit it periodically as a separate maintenance change with `git add packages/ai/src/models.generated.ts && git commit -sm "chore: update generated models"`.
 
 ## Commands
 
 - After code changes (not documentation changes): `npm run check` (get full output, no tail). Fix all errors, warnings, and infos before committing.
 - Note: `npm run check` does not run tests.
 - NEVER run: `npm run dev`, `npm run build`, `npm test`
-- Only run specific tests if user instructs: `npx tsx ../../node_modules/vitest/dist/cli.js --run test/specific.test.ts`
+- Run the focused tests affected by the change:
+  `npx tsx ../../node_modules/vitest/dist/cli.js --run test/specific.test.ts`.
+  Do not run the full test suite unless the user or repository policy requests it.
 - Run tests from the package root, not the repo root.
 - If you create or modify a test file, you MUST run that test file and iterate until it passes.
 - When writing tests, run them, identify issues in either the test or implementation, and iterate until fixed.
@@ -83,11 +88,11 @@ To test Prime Agent's TUI in a controlled terminal environment:
 # Create tmux session with specific dimensions
 tmux new-session -d -s prime-agent-test -x 80 -y 24
 
-# Start Prime Agent from source
-tmux send-keys -t prime-agent-test "cd /Users/kevin/pi/prime-agent && ./prime-agent.sh" Enter
+# Start Prime Agent from the repository root
+tmux send-keys -t prime-agent-test "./prime-agent.sh" Enter
 
-# Wait for startup, then capture output
-sleep 3 && tmux capture-pane -t prime-agent-test -p
+# Capture output after the startup screen is ready
+tmux capture-pane -t prime-agent-test -p
 
 # Send input
 tmux send-keys -t prime-agent-test "your prompt here" Enter
@@ -104,13 +109,17 @@ You, yourself, are often running into a tmux session, so be careful when killing
 
 ## Changelog
 
-Location: `packages/<pkg>/.changes/<slug>.md` (one fragment file per PR per touched package)
+Location: `packages/<pkg>/CHANGELOG.md`
 
 ### Format
 
-Do NOT edit `packages/*/CHANGELOG.md` directly. Instead, add a fragment file `packages/<pkg>/.changes/<slug>.md` (slug = kebab-case, branch- or ticket-derived, e.g. `eng-1234-fix-resize.md`) containing exactly the bullet line(s) for the change. Bullets are plain `- ...` lines with no `### Added` / `### Changed` / `### Fixed` / `### Removed` subsections — one bullet per change, written as a short sentence starting with a past-tense verb (Added, Changed, Fixed, Removed). Keep each bullet to one line; describe the user-visible change, not the implementation. The release script folds fragments into the release section of CHANGELOG.md and deletes them.
+Edit the touched package's `CHANGELOG.md` directly. Add an `## [Unreleased]`
+section immediately below the title when one is not already present, then add
+one bullet per user-visible change. Write each bullet as a short sentence that
+starts with a past-tense verb (Added, Changed, Fixed, Removed). Keep each bullet
+to one line and describe the behavior, not the implementation.
 
-Example fragment (`packages/coding-agent/.changes/eng-1234-effort-command.md`):
+Example entry:
 
 ```markdown
 - Added `/effort` to set the reasoning level, with autocomplete for the levels the current model supports.
@@ -118,7 +127,7 @@ Example fragment (`packages/coding-agent/.changes/eng-1234-effort-command.md`):
 
 ### Rules
 
-- One fragment file per PR per touched package; a fragment may contain multiple bullets
+- Keep one shared `## [Unreleased]` section per package
 - NEVER modify already-released version sections in CHANGELOG.md (e.g., `## [0.2.1]`) — each is immutable once released
 - Purely internal changes may opt out via the `no-changelog` PR label
 
@@ -178,7 +187,7 @@ Create provider file exporting:
 ### 7. Documentation
 
 - `packages/ai/README.md`: Add to providers table, document options/auth, add env vars
-- `packages/ai/.changes/<slug>.md`: Add a changelog fragment (see Changelog above)
+- `packages/ai/CHANGELOG.md`: Add an unreleased changelog entry (see Changelog above)
 
 ## Releasing
 
@@ -191,7 +200,7 @@ Create provider file exporting:
 
 ### Steps
 
-1. **Check fragments**: Ensure all changes since last release have fragment files in `packages/<pkg>/.changes/`
+1. **Check changelogs**: Ensure user-visible changes are listed under `## [Unreleased]` in each touched package's `CHANGELOG.md`
 
 2. **Run release script**:
    ```bash
@@ -199,7 +208,14 @@ Create provider file exporting:
    npm run release:minor    # API breaking changes
    ```
 
-The script handles: version bump, folding `.changes/` fragments into the release section, commit, tag, and publish.
+The script handles: version bump, renaming each `## [Unreleased]` section to the release version and date, commit, tag, and publish.
+
+## Repository Target and Publication
+
+- The writable repository for this checkout is `paralin/prime-agent`.
+- Prefer a normal branch or a direct commit on `main`, then push to the matching branch or `main` in `paralin/prime-agent`.
+- Open a pull request only when review, branch protection, or the user requires one.
+- Never open or update a pull request against `PrimeIntellect-ai/prime-agent`. That upstream automatically closes these pull requests. Treat it as read-only unless the user explicitly changes this policy.
 
 ## **CRITICAL** Git Rules for Parallel Agents **CRITICAL**
 
@@ -213,7 +229,7 @@ Multiple agents may work on different files in the same worktree simultaneously.
 - ALWAYS use `git add <specific-file-paths>` listing only files you modified
 - Before committing, run `git status` and verify you are only staging YOUR files
 - Track which files you created/modified/deleted during the session
-- It is always fine to include `packages/ai/src/models.generated.ts` in a commit alongside the actual files you want to commit
+- Include `packages/ai/src/models.generated.ts` with a feature or fix only when that work intentionally changes model generation. Leave build-only catalog churn unstaged and commit it separately as described above.
 
 ### Forbidden Git Operations
 
@@ -234,10 +250,10 @@ git status
 
 # 2. Add ONLY your specific files
 git add packages/ai/src/providers/transform-messages.ts
-git add packages/ai/.changes/eng-1234-fix-resize.md
+git add packages/ai/CHANGELOG.md
 
 # 3. Commit
-git commit -m "fix(ai): description"
+git commit -sm "fix(ai): description"
 
 # 4. Push (pull --rebase if needed, but NEVER reset/checkout)
 git pull --rebase && git push
@@ -248,7 +264,3 @@ git pull --rebase && git push
 - Resolve conflicts in YOUR files only
 - If conflict is in a file you didn't modify, abort and ask the user
 - NEVER force push
-
-### User override
-
-If the user instructions conflict with rules set out here, ask for confirmation that they want to override the rules. Only then execute their instructions.

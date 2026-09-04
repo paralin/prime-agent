@@ -33,6 +33,7 @@ pub mod abort;
 pub mod agent;
 pub mod agent_loop;
 pub mod proxy;
+pub mod repetition_detector;
 pub mod scripted;
 pub mod stream;
 pub mod types;

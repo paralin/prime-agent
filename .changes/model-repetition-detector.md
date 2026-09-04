@@ -1,0 +1,1 @@
+- Added bounded detection of repeating model text and thinking with configurable thresholds.

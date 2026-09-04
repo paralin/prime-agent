@@ -26,6 +26,8 @@ pub const SCRATCH_HANDOFF_READ_CUSTOM_TYPE: &str = "scratch-handoff-read";
 pub const SCRATCH_HANDOFF_PATH_CUSTOM_TYPE: &str = "scratch-handoff-path";
 pub const SCRATCH_HANDOFF_WARNING_CUSTOM_TYPE: &str = "scratch-handoff-warning";
 pub const SCRATCH_HANDOFF_CLOSEOUT_CUSTOM_TYPE: &str = "scratch-handoff-closeout";
+pub const SCRATCH_HANDOFF_CLOSEOUT_GUIDANCE: &str = "This turn only prepares the handoff file. Write a useful draft checkpoint before investigating uncertain details, then make targeted edits if needed. For an existing checkpoint, read it and update it in place. Record the newest user request, completed work, remaining TODOs, blockers, and the next concrete action. Separate facts by host, repository, and path. Preserve uncertainty explicitly instead of repeatedly reconstructing the entire conversation from memory. Earlier thinking is tentative, not evidence that an action happened. Use actual tool results and current state for disputed facts. Do not resume the underlying task during closeout. Finish after saving the file.";
+
 pub const SCRATCH_HANDOFF_CONTINUE_INSTRUCTION: &str = "Keep this org file up to date as you continue the tasks within. When you finish a task or subtask, update it from TODO to DONE and move any notes to the daily log leaving behind a short org-link to the relevant daily log entry in the scratch file. If you are confused on what this means, read the daily-log skill. After marking a task as DONE, check if there are any parent headings to mark DONE, or any peer or child TODO headings to action next, and loop.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

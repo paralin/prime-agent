@@ -4,7 +4,6 @@ use serde_json::{json, Value};
 #[derive(Default)]
 pub(super) struct TurnProgress {
     incomplete: usize,
-    pub(super) recovery_max_tokens: Option<u64>,
     signature: Option<String>,
     result_signature: Option<String>,
     batches: usize,
@@ -21,7 +20,6 @@ pub(super) fn incomplete(message: &AssistantMessage) -> bool {
 
 impl TurnProgress {
     pub fn reset_tools(&mut self) {
-        self.recovery_max_tokens = None;
         self.signature = None;
         self.result_signature = None;
         self.batches = 0;
@@ -38,7 +36,7 @@ impl TurnProgress {
         }
         self.result_signature = Some(signature);
     }
-    pub fn finalize(&mut self, mut message: AssistantMessage, config: &super::AgentLoopConfig) -> AssistantMessage {
+    pub fn finalize(&mut self, mut message: AssistantMessage) -> AssistantMessage {
         let calls = message.tool_calls();
         if calls.is_empty() {
             self.signature = None;
@@ -86,13 +84,6 @@ impl TurnProgress {
                     })
                 })
             {
-                let used_budget = message.usage.output.max(self.recovery_max_tokens.unwrap_or(0));
-                let next_budget = used_budget.saturating_mul(2).min(config.model.max_tokens);
-                if config.max_tokens.is_none() && next_budget > used_budget && self.incomplete < 2 {
-                    self.recovery_max_tokens = Some(next_budget);
-                    self.incomplete += 1;
-                    return message;
-                }
                 message.stop_reason = StopReason::Error;
                 message.error_message = Some("Provider exhausted the output budget on reasoning without producing an answer; increase the output budget or lower the reasoning effort".into());
                 return message;
@@ -105,8 +96,7 @@ impl TurnProgress {
             }
         } else {
             self.incomplete = 0;
-            self.recovery_max_tokens = None;
-        }
+            }
         message
     }
 }

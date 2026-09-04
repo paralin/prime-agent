@@ -292,7 +292,7 @@ async fn stream_assistant_response_inner(
                         }
                     }
                 }
-                final_message = progress.finalize(final_message, config);
+                final_message = progress.finalize(final_message);
                 return publish_response(context, config, emit, final_message, *added_partial)
                     .await;
             }
@@ -303,7 +303,7 @@ async fn stream_assistant_response_inner(
     // Stream ended without a terminal event: resolve the final message (TS
     // awaits `response.result()` here too; a stream that ends cleanly always
     // pushed done/error first).
-    let final_message = progress.finalize(with_timeout(response.result(), config, signal).await?, config);
+    let final_message = progress.finalize(with_timeout(response.result(), config, signal).await?);
     publish_response(context, config, emit, final_message, *added_partial).await
 }
 

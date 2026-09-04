@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 import resource
 import signal
+import shlex
 import socket
 import subprocess
 import sys
@@ -15,7 +17,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
-from rlm import bash
+from rlm import bash, rg, rsync, ssh_forward
 
 # The package re-exports the bash() function under the same name, so reach the
 # module through sys.modules for internals.
@@ -24,14 +26,14 @@ bash_module = sys.modules["rlm.bash"]
 
 def _win_spawn(procs=None, resume=True):
     # POSIX stand-in for _winjob.spawn_in_job: a real Popen plus a resume() mock (Ubuntu CI).
-    def spawn_in_job(job, argv, cwd, env):
+    def spawn_in_job(job, argv, cwd, env, *, pipe_stdin=False):
         proc = subprocess.Popen(
             argv,
             cwd=cwd,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if pipe_stdin else subprocess.DEVNULL,
         )
         proc.resume = mock.Mock(return_value=resume)
         proc.close = mock.Mock()
@@ -44,6 +46,34 @@ def _win_spawn(procs=None, resume=True):
     return spawn_in_job
 
 
+
+
+def _fake_ssh(directory: str) -> str:
+    path = os.path.join(directory, "ssh")
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(
+            "#!/usr/bin/env python3\n"
+            "import json, os, subprocess, sys\n"
+            "capture = os.environ['PRIME_AGENT_TEST_SSH_CAPTURE']\n"
+            "open(capture + '.argv', 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n"
+            "separator = sys.argv.index('--')\n"
+            "host = sys.argv[separator + 1]\n"
+            "if host == 'connection-failure':\n"
+            "    print('ssh: connect to host failed', file=sys.stderr)\n"
+            "    raise SystemExit(255)\n"
+            "if host == 'slow-reader':\n"
+            "    import time; time.sleep(0.5)\n"
+            "data = sys.stdin.buffer.read()\n"
+            "open(capture + '.stdin', 'wb').write(data)\n"
+            "command = sys.argv[separator + 2]\n"
+            "remote_env = {'PATH': os.environ.get('PATH', ''), 'HOME': os.environ.get('HOME', '')}\n"
+            "result = subprocess.run(['/bin/sh', '-c', command], input=data, env=remote_env)\n"
+            "raise SystemExit(result.returncode)\n"
+        )
+    os.chmod(path, 0o755)
+    return path
+
+
 class BashTest(unittest.IsolatedAsyncioTestCase):
     async def test_await_returns_result(self):
         result = await bash("echo hi")
@@ -54,6 +84,446 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         handle = bash("echo again")
         awaited = await handle
         self.assertEqual(handle.poll(), awaited)
+
+    async def test_timeout_terminates_command_and_raises(self):
+        started = time.monotonic()
+        handle = bash("sleep 30", timeout=0.1)
+        with self.assertRaisesRegex(TimeoutError, "timed out after 0.1 seconds"):
+            await handle
+        self.assertFalse(handle.running)
+        self.assertLess(time.monotonic() - started, 5)
+
+    async def test_timeout_validation(self):
+        for timeout in (0, -1, float("inf"), float("nan")):
+            with self.assertRaises(ValueError):
+                bash("echo no", timeout=timeout)
+        for timeout in (True, "1"):
+            with self.assertRaises(TypeError):
+                bash("echo no", timeout=timeout)
+
+    async def test_rg_ssh_runs_the_quoted_argv_on_the_remote_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = _fake_ssh(tmp)
+            haystack = os.path.join(tmp, "hay stack.txt")
+            with open(haystack, "w", encoding="utf-8") as stream:
+                stream.write("needle here\n")
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
+                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": os.path.join(tmp, "capture")}
+            ):
+                result = await rg("needle", haystack, ssh="core@thumper", cwd=tmp)
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(result.transport, "ssh")
+            self.assertIn("needle here", result.output)
+            argv = json.loads(Path(os.path.join(tmp, "capture.argv")).read_text())
+            host_index = argv.index("--") + 1
+            script = Path(os.path.join(tmp, "capture.stdin")).read_text()
+            # The remote prelude cds into cwd and the command is shell-quoted.
+            self.assertIn(shlex.quote(haystack), script)
+            self.assertIn("cd -- " + shlex.quote(tmp), script)
+
+    async def test_rg_rejects_remote_only_options_without_ssh(self):
+        for kwargs in ({"cwd": "/x"}, {"ssh_options": ["-J", "jump"]}):
+            with self.assertRaises(ValueError):
+                rg("needle", ssh=None, **kwargs)
+
+    async def test_rsync_ssh_builds_a_batchmode_remote_shell(self):
+        handle = rsync("src/", "core@thumper:dst/", ssh="core@thumper", ssh_options=["-J", "jump host"])
+        self.assertIn("-e", handle.command)
+        self.assertIn("ssh -oBatchMode=yes", handle.command)
+        self.assertIn("jump host", handle.command)
+        with self.assertRaises(ValueError):
+            rsync("a/", "b/", ssh_options=["-J", "jump"])
+
+    async def test_rsync_ssh_dry_run_completes_through_the_real_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            dst = os.path.join(tmp, "dst")
+            os.mkdir(src)
+            with open(os.path.join(src, "file.txt"), "w", encoding="utf-8") as stream:
+                stream.write("payload\n")
+            result = await rsync(src + "/", dst + "/", options=("-a", "--dry-run"), ssh="core@thumper")
+            self.assertEqual(result.exit_code, 0)
+
+    async def test_ssh_chain_nests_each_hop_and_streams_to_the_final_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # The fake ssh runs its "remote" command locally, so the nested chain
+            # executes real ssh calls; patch the client so every hop uses the fake.
+            # Intermediate hops run through a stripped remote shell, so this fake
+            # re-exports the capture path explicitly.
+            fake = os.path.join(tmp, "ssh-chain")
+            with open(fake, "w", encoding="utf-8") as stream:
+                stream.write(
+                    "#!/usr/bin/env python3\n"
+                    "import json, os, subprocess, sys\n"
+                    "capture = os.environ['PRIME_AGENT_TEST_SSH_CAPTURE']\n"
+                    "open(capture + '.argv', 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n"
+                    "separator = sys.argv.index('--')\n"
+                    "data = sys.stdin.buffer.read()\n"
+                    "open(capture + '.stdin', 'wb').write(data)\n"
+                    "command = sys.argv[separator + 2]\n"
+                    "env = dict(os.environ)\n"
+                    "env['PATH'] = os.environ.get('PATH', '')\n"
+                    "env['HOME'] = os.environ.get('HOME', '')\n"
+                    "result = subprocess.run(['/bin/sh', '-c', command], input=data, env=env)\n"
+                    "raise SystemExit(result.returncode)\n"
+                )
+            os.chmod(fake, 0o755)
+            marker = os.path.join(tmp, "chain-marker.txt")
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
+                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": os.path.join(tmp, "capture")}
+            ):
+                result = await bash("printf chain-ok", ssh=["hop-a", "hop-b", "core@thumper"])
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("chain-ok", result.output)
+            # capture.argv holds the innermost invocation: the final hop; the
+            # script streamed through both intermediate hops to get there.
+            argv = json.loads(Path(os.path.join(tmp, "capture.argv")).read_text())
+            self.assertEqual(argv[argv.index("--") + 1], "core@thumper")
+            script = Path(os.path.join(tmp, "capture.stdin")).read_text()
+            self.assertIn("printf chain-ok", script)
+
+    async def test_ssh_chain_validation(self):
+        with self.assertRaises(TypeError):
+            bash("x", ssh=42)
+        with self.assertRaises(ValueError):
+            bash("x", ssh=[])
+        with self.assertRaises(ValueError):
+            bash("x", ssh=["-bad"])
+        handle = bash("echo ok", ssh=["hop-a", "core@thumper"])
+        self.assertEqual(handle.ssh, "core@thumper")
+
+    async def test_ssh_forward_starts_a_cancellable_background_session(self):
+        # A listener on a real loopback port proves the tunnel end to end.
+        import socket
+
+        listener = socket.create_server(("127.0.0.1", 0))
+        listener_port = listener.getsockname()[1]
+        serve_once = threading.Thread(
+            target=lambda: (
+                listener.settimeout(10),
+                (lambda conn: (conn.sendall(b"through-the-tunnel\n"), conn.close()))(listener.accept()[0]),
+            ),
+            daemon=True,
+        )
+        serve_once.start()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = _fake_ssh(tmp)
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
+                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": os.path.join(tmp, "capture")}
+            ):
+                handle = ssh_forward("core@thumper", f"{listener_port + 1}:127.0.0.1:{listener_port}")
+                capture = os.path.join(tmp, "capture.argv")
+                for _ in range(100):
+                    if os.path.exists(capture):
+                        break
+                    await asyncio.sleep(0.02)
+                argv = json.loads(Path(capture).read_text())
+                self.assertIn("-N", argv)
+                self.assertIn("-oExitOnForwardFailure=yes", argv)
+                self.assertIn("-L", argv)
+                self.assertIn(f"{listener_port + 1}:127.0.0.1:{listener_port}", argv)
+                self.assertEqual(argv[argv.index("--") + 1], "core@thumper")
+                self.assertIsNone(handle.timeout)
+                handle.kill()
+
+        listener.close()
+
+    async def test_ssh_forward_validation(self):
+        with self.assertRaises(ValueError):
+            ssh_forward("host")
+        with self.assertRaises(TypeError):
+            ssh_forward("host", 8080)
+        handle = ssh_forward("host", "D:1080", "R:9090:localhost:3000")
+        self.assertIn("-D", handle.command)
+        self.assertIn("-R", handle.command)
+        handle.kill()
+
+    async def test_ssh_streams_exact_script_with_quoted_remote_prelude(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            remote_cwd = os.path.join(tmp, "remote dir's value")
+            requested_cwd = "~/remote dir's value"
+            os.mkdir(remote_cwd)
+            capture = os.path.join(tmp, "capture")
+            fake = _fake_ssh(tmp)
+            script = """set -eu
+test "${LOCAL_SECRET_NOT_FOR_REMOTE-unset}" = unset
+single='one two'
+double=\"three $single\"
+sub=$(printf command-substitution)
+printf '%s\\n' \"$SKIFF_WORKSPACE:$sub\"
+printf '%s\\n' 'a b' | awk '{ print \"awk:\" $2 }'
+cat <<'PAYLOAD'
+heredoc '$' \"quotes\" $(not-expanded)
+Unicode: 雪
+
+PAYLOAD
+pwd
+"""
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
+                os.environ,
+                {
+                    "PRIME_AGENT_TEST_SSH_CAPTURE": capture,
+                    "LOCAL_SECRET_NOT_FOR_REMOTE": "secret",
+                    "HOME": tmp,
+                },
+            ):
+                handle = bash(
+                    script,
+                    ssh="core@thumper",
+                    cwd=requested_cwd,
+                    env={"SKIFF_WORKSPACE": "desktop value"},
+                    ssh_options=["-J", "jump-host"],
+                )
+                self.assertEqual(handle.ssh, "core@thumper")
+                self.assertEqual(handle.remote_cwd, requested_cwd)
+                self.assertEqual(handle.remote_env_keys, ("SKIFF_WORKSPACE",))
+                self.assertNotIn("desktop value", repr(handle))
+                result = await handle
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(result.transport, "ssh")
+            self.assertFalse(result.transport_error)
+            self.assertIn("desktop value:command-substitution", result.output)
+            self.assertIn("awk:b", result.output)
+            self.assertIn("heredoc '$' \"quotes\" $(not-expanded)", result.output)
+            self.assertIn("Unicode: 雪", result.output)
+            self.assertIn(remote_cwd, result.output)
+            transported = Path(capture + ".stdin").read_bytes()
+            self.assertTrue(transported.endswith(script.encode("utf-8")))
+            argv = json.loads(Path(capture + ".argv").read_text(encoding="utf-8"))
+            self.assertEqual(argv[:4], ["-oBatchMode=yes", "-J", "jump-host", "-T"])
+            self.assertEqual(argv[4], "--")
+            self.assertEqual(argv[5], "core@thumper")
+            self.assertTrue(argv[6].startswith("exec bash -c "))
+            self.assertNotIn("command-substitution", argv[6])
+
+    async def test_ssh_does_not_add_errexit_to_the_user_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = os.path.join(tmp, "capture")
+            fake = _fake_ssh(tmp)
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
+                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}
+            ):
+                result = await bash("printf 'before\n'; false; printf 'after\n'", ssh="host")
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(result.output, "before\nafter\n")
+            self.assertFalse(result.transport_error)
+
+    async def test_ssh_distinguishes_transport_failure_from_remote_exit_255(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = os.path.join(tmp, "capture")
+            fake = _fake_ssh(tmp)
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
+                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}
+            ):
+                failed = await bash("printf never", ssh="connection-failure")
+                remote_255 = await bash("printf remote-255; exit 255", ssh="host")
+
+            self.assertEqual(failed.exit_code, 255)
+            self.assertTrue(failed.transport_error)
+            self.assertIn("connect to host failed", failed.output)
+            self.assertEqual(remote_255.exit_code, 255)
+            self.assertFalse(remote_255.transport_error)
+            self.assertEqual(remote_255.output, "remote-255")
+
+    async def test_ssh_large_script_does_not_block_handle_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = os.path.join(tmp, "capture")
+            fake = _fake_ssh(tmp)
+            script = ("# payload\n" * 200_000) + "printf large-complete"
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
+                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}
+            ):
+                started = time.monotonic()
+                handle = bash(script, ssh="slow-reader")
+                self.assertLess(time.monotonic() - started, 0.3)
+                result = await asyncio.wait_for(handle, timeout=10)
+            self.assertEqual(result.output, "large-complete")
+            self.assertTrue(Path(capture + ".stdin").read_bytes().endswith(script.encode()))
+
+    async def test_ssh_cwd_failure_prevents_script_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = os.path.join(tmp, "capture")
+            marker = os.path.join(tmp, "must-not-exist")
+            fake = _fake_ssh(tmp)
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
+                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}
+            ):
+                result = await bash(f"touch {shlex.quote(marker)}", ssh="host", cwd="/missing/remote/path")
+            self.assertEqual(result.exit_code, 128)
+            self.assertFalse(result.transport_error)
+            self.assertFalse(os.path.exists(marker))
+
+    async def test_ssh_journal_failure_sends_no_script_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = os.path.join(tmp, "capture")
+            fake = _fake_ssh(tmp)
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.object(
+                bash_module, "_record_journal", return_value=False
+            ), mock.patch.dict(os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}):
+                with self.assertRaisesRegex(RuntimeError, "orphan-journal enrollment failed"):
+                    bash("touch should-never-run", ssh="host")
+            stdin_path = Path(capture + ".stdin")
+            if stdin_path.exists():
+                self.assertEqual(stdin_path.read_bytes(), b"")
+
+    async def test_ssh_timeout_terminates_local_transport_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = os.path.join(tmp, "capture")
+            fake = _fake_ssh(tmp)
+            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
+                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}
+            ):
+                handle = bash("trap '' TERM; sleep 30", ssh="host", timeout=0.1)
+                with self.assertRaises(TimeoutError):
+                    await handle
+            self.assertFalse(handle.running)
+            self.assertEqual(handle.poll().transport, "ssh")
+            self.assertTrue(handle.poll().transport_error)
+
+    async def test_ssh_rejects_options_that_break_script_transport(self):
+        forbidden = [
+            ["-n"],
+            ["-nT"],
+            ["-f"],
+            ["-F", "alternate-config"],
+            ["-t"],
+            ["-T"],
+            ["-W", "host:1"],
+            ["-oBatchMode=no"],
+            ["-oRequestTTY=yes"],
+            ["-o", "RequestTTY yes"],
+            ["-o", "StdinNull=yes"],
+            ["unexpected-positional-operand"],
+            ["-J"],
+            ["--"],
+        ]
+        for options in forbidden:
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                bash("echo no", ssh="host", ssh_options=options)
+        with self.assertRaisesRegex(ValueError, "exact script transport"):
+            bash("echo no", ssh="host", tty=True)
+        with self.assertRaises(ValueError):
+            bash("echo no", ssh="-host")
+        with self.assertRaisesRegex(ValueError, "remote-user tilde"):
+            bash("echo no", ssh="host", cwd="~other/build")
+
+    async def test_argv_transport_preserves_arguments_without_a_shell(self):
+        argument = "literal $HOME * ' quote"
+        result = await bash_module._argv_handle(
+            [sys.executable, "-c", "import sys; print(sys.argv[1])", argument], None
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.output.strip(), argument)
+
+    async def test_argv_transport_marks_its_journal_record_inactive_after_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = os.path.join(tmp, "journal.jsonl")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL": journal,
+                    "PRIME_AGENT_KERNEL_OWNER_PID": str(os.getpid()),
+                },
+            ):
+                result = await bash_module._argv_handle(
+                    [sys.executable, "-c", "print('journaled')"], None
+                )
+                records = await _poll_journal(journal, 2)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual([record["active"] for record in records], [True, False])
+        self.assertEqual(records[0]["pid"], records[1]["pid"])
+
+    async def test_argv_transport_timeout_terminates_the_process_group(self):
+        handle = bash_module._argv_handle(
+            [sys.executable, "-c", "import time; time.sleep(30)"], 0.1
+        )
+        with self.assertRaises(TimeoutError):
+            await handle
+        self.assertFalse(handle.running)
+
+    async def test_argv_transport_journal_failure_prevents_target_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "ran")
+            bad_journal = os.path.join(tmp, "missing", "journal.jsonl")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL": bad_journal,
+                    "PRIME_AGENT_KERNEL_OWNER_PID": str(os.getpid()),
+                },
+            ):
+                with self.assertRaisesRegex(RuntimeError, "orphan-journal enrollment failed"):
+                    bash_module._argv_handle(
+                        [sys.executable, "-c", "from pathlib import Path; Path(__import__('sys').argv[1]).touch()", marker],
+                        None,
+                    )
+            self.assertFalse(os.path.exists(marker))
+
+    def test_rg_builds_an_argv_search_and_reuses_bash_handle_custody(self):
+        handle = object()
+        with mock.patch.object(bash_module, "_tool_path", return_value="/tools/rg"), mock.patch.object(
+            bash_module, "_argv_handle", return_value=handle
+        ) as runner:
+            result = rg("single ' quote", "dir with space", options=("--hidden",), timeout=3)
+        self.assertIs(result, handle)
+        runner.assert_called_once_with(
+            ["/tools/rg", "--hidden", "-e", "single ' quote", "--", "dir with space"], 3
+        )
+
+    def test_rg_defaults_to_the_current_directory_and_validates_argv(self):
+        with mock.patch.object(bash_module, "_tool_path", return_value="/tools/rg"), mock.patch.object(
+            bash_module, "_argv_handle", return_value=object()
+        ) as runner:
+            rg("needle")
+        runner.assert_called_once_with(["/tools/rg", "-e", "needle", "--", "."], None)
+        with self.assertRaises(TypeError):
+            rg(3)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            rg("needle", "bad\0path")
+        with self.assertRaises(ValueError):
+            rg("needle", options=("--",))
+        with self.assertRaises(ValueError):
+            rg("needle", options=("--pre=cat",))
+        with mock.patch.dict(os.environ, {"PRIME_AGENT_RG": "/missing/rg"}), mock.patch.object(
+            bash_module.shutil, "which", return_value=None
+        ):
+            with self.assertRaisesRegex(RuntimeError, "PRIME_AGENT_RG"):
+                rg("needle")
+
+    def test_rsync_builds_a_protected_archive_argv_and_reuses_bash_handle_custody(self):
+        handle = object()
+        with mock.patch.object(bash_module, "_tool_path", return_value="/tools/rsync"), mock.patch.object(
+            bash_module, "_argv_handle", return_value=handle
+        ) as runner:
+            result = rsync("source dir/", "host:target dir/", timeout=9)
+        self.assertIs(result, handle)
+        runner.assert_called_once_with(
+            [
+                "/tools/rsync",
+                "-a",
+                "--protect-args",
+                "--",
+                "source dir/",
+                "host:target dir/",
+            ],
+            9,
+        )
+
+    def test_rsync_allows_native_defaults_and_rejects_unsafe_or_incomplete_calls(self):
+        with mock.patch.object(bash_module, "_tool_path", return_value="/tools/rsync"), mock.patch.object(
+            bash_module, "_argv_handle", return_value=object()
+        ) as runner:
+            rsync("source", "target", options=(), protect_args=False)
+        runner.assert_called_once_with(["/tools/rsync", "--", "source", "target"], None)
+        with self.assertRaises(ValueError):
+            rsync("source")
+        with self.assertRaises(TypeError):
+            rsync("source", "target", protect_args="yes")  # type: ignore[arg-type]
+        for options in (("-e", "ssh -J jump"), ("-avze",), ("--rsh=ssh",), ("--daemon",), ("--",)):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                rsync("source", "target", options=options)
 
     async def test_status_pipe_survives_high_fds_and_strict_posix_shell(self):
         # Regression: dash rejects multi-digit fds in redirections at parse
@@ -702,6 +1172,48 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                     handle._job = None
                     handle.kill(signal.SIGKILL)
                     await asyncio.wait_for(handle, timeout=5)
+
+    async def test_windows_argv_spawn_uses_the_existing_job_container(self):
+        spawned = []
+        with mock.patch.object(bash_module, "_IS_POSIX", False), mock.patch.object(
+            bash_module._winjob, "create_job", return_value=5150
+        ), mock.patch.object(
+            bash_module._winjob, "spawn_in_job", _win_spawn(spawned)
+        ), mock.patch.object(
+            bash_module._winjob, "terminate", return_value=True
+        ), mock.patch.object(
+            bash_module._winjob, "close"
+        ), mock.patch.object(
+            bash_module, "_record_journal", return_value=True
+        ):
+            result = await bash_module._argv_handle(
+                [sys.executable, "-c", "print('windows-argv')"], None
+            )
+
+        self.assertEqual(result.output.strip(), "windows-argv")
+        self.assertEqual(spawned[0].spawn_argv, [sys.executable, "-c", "print('windows-argv')"])
+        self.assertIsNone(spawned[0].stdin)
+
+    async def test_windows_ssh_spawn_uses_job_contained_stdin_pipe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = os.path.join(tmp, "capture")
+            fake = _fake_ssh(tmp)
+            spawned = []
+            with mock.patch.object(bash_module, "_IS_POSIX", False), mock.patch.object(
+                bash_module, "_ssh_executable", return_value=fake
+            ), mock.patch.object(bash_module._winjob, "create_job", return_value=5151), mock.patch.object(
+                bash_module._winjob, "spawn_in_job", _win_spawn(spawned)
+            ), mock.patch.object(bash_module._winjob, "terminate", return_value=True), mock.patch.object(
+                bash_module._winjob, "close"
+            ), mock.patch.object(bash_module, "_record_journal", return_value=True), mock.patch.dict(
+                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}
+            ):
+                result = await bash("printf windows-remote", ssh="host")
+
+            self.assertEqual(result.output, "windows-remote")
+            self.assertEqual(result.transport, "ssh")
+            self.assertEqual(spawned[0].spawn_argv[0], fake)
+            self.assertIsNotNone(spawned[0].stdin)
 
     async def test_windows_create_job_failure_fails_closed(self):
         journal_calls = []

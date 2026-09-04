@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import atexit
 import json
+import math
 import os
+import re
 import secrets
 import selectors
+import shlex
 import shutil
 import signal
 import socket
@@ -17,7 +20,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, cast
@@ -55,6 +58,25 @@ class BashResult:
     exit_code: int
     output: str
     duration: float
+    transport: str = "local"
+    transport_error: bool = False
+
+
+@dataclass(frozen=True)
+class _ArgvTransport:
+    argv: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _SshTransport:
+    argv: tuple[str, ...]
+    script: bytes
+    shell: str
+    host: str
+    cwd: str | None
+    env_keys: tuple[str, ...]
+    hosts: tuple[str, ...] = ()
+    options: tuple[str, ...] = ()
 
 
 class _BoundedBuffer:
@@ -106,7 +128,7 @@ class _BoundedBuffer:
 
 
 class BashHandle:
-    """Live handle to a shell command; await it for the BashResult.
+    """Live handle to a managed shell or argv process; await it for BashResult.
 
     A handle awaited before any other API use (the `await bash(cmd)` one-shot
     form, including `h = bash(cmd)` awaited immediately) owns the command:
@@ -115,11 +137,24 @@ class BashHandle:
     handle; later awaits only wait and cancelling them leaves it running.
     """
 
-    def __init__(self, command: str) -> None:
+    def __init__(
+        self,
+        command: str,
+        timeout: float | None = None,
+        *,
+        ssh_transport: _SshTransport | None = None,
+        argv_transport: _ArgvTransport | None = None,
+    ) -> None:
         self.command = command
+        self.timeout = timeout
+        self._ssh_transport = ssh_transport
+        self._argv_transport = argv_transport
+        if ssh_transport is not None and argv_transport is not None:
+            raise ValueError("a BashHandle process can have only one transport")
         self._buffer = _BoundedBuffer()
         self._done = threading.Event()
         self._eof = threading.Event()
+        self._stdin_done = threading.Event()
         self._completion_terminal = threading.Event()
         self._completion_output: str | None = None
         self._completion_lock = threading.Lock()
@@ -130,6 +165,8 @@ class BashHandle:
         self._result: BashResult | None = None
         self._callbacks: list[Callable[[], None]] = []
         self._callback_lock = threading.Lock()
+        self._timed_out = False
+        self._timeout_timer: threading.Timer | None = None
         # Serializes kill/reap so a pid fallback can never outlive the process handle.
         self._kill_lock = threading.Lock()
         self._started = time.monotonic()
@@ -143,7 +180,37 @@ class BashHandle:
         self._job: int | None = None
         self._completion_marker: bytes | None = None
         status_write = -1
-        if _IS_POSIX:
+        ssh_argv: list[str] | None = None
+        if ssh_transport is not None:
+            completion_token = secrets.token_hex(32)
+            token_midpoint = len(completion_token) // 2
+            self._completion_marker = (
+                _COMPLETION_PREFIX + completion_token.encode("ascii") + _COMPLETION_SUFFIX
+            )
+            remote_command = _ssh_remote_command(
+                ssh_transport.shell,
+                completion_token[:token_midpoint],
+                completion_token[token_midpoint:],
+            )
+            # Each intermediate hop's shell reparses the next ssh invocation, so
+            # the innermost remote command is quoted once per enclosing hop.
+            for hop in reversed(ssh_transport.hosts[1:]):
+                inner = " ".join(
+                    [
+                        shlex.quote(ssh_transport.argv[0]),
+                        "-oBatchMode=yes",
+                        *(shlex.quote(option) for option in ssh_transport.options),
+                        "-T",
+                        "--",
+                        shlex.quote(hop),
+                        shlex.quote(remote_command),
+                    ]
+                )
+                remote_command = inner
+            ssh_argv = [*ssh_transport.argv, remote_command]
+        elif argv_transport is not None:
+            pass
+        elif _IS_POSIX:
             # Full-duplex status channel: the child end rides in as stdin (fd 0)
             # and the script remaps it to _STATUS_FD before swapping in /dev/null
             # (dash rejects multi-digit fds in redirections at parse time). The
@@ -170,16 +237,37 @@ class BashHandle:
                 completion_token[:token_midpoint],
                 completion_token[token_midpoint:],
             )
-        else:
+        elif argv_transport is None:
             # Windows lacks a foreground-status channel, so its exit drain stays best-effort.
             script = _with_prefix(command)
+        if not _IS_POSIX:
             self._job = _winjob.create_job()
             if self._job is None:
                 # Nothing spawned yet, so nothing can leak: refuse to start.
                 raise RuntimeError("bash(): Windows job containment could not be established")
         try:
             self._proc: subprocess.Popen[bytes] | _winjob.JobProcess
-            if _IS_POSIX:
+            if argv_transport is not None and _IS_POSIX:
+                self._proc = subprocess.Popen(
+                    [sys.executable, os.path.join(os.path.dirname(__file__), "_exec.py"), *argv_transport.argv],
+                    cwd=os.getcwd(),
+                    env=_child_env(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            elif ssh_transport is not None and _IS_POSIX:
+                self._proc = subprocess.Popen(
+                    ssh_argv,
+                    cwd=os.getcwd(),
+                    env=_child_env(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            elif _IS_POSIX:
                 self._proc = subprocess.Popen(
                     [_shell(), "-c", script],
                     cwd=os.getcwd(),
@@ -188,6 +276,14 @@ class BashHandle:
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                     stdin=status_write,
+                )
+            elif argv_transport is not None:
+                self._proc = _winjob.spawn_in_job(
+                    self._job, list(argv_transport.argv), cwd=os.getcwd(), env=_child_env()
+                )
+            elif ssh_transport is not None:
+                self._proc = _winjob.spawn_in_job(
+                    self._job, ssh_argv, cwd=os.getcwd(), env=_child_env(), pipe_stdin=True
                 )
             else:
                 self._proc = _winjob.spawn_in_job(
@@ -217,7 +313,17 @@ class BashHandle:
                 "bash(): orphan-journal enrollment failed (journal configured but the "
                 "pid could not be recorded); the spawned process was killed"
             )
-        if _IS_POSIX:
+        if _IS_POSIX and argv_transport is not None:
+            stream = self._proc.stdin
+            assert stream is not None
+            try:
+                stream.write(b"\n")
+                stream.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            finally:
+                stream.close()
+        elif _IS_POSIX and ssh_transport is None:
             # Journal first, then open the gate: the child does not run the user
             # command until this byte arrives. A failed write means the child
             # already died; the status/EOF paths report that normally.
@@ -225,7 +331,7 @@ class BashHandle:
                 os.write(self._status_read, b"\n")
             except OSError:
                 pass
-        else:
+        elif not _IS_POSIX:
             # The child is already job-contained and journaled; resume is the
             # last step. A failed resume would strand a permanently suspended
             # child: fail closed via the assigned job.
@@ -233,8 +339,35 @@ class BashHandle:
                 self._abort_spawn()
                 raise RuntimeError("bash(): Windows job containment could not be established")
         threading.Thread(target=self._pump, daemon=True).start()
-        threading.Thread(target=self._report, daemon=True).start()
-        threading.Thread(target=self._watch, daemon=True).start()
+        if argv_transport is not None:
+            threading.Thread(target=self._watch_argv, daemon=True).start()
+        elif ssh_transport is not None:
+            threading.Thread(
+                target=self._feed_stdin, args=(ssh_transport.script,), daemon=True
+            ).start()
+            threading.Thread(target=self._watch_ssh, daemon=True).start()
+        else:
+            threading.Thread(target=self._report, daemon=True).start()
+            threading.Thread(target=self._watch, daemon=True).start()
+        if timeout is not None:
+            self._timeout_timer = threading.Timer(timeout, self._expire)
+            self._timeout_timer.daemon = True
+            self._timeout_timer.start()
+
+    @property
+    def ssh(self) -> str | None:
+        """Remote SSH destination, or None for a local command."""
+        return self._ssh_transport.host if self._ssh_transport is not None else None
+
+    @property
+    def remote_cwd(self) -> str | None:
+        """Requested remote working directory, without generated transport quoting."""
+        return self._ssh_transport.cwd if self._ssh_transport is not None else None
+
+    @property
+    def remote_env_keys(self) -> tuple[str, ...]:
+        """Explicit remote environment names; values remain private."""
+        return self._ssh_transport.env_keys if self._ssh_transport is not None else ()
 
     @property
     def pid(self) -> int:
@@ -295,9 +428,13 @@ class BashHandle:
         if not _IS_POSIX:
             try:
                 while chunk := stdout.read1(_READ_CHUNK):
-                    self._buffer.write(chunk)
+                    if self._completion_marker is None:
+                        self._buffer.write(chunk)
+                    else:
+                        self._consume_output(chunk)
             except (OSError, ValueError):
                 pass
+            self._abandon_completion()
             stdout.close()
             self._eof.set()
             return
@@ -312,7 +449,10 @@ class BashHandle:
                         chunk = os.read(fd, _READ_CHUNK)
                         if not chunk:
                             break
-                        self._consume_output(chunk)
+                        if self._completion_marker is None:
+                            self._buffer.write(chunk)
+                        else:
+                            self._consume_output(chunk)
                     finally:
                         self._pump_transfer = False
         except (OSError, ValueError):
@@ -380,6 +520,57 @@ class BashHandle:
             if output is None:
                 self._drain_grace()
             self._finalize(status, output)
+
+    def _watch_argv(self) -> None:
+        exit_code = self._proc.wait()
+        self._eof.wait()
+        with self._kill_lock:
+            delivered = self._reap_group()
+            self._reaped = True
+            if not _IS_POSIX:
+                cast("_winjob.JobProcess", self._proc).close()
+        if delivered:
+            _record_journal(self._pid, active=False)
+        self._finalize(exit_code)
+        with _live_lock:
+            _live_handles.discard(self)
+
+    def _feed_stdin(self, data: bytes) -> None:
+        stream = self._proc.stdin
+        assert stream is not None
+        try:
+            for offset in range(0, len(data), _READ_CHUNK):
+                stream.write(data[offset : offset + _READ_CHUNK])
+            stream.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+            self._stdin_done.set()
+
+    def _watch_ssh(self) -> None:
+        exit_code = self._proc.wait()
+        self._stdin_done.wait()
+        self._eof.wait()
+        output = self._wait_for_completion()
+        with self._kill_lock:
+            delivered = self._reap_group()
+            self._reaped = True
+            if not _IS_POSIX:
+                cast("_winjob.JobProcess", self._proc).close()
+        if delivered:
+            _record_journal(self._pid, active=False)
+        self._finalize(
+            exit_code,
+            output=output,
+            transport="ssh",
+            transport_error=output is None,
+        )
+        with _live_lock:
+            _live_handles.discard(self)
 
     def _watch(self) -> None:
         # Observe shell death independently of the status socket: an early
@@ -493,20 +684,38 @@ class BashHandle:
             return False
         return pending > 0
 
-    def _finalize(self, exit_code: int, output: str | None = None) -> None:
+    def _finalize(
+        self,
+        exit_code: int,
+        output: str | None = None,
+        *,
+        transport: str = "local",
+        transport_error: bool = False,
+    ) -> None:
         with self._callback_lock:
             if self._done.is_set():
                 return
+            if self._timeout_timer is not None:
+                self._timeout_timer.cancel()
             self._result = BashResult(
                 exit_code=exit_code,
                 output=self._buffer.text() if output is None else output,
                 duration=time.monotonic() - self._started,
+                transport=transport,
+                transport_error=transport_error,
             )
             self._done.set()
             callbacks = self._callbacks
             self._callbacks = []
         for callback in callbacks:
             callback()
+
+    def _expire(self) -> None:
+        with self._callback_lock:
+            if self._done.is_set():
+                return
+            self._timed_out = True
+        self.kill(grace=_CANCEL_TERM_GRACE)
 
     def _add_done_callback(self, callback: Callable[[], None]) -> None:
         with self._callback_lock:
@@ -530,6 +739,9 @@ class BashHandle:
         self._add_done_callback(_wake)
         await fut
         assert self._result is not None
+        if self._timed_out:
+            await self._confirm_group_exit()
+            raise TimeoutError(f"bash command timed out after {self.timeout} seconds")
         return self._result
 
     async def _wait_owned(self) -> BashResult:
@@ -617,6 +829,8 @@ class BashHandle:
                         delivered = True
                     except OSError:
                         pass
+        if self._proc.stdin is not None:
+            self._proc.stdin.close()
         if self._proc.stdout is not None:
             self._proc.stdout.close()
         # The blocking wait stays outside the lock: hProcess is still open, so a
@@ -646,28 +860,442 @@ class BashHandle:
 
     def __repr__(self) -> str:
         state = f"exit_code={self._result.exit_code}" if self._result else "running"
-        return f"<BashHandle pid={self._pid} {state} command={self.command!r}>"
+        remote = ""
+        if self._ssh_transport is not None:
+            remote = (
+                f" ssh={self._ssh_transport.host!r} cwd={self._ssh_transport.cwd!r}"
+                f" env_keys={self._ssh_transport.env_keys!r}"
+            )
+        return f"<BashHandle pid={self._pid} {state}{remote} command={self.command!r}>"
 
 
-def bash(command: str) -> BashHandle:
-    """Start a shell command immediately; await the handle for the result.
+_REMOTE_ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_SSH_FORBIDDEN_OPTIONS = {
+    "-F",
+    "-f",
+    "-G",
+    "-M",
+    "-n",
+    "-N",
+    "-O",
+    "-Q",
+    "-s",
+    "-t",
+    "-T",
+    "-V",
+    "-W",
+}
+_SSH_OPTIONS_WITH_ARGUMENT = set("BbcDEeFIiJLblmPpRSZw")
+_SSH_FORBIDDEN_CONFIG = {
+    "batchmode",
+    "forkafterauthentication",
+    "remotecommand",
+    "requesttty",
+    "sessiontype",
+    "stdinnull",
+}
+
+
+def _ssh_executable() -> str:
+    if not _IS_POSIX:
+        system_ssh = _system32("OpenSSH", "ssh.exe")
+        if os.path.isfile(system_ssh):
+            return system_ssh
+    executable = shutil.which("ssh")
+    if executable is None:
+        raise RuntimeError("bash(ssh=...): system OpenSSH client not found on PATH")
+    return executable
+
+
+def _validate_ssh_options(options: Sequence[str] | None) -> list[str]:
+    if options is None:
+        return []
+    if isinstance(options, (str, bytes)):
+        raise TypeError("ssh_options must be a sequence of argv strings, not a string")
+    result = list(options)
+    expects_argument = False
+    for index, option in enumerate(result):
+        if not isinstance(option, str):
+            raise TypeError(f"ssh_options[{index}] must be str, got {type(option).__name__}")
+        if not option or "\0" in option or "\n" in option or "\r" in option:
+            raise ValueError(f"ssh_options[{index}] must be a non-empty single-line argv value")
+        if expects_argument:
+            expects_argument = False
+            continue
+        if option == "--" or not option.startswith("-"):
+            raise ValueError(f"ssh_options[{index}] is not an SSH option")
+        if option in _SSH_FORBIDDEN_OPTIONS:
+            raise ValueError(f"ssh option {option!r} conflicts with script transport")
+        if option == "-o":
+            expects_argument = True
+            continue
+        if option.startswith("-o"):
+            config = option[2:]
+            if not config:
+                raise ValueError("ssh option '-o' requires a value")
+            key = re.split(r"[=\s]", config, maxsplit=1)[0].lower()
+            if key in _SSH_FORBIDDEN_CONFIG:
+                raise ValueError(f"ssh option {config!r} conflicts with script transport")
+            continue
+        short_flags = option[1:]
+        for position, flag in enumerate(short_flags):
+            if f"-{flag}" in _SSH_FORBIDDEN_OPTIONS:
+                raise ValueError(f"ssh option {option!r} conflicts with script transport")
+            if flag in _SSH_OPTIONS_WITH_ARGUMENT:
+                expects_argument = position == len(short_flags) - 1
+                break
+    if expects_argument:
+        raise ValueError(f"ssh option {result[-1]!r} requires a value")
+    for index, option in enumerate(result[:-1]):
+        if option == "-o":
+            config = result[index + 1]
+            key = re.split(r"[=\s]", config, maxsplit=1)[0].lower()
+            if key in _SSH_FORBIDDEN_CONFIG:
+                raise ValueError(f"ssh option {config!r} conflicts with script transport")
+    return result
+
+
+def _remote_cwd(cwd: str) -> str:
+    if cwd == "~":
+        return '"$HOME"'
+    if cwd.startswith("~/"):
+        suffix = cwd[2:]
+        return '"$HOME"' if not suffix else f'"$HOME"/{shlex.quote(suffix)}'
+    if cwd.startswith("~"):
+        raise ValueError("cwd supports ~ and ~/ paths, not remote-user tilde expansion")
+    return shlex.quote(cwd)
+
+
+def _remote_script(command: str, cwd: str | None, env: Mapping[str, str] | None) -> bytes:
+    lines = ["export NO_COLOR=1 TERM=dumb CLICOLOR=0 FORCE_COLOR=0"]
+    if cwd is not None:
+        if not isinstance(cwd, str):
+            raise TypeError(f"cwd must be str or None, got {type(cwd).__name__}")
+        if not cwd or "\0" in cwd or "\n" in cwd or "\r" in cwd:
+            raise ValueError("cwd must be a non-empty single-line path without NUL")
+        lines.append(f"cd -- {_remote_cwd(cwd)} || exit 128")
+    if env is not None:
+        if not isinstance(env, Mapping):
+            raise TypeError(f"env must be a mapping or None, got {type(env).__name__}")
+        for key, value in env.items():
+            if not isinstance(key, str) or _REMOTE_ENV_KEY.fullmatch(key) is None:
+                raise ValueError(f"invalid remote environment name: {key!r}")
+            if not isinstance(value, str):
+                raise TypeError(f"remote environment value for {key} must be str")
+            if "\0" in value:
+                raise ValueError(f"remote environment value for {key} contains NUL")
+            lines.append(f"export {key}={shlex.quote(value)}")
+    return ("\n".join(lines) + "\n" + command).encode("utf-8")
+
+
+def _ssh_remote_command(shell: str, completion_a: str, completion_b: str) -> str:
+    quoted_shell = shlex.quote(shell)
+    emit = "command -p printf"
+    wrapper = (
+        f"{quoted_shell} -s\n"
+        "__prime_status=$?\n"
+        "set +x\n"
+        f"{emit} '\\036prime-agent-complete:%s%s\\037' "
+        f"'{completion_a}' '{completion_b}'\n"
+        'exit "$__prime_status"\n'
+    )
+    return f"exec {quoted_shell} -c {shlex.quote(wrapper)}"
+
+
+def _ssh_destination(value: object, label: str = "ssh") -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be str, got {type(value).__name__}")
+    if not value or value.startswith("-") or any(character in value for character in "\0\n\r"):
+        raise ValueError(f"{label} must be a non-empty host or user@host argv value")
+    return value
+
+
+def _ssh_host_chain(ssh: str | Sequence[str]) -> tuple[str, ...]:
+    """Normalize the ssh parameter into a proxy chain ending at the target host."""
+    if isinstance(ssh, str):
+        return (_ssh_destination(ssh),)
+    if isinstance(ssh, (bytes, bytearray)) or not isinstance(ssh, Sequence):
+        raise TypeError("ssh must be a host string or a sequence of host strings")
+    hosts = [_ssh_destination(host, "ssh hop") for host in ssh]
+    if not hosts:
+        raise ValueError("ssh chain must name at least the destination host")
+    return tuple(hosts)
+
+
+def _ssh_transport(
+    command: str,
+    host: str | Sequence[str],
+    cwd: str | None,
+    env: Mapping[str, str] | None,
+    ssh_options: Sequence[str] | None,
+    tty: bool,
+    shell: str,
+) -> _SshTransport:
+    hosts = _ssh_host_chain(host)
+    if not isinstance(tty, bool):
+        raise TypeError(f"tty must be bool, got {type(tty).__name__}")
+    if tty:
+        raise ValueError("tty=True is incompatible with exact script transport; use an interactive SSH client")
+    if not isinstance(shell, str):
+        raise TypeError(f"ssh_shell must be str, got {type(shell).__name__}")
+    if not shell or shell.startswith("-") or any(character in shell for character in "\0\n\r"):
+        raise ValueError("ssh_shell must be a non-empty single-line executable path")
+    options = _validate_ssh_options(ssh_options)
+    argv = (_ssh_executable(), "-oBatchMode=yes", *options, "-T", "--", hosts[0])
+    env_keys = tuple(env.keys()) if env is not None else ()
+    return _SshTransport(
+        argv=argv,
+        script=_remote_script(command, cwd, env),
+        shell=shell,
+        host=hosts[-1],
+        cwd=cwd,
+        env_keys=env_keys,
+        hosts=hosts,
+        options=tuple(options),
+    )
+
+
+def _validated_timeout(timeout: float | None) -> float | None:
+    if timeout is None:
+        return None
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise TypeError("timeout must be a positive number or None")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be a finite positive number")
+    return float(timeout)
+
+
+def bash(
+    command: str,
+    timeout: float | None = None,
+    *,
+    ssh: str | Sequence[str] | None = None,
+    cwd: str | None = None,
+    env: Mapping[str, str] | None = None,
+    ssh_options: Sequence[str] | None = None,
+    tty: bool = False,
+    ssh_shell: str = "bash",
+) -> BashHandle:
+    """Start a local or SSH shell command immediately and return its live handle.
+
+    With ssh set, the system OpenSSH client receives an argv-safe destination
+    and the exact UTF-8 script on stdin. cwd and env become a strictly quoted
+    remote prelude. No PTY is allocated. Exit 255 without the private remote
+    completion fence is reported as transport_error for any exit code; an
+    explicit remote ``exit 255`` retains transport_error=False.
+
+    ssh also accepts a sequence of hosts as a proxy chain: each hop runs the
+    next ssh through the previous one, and the script streams to the final
+    host. ssh_options apply to every hop.
+
+    Cancellation and timeout terminate the local SSH client. OpenSSH then closes
+    its remote session, but work that daemonizes, disowns, or starts a new remote
+    session can survive and must be stopped through its own remote owner.
 
     `await bash(cmd)` is a one-shot: cancelling the await (e.g. an interrupt)
-    kills the command's process group. `h = bash(cmd)` used as a background
+    kills the command's local process group. `h = bash(cmd)` used as a background
     handle (any .pid/.running/.output()/.tail()/.poll()/.kill() access before
-    the first await) survives cancellation; awaiting it only waits. Leak
-    containment is per-platform: process groups plus the orphan journal on
-    POSIX; a kill-on-close job object on Windows entered while the child is
-    still suspended, so no descendant can escape it and kill()/crash cleanup
-    are unconditional -- bash() raises if containment cannot be established.
-    Output written after the completion fence (e.g. by an EXIT trap or a
-    background job) is not in BashResult.output but stays visible via
-    handle.output()/tail().
+    the first await) survives cancellation; awaiting it only waits. Local leak
+    containment uses process groups plus the orphan journal on POSIX and a
+    kill-on-close job object on Windows. Output after the private completion
+    fence is excluded from BashResult.output but remains available through
+    handle.output() and handle.tail().
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
+    if "\0" in command:
+        raise ValueError("command cannot contain NUL")
+    timeout = _validated_timeout(timeout)
+    transport = None
+    if ssh is None:
+        if cwd is not None or env is not None or ssh_options is not None or tty or ssh_shell != "bash":
+            raise ValueError("cwd, env, ssh_options, tty, and ssh_shell require ssh=...")
+    else:
+        transport = _ssh_transport(command, ssh, cwd, env, ssh_options, tty, ssh_shell)
     _install_shutdown_hook()
-    return BashHandle(command)
+    if transport is None:
+        if timeout is None:
+            return BashHandle(command)
+        return BashHandle(command, timeout)
+    if timeout is None:
+        return BashHandle(command, ssh_transport=transport)
+    return BashHandle(command, timeout, ssh_transport=transport)
+
+
+def _argv_values(values: Sequence[str | os.PathLike[str]], label: str) -> list[str]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{label} must be a sequence of argv values, not a string")
+    result: list[str] = []
+    for index, value in enumerate(values):
+        if not isinstance(value, (str, os.PathLike)):
+            raise TypeError(f"{label}[{index}] must be str or PathLike, got {type(value).__name__}")
+        argument = os.fspath(value)
+        if not isinstance(argument, str) or not argument or "\0" in argument:
+            raise ValueError(f"{label}[{index}] must be a non-empty path or argument without NUL")
+        result.append(argument)
+    return result
+
+
+def _tool_path(name: str, environment_name: str) -> str:
+    configured = os.environ.get(environment_name, name)
+    executable = shutil.which(configured)
+    if executable is None:
+        raise RuntimeError(f"{name}() requires the {name} executable; install it or set {environment_name}")
+    return executable
+
+
+def _argv_handle(argv: Sequence[str], timeout: float | None) -> BashHandle:
+    normalized_timeout = _validated_timeout(timeout)
+    display = shlex.join(argv)
+    transport = _ArgvTransport(tuple(argv))
+    if normalized_timeout is None:
+        return BashHandle(display, argv_transport=transport)
+    return BashHandle(display, normalized_timeout, argv_transport=transport)
+
+
+def rg(
+    pattern: str,
+    *paths: str | os.PathLike[str],
+    options: Sequence[str] = (),
+    timeout: float | None = None,
+    ssh: str | Sequence[str] | None = None,
+    ssh_options: Sequence[str] | None = None,
+    cwd: str | None = None,
+) -> BashHandle:
+    """Search paths with ripgrep through the existing BashHandle process owner.
+
+    Paths default to the current directory. ``options`` contains individual
+    ripgrep argv entries; no argument passes through a shell. The returned
+    handle has the same await, cancellation, timeout, output, and external-event
+    behavior as ``bash()``.
+
+    With ``ssh`` set, the same argv is quoted and run on the remote host with
+    the remote ``rg`` from PATH; paths and ``cwd`` name remote locations and
+    ``ssh_options`` passes extra OpenSSH argv entries exactly like ``bash()``.
+    """
+    if not isinstance(pattern, str):
+        raise TypeError(f"pattern must be str, got {type(pattern).__name__}")
+    if not pattern or "\0" in pattern:
+        raise ValueError("pattern must be a non-empty str without NUL")
+    arguments = _argv_values(options, "options")
+    if "--" in arguments:
+        raise ValueError("rg options must not contain the end-of-options marker")
+    if any(option == "--pre" or option.startswith("--pre=") for option in arguments):
+        raise ValueError("rg --pre conflicts with direct argv process custody")
+    requested_paths = _argv_values(paths or (".",), "paths")
+    if ssh is None:
+        if cwd is not None or ssh_options is not None:
+            raise ValueError("cwd and ssh_options require ssh=...")
+        argv = [_tool_path("rg", "PRIME_AGENT_RG"), *arguments, "-e", pattern, "--", *requested_paths]
+        return _argv_handle(argv, timeout)
+    remote_argv = ["rg", *arguments, "-e", pattern, "--", *requested_paths]
+    return bash(shlex.join(remote_argv), timeout, ssh=ssh, ssh_options=ssh_options, cwd=cwd)
+
+
+_RSYNC_FORBIDDEN_OPTIONS = ("-e", "--daemon", "--rsh", "--rsync-path")
+
+
+def _validate_rsync_options(options: Sequence[str]) -> list[str]:
+    arguments = _argv_values(options, "options")
+    if "--" in arguments:
+        raise ValueError("rsync options must not contain the end-of-options marker")
+    for option in arguments:
+        if option == "-e" or (option.startswith("-") and not option.startswith("--") and "e" in option[1:]):
+            raise ValueError(f"rsync option {option!r} can replace the remote shell")
+        if any(option == forbidden or option.startswith(f"{forbidden}=") for forbidden in _RSYNC_FORBIDDEN_OPTIONS[1:]):
+            raise ValueError(f"rsync option {option!r} conflicts with managed process custody")
+    return arguments
+
+
+def rsync(
+    *paths: str | os.PathLike[str],
+    options: Sequence[str] = ("-a",),
+    timeout: float | None = None,
+    protect_args: bool = True,
+    ssh: str | Sequence[str] | None = None,
+    ssh_options: Sequence[str] | None = None,
+) -> BashHandle:
+    """Synchronize two or more paths through the existing BashHandle process owner.
+
+    Archive mode and rsync's protected-arguments protocol are enabled by
+    default. Pass ``options=()`` or ``protect_args=False`` only when the peer's
+    contract requires native rsync defaults or a pre-3.0 remote. Remote paths
+    retain rsync's standard ``host:path`` syntax; remote-shell replacement
+    options are rejected.
+
+    ``ssh`` sets the remote shell rsync uses for ``host:path`` operands to the
+    system OpenSSH client with BatchMode and the given ``ssh_options``, so
+    remote transfers use the same transport rules as ``bash()`` instead of
+    whatever ``ssh`` resolves in the environment. A sequence of hosts becomes a
+    ProxyJump chain (``-J hop1,hop2``); the ``host:path`` operand names the
+    final host.
+    """
+    if len(paths) < 2:
+        raise ValueError("rsync requires at least one source and one destination")
+    if not isinstance(protect_args, bool):
+        raise TypeError(f"protect_args must be bool, got {type(protect_args).__name__}")
+    if ssh is None and ssh_options is not None:
+        raise ValueError("ssh_options require ssh=...")
+    arguments = _validate_rsync_options(options)
+    if ssh is not None:
+        if isinstance(ssh, str):
+            hosts: Sequence[str] = (ssh,)
+        else:
+            hosts = _ssh_host_chain(ssh)
+        remote_shell_parts = ["ssh", "-oBatchMode=yes", *(_validate_ssh_options(ssh_options))]
+        if len(hosts) > 1:
+            remote_shell_parts += ["-J", ",".join(hosts[1:])]
+        remote_shell = " ".join(shlex.quote(part) for part in remote_shell_parts)
+        arguments = [*arguments, "-e", remote_shell]
+    requested_paths = _argv_values(paths, "paths")
+    protected = ["--protect-args"] if protect_args else []
+    argv = [_tool_path("rsync", "PRIME_AGENT_RSYNC"), *arguments, *protected, "--", *requested_paths]
+    return _argv_handle(argv, timeout)
+
+
+def ssh_forward(
+    destination: str,
+    *forwards: str,
+    ssh_options: Sequence[str] | None = None,
+) -> BashHandle:
+    """Start a background SSH forwarding session; stop it later with handle.kill().
+
+    Each forward is one argv value:
+
+    - ``"8080:db.internal:5432"`` — local forward (``-L``)
+    - ``"R:9090:localhost:3000"`` — remote forward (``-R``)
+    - ``"D:1080"`` — SOCKS dynamic forward (``-D``)
+
+    The session runs ``ssh -N -oExitOnForwardFailure=yes`` immediately in the
+    background and outlives the current cell; kill the returned handle to close
+    the session and its forwarded connections. ``handle.tail()`` shows ssh
+    diagnostics such as bind conflicts. Exit-on-forward-failure means a busy
+    listen port settles the handle with that error instead of hanging.
+    """
+    destination = _ssh_destination(destination, "destination")
+    if not forwards:
+        raise ValueError("ssh_forward requires at least one forward")
+    forward_args: list[str] = []
+    for forward in forwards:
+        if not isinstance(forward, str) or not forward or "\0" in forward or "\n" in forward or "\r" in forward:
+            raise TypeError("each forward must be a non-empty single-line str")
+        if forward.startswith("R:"):
+            forward_args += ["-R", forward[2:]]
+        elif forward.startswith("D:"):
+            forward_args += ["-D", forward[2:]]
+        else:
+            forward_args += ["-L", forward]
+    argv = [
+        _ssh_executable(),
+        "-oBatchMode=yes",
+        *_validate_ssh_options(ssh_options),
+        "-N",
+        "-oExitOnForwardFailure=yes",
+        *forward_args,
+        "--",
+        destination,
+    ]
+    return _argv_handle(argv, None)
 
 
 def _shell() -> str:

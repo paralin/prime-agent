@@ -117,7 +117,7 @@ class ReplTest(unittest.TestCase):
 
     def test_ready_handshake_and_startup_time(self):
         self.assertEqual(self.ready_event["event"], "ready")
-        self.assertEqual(self.ready_event["protocol"], 3)
+        self.assertEqual(self.ready_event["protocol"], 4)
         major, minor = sys.version_info[:2]
         self.assertTrue(self.ready_event["python"].startswith(f"{major}.{minor}."))
         # Loose bound for loaded CI machines; still catches an order-of-magnitude regression.
@@ -1520,6 +1520,57 @@ class SnapshotPruneShieldTest(unittest.TestCase):
                 self.assertEqual(json.load(fh)["pruned"], ["big1", "big2"])
 
 
+class SnapshotFileHandleSafetyTest(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, SRC)
+        self.addCleanup(sys.path.remove, SRC)
+
+    def test_snapshot_rejects_nested_file_handles(self):
+        from rlm.repl import _snapshot_state
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "user.txt")
+            with open(target, "w") as handle:
+                result = _snapshot_state(
+                    {"nested": {"handle": handle}},
+                    os.path.join(tmp, "kernel-state.dill"),
+                    os.path.join(tmp, "kernel-state.json"),
+                    max_bytes=1 << 20,
+                    max_variable_bytes=1 << 20,
+                    prune_oversized=False,
+                )
+
+        self.assertEqual(result["saved"], [])
+        self.assertEqual(result["skipped"][0]["name"], "nested")
+        self.assertIn("not snapshot-safe", result["skipped"][0]["reason"])
+
+    def test_restore_rejects_file_handle_reducer_without_reopening_target(self):
+        import dill
+
+        from rlm.repl import _restore_state
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "user.txt")
+            handle = open(target, "w")
+            handle.write("keep-me")
+            handle.flush()
+            blob = dill.dumps(handle)
+            handle.close()
+            path = os.path.join(tmp, "kernel-state.dill")
+            with open(path, "wb") as snapshot:
+                dill.dump({"danger": blob}, snapshot)
+
+            namespace: dict[str, object] = {}
+            result = _restore_state(namespace, path)
+
+            with open(target) as restored_target:
+                self.assertEqual(restored_target.read(), "keep-me")
+        self.assertEqual(namespace, {})
+        self.assertEqual(result["restored"], [])
+        self.assertEqual(result["failed"][0]["name"], "danger")
+        self.assertIn("unsafe file-handle reducer", result["failed"][0]["reason"])
+
+
 class RestoreApplyShieldTest(unittest.TestCase):
     """The restore assignment loop must not be split by a SIGINT-raised KeyboardInterrupt."""
 
@@ -1557,26 +1608,24 @@ class RestoreApplyShieldTest(unittest.TestCase):
                 signal.raise_signal(signal.SIGINT)
 
     def test_sigint_during_staging_leaves_namespace_unchanged(self):
-        import dill
+        import rlm.repl as repl
 
-        from rlm.repl import _restore_state
-
-        real_loads = dill.loads
+        real_load = repl._safe_snapshot_load
         calls = {"n": 0}
 
-        def loads_then_sigint(blob):
+        def load_then_sigint(stream, dill_module):
             calls["n"] += 1
-            if calls["n"] == 2:
+            if calls["n"] == 3:
                 # Synchronous SIGINT mid-deserialize: nothing may have touched ns yet.
                 signal.raise_signal(signal.SIGINT)
-            return real_loads(blob)
+            return real_load(stream, dill_module)
 
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_snapshot(tmp, {"a": 1, "b": 2})
             ns = {"a": "old", "unrelated": "keep"}
-            with mock.patch.object(dill, "loads", loads_then_sigint):
+            with mock.patch.object(repl, "_safe_snapshot_load", load_then_sigint):
                 with self.assertRaises(KeyboardInterrupt):
-                    _restore_state(ns, path)
+                    repl._restore_state(ns, path)
         # The old namespace is byte-identical: no partial old/new mixture.
         self.assertEqual(ns, {"a": "old", "unrelated": "keep"})
 

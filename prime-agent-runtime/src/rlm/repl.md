@@ -3,7 +3,7 @@
 `python -m rlm.repl` starts a CPython REPL runtime that executes code cells in
 one persistent `__main__` namespace on a single asyncio event loop. The wire
 format is newline-delimited JSON: one object per line, UTF-8, no other framing.
-The current protocol version is `3`; the runtime announces it in the `ready`
+The current protocol version is `4`; the runtime announces it in the `ready`
 event.
 
 ## Channels
@@ -29,20 +29,21 @@ event.
 |---|---|
 | `execute` | `{"type":"execute","id":str,"code":str}` |
 | `interrupt` | `{"type":"interrupt","id"?:str}` — no reply |
-| `host_reply` | `{"type":"host_reply","id":str,"data":{"status":"ok","result":{...}}}` or an error envelope — no reply |
+| `host_reply` | `{"type":"host_reply","id":str,"data":{"status":"ok","result":{...}}}` or an error envelope — terminal host-handler reply, no runtime reply |
+| `host_message` | `{"type":"host_message","id":str,"data":{...}}` — one non-terminal message for a duplex host request, no runtime reply |
 | `snapshot` | `{"type":"snapshot","id":str,"path":str,"manifest_path":str,"max_bytes"?:int,"max_variable_bytes"?:int,"prune_oversized"?:bool}` |
 | `restore` | `{"type":"restore","id":str,"path":str}` |
 | `list_names` | `{"type":"list_names","id":str}` |
 | `shutdown` | `{"type":"shutdown","id"?:str}` |
 
-Requests other than `interrupt` and `host_reply` run strictly in order, one at
+Requests other than `interrupt`, `host_reply`, and `host_message` run strictly in order, one at
 a time. A malformed line
 produces `{"event":"error","id":null,"ename":"ProtocolError",...}` and the
 runtime keeps serving. Closing stdin is equivalent to `shutdown`.
 
 ## Events
 
-- `{"event":"ready","protocol":3,"python":"3.13.11"}` — sent once at startup;
+- `{"event":"ready","protocol":4,"python":"3.13.11"}` — sent once at startup;
   the handshake. No banner precedes it.
 - `{"event":"stdout"|"stderr","id":str|null,"text":str}` — captured output.
   `id` is the cell whose Python execution context performed the write; asyncio
@@ -60,6 +61,8 @@ runtime keeps serving. Closing stdin is equivalent to `shutdown`.
 - `{"event":"host_request","id":str,"data":{...}}` — one typed request from
   runtime code to the host; the host answers with a `host_reply` request
   carrying the same id.
+- `{"event":"host_message","id":str,"data":{...}}` — one non-terminal
+  message on an open duplex host request.
 - `{"event":"error","id":str|null,"ename":str,"evalue":str,"traceback":[str,...]}`
 - `{"event":"done","id":str,"status":"ok"|"error"}` — exactly one per id'd
   request, always after all of that request's other events. A snapshot `done`
@@ -130,13 +133,15 @@ strings; the dict is forwarded verbatim as the event's `data`.
 
 ## Host bridge
 
-`await rlm.repl.host_request(data)` ships a `host_request` event with a
-runtime-minted id and awaits the matching `host_reply`, returning its `data`
-dict verbatim. Replies are routed on the reader thread like `interrupt` —
-never through the request queue, since the awaiting cell is itself the
-in-flight execute. Replies for unknown ids, or for a request whose awaiting
-cell was cancelled, are dropped. `rlm.repl.is_active()` reports whether the
-process is serving the protocol (importing the module does not count).
+`await rlm.repl.host_request(data)` uses a duplex `HostExchange`, ships a
+`host_request` event with a runtime-minted id, and awaits the matching terminal
+`host_reply`, returning its `data` dict verbatim. `host_message` frames can flow
+in either direction before that reply; shared-kernel Act uses them for cell
+requests and results. Host traffic is routed on the reader thread like
+`interrupt`—never through the request queue, since the awaiting cell is itself
+the in-flight execute. Messages for unknown or closed ids are dropped.
+`rlm.repl.is_active()` reports whether the process is serving the protocol
+(importing the module does not count).
 
 ## Snapshot / restore
 

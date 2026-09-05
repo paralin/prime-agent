@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed child deletion rejecting spawn handles and clarified exception recovery and idempotent child bookkeeping.
 - Fixed source launches outside the checkout loading stale compiled workspace dependencies.
 - Added one same-model scratch recovery after reasoning exhaustion, with no automatic retry after a failed checkpoint or a second exhaustion.
 - Added local request timing, cache usage, and recovery-phase diagnostics without remote telemetry.

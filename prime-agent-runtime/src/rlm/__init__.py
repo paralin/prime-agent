@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator
 from ._act import _ActCellResult, _ActInterrupted, _run_cells, done
 from .bash import BashHandle, BashResult, bash, rg, rsync, ssh_forward
 from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
+
 ACT_CANCELLATION_CAPABILITY = "posix-managed" if os.name == "posix" else "cooperative-only"
 RLM_SERVICE_TIERS = ("auto", "default", "flex", "scale", "priority")
 
@@ -31,9 +32,10 @@ class ActCancelledError(ActError):
     """The host accepted Act cancellation under ACT_CANCELLATION_CAPABILITY."""
 
 
-
 @dataclass(frozen=True)
 class RLMSpawnHandle:
+    """Admitted child identity, accepted by delete_subagent without a registry lookup."""
+
     rlm_child_id: str
     name: str
     session_dir: Path
@@ -52,6 +54,8 @@ class RLMModel:
 
 @dataclass(frozen=True)
 class RLMSubagent:
+    """Current parent-scoped registry entry; completed children remain until deleted."""
+
     rlm_child_id: str
     active_session_id: str | None
     session_id: str | None
@@ -335,16 +339,20 @@ async def list_subagents() -> list[RLMSubagent]:
     return [_subagent_from_payload(entry) for entry in entries]
 
 
-async def delete_subagent(target: str | RLMSubagent) -> RLMSubagent:
-    """Delete one running or retained direct child from the current parent session."""
-    if isinstance(target, RLMSubagent):
+async def delete_subagent(target: str | RLMSubagent | RLMSpawnHandle) -> RLMSubagent:
+    """Delete a direct child by selector, registry entry, or admitted spawn handle.
+
+    Returns the deleted registry entry after the host confirms deletion. Host
+    failures propagate; caller-owned queues and dictionaries are not modified.
+    """
+    if isinstance(target, (RLMSubagent, RLMSpawnHandle)):
         selector = target.rlm_child_id
     elif isinstance(target, str):
         selector = target.strip()
         if not selector:
             raise ValueError("target must not be empty")
     else:
-        raise TypeError(f"target must be str or RLMSubagent, got {type(target).__name__}")
+        raise TypeError(f"target must be str or RLMSubagent or RLMSpawnHandle, got {type(target).__name__}")
     payload = await host_request("rlm.delete_subagent", {"target": selector})
     return _subagent_from_payload(payload.get("subagent"), "rlm.delete_subagent")
 
@@ -417,7 +425,7 @@ class _RLMCallable:
     async def list_subagents(self) -> list[RLMSubagent]:
         return await list_subagents()
 
-    async def delete_subagent(self, target: str | RLMSubagent) -> RLMSubagent:
+    async def delete_subagent(self, target: str | RLMSubagent | RLMSpawnHandle) -> RLMSubagent:
         return await delete_subagent(target)
 
     async def __call__(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:

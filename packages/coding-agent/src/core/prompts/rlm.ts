@@ -24,6 +24,7 @@ const SIMPLIFIED_TECHNICAL_ENGLISH_PROMPT = [
 
 const IPYTHON_CONTROL_PROMPT = [
 	"IPython is Prime Agent's persistent Python control environment. Its kernel keeps Python variables, imports, helper functions, and other in-memory state across cells, turns, and compaction. Use that state when it makes inspection, transformation, or tool coordination clearer or cheaper.",
+	"A failed cell is not a transaction: assignments, pops, appends, and external actions completed before the exception remain in effect. After an exception or contradictory counts, inspect the relevant live variables and registry once, then repair only the missing step. Do not replay an entire mutating cell or reconstruct its effects from remembered conversation order.",
 	"",
 	"A repository, package, service, dataset, paper, website, benchmark, or API may have its own runtime and normal interface. Run and evaluate that external system through its own environment. Use IPython to coordinate the work and inspect the results.",
 	"",
@@ -200,6 +201,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			parts.push("Inspect files written by the child when no observation capability is available.");
 		}
 		parts.push(
+			"For a bounded child queue, use one completion handler keyed by stable task or child ID. The host registry from `await rlm.list_subagents()` owns child lifecycle state; your Python tracking is only a local view. Delete with `await rlm.delete_subagent(handle)` or a registry entry, then remove the local active entry and record completion once. Before admitting replacements, reconcile retained children and their statuses against local tracking and the user's concurrency cap. A repeated completion notification must not append another completion or spawn another replacement. If deletion fails, inspect the registry before retrying; if admission is uncertain, recover the named child before spawning again.",
 			"Spawn independent children in separate calls. After spawning or messaging children, continue other independent work if any. When no independent action remains, end your turn immediately and go idle. Never use `asyncio.sleep`, bash `sleep`, or a later Python or tool call solely to give a child more time or check it again. The system wakes this session when a child sends a message or stops; inspect the delivered event then. Multiple replies may arrive over multiple turns. Delete a direct child explicitly with `await rlm.delete_subagent(child)` when it is no longer needed.",
 			"Follow the applicable workspace publication policy. Without one, do not publish a pull request, issue, release, or deployment.",
 		);

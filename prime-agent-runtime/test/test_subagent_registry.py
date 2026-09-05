@@ -6,7 +6,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-
 rlm_module = importlib.import_module("rlm")
 
 
@@ -38,7 +37,6 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         self.assertEqual(subagents[0].session_dir, Path("/tmp/parent/sub-a1b2c3d4"))
         self.assertEqual(subagents[0].status, "completed")
         host_request.assert_awaited_once_with("rlm.list_subagents")
-
 
     def test_lists_failed_subagents_from_host(self) -> None:
         host_request = AsyncMock(
@@ -238,6 +236,49 @@ class RlmSubagentRegistryTest(unittest.TestCase):
             asyncio.run(rlm_module.delete_subagent("   "))
         with self.assertRaisesRegex(TypeError, "target must be str or RLMSubagent"):
             asyncio.run(rlm_module.delete_subagent(123))
+
+    def test_deletes_admitted_handle_through_module_and_callable(self) -> None:
+        handle = rlm_module.RLMSpawnHandle(
+            rlm_child_id="sub-stable",
+            name="worker",
+            session_dir=Path("/tmp/parent/sub-stable"),
+            model="faux/faux-1",
+        )
+        deleted_payload = {
+            "rlm_child_id": handle.rlm_child_id,
+            "active_session_id": None,
+            "session_id": "session-child",
+            "session_name": handle.name,
+            "session_dir": str(handle.session_dir),
+            "status": "completed",
+        }
+
+        for api in (rlm_module, rlm_module.rlm):
+            with self.subTest(api=type(api).__name__):
+                host_request = AsyncMock(return_value={"subagent": deleted_payload})
+                with patch.object(rlm_module, "host_request", host_request):
+                    deleted = asyncio.run(api.delete_subagent(handle))
+
+                self.assertEqual(deleted.rlm_child_id, handle.rlm_child_id)
+                host_request.assert_awaited_once_with(
+                    "rlm.delete_subagent", {"target": handle.rlm_child_id}
+                )
+
+    def test_failed_handle_deletion_preserves_host_error_without_retry(self) -> None:
+        handle = rlm_module.RLMSpawnHandle(
+            rlm_child_id="sub-stable",
+            name="worker",
+            session_dir=Path("/tmp/parent/sub-stable"),
+            model="faux/faux-1",
+        )
+        host_request = AsyncMock(side_effect=RuntimeError("child deletion failed"))
+        with patch.object(rlm_module, "host_request", host_request):
+            with self.assertRaisesRegex(RuntimeError, "child deletion failed"):
+                asyncio.run(rlm_module.rlm.delete_subagent(handle))
+
+        host_request.assert_awaited_once_with(
+            "rlm.delete_subagent", {"target": handle.rlm_child_id}
+        )
 
     def test_rejects_invalid_registry_payload(self) -> None:
         host_request = AsyncMock(return_value={"subagents": [{"status": "completed"}]})

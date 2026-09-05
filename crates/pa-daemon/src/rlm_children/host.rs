@@ -531,10 +531,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 let record = record.lock().await;
                 this.remember_deleted_child(&record);
             }
-            // The deletion commits BEFORE the best-effort terminal
-            // notice: the notice's supervisor delivery can ride its full
-            // timeout, and a deleted child must leave the registry and the
-            // cached context tree immediately, not after it.
+            // Explicit deletion removes the registry and context-tree rows immediately.
             this.children
                 .lock()
                 .await
@@ -550,26 +547,6 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 .clone()
             {
                 notify(&entry.rlm_child_id);
-            }
-            // A still-running child was cut short by the delete: the parent
-            // session receives the cancelled terminal notice (TS
-            // `completeDeletion`, reason `Deleted by parent orchestrator`).
-            // The settle watcher stops silently once the record leaves the
-            // registry, so the delete path owns this notice.
-            if was_running {
-                let notice = {
-                    let mut record = record.lock().await;
-                    let claimed = !record.notice_delivered;
-                    record.notice_delivered = true;
-                    claimed.then(|| RlmChildTerminalNotice::Cancelled {
-                        child_id: record.rlm_child_id.clone(),
-                        session_name: record.session_name.clone(),
-                        reason: Some("Deleted by parent orchestrator".to_string()),
-                    })
-                };
-                if let Some(notice) = notice {
-                    this.deliver_terminal_notice(&notice).await;
-                }
             }
             // The deletion settles the run (TS `_finishRlmRunDeletion`,
             // the same resume site the inactive delete funnels through):

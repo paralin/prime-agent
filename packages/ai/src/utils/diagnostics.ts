@@ -3,7 +3,7 @@ import type { AssistantMessage } from "../types.js";
 /** Identify failed reasoning-only responses, including legacy journals saved as length. */
 export function isReasoningExhaustedResponse(message: AssistantMessage): boolean {
 	return (
-		message.stopReason === "length" &&
+		(message.stopReason === "length" || message.stopReason === "error") &&
 		!message.content.some(
 			(part) => part.type === "toolCall" || (part.type === "text" && part.text.trim().length > 0),
 		) &&

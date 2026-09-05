@@ -31,6 +31,7 @@ import {
 	getApiProvider,
 	getSupportedThinkingLevels,
 	isContextOverflow,
+	isReasoningExhaustedResponse,
 	modelsAreEqual,
 	resetApiProviders,
 	supportsFastMode,
@@ -265,6 +266,12 @@ import {
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import { renderScratchHandoffCloseoutMessage, SCRATCH_HANDOFF_CLOSEOUT_GUIDANCE } from "./prompts/scratch-handoff.js";
+import {
+	createReasoningOutputNudgeMessage,
+	REASONING_OUTPUT_NUDGE_CUSTOM_TYPE,
+	REASONING_OUTPUT_NUDGE_PREVIEW_LABEL,
+	REASONING_OUTPUT_NUDGE_PROMPT,
+} from "./reasoning-output-nudge.js";
 import {
 	type AutoRefineReason,
 	type AutoRefineReview,
@@ -949,6 +956,8 @@ function injectedMessagePreviewLabel(message: CustomMessage): string | undefined
 			return TOOL_ERROR_NUDGE_PREVIEW_LABEL;
 		case ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE:
 			return ENGLISH_OUTPUT_NUDGE_PREVIEW_LABEL;
+		case REASONING_OUTPUT_NUDGE_CUSTOM_TYPE:
+			return REASONING_OUTPUT_NUDGE_PREVIEW_LABEL;
 		case GOAL_CONTEXT_CUSTOM_TYPE:
 			return GOAL_CONTEXT_PREVIEW_LABEL;
 		case EXTERNAL_EVENT_CUSTOM_TYPE:
@@ -1330,7 +1339,7 @@ export class AgentSession {
 	private _compactionOperation: Promise<void> | undefined = undefined;
 	/** One recovery attempt per overflow; "reported" dedups the failure notice. */
 	private _overflowRecovery: "idle" | "attempted" | "reported" = "idle";
-	/** One scratch recovery without progress; checkpoint work and notifications do not reset it. */
+	/** One reasoning nudge without progress; checkpoint work and notifications do not reset it. */
 	private _reasoningRecoveryAttempted = false;
 	private _firstActionLatencyMs: number | undefined;
 	private _continueAfterThresholdCompaction = false;
@@ -4200,6 +4209,23 @@ export class AgentSession {
 			const concreteAuthFailure = this._isConcreteProviderAuthFailure(msg);
 			const retryConcreteAuthFailure =
 				concreteAuthFailure && !this._isStructuredPermanentProviderRetryExhausted(msg);
+			if (isReasoningExhaustedResponse(msg)) {
+				// Keep the failed response in scrollback, but remove it by identity
+				// so any messages appended after it remain in the live context.
+				this.agent.state.messages = this.agent.state.messages.filter((message) => message !== msg);
+				if (!this._reasoningRecoveryAttempted) {
+					this._reasoningRecoveryAttempted = true;
+					await this._queuePreparedPrompt("steer", REASONING_OUTPUT_NUDGE_PROMPT, undefined, {
+						message: createReasoningOutputNudgeMessage(),
+						previewLabel: REASONING_OUTPUT_NUDGE_PREVIEW_LABEL,
+						resumeIfIdle: true,
+						front: true,
+					});
+					this._finishActiveRetryWithFailure(msg);
+					this._resolveRetry();
+					return;
+				}
+			}
 			if (this._isAgentRepetitionLoop(msg)) {
 				// Retrying would replay the same prompt into the same loop. Drop the
 				// cancelled output from live context (it stays in session history),
@@ -9569,25 +9595,6 @@ export class AgentSession {
 		const assistantIsFromBeforeCompaction =
 			compactionTimestamp !== undefined && assistantMessage.timestamp <= compactionTimestamp;
 
-		if (this._isProviderReasoningExhausted(assistantMessage) && assistantMessage.stopReason === "error") {
-			if (
-				!queueAutonomousContinuation ||
-				assistantIsFromBeforeCompaction ||
-				!sameModel ||
-				!settings.enabled ||
-				!this._scratchHandoffRoute()
-			)
-				return false;
-			if (this._reasoningRecoveryAttempted) return false;
-			if (this._hasQueuedCompactCommand()) return false;
-			this._reasoningRecoveryAttempted = true;
-			this._pendingRequestedCompaction = {
-				customInstructions:
-					"Reasoning exhausted: save the active task checkpoint using the current model, then resume once from compacted context. Do not repeat completed actions.",
-			};
-			return await this._runAutoCompaction("requested", true);
-		}
-
 		// Case 1: Overflow - takes priority over a pending model request so the error
 		// strip + retry still happen; the compaction it runs consumes the request.
 		if (
@@ -13215,7 +13222,7 @@ export class AgentSession {
 			return false;
 		}
 
-		if (this._isProviderReasoningExhausted(message)) {
+		if (isReasoningExhaustedResponse(message)) {
 			return false;
 		}
 
@@ -13236,14 +13243,6 @@ export class AgentSession {
 
 	private _isAgentRepetitionLoop(message: AssistantMessage): boolean {
 		return message.diagnostics?.some((diagnostic) => diagnostic.type === "agent_repetition_loop") ?? false;
-	}
-
-	private _isProviderReasoningExhausted(message: AssistantMessage): boolean {
-		return (
-			message.diagnostics?.some(
-				(diagnostic) => diagnostic.type === "provider_warning" && diagnostic.error?.code === "reasoning_exhausted",
-			) ?? false
-		);
 	}
 
 	private _getProviderStreamFailureDetails(message: AssistantMessage): Record<string, unknown> | undefined {

@@ -7,8 +7,10 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, ProviderPayload, TextContent } from "@earendil-works/pi-ai";
+import { isReasoningExhaustedResponse } from "@earendil-works/pi-ai";
 import type { AgentCronJob } from "./cron-jobs.js";
 import { ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE, ENGLISH_OUTPUT_NUDGE_PROMPT } from "./english-output-nudge.js";
+import { REASONING_OUTPUT_NUDGE_CUSTOM_TYPE } from "./reasoning-output-nudge.js";
 import type { AppliedRefinementEdit, HarnessScope, RefinementResult } from "./refinement/refinement.js";
 import { isSessionSlashCommandName, parseSessionSlashCommand, type SessionSlashCommand } from "./slash-commands.js";
 import { TOOL_ERROR_NUDGE_CUSTOM_TYPE } from "./tool-error-nudge.js";
@@ -589,6 +591,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					if (
 						m.customType === REPETITION_NOTICE_CUSTOM_TYPE ||
 						m.customType === TOOL_ERROR_NUDGE_CUSTOM_TYPE ||
+						m.customType === REASONING_OUTPUT_NUDGE_CUSTOM_TYPE ||
 						m.customType === ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE
 					) {
 						return {
@@ -634,7 +637,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						timestamp: m.timestamp,
 					};
 				case "assistant":
-					if (isRepetitionLoopAssistant(m)) return undefined;
+					if (isRepetitionLoopAssistant(m) || isReasoningExhaustedResponse(m)) return undefined;
 					return m;
 				case "user":
 				case "toolResult":

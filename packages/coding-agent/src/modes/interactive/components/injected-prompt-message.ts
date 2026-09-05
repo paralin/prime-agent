@@ -27,6 +27,10 @@ import {
 	type RlmChildFailureDetails,
 	type RlmChildTerminalNoticeDetails,
 } from "../../../core/messages.js";
+import {
+	REASONING_OUTPUT_NUDGE_CUSTOM_TYPE,
+	REASONING_OUTPUT_NUDGE_PREVIEW_LABEL,
+} from "../../../core/reasoning-output-nudge.js";
 import { TOOL_ERROR_NUDGE_CUSTOM_TYPE } from "../../../core/tool-error-nudge.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { expandCollapseHint } from "./keybinding-hints.js";
@@ -47,6 +51,7 @@ export function isInjectedPromptMessage(message: AgentMessage): message is Injec
 			message.customType === REPETITION_NOTICE_CUSTOM_TYPE ||
 			message.customType === TOOL_ERROR_NUDGE_CUSTOM_TYPE ||
 			message.customType === ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE ||
+			message.customType === REASONING_OUTPUT_NUDGE_CUSTOM_TYPE ||
 			message.customType === SCRATCH_HANDOFF_CLOSEOUT_CUSTOM_TYPE ||
 			message.customType === SCRATCH_HANDOFF_READ_CUSTOM_TYPE ||
 			message.customType === GOAL_CONTEXT_CUSTOM_TYPE ||
@@ -153,6 +158,9 @@ export class InjectedPromptMessageComponent extends Container {
 		}
 		if (this.message.customType === ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE) {
 			return this.noticeHeaderText("English reminder");
+		}
+		if (this.message.customType === REASONING_OUTPUT_NUDGE_CUSTOM_TYPE) {
+			return this.noticeHeaderText(REASONING_OUTPUT_NUDGE_PREVIEW_LABEL);
 		}
 		if (this.message.customType === SCRATCH_HANDOFF_CLOSEOUT_CUSTOM_TYPE) {
 			const details = this.message.details as ScratchHandoffCloseoutDetails | undefined;

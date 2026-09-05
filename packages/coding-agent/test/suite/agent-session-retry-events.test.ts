@@ -217,7 +217,7 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.session.isRetrying).toBe(false);
 	});
 
-	it("does not retry a reasoning-exhausted response with unchanged settings", async () => {
+	it("recovers reasoning exhaustion with guidance instead of a transport retry", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 		harnesses.push(harness);
 		const exhausted = fauxAssistantMessage("", {
@@ -234,11 +234,12 @@ describe("AgentSession retry and event characterization", () => {
 				},
 			},
 		];
-		harness.setResponses([exhausted, fauxAssistantMessage("retry should not happen")]);
+		harness.setResponses([exhausted, fauxAssistantMessage("Evidence reconciled")]);
 
 		await harness.session.prompt("test");
+		await harness.session.waitForHeadlessIdle();
 
-		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.faux.state.callCount).toBe(2);
 		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
 		expect(harness.session.isRetrying).toBe(false);
 	});

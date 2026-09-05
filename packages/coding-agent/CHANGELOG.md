@@ -6,7 +6,7 @@
 - Fixed saved harness instructions losing qualifications through truncation and identified Python imports when explicitly invoking hidden skills.
 - Fixed child deletion rejecting spawn handles and clarified exception recovery and idempotent child bookkeeping.
 - Fixed source launches outside the checkout loading stale compiled workspace dependencies.
-- Added bounded same-model scratch recovery after reasoning exhaustion, rearmed by successful task tools or completed answers; failed checkpoints and consecutive no-progress exhaustion still stop.
+- Changed reasoning-exhaustion recovery to exclude failed thinking and resume with an information-gathering reminder, preserving conversation context without forced compaction.
 - Added local request timing, cache usage, and recovery-phase diagnostics without remote telemetry.
 - Clarified that tool output is observation from the assistant's action, not a new user request, and excluded exhausted reasoning from new history snapshots.
 - Anchored scratch handoffs to the active user request and next action, separated historical evidence from instructions, and discouraged repeated deliberation.

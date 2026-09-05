@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Excluded legacy reasoning-exhausted responses from same-model and cross-model replay while preserving useful partial answers and tool calls.
+- Excluded legacy and error-normalized reasoning-exhausted responses from same-model and cross-model replay while preserving useful partial answers and tool calls.
 - Added sanitized Merge Gateway request-control and serving-vendor diagnostics to session responses.
 - Fixed Merge Gateway replay of legacy native reasoning and reasoning-only responses without turning internal plans into assistant text.
 - Rejected malformed terminal tool arguments and Merge thinking budgets that leave no room for an answer.

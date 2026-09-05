@@ -1419,7 +1419,7 @@ describe("AgentSession rlm recursion", () => {
 		).toHaveLength(0);
 	});
 
-	it("notifies after detached startup deletion cleanup settles", async () => {
+	it("keeps detached startup deletion confirmation out of model context", async () => {
 		let releaseRuntimeCreation: () => void = () => {};
 		const runtimeCreationGate = new Promise<void>((resolve) => {
 			releaseRuntimeCreation = resolve;
@@ -1446,11 +1446,7 @@ describe("AgentSession rlm recursion", () => {
 			root.messages.filter(
 				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
 			),
-		).toEqual([
-			expect.objectContaining({
-				details: expect.objectContaining({ kind: "cancelled", reason: "Deleted by parent orchestrator" }),
-			}),
-		]);
+		).toHaveLength(0);
 	});
 
 	it("fully deletes a settled startup failure and frees its session name", async () => {
@@ -3555,14 +3551,10 @@ describe("AgentSession rlm recursion", () => {
 			root.messages.filter(
 				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
 			),
-		).toEqual([
-			expect.objectContaining({
-				details: expect.objectContaining({ kind: "cancelled", reason: "Deleted by parent orchestrator" }),
-			}),
-		]);
+		).toHaveLength(0);
 	});
 
-	it("admits a private durable deletion notice only after runtime cleanup", async () => {
+	it("does not send a redundant deletion notice after runtime cleanup", async () => {
 		let releaseChild: () => void = () => {};
 		const childGate = new Promise<void>((resolve) => {
 			releaseChild = resolve;
@@ -3628,11 +3620,7 @@ describe("AgentSession rlm recursion", () => {
 			root.messages.filter(
 				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
 			),
-		).toEqual([
-			expect.objectContaining({
-				content: expect.stringContaining("was cancelled: Deleted by parent orchestrator"),
-			}),
-		]);
+		).toHaveLength(0);
 	});
 
 	it("preserves failed cleanup retry across transient preflight failure before abort-insensitive unwind", async () => {
@@ -3704,7 +3692,7 @@ describe("AgentSession rlm recursion", () => {
 			root.messages.filter(
 				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
 			),
-		).toHaveLength(1);
+		).toHaveLength(0);
 		expect(internals._rlmChildCleanupFailures.size).toBe(0);
 		await expect(root.runRlmChild("replacement", { name: "retry-worker" })).resolves.toMatchObject({
 			name: "retry-worker",

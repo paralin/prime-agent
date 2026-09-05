@@ -1078,9 +1078,6 @@ interface RlmChildRun {
 	deletionReservation: AgentMessageDeferred;
 	deletionCleanupFailed?: boolean;
 	deletionRunFinished?: boolean;
-	deletionNotice?: Promise<void>;
-	deletionNeedsCompletionNotice?: boolean;
-	completeDeletion?: () => Promise<void>;
 	reportDeletionCleanupFailure?: (error: unknown) => Promise<void>;
 	emitUpdate?: () => void;
 	lastEmittedUpdate?: string;
@@ -11716,7 +11713,6 @@ export class AgentSession {
 	}
 
 	private async _finishRlmRunDeletion(run: RlmChildRun): Promise<void> {
-		await run.completeDeletion?.();
 		if (this._activeRlmChildRuns.get(run.id) === run) {
 			this._removeRlmSubagentTracking(run.id, run);
 		}
@@ -11812,9 +11808,7 @@ export class AgentSession {
 			// cancellation so its catch/finally path cannot race a normal release or
 			// terminal notice against the physical delete.
 			run.detachedDeletion = subagent;
-			if (this._cancelRlmChildRun(run, "Deleted by parent orchestrator")) {
-				run.deletionNeedsCompletionNotice = true;
-			} else {
+			if (!this._cancelRlmChildRun(run, "Deleted by parent orchestrator")) {
 				this._emitRlmSubagentRemoval(subagent);
 			}
 			const liveSession = run.session;
@@ -12897,23 +12891,6 @@ export class AgentSession {
 			// Synthesized lifecycle notices always use the parent's private durable
 			// path. Explicit child replies continue through agent_message separately.
 			await this._deferRlmTerminalNotice(message);
-		};
-
-		run.completeDeletion = () => {
-			if (!run.deletionNeedsCompletionNotice || run.suppressTerminalNotice || this._disposed || this._disposing) {
-				return Promise.resolve();
-			}
-			if (run.deletionNotice) return run.deletionNotice;
-			const notice = deliverTerminalMessageToParent(
-				createRlmChildTerminalNoticeMessage({
-					kind: "cancelled",
-					childId: run.id,
-					sessionName,
-					reason: run.error ?? "Deleted by parent orchestrator",
-				}),
-			);
-			run.deletionNotice = notice;
-			return notice;
 		};
 
 		run.reportDeletionCleanupFailure = (error) => {

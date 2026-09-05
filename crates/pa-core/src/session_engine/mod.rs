@@ -150,7 +150,8 @@ fn standard_message(message: &pa_agent::types::AgentMessage) -> Option<&pa_agent
 mod reasoning_recovery;
 
 pub struct AgentSession {
-    reasoning_recovery_attempted: std::sync::atomic::AtomicBool,
+    reasoning_recovery_attempted: Arc<std::sync::atomic::AtomicBool>,
+    scratch_closeout_active: Arc<std::sync::atomic::AtomicBool>,
     agent: Arc<Agent>,
     session: Arc<tokio::sync::Mutex<SessionManager>>,
     prompt_templates: Vec<PromptTemplate>,
@@ -263,8 +264,25 @@ impl AgentSession {
         let foreground = Arc::new(root_foreground_lease::RootForegroundLease::default());
         agent.set_run_scope(Some(foreground.run_scope()));
         let persistence = session.clone();
+        let reasoning_recovery_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scratch_closeout_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let recovery = reasoning_recovery_attempted.clone();
+        let closeout = scratch_closeout_active.clone();
         agent
             .subscribe(move |event, _signal| {
+                if !closeout.load(std::sync::atomic::Ordering::Acquire) {
+                    let progress = match &event {
+                        AgentEvent::MessageEnd { message, .. } => match standard_message(message) {
+                            Some(pa_agent::types::Message::ToolResult(result)) => !result.is_error,
+                            Some(pa_agent::types::Message::Assistant(assistant)) => assistant.stop_reason == pa_agent::types::StopReason::Stop && assistant.content.iter().any(|part| matches!(part, pa_agent::types::AssistantContent::Text(text) if !text.text.trim().is_empty())),
+                            Some(pa_agent::types::Message::User(_)) | None => false,
+                        },
+                        AgentEvent::MessageStart { message } => matches!(standard_message(message), Some(pa_agent::types::Message::User(_))),
+                        _ => false,
+                    };
+                    if progress { recovery.store(false, std::sync::atomic::Ordering::Release); }
+                }
+
                 let persistence = persistence.clone();
                 Box::pin(async move {
                     persist_event(&persistence, event).await?;
@@ -290,7 +308,8 @@ impl AgentSession {
             skill_telemetry: None,
             image_model_router: None,
             compaction_summary_sink: std::sync::Mutex::new(None),
-            reasoning_recovery_attempted: std::sync::atomic::AtomicBool::new(false),
+            reasoning_recovery_attempted,
+            scratch_closeout_active,
             native_compaction: std::sync::atomic::AtomicBool::new(true),
             foreground,
             scratch_handoff: std::sync::RwLock::new(None),

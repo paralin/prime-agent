@@ -17,6 +17,11 @@ use crate::session_engine::compact_session::{CompactOutcome, CompactRun};
 use crate::session_engine::compaction_exec::CompactionResult;
 use crate::session_engine::{compaction, provider_adapter, AgentSession};
 
+struct CloseoutGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for CloseoutGuard {
+    fn drop(&mut self) { self.0.store(false, std::sync::atomic::Ordering::Release); }
+}
+
 fn local_date() -> anyhow::Result<String> {
     let seconds = libc::time_t::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
     let mut calendar = std::mem::MaybeUninit::<libc::tm>::uninit();
@@ -78,6 +83,8 @@ pub(crate) async fn execute_scratch_handoff(
         payload: json!({"customType":SCRATCH_HANDOFF_CLOSEOUT_CUSTOM_TYPE,"content":prompt,"display":true,
             "details":{"path":path.display_path,"phase":if create {"create"} else {"update"}},"timestamp":super::super::now_millis()}),
     });
+    session.scratch_closeout_active.store(true, std::sync::atomic::Ordering::Release);
+    let _closeout_guard = CloseoutGuard(session.scratch_closeout_active.clone());
     let _suppression = session.agent.suppress_continuations();
     let closeout = session
         .agent

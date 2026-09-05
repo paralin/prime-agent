@@ -6,7 +6,7 @@ use super::{
     assert_thinking_supported, bail, create_default_rlm_subagent_session_name, json, now_ms,
     resolve_child_model, rlm_child_label, spawn_name_unavailable, Arc, ChildCloseReason,
     ChildRecord, Context, DaemonCommand, Duration, Instant, Mutex, Path, PathBuf, Result,
-    RlmChildResult, RlmChildTerminalNotice, RlmCreateSessionHandle, RlmCreateSessionRequest,
+    RlmChildResult, RlmCreateSessionHandle, RlmCreateSessionRequest,
     RlmDeleteSubagentResult, RlmHostFuture, RlmSpawnHandle, RlmSpawnRequest, RlmSubagentEntry,
     RlmSubagentHost, SpawnNameReservationGuard, SupervisorChildSessions,
     SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS,
@@ -497,7 +497,6 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 ]),
             };
             drop(record_guard);
-            let was_running = record.lock().await.settled_status.is_none();
             // Capture before the kill: a deleted running child's durable
             // rows are its last observable spend on the parent side.
             this.emit_child_usage(&record).await;

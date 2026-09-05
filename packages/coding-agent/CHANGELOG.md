@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed source launches outside the checkout loading stale compiled workspace dependencies.
 - Added one same-model scratch recovery after reasoning exhaustion, with no automatic retry after a failed checkpoint or a second exhaustion.
 - Added local request timing, cache usage, and recovery-phase diagnostics without remote telemetry.
 - Clarified that tool output is observation from the assistant's action, not a new user request, and excluded exhausted reasoning from new history snapshots.

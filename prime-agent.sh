@@ -85,4 +85,4 @@ if [[ ! -x "$TSX_BIN" ]]; then
   exit 1
 fi
 
-exec_with_args "$TSX_BIN" "$SCRIPT_DIR/packages/coding-agent/src/cli.ts"
+exec_with_args "$TSX_BIN" --tsconfig "$SCRIPT_DIR/tsconfig.json" "$SCRIPT_DIR/packages/coding-agent/src/cli.ts"

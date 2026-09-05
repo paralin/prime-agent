@@ -36,7 +36,7 @@ describe("scratch handoff compaction", () => {
 				(context) => {
 					seenCloseouts.push(JSON.stringify(context.messages.at(-1)));
 					expect(context.systemPrompt).toContain(
-						"Write a useful draft checkpoint before investigating uncertain details",
+						"Write a useful draft checkpoint from the existing conversation evidence",
 					);
 					mkdirSync(dirname(expectedPath), { recursive: true });
 					writeFileSync(
@@ -282,9 +282,14 @@ describe("scratch handoff compaction", () => {
 			await session.prompt("do work before the extension boundary");
 			await session.compact();
 
-			expect(extensionPrompts).toContain(
-				`Stop working for now; please create a .org file brain-dump of your ongoing work to ${expectedPath}, use org-todo structure including TODO subheadings, subheadings of subheadings, TODOs on nested subheadings, and so on. It should be detailed enough to hand off this work to a colleague.`,
+			expect(extensionPrompts).toEqual(
+				expect.arrayContaining([
+					expect.stringContaining(
+						`Stop working for now; please create a .org file brain-dump of your ongoing work to ${expectedPath}`,
+					),
+				]),
 			);
+			expect(extensionPrompts.at(-1)).toContain("scratch_write(text)");
 			expect(closeoutSystemPrompt).toContain("extension closeout instructions");
 			expect(sawExtensionContext).toBe(true);
 			expect(

@@ -289,6 +289,8 @@ export interface IpythonToolDetails {
 }
 
 export interface IpythonToolOptions {
+	/** Trusted bootstrap replacing the ordinary RLM and skill namespace. */
+	bootstrapCode?: string;
 	/** Python override. Must have prime-agent-runtime installed. */
 	python?: string;
 	env?: Record<string, string>;
@@ -531,7 +533,7 @@ export class IpythonKernelProvisioner {
 			const shellPath = resolveKernelBashShell(this.options?.shellPath);
 			const commandPrefix = this.options?.commandPrefix;
 			const rgPath = getToolPath("rg");
-			const bootstrapCode = buildRlmBootstrapCode(this.options?.pythonSkills);
+			const bootstrapCode = this.options?.bootstrapCode ?? buildRlmBootstrapCode(this.options?.pythonSkills);
 			const m = new ReplKernelManager({
 				python: this.options?.python,
 				cwd: this.cwd,

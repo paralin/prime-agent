@@ -146,6 +146,7 @@ import {
 	serializeConversation,
 	shouldCompact,
 } from "./compaction/index.js";
+import { SCRATCH_KERNEL_GUIDANCE, ScratchKernel } from "./compaction/scratch-kernel.js";
 import {
 	type ContextTreeNode,
 	type ContextWindowResolver,
@@ -8574,13 +8575,15 @@ export class AgentSession {
 			this.sessionManager.appendCustomEntry(SCRATCH_HANDOFF_PATH_CUSTOM_TYPE, { path: displayPath });
 		}
 
-		const prompt = renderScratchHandoffCloseoutMessage(displayPath, create);
+		const prompt = `${renderScratchHandoffCloseoutMessage(displayPath, create)}\n\n${SCRATCH_KERNEL_GUIDANCE}`;
 		const message = createScratchHandoffCloseoutMessage({
 			displayPath,
 			phase: create ? "create" : "update",
 			content: prompt,
 		});
 		const previousSystemPrompt = this.agent.state.systemPrompt;
+		const previousTools = this.agent.state.tools;
+		const scratchKernel = new ScratchKernel(this._cwd, displayPath);
 		try {
 			await this.agent.waitForIdle();
 			if (signal.aborted) throw new Error("Compaction cancelled");
@@ -8597,6 +8600,7 @@ export class AgentSession {
 			const messages: AgentMessage[] = [message];
 			this._appendBeforeAgentStartMessages(messages, extensionResult);
 			this._scratchCloseoutRunActive = true;
+			this.agent.state.tools = [scratchKernel.tool];
 			await this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(messages));
 			await this._agentEventQueue;
 			if (signal.aborted) throw new Error("Compaction cancelled");
@@ -8605,6 +8609,8 @@ export class AgentSession {
 		} finally {
 			this._scratchCloseoutRunActive = false;
 			this.agent.state.systemPrompt = previousSystemPrompt;
+			this.agent.state.tools = previousTools;
+			await scratchKernel.dispose();
 		}
 	}
 

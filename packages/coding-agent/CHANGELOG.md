@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Restricted scratch closeout to a separate lazy Python kernel with checkpoint-only editing calls, preserving the working kernel for continuation.
 - Removed redundant model notifications after parent-requested child deletion while preserving cleanup-failure alerts.
 - Fixed saved harness instructions losing qualifications through truncation and identified Python imports when explicitly invoking hidden skills.
 - Fixed child deletion rejecting spawn handles and clarified exception recovery and idempotent child bookkeeping.

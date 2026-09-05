@@ -1330,7 +1330,7 @@ export class AgentSession {
 	private _compactionOperation: Promise<void> | undefined = undefined;
 	/** One recovery attempt per overflow; "reported" dedups the failure notice. */
 	private _overflowRecovery: "idle" | "attempted" | "reported" = "idle";
-	/** One scratch recovery per user run; closeout and automatic continuation do not reset it. */
+	/** One scratch recovery without progress; checkpoint work and notifications do not reset it. */
 	private _reasoningRecoveryAttempted = false;
 	private _firstActionLatencyMs: number | undefined;
 	private _continueAfterThresholdCompaction = false;
@@ -4074,6 +4074,9 @@ export class AgentSession {
 		this._emit(event);
 
 		if (event.type === "message_end") {
+			if (!this._scratchCloseoutRunActive && event.message.role === "toolResult" && !event.message.isError) {
+				this._reasoningRecoveryAttempted = false;
+			}
 			if (event.message.role === "assistant") {
 				const message = event.message;
 				const usage = message.usage;
@@ -4128,6 +4131,12 @@ export class AgentSession {
 				}
 
 				const assistantMsg = event.message as AssistantMessage;
+				if (
+					assistantMsg.stopReason === "stop" &&
+					assistantMsg.content.some((part) => part.type === "text" && part.text.trim().length > 0)
+				) {
+					this._reasoningRecoveryAttempted = false;
+				}
 				if (assistantMsg.stopReason !== "error") {
 					addAutonomousUsage(this._autonomousState, assistantMsg.usage);
 				}

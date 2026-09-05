@@ -1,4 +1,5 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createEnglishOutputNudgeMessage,
@@ -48,12 +49,24 @@ describe("needsEnglishOutputNudge", () => {
 		]);
 	});
 
-	it("ignores Chinese in thinking traces", () => {
+	it("detects Chinese in thinking traces", () => {
 		const message = fauxAssistantMessage([
 			{ type: "thinking", thinking: "先看测试结果" },
 			{ type: "text", text: "The tests passed." },
 		]);
-		expect(needsEnglishOutputNudge(message)).toBe(false);
+		expect(needsEnglishOutputNudge(message)).toBe(true);
+	});
+
+	it("checks Python code lines without modifying arguments or scanning unrelated tools", () => {
+		const code = `${"value = 1\n".repeat(40)}# 接下来检查结果\nprint(value)`;
+		const message = fauxAssistantMessage([{ type: "toolCall", id: "python", name: "ipython", arguments: { code } }]);
+		expect(needsEnglishOutputNudge(message)).toBe(true);
+		expect(message.content[0]).toMatchObject({ arguments: { code } });
+		expect(
+			needsEnglishOutputNudge(
+				fauxAssistantMessage([{ type: "toolCall", id: "read", name: "read", arguments: { path: "中文文件.txt" } }]),
+			),
+		).toBe(false);
 	});
 });
 
@@ -85,6 +98,42 @@ describe("AgentSession english output nudge", () => {
 
 	afterEach(() => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
+	});
+
+	it("executes Python once and queues the reminder after the result without rewriting code", async () => {
+		const harness = await createHarness({ tools: [] });
+		harnesses.push(harness);
+		let calls = 0;
+		const code = '# 检查测试结果\nprint("ok")';
+		harness.session.agent.state.tools = [
+			{
+				name: "ipython",
+				label: "ipython",
+				description: "Fixture Python",
+				parameters: Type.Object({ code: Type.String() }),
+				execute: async (_id, args) => {
+					calls++;
+					expect(args).toEqual({ code });
+					return { content: [{ type: "text", text: "ok" }], details: {} };
+				},
+			},
+		];
+		harness.setResponses([
+			fauxAssistantMessage([{ type: "toolCall", id: "python", name: "ipython", arguments: { code } }], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("Continuing in English."),
+			fauxAssistantMessage("Done."),
+		]);
+		await harness.session.prompt("Check it");
+		await harness.session.waitForHeadlessIdle();
+		expect(calls).toBe(1);
+		expect(JSON.stringify(harness.sessionManager.getEntries())).toContain("检查测试结果");
+		expect(
+			harness.session.messages.some(
+				(message) => message.role === "custom" && message.customType === ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE,
+			),
+		).toBe(true);
 	});
 
 	it("preserves Chinese assistant text then steers a prospective English reminder", async () => {

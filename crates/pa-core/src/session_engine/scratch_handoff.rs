@@ -10,6 +10,7 @@ use crate::tools::path_utils::resolve_to_cwd;
 use super::history_snapshot::{build_session_history_snapshot, HistorySnapshot};
 
 mod execute;
+mod kernel;
 pub(crate) use execute::execute_scratch_handoff;
 
 #[derive(Debug, Clone)]

@@ -54,14 +54,14 @@ pub fn overview_for_prompt(state: &HarnessState) -> String {
             let arguments_text =
                 if entry.kind == RefinementKind::Skill && !entry.arguments.is_empty() {
                     let serialized = serde_json::to_string(&entry.arguments).unwrap_or_default();
-                    format!(" args={}", serialized)
+                    format!(" args={serialized}")
                 } else {
                     String::new()
                 };
             let reference_text =
                 if entry.kind == RefinementKind::Skill && !entry.reference.is_empty() {
                     let serialized = serde_json::to_string(&entry.reference).unwrap_or_default();
-                    format!(" ref={}", serialized)
+                    format!(" ref={serialized}")
                 } else {
                     String::new()
                 };

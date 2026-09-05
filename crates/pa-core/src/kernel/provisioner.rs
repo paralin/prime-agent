@@ -113,6 +113,8 @@ pub type KernelBootstrapResultHandler = Arc<dyn Fn(KernelBootstrapStats) + Send 
 
 #[derive(Default, Clone)]
 pub struct IpythonKernelProvisionerOptions {
+    /// Override the working RLM bootstrap for an isolated, ephemeral kernel.
+    pub bootstrap_code: Option<String>,
     /// Python override. Must have prime-agent-runtime installed.
     pub python: Option<PathBuf>,
     pub env: HashMap<String, String>,
@@ -673,7 +675,7 @@ async fn start_kernel_impl(
         gate().await;
     }
     let snapshot_dir = options.snapshot_dir.clone();
-    let bootstrap_code = build_rlm_bootstrap_code(&options.python_skills);
+    let bootstrap_code = options.bootstrap_code.clone().unwrap_or_else(|| build_rlm_bootstrap_code(&options.python_skills));
     let mut env = options.env.clone();
     if let Some(shell_path) = &options.shell_path {
         env.insert(

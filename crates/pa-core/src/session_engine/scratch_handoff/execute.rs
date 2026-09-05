@@ -73,10 +73,12 @@ pub(crate) async fn execute_scratch_handoff(
         }
         (path, history, create)
     };
+    let scratch = super::kernel::ScratchKernel::install(&session.agent, &settings.cwd, &path.absolute_path).await?;
     let prompt = format!(
-        "{}\n\n{}",
+        "{}\n\n{}\n\n{}",
         render_scratch_handoff_closeout_message(&path.display_path, create),
-        super::SCRATCH_HANDOFF_CLOSEOUT_GUIDANCE
+        super::SCRATCH_HANDOFF_CLOSEOUT_GUIDANCE,
+        super::kernel::GUIDANCE
     );
     let message = AgentMessage::Custom(CustomAgentMessage {
         role: "custom".into(),
@@ -103,6 +105,7 @@ pub(crate) async fn execute_scratch_handoff(
     } else {
         closeout.await?;
     }
+    scratch.finish().await;
     pa_agent::abort::throw_if_aborted_signal(abort)?;
     let state = session.agent.state().await;
     let final_assistant = state

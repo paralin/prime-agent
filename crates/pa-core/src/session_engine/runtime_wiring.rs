@@ -247,6 +247,7 @@ pub fn kernel_provisioner(
     Arc::new(KernelProvisioner::new(
         cwd,
         IpythonKernelProvisionerOptions {
+            bootstrap_code: None,
             python: None,
             env,
             command_prefix: None,

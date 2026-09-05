@@ -5723,7 +5723,13 @@ export class AgentSession {
 		try {
 			const content = readFileSync(skill.filePath, "utf-8");
 			const body = stripFrontmatter(content).trim();
-			const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
+			const pythonAvailability =
+				skill.kind === "python"
+					? this.getActiveToolNames().includes("ipython")
+						? `\nPython module: \`${skill.python.importName}\`. This skill is configured for preload in the IPython kernel, including when it is user-invoked only. Call its documented API there; report any actual import failure.`
+						: `\nPython module: \`${skill.python.importName}\`. IPython is not active in this session; no kernel preload is available.`
+					: "";
+			const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.${pythonAvailability}\n\n${body}\n</skill>`;
 			return args ? `${skillBlock}\n\n${args}` : skillBlock;
 		} catch (err) {
 			this._extensionRunner.emitError({

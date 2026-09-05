@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed saved harness instructions losing qualifications through truncation and identified Python imports when explicitly invoking hidden skills.
 - Fixed child deletion rejecting spawn handles and clarified exception recovery and idempotent child bookkeeping.
 - Fixed source launches outside the checkout loading stale compiled workspace dependencies.
 - Added one same-model scratch recovery after reasoning exhaustion, with no automatic retry after a failed checkpoint or a second exhaustion.

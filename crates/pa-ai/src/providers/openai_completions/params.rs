@@ -26,7 +26,9 @@ pub(crate) fn build_params(
     let options = options.cloned().unwrap_or_default();
     let messages = convert_messages(model, context, compat);
     let mut params = Map::new();
-    if model.provider == "merge-gateway" { params.insert("include_routing_metadata".into(), json!(true)); }
+    if model.provider == "merge-gateway" {
+        params.insert("include_routing_metadata".into(), json!(true));
+    }
     params.insert("model".into(), json!(model.id));
     params.insert("messages".into(), json!(messages));
     params.insert("stream".into(), json!(true));
@@ -100,7 +102,9 @@ pub(crate) fn build_params(
     if supports_thinking(model) {
         match compat.thinking_format {
             crate::types::ThinkingFormat::Merge => {
-                if let Some(budget) = options.reasoning_budget_tokens.filter(|_| options.reasoning_effort.is_none() || !compat.supports_reasoning_effort) {
+                if let Some(budget) = options.reasoning_budget_tokens.filter(|_| {
+                    options.reasoning_effort.is_none() || !compat.supports_reasoning_effort
+                }) {
                     params.insert(
                         "thinking".into(),
                         json!({"type":"enabled", "budget_tokens":budget}),

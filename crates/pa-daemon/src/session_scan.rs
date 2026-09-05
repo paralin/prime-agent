@@ -125,12 +125,20 @@ pub fn list_sessions_with(
     let mut infos = Vec::new();
     for (batch, chunk) in files.chunks(4).enumerate() {
         let rows = std::thread::scope(|scope| {
-            let workers = chunk.iter().map(|(path, _)| scope.spawn(move || roster_session_info(path))).collect::<Vec<_>>();
-            workers.into_iter().map(|worker| worker.join().expect("session metadata reader panicked")).collect::<Vec<_>>()
+            let workers = chunk
+                .iter()
+                .map(|(path, _)| scope.spawn(move || roster_session_info(path)))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("session metadata reader panicked"))
+                .collect::<Vec<_>>()
         });
         for (offset, row) in rows.into_iter().enumerate() {
             if let Some(info) = row {
-                if !on_row(batch * 4 + offset, total, &info) { return infos; }
+                if !on_row(batch * 4 + offset, total, &info) {
+                    return infos;
+                }
                 infos.push(info);
             }
         }

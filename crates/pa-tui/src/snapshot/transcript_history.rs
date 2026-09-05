@@ -1,24 +1,42 @@
-use std::collections::{HashMap, HashSet};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 
 pub(crate) fn transcript_history(tree: &Value, live: &[Value]) -> Vec<Value> {
-    let entries: HashMap<_, _> = tree["flatNodes"].as_array().into_iter().flatten()
-        .filter_map(|node| node["entry"]["id"].as_str().map(|id| (id, &node["entry"]))).collect();
+    let entries: HashMap<_, _> = tree["flatNodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node["entry"]["id"].as_str().map(|id| (id, &node["entry"])))
+        .collect();
     let mut branch = Vec::new();
     let mut visited = HashSet::new();
     let mut cursor = tree["leafId"].as_str();
     while let Some(entry) = cursor.and_then(|id| entries.get(id)) {
-        if !visited.insert(entry["id"].as_str()) { break; }
+        if !visited.insert(entry["id"].as_str()) {
+            break;
+        }
         branch.push(*entry);
         cursor = entry["parentId"].as_str();
     }
     branch.reverse();
-    if branch.is_empty() { return live.to_vec(); }
-    let checkpoints: HashMap<_, _> = branch.iter().filter(|entry| entry["type"] == "compaction")
+    if branch.is_empty() {
+        return live.to_vec();
+    }
+    let checkpoints: HashMap<_, _> = branch
+        .iter()
+        .filter(|entry| entry["type"] == "compaction")
         .filter_map(|entry| {
             let scratch = &entry["details"]["scratchHandoff"];
-            (scratch["version"] == 1).then(|| Some((entry["firstKeptEntryId"].as_str()?, scratch["path"].as_str()?))).flatten()
-        }).collect();
+            (scratch["version"] == 1)
+                .then(|| {
+                    Some((
+                        entry["firstKeptEntryId"].as_str()?,
+                        scratch["path"].as_str()?,
+                    ))
+                })
+                .flatten()
+        })
+        .collect();
     let mut messages = Vec::new();
     let mut persisted = HashSet::new();
     for entry in branch {
@@ -45,6 +63,17 @@ pub(crate) fn transcript_history(tree: &Value, live: &[Value]) -> Vec<Value> {
             Some(_) | None => {}
         }
     }
-    messages.extend(live.iter().filter(|message| message["role"] != "compactionSummary" && message["role"] != "branchSummary" && !persisted.contains(&(message["role"].to_string(),message["timestamp"].to_string()))).cloned());
+    messages.extend(
+        live.iter()
+            .filter(|message| {
+                message["role"] != "compactionSummary"
+                    && message["role"] != "branchSummary"
+                    && !persisted.contains(&(
+                        message["role"].to_string(),
+                        message["timestamp"].to_string(),
+                    ))
+            })
+            .cloned(),
+    );
     messages
 }

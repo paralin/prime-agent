@@ -83,10 +83,16 @@ pub fn transform_messages_with_normalizer(
     normalize_tool_call_id: &Normalizer<'_>,
 ) -> Vec<Message> {
     let mut tool_call_id_map: HashMap<String, String> = HashMap::new();
-    let replay: Vec<_> = messages.iter().filter(|message| match message {
-        Message::Assistant(assistant) => !crate::utils_inner::diagnostics::is_reasoning_exhausted_response(assistant),
-        Message::User(_) | Message::ToolResult(_) => true,
-    }).cloned().collect();
+    let replay: Vec<_> = messages
+        .iter()
+        .filter(|message| match message {
+            Message::Assistant(assistant) => {
+                !crate::utils_inner::diagnostics::is_reasoning_exhausted_response(assistant)
+            }
+            Message::User(_) | Message::ToolResult(_) => true,
+        })
+        .cloned()
+        .collect();
     let image_aware = downgrade_unsupported_images(&replay, model);
 
     let transformed: Vec<Message> = image_aware

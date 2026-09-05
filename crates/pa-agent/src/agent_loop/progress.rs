@@ -96,7 +96,7 @@ impl TurnProgress {
             }
         } else {
             self.incomplete = 0;
-            }
+        }
         message
     }
 }

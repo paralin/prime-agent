@@ -55,18 +55,18 @@ pub fn overview_for_prompt(state: &HarnessState) -> String {
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
-            let content: String = content.chars().take(240).collect();
+            let content = entry.content.clone();
             let arguments_text =
                 if entry.kind == RefinementKind::Skill && !entry.arguments.is_empty() {
                     let serialized = serde_json::to_string(&entry.arguments).unwrap_or_default();
-                    format!(" args={}", &serialized[..serialized.len().min(240)])
+                    format!(" args={}", serialized)
                 } else {
                     String::new()
                 };
             let reference_text =
                 if entry.kind == RefinementKind::Skill && !entry.reference.is_empty() {
                     let serialized = serde_json::to_string(&entry.reference).unwrap_or_default();
-                    format!(" ref={}", &serialized[..serialized.len().min(240)])
+                    format!(" ref={}", serialized)
                 } else {
                     String::new()
                 };

@@ -68,7 +68,11 @@ pub(crate) async fn execute_scratch_handoff(
         }
         (path, history, create)
     };
-    let prompt = format!("{}\n\n{}", render_scratch_handoff_closeout_message(&path.display_path, create), super::SCRATCH_HANDOFF_CLOSEOUT_GUIDANCE);
+    let prompt = format!(
+        "{}\n\n{}",
+        render_scratch_handoff_closeout_message(&path.display_path, create),
+        super::SCRATCH_HANDOFF_CLOSEOUT_GUIDANCE
+    );
     let message = AgentMessage::Custom(CustomAgentMessage {
         role: "custom".into(),
         payload: json!({"customType":SCRATCH_HANDOFF_CLOSEOUT_CUSTOM_TYPE,"content":prompt,"display":true,

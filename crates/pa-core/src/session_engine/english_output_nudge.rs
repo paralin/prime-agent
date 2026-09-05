@@ -22,7 +22,10 @@ pub fn text_has_chinese(text: &str) -> bool {
 
 #[must_use]
 pub fn needs_english_output_nudge(message: &AssistantMessage) -> bool {
-    message.content.iter().any(|block| matches!(block, AssistantContent::Text(text) if text_has_chinese(&text.text)))
+    message
+        .content
+        .iter()
+        .any(|block| matches!(block, AssistantContent::Text(text) if text_has_chinese(&text.text)))
 }
 
 #[derive(Default)]
@@ -104,7 +107,6 @@ mod tests {
             "api":"faux","provider":"faux","model":"faux","usage":pa_agent::types::Usage::zero(),"stopReason":"toolUse","timestamp":0
         })).unwrap();
         assert!(needs_english_output_nudge(&message));
-
     }
 
     #[test]

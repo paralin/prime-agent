@@ -443,13 +443,8 @@ pub fn merge_refinement_history(
 }
 
 pub(crate) fn compact_text(text: &str, max_length: usize) -> String {
-    let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= max_length {
-        return normalized;
-    }
-    let keep = max_length.saturating_sub(3);
-    let truncated: String = normalized.chars().take(keep).collect();
-    format!("{truncated}...")
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_length { normalized } else { "[omitted: read the complete saved entry before using it]".into() }
 }
 
 /// Digest-notation notice body for a refinement.

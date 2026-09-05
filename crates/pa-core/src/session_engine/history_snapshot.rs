@@ -116,7 +116,9 @@ pub fn serialize_session_history(entries: &[Value]) -> String {
                         }
                     }
                     Some("assistant") => {
-                        if matches!(message["stopReason"].as_str(), Some("error" | "aborted")) { continue; }
+                        if matches!(message["stopReason"].as_str(), Some("error" | "aborted")) {
+                            continue;
+                        }
                         let mut blocks = Vec::new();
                         for block in message["content"].as_array().into_iter().flatten() {
                             match block["type"].as_str() {

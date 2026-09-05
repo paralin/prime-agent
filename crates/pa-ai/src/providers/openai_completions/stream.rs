@@ -210,8 +210,20 @@ fn handle_chunk(
     }
     if model.provider == "merge-gateway" {
         if let Some(vendor) = chunk["routing"]["vendor_used"].as_str() {
-            if !state.output.diagnostics.as_ref().is_some_and(|entries| entries.iter().any(|entry| entry.type_ == "merge_routing")) {
-                state.output.diagnostics.get_or_insert_with(Vec::new).push(crate::types::AssistantMessageDiagnostic { type_: "merge_routing".into(), timestamp: crate::utils_inner::diagnostics::now_ms(), error: None, details: Some(Map::from_iter([("vendor_used".into(), json!(vendor))])) });
+            if !state
+                .output
+                .diagnostics
+                .as_ref()
+                .is_some_and(|entries| entries.iter().any(|entry| entry.type_ == "merge_routing"))
+            {
+                state.output.diagnostics.get_or_insert_with(Vec::new).push(
+                    crate::types::AssistantMessageDiagnostic {
+                        type_: "merge_routing".into(),
+                        timestamp: crate::utils_inner::diagnostics::now_ms(),
+                        error: None,
+                        details: Some(Map::from_iter([("vendor_used".into(), json!(vendor))])),
+                    },
+                );
             }
         }
     }
@@ -643,8 +655,15 @@ async fn run_stream(
     );
     if compat.thinking_format == crate::types::ThinkingFormat::Merge {
         if let Some(budget) = params["thinking"]["budget_tokens"].as_u64() {
-            if budget == 0 || params["max_tokens"].as_u64().is_some_and(|maximum| budget >= maximum) {
-                return Err(ProviderError::Message("Merge thinking budget must be a positive integer smaller than max_tokens".into()));
+            if budget == 0
+                || params["max_tokens"]
+                    .as_u64()
+                    .is_some_and(|maximum| budget >= maximum)
+            {
+                return Err(ProviderError::Message(
+                    "Merge thinking budget must be a positive integer smaller than max_tokens"
+                        .into(),
+                ));
             }
         }
     }
@@ -656,12 +675,34 @@ async fn run_stream(
 
     if model.provider == "merge-gateway" {
         let mut details = Map::new();
-        for key in ["model", "vendor", "reasoning_effort", "max_tokens", "max_completion_tokens"] {
-            if let Some(value) = params.get(key).filter(|value| value.is_string() || value.is_number()) { details.insert(key.into(), value.clone()); }
+        for key in [
+            "model",
+            "vendor",
+            "reasoning_effort",
+            "max_tokens",
+            "max_completion_tokens",
+        ] {
+            if let Some(value) = params
+                .get(key)
+                .filter(|value| value.is_string() || value.is_number())
+            {
+                details.insert(key.into(), value.clone());
+            }
         }
-        if let Some(value) = params["thinking"]["type"].as_str() { details.insert("thinking_type".into(), json!(value)); }
-        if let Some(value) = params["thinking"]["budget_tokens"].as_u64() { details.insert("thinking_budget_tokens".into(), json!(value)); }
-        output.diagnostics.get_or_insert_with(Vec::new).push(crate::types::AssistantMessageDiagnostic { type_: "merge_request".into(), timestamp: crate::utils_inner::diagnostics::now_ms(), error: None, details: Some(details) });
+        if let Some(value) = params["thinking"]["type"].as_str() {
+            details.insert("thinking_type".into(), json!(value));
+        }
+        if let Some(value) = params["thinking"]["budget_tokens"].as_u64() {
+            details.insert("thinking_budget_tokens".into(), json!(value));
+        }
+        output.diagnostics.get_or_insert_with(Vec::new).push(
+            crate::types::AssistantMessageDiagnostic {
+                type_: "merge_request".into(),
+                timestamp: crate::utils_inner::diagnostics::now_ms(),
+                error: None,
+                details: Some(details),
+            },
+        );
     }
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
     let mut headers = build_headers(
@@ -841,9 +882,15 @@ fn validate_stream_end(state: &StreamingState, required: bool) -> Result<(), Pro
         for accumulator in state.tool_call_partial_args.values() {
             let text = accumulator.text();
             let arguments: Value = serde_json::from_str(if text.is_empty() { "{}" } else { text })
-                .map_err(|_| ProviderError::Message("OpenAI Chat tool call arguments are not complete JSON".into()))?;
+                .map_err(|_| {
+                    ProviderError::Message(
+                        "OpenAI Chat tool call arguments are not complete JSON".into(),
+                    )
+                })?;
             if !arguments.is_object() {
-                return Err(ProviderError::Message("OpenAI Chat tool call arguments must be a JSON object".into()));
+                return Err(ProviderError::Message(
+                    "OpenAI Chat tool call arguments must be a JSON object".into(),
+                ));
             }
         }
     }

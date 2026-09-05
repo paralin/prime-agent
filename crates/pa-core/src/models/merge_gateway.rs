@@ -105,12 +105,16 @@ pub fn parse_merge_gateway_models(payload: &Value, known: &[Model]) -> Result<Ve
             if let Some(display) = entry.get("display_name").and_then(Value::as_str) {
                 model["name"] = json!(display);
             }
-            let reasoning = routes.iter().all(|route| route["capabilities"]["supports_reasoning"] == true);
-            let thinking_budget = reasoning && routes.iter().all(|route| {
-                let controls = &route["capabilities"]["reasoning"]["controls"];
-                contains(controls, "thinking") || contains(controls, "thinking.budget_tokens")
-            });
-            model["compat"]["thinkingFormat"] = json!(if thinking_budget { "merge" } else { "openai" });
+            let reasoning = routes
+                .iter()
+                .all(|route| route["capabilities"]["supports_reasoning"] == true);
+            let thinking_budget = reasoning
+                && routes.iter().all(|route| {
+                    let controls = &route["capabilities"]["reasoning"]["controls"];
+                    contains(controls, "thinking") || contains(controls, "thinking.budget_tokens")
+                });
+            model["compat"]["thinkingFormat"] =
+                json!(if thinking_budget { "merge" } else { "openai" });
             let disable = thinking_budget
                 && routes
                     .iter()

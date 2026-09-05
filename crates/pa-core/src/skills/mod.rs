@@ -238,8 +238,9 @@ pub fn expand_skill_command<'a>(text: &str, skills: &'a [Skill]) -> (String, Opt
         return (text.to_string(), None);
     };
     let body = frontmatter::strip_frontmatter(&content).trim().to_string();
+    let python_availability = skill.python.as_ref().map_or_else(String::new, |python| format!("\nPython module: `{}`. This skill is configured for preload when IPython is active, including when it is user-invoked only. Call its documented API there; report any actual import failure. If IPython is not active, no kernel preload is available.", python.import_name));
     let block = format!(
-        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
+        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.{python_availability}\n\n{}\n</skill>",
         skill.name,
         skill.file_path.display(),
         skill.base_dir.display(),

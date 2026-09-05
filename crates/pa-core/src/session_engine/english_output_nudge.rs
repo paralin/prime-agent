@@ -5,7 +5,7 @@ use serde_json::json;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub const ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE: &str = "english_output_nudge";
-pub const ENGLISH_OUTPUT_NUDGE_PROMPT: &str = "Continue the user's active task from the latest tool result. Use English for subsequent user-facing explanations. This is a language reminder, not a new task: do not reconstruct the conversation or repeat completed work. No reply to this notice is needed.";
+pub const ENGLISH_OUTPUT_NUDGE_PROMPT: &str = "Continue the user's active task from the latest tool result. Use English for subsequent reasoning, explanations, and Python code comments and prose. Preserve quoted source data, exact paths, and required non-English strings. This is a language reminder, not a new task: do not reconstruct the conversation or repeat completed work. No reply to this notice is needed.";
 
 /// # Panics
 /// Panics if the regex engine no longer supports the `Unified_Ideograph` property.
@@ -25,7 +25,11 @@ pub fn needs_english_output_nudge(message: &AssistantMessage) -> bool {
     message
         .content
         .iter()
-        .any(|block| matches!(block, AssistantContent::Text(text) if text_has_chinese(&text.text)))
+        .any(|block| match block {
+            AssistantContent::Text(text) => text_has_chinese(&text.text),
+            AssistantContent::Thinking(thinking) => text_has_chinese(&thinking.thinking),
+            AssistantContent::ToolCall(call) => call.name == "ipython" && call.arguments.get("code").and_then(serde_json::Value::as_str).is_some_and(|code| code.lines().any(text_has_chinese)),
+        })
 }
 
 #[derive(Default)]

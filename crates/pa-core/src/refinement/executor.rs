@@ -50,11 +50,6 @@ pub fn overview_for_prompt(state: &HarnessState) -> String {
             .unwrap_or_default();
         lines.push(format!("{kind}: {}", entries.len()));
         for entry in entries.iter().take(40) {
-            let content: String = entry
-                .content
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
             let content = entry.content.clone();
             let arguments_text =
                 if entry.kind == RefinementKind::Skill && !entry.arguments.is_empty() {

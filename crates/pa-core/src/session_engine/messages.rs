@@ -364,7 +364,8 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
                     UserContent::Text(text)
                         if custom.custom_type
                             == super::tool_error_nudge::TOOL_ERROR_NUDGE_CUSTOM_TYPE
-                            || custom.custom_type == super::english_output_nudge::ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE =>
+                            || custom.custom_type == super::english_output_nudge::ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE
+                            || custom.custom_type == super::reasoning_recovery::REASONING_OUTPUT_NUDGE_CUSTOM_TYPE =>
                     {
                         UserContent::Blocks(vec![text_block(format!(
                             "<system-notice>\n{text}\n</system-notice>"

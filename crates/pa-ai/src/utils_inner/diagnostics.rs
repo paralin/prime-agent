@@ -42,7 +42,7 @@ pub fn append_assistant_message_diagnostic(
 /// Failed reasoning-only responses, including older journals saved as length.
 #[must_use]
 pub fn is_reasoning_exhausted_response(message: &AssistantMessage) -> bool {
-    message.stop_reason == crate::types::StopReason::Length
+    matches!(message.stop_reason, crate::types::StopReason::Length | crate::types::StopReason::Error)
         && !message.content.iter().any(|part| match part {
             crate::types::AssistantContent::ToolCall(_) => true,
             crate::types::AssistantContent::Text(text) => !text.text.trim().is_empty(),

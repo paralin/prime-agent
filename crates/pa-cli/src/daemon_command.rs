@@ -370,6 +370,7 @@ fn run_rename(client: &mut DaemonClient, args: &[String], json: bool) -> Result<
 // ---------------------------------------------------------------------------
 
 struct ParsedSendArgs {
+    delivery_mode: Option<Value>,
     target_active_session_id: String,
     from_active_session_id: Option<String>,
     message: String,
@@ -383,7 +384,7 @@ fn run_send(client: &mut DaemonClient, args: &[String], json: bool) -> Result<()
         message: parsed.message,
         from_active_session_id: parsed.from_active_session_id,
         agent_origin: None,
-        delivery_mode: None,
+        delivery_mode: parsed.delivery_mode,
         rest: serde_json::Map::new(),
     })?;
     let data = require_success(response)?.unwrap_or(Value::Null);
@@ -424,6 +425,7 @@ fn run_send(client: &mut DaemonClient, args: &[String], json: bool) -> Result<()
 }
 
 fn parse_send_args(args: &[String]) -> Result<ParsedSendArgs> {
+    let mut delivery_mode: Option<Value> = None;
     let mut from_active_session_id: Option<String> = None;
     let mut target_active_session_id: Option<String> = None;
     let mut explicit_message: Option<String> = None;
@@ -435,6 +437,12 @@ fn parse_send_args(args: &[String]) -> Result<ParsedSendArgs> {
         index += 1;
         if parse_options && arg == "--" {
             parse_options = false;
+            continue;
+        }
+        if parse_options && matches!(arg, "--steer" | "--follow-up") {
+            let mode = Value::String(if arg == "--steer" { "steer" } else { "follow_up" }.into());
+            if delivery_mode.as_ref().is_some_and(|prior| *prior != mode) { bail!("--steer and --follow-up cannot be used together"); }
+            delivery_mode = Some(mode);
             continue;
         }
         if parse_options && arg == "--from" {
@@ -477,6 +485,7 @@ fn parse_send_args(args: &[String]) -> Result<ParsedSendArgs> {
         bail!("Usage: prime-agent send [--from <agent>] <agent> [--message <message>|<message>]");
     }
     Ok(ParsedSendArgs {
+        delivery_mode,
         target_active_session_id: target_active_session_id.expect("checked above"),
         from_active_session_id,
         message,

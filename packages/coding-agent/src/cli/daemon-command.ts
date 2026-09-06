@@ -5,6 +5,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import chalk from "chalk";
 import { spawn } from "child_process";
 import { expandTildePath } from "../config.js";
+import type { AgentSessionMessageDeliveryMode } from "../core/agent-messages.js";
 import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
@@ -896,6 +897,7 @@ async function runSend(client: DaemonClient, args: string[], json: boolean): Pro
 		type: "send_message",
 		targetActiveSessionId: parsed.targetActiveSessionId,
 		fromActiveSessionId: parsed.fromActiveSessionId,
+		deliveryMode: parsed.deliveryMode,
 		message: parsed.message,
 	});
 	const data = requireSuccess(response);
@@ -914,6 +916,7 @@ async function runSend(client: DaemonClient, args: string[], json: boolean): Pro
 interface ParsedSendArgs {
 	targetActiveSessionId: string;
 	fromActiveSessionId?: string;
+	deliveryMode?: AgentSessionMessageDeliveryMode;
 	message: string;
 }
 
@@ -921,6 +924,7 @@ function parseSendArgs(args: string[]): ParsedSendArgs {
 	let fromActiveSessionId: string | undefined;
 	let targetActiveSessionId: string | undefined;
 	let explicitMessage: string | undefined;
+	let deliveryMode: AgentSessionMessageDeliveryMode | undefined;
 	const messageParts: string[] = [];
 	let parseOptions = true;
 
@@ -937,6 +941,14 @@ function parseSendArgs(args: string[]): ParsedSendArgs {
 			}
 			fromActiveSessionId = value;
 			index++;
+			continue;
+		}
+		if (parseOptions && (arg === "--steer" || arg === "--follow-up")) {
+			const mode = arg === "--steer" ? "steer" : "follow_up";
+			if (deliveryMode && deliveryMode !== mode) {
+				throw new Error("--steer and --follow-up cannot be used together");
+			}
+			deliveryMode = mode;
 			continue;
 		}
 		if (parseOptions && arg === "--message") {
@@ -972,6 +984,7 @@ function parseSendArgs(args: string[]): ParsedSendArgs {
 	return {
 		targetActiveSessionId,
 		fromActiveSessionId,
+		deliveryMode,
 		message,
 	};
 }

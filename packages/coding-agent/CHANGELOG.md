@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed `send --steer` and `send --follow-up` rejecting the advertised delivery options.
+
 - Extended English reminders to assistant thinking and Python tool-call code while preserving original code and quoted data.
 - Restricted scratch closeout to a separate lazy Python kernel with checkpoint-only editing calls, preserving the working kernel for continuation.
 - Removed redundant model notifications after parent-requested child deletion while preserving cleanup-failure alerts.

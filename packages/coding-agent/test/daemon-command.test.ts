@@ -295,6 +295,56 @@ describe("daemon command", () => {
 		).toBe(true);
 	});
 
+	it.each([
+		["--steer", "steer"],
+		["--follow-up", "follow_up"],
+	])("sends %s through the existing message delivery mode", async (flag, deliveryMode) => {
+		await handleDaemonCommand([
+			"daemon",
+			"--socket",
+			"/tmp/prime-agent.sock",
+			"send",
+			flag,
+			"--from",
+			"planner",
+			"worker",
+			"hello",
+		]);
+
+		expect(process.exitCode).toBeUndefined();
+		expect(daemonClientMock.instances[0]?.requests).toEqual([
+			{
+				type: "send_message",
+				targetActiveSessionId: "worker",
+				fromActiveSessionId: "planner",
+				deliveryMode,
+				message: "hello",
+			},
+		]);
+	});
+
+	it("rejects conflicting send delivery flags", async () => {
+		await handleDaemonCommand([
+			"daemon",
+			"--socket",
+			"/tmp/prime-agent.sock",
+			"send",
+			"worker",
+			"--steer",
+			"--follow-up",
+			"hello",
+		]);
+
+		expect(process.exitCode).toBe(1);
+		expect(daemonClientMock.instances[0]?.requests).toEqual([]);
+		expect(
+			consoleErrorMessages.some(
+				(message) =>
+					typeof message === "string" && message.includes("--steer and --follow-up cannot be used together"),
+			),
+		).toBe(true);
+	});
+
 	it("supports send separator after the target for flag-like message text", async () => {
 		await expect(
 			handleDaemonCommand([

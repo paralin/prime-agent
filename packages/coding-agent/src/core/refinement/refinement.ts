@@ -1,21 +1,13 @@
-import { randomUUID } from "node:crypto";
-import {
-	appendFileSync,
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	renameSync,
-	statSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../../config.js";
+import { realpathIfPresentSync, writeFileAtomicSync } from "../../utils/atomic-file.js";
 import { serializeConversation, serializePromptData } from "../compaction/utils.js";
 import { convertToLlm } from "../messages.js";
+import { completeWithProviderRetry, type ProviderRetryPolicy } from "../provider-retry.js";
 import type { CustomEntry } from "../session-manager.js";
 
 export const REFINEMENT_CUSTOM_TYPE = "prime-agent.refinement";
@@ -105,6 +97,7 @@ export interface RefineOptions {
 	instructions?: string;
 	rollbackId?: string;
 	global?: boolean;
+	retry?: ProviderRetryPolicy;
 }
 
 export type AutoRefineReason = "turn_interval" | "compact";
@@ -323,11 +316,17 @@ export function mergeHarnessStates(globalState: HarnessState, localState?: Harne
 	for (const kind of Object.keys(merged.entries) as RefinementKind[]) {
 		for (const [id, entry] of Object.entries(globalState.entries[kind])) {
 			const cloned = cloneEntry(entry)!;
-			merged.entries[kind][id] = { ...cloned, scope: normalizeHarnessScope(cloned.scope, "global") };
+			merged.entries[kind][id] = {
+				...cloned,
+				scope: normalizeHarnessScope(cloned.scope, "global"),
+			};
 		}
 		for (const [id, entry] of Object.entries(localState?.entries[kind] ?? {})) {
 			const cloned = cloneEntry(entry)!;
-			const scopedEntry = { ...cloned, scope: normalizeHarnessScope(cloned.scope, "local") };
+			const scopedEntry = {
+				...cloned,
+				scope: normalizeHarnessScope(cloned.scope, "local"),
+			};
 			const mergedId = merged.entries[kind][id] ? `${scopedEntry.scope}:${id}` : id;
 			merged.entries[kind][mergedId] = scopedEntry;
 		}
@@ -351,18 +350,13 @@ function assertHarnessStateWritable(statePath: string): void {
 
 export function saveHarnessState(harnessStateDir: string, state: HarnessState): string {
 	const statePath = getHarnessStatePath(harnessStateDir);
-	const tempPath = `${statePath}.${process.pid}.${randomUUID()}.tmp`;
 	mkdirSync(harnessStateDir, { recursive: true });
 	assertHarnessStateWritable(statePath);
-	try {
-		const mode = existsSync(statePath) ? statSync(statePath).mode & 0o777 : 0o600;
-		writeFileSync(tempPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode });
-		renameSync(tempPath, statePath);
-	} finally {
-		if (existsSync(tempPath)) {
-			unlinkSync(tempPath);
-		}
-	}
+	const targetPath = realpathIfPresentSync(statePath);
+	const mode = existsSync(targetPath) ? statSync(targetPath).mode & 0o777 : 0o600;
+	writeFileAtomicSync(targetPath, `${JSON.stringify(state, null, 2)}\n`, {
+		mode,
+	});
 	return statePath;
 }
 
@@ -726,7 +720,12 @@ function validateEdit(edit: RefinementEdit, computedId?: string): string | undef
 export function applyRefinementProposal(
 	state: HarnessState,
 	proposal: RefinementProposal,
-	options: { id: string; rollbackOf?: string; scope?: HarnessScope; baselineState?: HarnessState },
+	options: {
+		id: string;
+		rollbackOf?: string;
+		scope?: HarnessScope;
+		baselineState?: HarnessState;
+	},
 ): RefinementResult {
 	const appliedEdits: AppliedRefinementEdit[] = [];
 	const proposalModifiedKeys = new Set<string>();
@@ -735,7 +734,12 @@ export function applyRefinementProposal(
 		const id = computedId ?? "";
 		const validationError = validateEdit(edit, id);
 		if (validationError) {
-			appliedEdits.push({ ...edit, id, applied: false, error: validationError });
+			appliedEdits.push({
+				...edit,
+				id,
+				applied: false,
+				error: validationError,
+			});
 			continue;
 		}
 
@@ -759,7 +763,12 @@ export function applyRefinementProposal(
 		}
 		if (edit.action === "delete") {
 			if (!before) {
-				appliedEdits.push({ ...edit, id, applied: false, error: "entry not found" });
+				appliedEdits.push({
+					...edit,
+					id,
+					applied: false,
+					error: "entry not found",
+				});
 				continue;
 			}
 			delete records[id];
@@ -768,11 +777,22 @@ export function applyRefinementProposal(
 			continue;
 		}
 		if (edit.action === "create" && before) {
-			appliedEdits.push({ ...edit, id, before, applied: false, error: "entry already exists" });
+			appliedEdits.push({
+				...edit,
+				id,
+				before,
+				applied: false,
+				error: "entry already exists",
+			});
 			continue;
 		}
 		if (edit.action === "update" && !before) {
-			appliedEdits.push({ ...edit, id, applied: false, error: "entry not found" });
+			appliedEdits.push({
+				...edit,
+				id,
+				applied: false,
+				error: "entry not found",
+			});
 			continue;
 		}
 
@@ -795,7 +815,13 @@ export function applyRefinementProposal(
 		};
 		records[id] = after;
 		proposalModifiedKeys.add(entryKey);
-		appliedEdits.push({ ...edit, id, before, after: cloneEntry(after), applied: true });
+		appliedEdits.push({
+			...edit,
+			id,
+			before,
+			after: cloneEntry(after),
+			applied: true,
+		});
 	}
 
 	const changes = appliedEdits.filter((edit) => edit.applied).map((edit) => `${edit.action} ${edit.kind}:${edit.id}`);
@@ -957,13 +983,28 @@ ${serializePromptData(options.instructions)}
 	// Keep the refinement request non-reasoning regardless of the interactive session
 	// thinking level so the model uses its output budget for the JSON object.
 	void thinkingLevel;
-	const response = await completeSimple(
-		model,
-		{
-			systemPrompt: requestSystemPrompt,
-			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
-		},
-		{ maxTokens: refinementMaxOutputTokens(model), signal, apiKey, headers },
+	const response = await completeWithProviderRetry(
+		() =>
+			completeSimple(
+				model,
+				{
+					systemPrompt: requestSystemPrompt,
+					messages: [
+						{
+							role: "user",
+							content: [{ type: "text", text: userPrompt }],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				{
+					maxTokens: refinementMaxOutputTokens(model),
+					signal,
+					apiKey,
+					headers,
+				},
+			),
+		{ policy: options.retry, signal },
 	);
 
 	if (response.stopReason === "error") {
@@ -1003,6 +1044,7 @@ export async function reviewAutoRefine(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	retry?: ProviderRetryPolicy,
 ): Promise<AutoRefineReview> {
 	const conversationText = boundTrajectoryForPrompt(serializeConversation(convertToLlm(messages)), 40_000);
 	const trigger = `${context.reason}; ${context.turnsSinceLastReview} assistant turns since last auto-refine review`;
@@ -1023,13 +1065,28 @@ ${serializePromptData(conversationText)}
 	// Auto-refine review requires parseable JSON. Keep it non-reasoning so
 	// reasoning-capable models use final text budget for the JSON object.
 	void thinkingLevel;
-	const response = await completeSimple(
-		model,
-		{
-			systemPrompt: AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
-			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
-		},
-		{ maxTokens: autoRefineReviewMaxOutputTokens(model), signal, apiKey, headers },
+	const response = await completeWithProviderRetry(
+		() =>
+			completeSimple(
+				model,
+				{
+					systemPrompt: AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
+					messages: [
+						{
+							role: "user",
+							content: [{ type: "text", text: userPrompt }],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				{
+					maxTokens: autoRefineReviewMaxOutputTokens(model),
+					signal,
+					apiKey,
+					headers,
+				},
+			),
+		{ policy: retry, signal },
 	);
 	if (response.stopReason === "error") {
 		throw new Error(`Auto-refine review failed: ${response.errorMessage || "Unknown error"}`);

@@ -402,7 +402,10 @@ export class IpythonKernelProvisioner {
 		if (!pending) return;
 		try {
 			const m = await pending;
-			await m.shutdown({ snapshot: this.disposeSnapshot, drainHostRequests: true });
+			await m.shutdown({
+				snapshot: this.disposeSnapshot,
+				drainHostRequests: true,
+			});
 		} catch {
 			// a failed startup already cleaned up after itself
 		}
@@ -444,13 +447,12 @@ export class IpythonKernelProvisioner {
 		if (signal?.aborted) {
 			return Promise.reject(createAbortError());
 		}
-		// A kernel that died unexpectedly is replaced by the next call: drop the
-		// dead cache entry so the memoized startup below launches exactly one
-		// fresh kernel (concurrent callers join it), which restores the last
-		// persisted snapshot. dispose()/kill() cleared the flag on the manager,
-		// so an explicitly torn-down kernel is never resurrected here.
-		const dead = this.startedManager;
-		if (dead && !dead.isRunning) {
+		// Only a terminally dead kernel drops the memo; a repairing manager (idle/starting) recovers itself.
+		const startedManager = this.startedManager;
+		const legacyUnexpectedExit = (
+			startedManager as (ReplKernelManager & { exitedUnexpectedly?: boolean }) | undefined
+		)?.exitedUnexpectedly;
+		if (startedManager && (startedManager.isDefunct || legacyUnexpectedExit === true)) {
 			this.managerPromise = undefined;
 			this.startedManager = undefined;
 		}
@@ -461,7 +463,9 @@ export class IpythonKernelProvisioner {
 				this.startupListeners.delete(onProgress);
 				signal?.removeEventListener("abort", cleanupProgressListener!);
 			};
-			signal?.addEventListener("abort", cleanupProgressListener, { once: true });
+			signal?.addEventListener("abort", cleanupProgressListener, {
+				once: true,
+			});
 			// Joining an in-flight startup: replay the current stage.
 			if (this.managerPromise && this.lastStartupMessage) {
 				onProgress(this.lastStartupMessage);
@@ -549,7 +553,10 @@ export class IpythonKernelProvisioner {
 				pythonSkills: this.options?.pythonSkills,
 				// Only persistent sessions (which have an artifact dir) get a revivable snapshot.
 				snapshot: snapshotDir
-					? { path: snapshotPathIn(snapshotDir), manifestPath: manifestPathIn(snapshotDir) }
+					? {
+							path: snapshotPathIn(snapshotDir),
+							manifestPath: manifestPathIn(snapshotDir),
+						}
 					: undefined,
 				stderrLogPath: snapshotDir ? join(snapshotDir, "kernel-stderr.log") : undefined,
 				bootstrapCode,

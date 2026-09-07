@@ -39,6 +39,7 @@ import { parseStreamingJson } from "../utils/json-parse.js";
 import { getOpenCodeSessionHeaders } from "../utils/opencode-headers.js";
 import { getOpenRouterHeaders } from "../utils/openrouter-headers.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
+import { recordStreamFailure } from "../utils/stream-failure.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { streamSimpleOpenAIResponses } from "./openai-responses.js";
@@ -206,7 +207,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 	options?: OpenAICompletionsOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
-	const maxRetryDelayMs = options?.maxRetryDelayMs ?? 60_000;
 
 	(async () => {
 		const output: AssistantMessage = {
@@ -247,7 +247,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				options?.headers,
 				cacheSessionId,
 				compat,
-				maxRetryDelayMs,
 				options?.sessionId,
 			);
 			let params = buildParams(model, context, options, compat, cacheRetention, cacheControl);
@@ -271,7 +270,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
-				...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
 			};
 			const { data: openaiStream, response } = await client.chat.completions
 				.create(params, requestOptions)
@@ -630,10 +628,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				delete (block as { streamIndex?: number }).streamIndex;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(error, maxRetryDelayMs);
+			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
 			// Some providers via OpenRouter give additional information in this field.
 			const rawMetadata = (error as any)?.error?.metadata?.raw;
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
+			recordStreamFailure(model, output, error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -763,54 +762,6 @@ function isOpenRouterResponsesTransportFailure(message: AssistantMessage): boole
 	);
 }
 
-const requestedRetryDelayHeader = "x-prime-requested-retry-delay-ms";
-
-function retryDelayMs(headers: Headers): number | undefined {
-	const retryAfterMilliseconds = headers.get("retry-after-ms")?.trim();
-	if (retryAfterMilliseconds) {
-		const milliseconds = Number(retryAfterMilliseconds);
-		if (Number.isFinite(milliseconds) && milliseconds >= 0) return milliseconds;
-	}
-
-	const retryAfter = headers.get("retry-after")?.trim();
-	if (!retryAfter) return undefined;
-	const seconds = Number(retryAfter);
-	if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
-	const date = Date.parse(retryAfter);
-	if (Number.isNaN(date)) return undefined;
-	return Math.max(0, date - Date.now());
-}
-
-function retryDelayCappedFetch(maxRetryDelayMs: number): typeof fetch {
-	const providerFetch = globalThis.fetch;
-	return async (input, init) => {
-		const response = await providerFetch(input, init);
-		const requestedDelayMs = retryDelayMs(response.headers);
-		if (requestedDelayMs === undefined || requestedDelayMs <= maxRetryDelayMs) return response;
-
-		const headers = new Headers(response.headers);
-		headers.set("x-should-retry", "false");
-		headers.set(requestedRetryDelayHeader, String(Math.ceil(requestedDelayMs)));
-		return new Response(response.body, {
-			status: response.status,
-			statusText: response.statusText,
-			headers,
-		});
-	};
-}
-
-function formatProviderError(error: unknown, maxRetryDelayMs: number): string {
-	const message = error instanceof Error ? error.message : JSON.stringify(error);
-	if (!(error instanceof Object) || !("headers" in error)) return message;
-	const headers = error.headers;
-	if (!(headers instanceof Headers)) return message;
-	const requestedDelay = headers.get(requestedRetryDelayHeader);
-	if (requestedDelay === null) return message;
-	const requestedDelayMs = Number(requestedDelay);
-	if (!Number.isFinite(requestedDelayMs)) return message;
-	return `${message}\nProvider requested a ${requestedDelayMs}ms retry delay, above the ${maxRetryDelayMs}ms maximum.`;
-}
-
 function createClient(
 	model: Model<"openai-completions">,
 	context: Context,
@@ -818,7 +769,6 @@ function createClient(
 	optionsHeaders?: Record<string, string>,
 	sessionId?: string,
 	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
-	maxRetryDelayMs?: number,
 	conversationId?: string,
 ) {
 	if (!apiKey) {
@@ -875,9 +825,7 @@ function createClient(
 		baseURL: isCloudflareProvider(model.provider) ? resolveCloudflareBaseUrl(model) : model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		defaultHeaders,
-		...(maxRetryDelayMs !== undefined && maxRetryDelayMs > 0
-			? { fetch: retryDelayCappedFetch(maxRetryDelayMs) }
-			: {}),
+		maxRetries: 0,
 	});
 }
 

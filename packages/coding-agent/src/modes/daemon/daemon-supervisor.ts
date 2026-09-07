@@ -1,15 +1,6 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import {
-	chmodSync,
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	renameSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -67,7 +58,13 @@ import {
 } from "../../core/session-manager.js";
 import { looksLikeSessionPath } from "../../core/session-resolver.js";
 import { SettingsManager } from "../../core/settings-manager.js";
-import { isProcessAlive, processIdExists, signalProcessGroupOrProcess } from "../../utils/child-process.js";
+import { writeFileAtomicSync } from "../../utils/atomic-file.js";
+import {
+	isProcessAlive,
+	processIdExists,
+	signalProcessGroupOrProcess,
+	spawnHidden,
+} from "../../utils/child-process.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
@@ -85,7 +82,7 @@ import {
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
-import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
+import { DaemonSessionRecoveringError, deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
@@ -186,7 +183,18 @@ type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : n
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 
 const structuredLog = getLogger("coding-agent.daemon-supervisor");
-const WORKER_CONNECT_TIMEOUT_MS = 30_000;
+// Windows antivirus scanning can delay worker startup beyond 30 seconds.
+const WORKER_CONNECT_TIMEOUT_MS = process.platform === "win32" ? 90_000 : 30_000;
+const WORKER_CONNECT_PROBE_MS = process.platform === "win32" ? 2_000 : 500;
+const WORKER_PROBE_BACKOFF_MIN_MS = 25;
+const WORKER_PROBE_BACKOFF_MAX_MS = process.platform === "win32" ? 2_000 : 25;
+
+/** Per-attempt handshake waits consume the remaining outer connect budget; a smaller fixed clock makes a consistently slow (win32) handshake fail every retry. */
+export function handshakeBudgetMs(deadline: number, now = Date.now()): number {
+	const remaining = deadline - now;
+	if (remaining <= 0) throw new DaemonWorkerProbeTimeoutError("Worker connection deadline elapsed");
+	return remaining;
+}
 const ROSTER_WATCHDOG_INTERVAL_MS = 15_000;
 const ROSTER_STALE_AFTER_MS = 3 * ROSTER_HEARTBEAT_INTERVAL_MS;
 const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
@@ -214,7 +222,8 @@ const STALE_RECLAIM_WAIT_MS = 10_000;
 // Polling loops probe existence cheaply via kill(0); the ps-backed zombie and
 // identity checks are throttled so a wedged worker cannot saturate the
 // supervisor event loop with synchronous subprocess spawns.
-const LIVENESS_IDENTITY_RECHECK_MS = 500;
+// Windows identity lookups launch PowerShell, so recheck less often there.
+const LIVENESS_IDENTITY_RECHECK_MS = process.platform === "win32" ? 3_000 : 500;
 const OWNED_WORKER_DISCONNECT_GRACE_MS = 30_000;
 const IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS = 5 * 60_000;
 const IDLE_EVICTION_MIN_SWEEP_INTERVAL_MS = 60_000;
@@ -547,7 +556,11 @@ function isSessionSummary(value: unknown): value is SessionSummary {
 	if (!value || typeof value !== "object") {
 		return false;
 	}
-	const candidate = value as { id?: unknown; sessionId?: unknown; cwd?: unknown };
+	const candidate = value as {
+		id?: unknown;
+		sessionId?: unknown;
+		cwd?: unknown;
+	};
 	return (
 		typeof candidate.id === "string" && typeof candidate.sessionId === "string" && typeof candidate.cwd === "string"
 	);
@@ -985,7 +998,11 @@ export class DaemonSupervisor {
 			}
 			return current.path;
 		};
-		const results: Array<{ rootSessionFile: string; job: AgentCronJob; info: SessionInfo }> = [];
+		const results: Array<{
+			rootSessionFile: string;
+			job: AgentCronJob;
+			info: SessionInfo;
+		}> = [];
 		for (const [artifactSessionId, store] of storeBySessionId) {
 			let jobs: AgentCronJob[];
 			try {
@@ -1054,7 +1071,10 @@ export class DaemonSupervisor {
 			for (const [rootKey, sessionPath] of due) {
 				if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
 				try {
-					await this.createOrReuseWorker(SCHEDULED_WAKE_CLIENT_ID, { type: "create", sessionPath });
+					await this.createOrReuseWorker(SCHEDULED_WAKE_CLIENT_ID, {
+						type: "create",
+						sessionPath,
+					});
 					this.scheduledWakeFailures.delete(rootKey);
 					this.log(`Woke session worker for a due scheduled job: ${sessionPath}`);
 				} catch (error) {
@@ -1381,8 +1401,14 @@ export class DaemonSupervisor {
 	}
 
 	/** Trees whose ephemeral-stop cancel failed stay owned until a retry lands: tombstoned client-owned descriptors with no resident worker. */
-	private collectEphemeralCancelIntents(): Array<{ descriptor: DaemonWorkerDescriptor; descriptorPath: string }> {
-		const intents: Array<{ descriptor: DaemonWorkerDescriptor; descriptorPath: string }> = [];
+	private collectEphemeralCancelIntents(): Array<{
+		descriptor: DaemonWorkerDescriptor;
+		descriptorPath: string;
+	}> {
+		const intents: Array<{
+			descriptor: DaemonWorkerDescriptor;
+			descriptorPath: string;
+		}> = [];
 		let names: string[];
 		try {
 			names = readdirSync(this.descriptorDir);
@@ -1433,10 +1459,7 @@ export class DaemonSupervisor {
 			socketPath: this.socketPath,
 			defaultSessionConfig: durableAgentSessionRuntimeConfig(this.defaultSessionConfig),
 		};
-		const tempPath = `${this.supervisorConfigPath}.${process.pid}.tmp`;
-		writeFileSync(tempPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
-		chmodSync(tempPath, 0o600);
-		renameSync(tempPath, this.supervisorConfigPath);
+		writeFileAtomicSync(this.supervisorConfigPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
 	}
 
 	private hasPersistedWorkerDescriptors(): boolean {
@@ -1448,10 +1471,7 @@ export class DaemonSupervisor {
 	private persistWorker(worker: ResidentWorker): void {
 		worker.descriptor.updatedAt = new Date().toISOString();
 		const persisted = durableDaemonWorkerDescriptor(worker.descriptor);
-		const tempPath = `${worker.descriptorPath}.${process.pid}.tmp`;
-		writeFileSync(tempPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
-		chmodSync(tempPath, 0o600);
-		renameSync(tempPath, worker.descriptorPath);
+		writeFileAtomicSync(worker.descriptorPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
 	}
 
 	private deleteWorkerDescriptor(worker: { descriptorPath: string; descriptor: DaemonWorkerDescriptor }): void {
@@ -1536,7 +1556,11 @@ export class DaemonSupervisor {
 			if (client.rosterResyncPending && client.rosterSubscribed === true) {
 				// socket.write queues even when it reports backpressure: one resync per loss gap.
 				client.rosterResyncPending = false;
-				this.write(client, { type: "roster_update", changed: this.rosterEntriesForClient(), resync: true });
+				this.write(client, {
+					type: "roster_update",
+					changed: this.rosterEntriesForClient(),
+					resync: true,
+				});
 			}
 			if (!client.snapshotStreaming) {
 				void this.catchUpClient(client).catch((error) =>
@@ -1941,16 +1965,26 @@ export class DaemonSupervisor {
 			case "cancel_prompt_admission": {
 				const admission =
 					cancellationAdmission ?? this.getPromptAdmission(client, command.activeSessionId, command.admissionId);
-				if (!admission) return success(command.id, command.type, { status: "unknown" as const });
-				if (admission.status === "owned") return success(command.id, command.type, { status: "owned" as const });
+				if (!admission)
+					return success(command.id, command.type, {
+						status: "unknown" as const,
+					});
+				if (admission.status === "owned")
+					return success(command.id, command.type, {
+						status: "owned" as const,
+					});
 				// A definitive cancellation never downgrades to unknown/waiting.
 				if (admission.status === "cancelled") {
-					return success(command.id, command.type, { status: "cancelled" as const });
+					return success(command.id, command.type, {
+						status: "cancelled" as const,
+					});
 				}
 				if (!admission.worker || !admission.workerActiveSessionId) {
 					admission.status = "cancelled";
 					admission.controller.abort();
-					return success(command.id, command.type, { status: "cancelled" as const });
+					return success(command.id, command.type, {
+						status: "cancelled" as const,
+					});
 				}
 				const response = await this.forwardToWorker(admission.worker, {
 					...command,
@@ -1975,7 +2009,9 @@ export class DaemonSupervisor {
 				return this.handleList(client, command);
 			case "roster_subscribe":
 				client.rosterSubscribed = true;
-				return success(command.id, command.type, { roster: this.rosterEntriesForClient() });
+				return success(command.id, command.type, {
+					roster: this.rosterEntriesForClient(),
+				});
 			case "roster_unsubscribe":
 				client.rosterSubscribed = false;
 				client.rosterResyncPending = false;
@@ -2022,7 +2058,11 @@ export class DaemonSupervisor {
 					const response = await this.forwardToWorker(worker, withoutSupervisorCreateFields(command));
 					if (response.success && isSessionSummary(response.data)) {
 						this.writeRosterEntry(workerRosterEntryFromSummary(response.data), worker);
-						return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
+						return {
+							...response,
+							id: command.id,
+							data: this.publicSummary(worker, response.data),
+						};
 					}
 					return responseWithId(response, command.id);
 				}
@@ -2144,7 +2184,9 @@ export class DaemonSupervisor {
 						!entry.releaseTask,
 				);
 				if (existing) {
-					return success(command.id, command.type, { pauseId: existing.pauseId });
+					return success(command.id, command.type, {
+						pauseId: existing.pauseId,
+					});
 				}
 				const response = await this.forwardToWorker(match.worker, {
 					...command,
@@ -2248,14 +2290,7 @@ export class DaemonSupervisor {
 				if ((this.workerStopCounts?.get(worker) ?? 0) > 0) {
 					throw new Error("Session worker is stopping; retry after it finishes");
 				}
-				worker.intentionalStop = false;
-				worker.descriptor.stopRequestedAt = undefined;
-				worker.descriptor.archiveOnStop = undefined;
-				worker.descriptor.lifecycle = "recovering";
-				worker.descriptor.consecutiveFailures = 0;
-				worker.deferredRecoveryRounds = 0;
-				this.persistWorker(worker);
-				await this.recoverWorker(worker);
+				await this.retryWorkerRecovery(worker);
 				if (this.workers.get(worker.descriptor.workerId)?.descriptor.lifecycle !== "ready") {
 					throw new Error(worker.descriptor.lastError ?? "Session worker recovery failed");
 				}
@@ -2279,7 +2314,10 @@ export class DaemonSupervisor {
 				}
 				const first = [...this.workers.values()].find((worker) => this.isLiveWorker(worker) && worker.client);
 				if (!first) {
-					return success(command.id, command.type, { paused: false, limits: {} });
+					return success(command.id, command.type, {
+						paused: false,
+						limits: {},
+					});
 				}
 				return this.forwardToWorker(first, command);
 			}
@@ -2326,7 +2364,9 @@ export class DaemonSupervisor {
 				for (const { job } of await this.collectPassiveScheduledJobs(command.includeInactive === true)) {
 					if (!jobs.has(job.id)) jobs.set(job.id, job);
 				}
-				return success(command.id, "cron_list", { jobs: sortCronJobs([...jobs.values()]) });
+				return success(command.id, "cron_list", {
+					jobs: sortCronJobs([...jobs.values()]),
+				});
 			}
 			case "heartbeats_list": {
 				if (command.activeSessionId) {
@@ -2337,33 +2377,36 @@ export class DaemonSupervisor {
 					(worker) => this.isLiveWorker(worker) && worker.descriptor.lifecycle !== "failed",
 				);
 				const heartbeats = new Map<string, AgentConnectionHeartbeat>();
-				const snapshots: Array<{ heartbeats?: AgentConnectionHeartbeat[]; response?: DaemonResponse }> =
-					await Promise.all(
-						workers.map(async (worker) => {
-							if (worker.client && worker.descriptor.lifecycle === "ready") {
-								const response = await this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
-									failure(command.id, command.type, error, serializeDaemonError(error)),
-								);
-								if (response.success) {
-									const snapshot = heartbeatsFromResponse(response);
-									worker.heartbeatSnapshot = snapshot;
-									worker.heartbeatSnapshotStale = false;
-									return { heartbeats: snapshot };
-								}
-								this.log(`Could not list heartbeats from a worker: ${response.error}`);
-								if (worker.heartbeatSnapshot === undefined || worker.heartbeatSnapshotStale === true) {
-									return { response };
-								}
+				const snapshots: Array<{
+					heartbeats?: AgentConnectionHeartbeat[];
+					response?: DaemonResponse;
+				}> = await Promise.all(
+					workers.map(async (worker) => {
+						if (worker.client && worker.descriptor.lifecycle === "ready") {
+							const response = await this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
+								failure(command.id, command.type, error, serializeDaemonError(error)),
+							);
+							if (response.success) {
+								const snapshot = heartbeatsFromResponse(response);
+								worker.heartbeatSnapshot = snapshot;
+								worker.heartbeatSnapshotStale = false;
+								return { heartbeats: snapshot };
 							}
-							if (worker.heartbeatSnapshot !== undefined && worker.heartbeatSnapshotStale !== true) {
-								return { heartbeats: worker.heartbeatSnapshot };
+							this.log(`Could not list heartbeats from a worker: ${response.error}`);
+							if (worker.heartbeatSnapshot === undefined || worker.heartbeatSnapshotStale === true) {
+								return { response };
 							}
-							const state =
-								worker.descriptor.lifecycle === "ready" ? "disconnected" : worker.descriptor.lifecycle;
-							const error = new Error(`Cannot list heartbeats while session worker is ${state}`);
-							return { response: failure(command.id, command.type, error, serializeDaemonError(error)) };
-						}),
-					);
+						}
+						if (worker.heartbeatSnapshot !== undefined && worker.heartbeatSnapshotStale !== true) {
+							return { heartbeats: worker.heartbeatSnapshot };
+						}
+						const state = worker.descriptor.lifecycle === "ready" ? "disconnected" : worker.descriptor.lifecycle;
+						const error = new Error(`Cannot list heartbeats while session worker is ${state}`);
+						return {
+							response: failure(command.id, command.type, error, serializeDaemonError(error)),
+						};
+					}),
+				);
 				const failed = snapshots.find((snapshot) => snapshot.response)?.response;
 				if (failed) {
 					return failed;
@@ -2382,7 +2425,9 @@ export class DaemonSupervisor {
 						...(info.firstMessage !== undefined ? { firstMessage: info.firstMessage } : {}),
 					});
 				}
-				return success(command.id, "heartbeats_list", { heartbeats: [...heartbeats.values()] });
+				return success(command.id, "heartbeats_list", {
+					heartbeats: [...heartbeats.values()],
+				});
 			}
 			case "heartbeat_manage": {
 				const cachedWorker = [...this.workers.values()].find((worker) =>
@@ -2513,7 +2558,10 @@ export class DaemonSupervisor {
 							});
 						const entry = this.roster().bySessionFile(canonicalSessionPath(command.sessionPath));
 						if (entry) {
-							this.writeRosterEntry({ ...entry, summary: { ...entry.summary, sessionName: target.name } });
+							this.writeRosterEntry({
+								...entry,
+								summary: { ...entry.summary, sessionName: target.name },
+							});
 						}
 						return success(command.id, command.type);
 					}
@@ -2641,7 +2689,10 @@ export class DaemonSupervisor {
 				);
 				return { ...response, id: command.id, command: command.type };
 			}
-			return this.forwardToWorker(target.worker, { ...command, targetActiveSessionId });
+			return this.forwardToWorker(target.worker, {
+				...command,
+				targetActiveSessionId,
+			});
 		}
 
 		if (!("activeSessionId" in command) || typeof command.activeSessionId !== "string") {
@@ -2909,7 +2960,9 @@ export class DaemonSupervisor {
 		const catalogCwd = command.scope === "current" ? cwd : undefined;
 		const roots = await this.catalog.list(catalogCwd, sessionDir, callbacks);
 		const saved = await this.mergeSavedSessionsWithRlmFamily(roots, catalogCwd, sessionDir);
-		return success(command.id, "list_saved_sessions", { sessions: saved.map(serializeSavedSessionInfo) });
+		return success(command.id, "list_saved_sessions", {
+			sessions: saved.map(serializeSavedSessionInfo),
+		});
 	}
 
 	private async createOrReuseWorker(clientId: string, command: DaemonCreateCommand): Promise<ResidentWorker> {
@@ -2995,13 +3048,15 @@ export class DaemonSupervisor {
 		ownerClientId: string | undefined,
 		sessionPath: string,
 	): Promise<ResidentWorker> {
-		if (worker.descriptor.lifecycle === "failed") {
+		if (worker.descriptor.lifecycle === "failed" && !this.canRetryFailedWorker(worker)) {
 			throw new Error(
 				`Session "${sessionPath}" is registered to a failed worker that could not be safely reclaimed`,
 			);
 		}
 		this.assertWorkerCreateOwner(worker, ownerClientId, sessionPath);
-		if (!this.isWorkerReadyForCreate(worker)) {
+		if (this.canRetryFailedWorker(worker)) {
+			await this.retryWorkerRecovery(worker);
+		} else if (!this.isWorkerReadyForCreate(worker)) {
 			if (worker.recovery) {
 				await worker.recovery;
 			} else if (this.isWorkerRecoveryEligible(worker)) {
@@ -3265,7 +3320,7 @@ export class DaemonSupervisor {
 		});
 		delete workerEnvironment.RLM_DEPTH;
 		await this.assertRecoveryAllowed();
-		const child: ChildProcess = spawn(launch.command, launch.args, {
+		const child: ChildProcess = spawnHidden(launch.command, launch.args, {
 			cwd: createCommand.config?.cwd ?? process.cwd(),
 			detached: true,
 			env: workerEnvironment,
@@ -3485,12 +3540,13 @@ export class DaemonSupervisor {
 	private async connectWorker(worker: ResidentWorker, timeoutMs: number): Promise<DaemonWorkerClient> {
 		const deadline = Date.now() + timeoutMs;
 		let lastError: unknown;
+		let backoffMs = WORKER_PROBE_BACKOFF_MIN_MS;
 		while (Date.now() < deadline) {
 			await this.assertRecoveryAllowed();
 			const client = new DaemonWorkerClient(worker.descriptor.socketPath);
 			try {
-				await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
-				await client.waitForHello(1000);
+				await client.connect(Math.min(WORKER_CONNECT_PROBE_MS, handshakeBudgetMs(deadline)));
+				await client.waitForHello(handshakeBudgetMs(deadline));
 				// Record the worker's advertised schema revision so compatibility gates
 				// (e.g. stable mailbox identity on worker_deliver_message) can trust it.
 				worker.schemaRevision = client.hello?.schemaRevision;
@@ -3507,7 +3563,7 @@ export class DaemonSupervisor {
 								? { workerInstanceId: worker.descriptor.workerInstanceId }
 								: {}),
 						},
-						1000,
+						handshakeBudgetMs(deadline),
 					);
 					await this.assertRecoveryAllowed();
 					if (!workerAuthAdvertisesRoster(authResponse.data)) {
@@ -3531,7 +3587,10 @@ export class DaemonSupervisor {
 				) {
 					throw error;
 				}
-				await delay(25);
+				const remaining = deadline - Date.now();
+				if (remaining <= 0) break;
+				await delay(Math.min(backoffMs, remaining));
+				backoffMs = Math.min(backoffMs * 2, WORKER_PROBE_BACKOFF_MAX_MS);
 			}
 		}
 		throw new DaemonWorkerProbeTimeoutError(`Timed out connecting to daemon session worker: ${String(lastError)}`);
@@ -3593,7 +3652,7 @@ export class DaemonSupervisor {
 				if (worker.descriptor.processStartId === undefined && isProcessAlive(worker.descriptor.pid)) {
 					const observedProcessStartId = getProcessStartId(worker.descriptor.pid);
 					try {
-						await this.connectWorker(worker, 2000);
+						await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
 						if (observedProcessStartId) {
 							worker.descriptor.processStartId = observedProcessStartId;
 							this.persistWorker(worker);
@@ -3620,7 +3679,7 @@ export class DaemonSupervisor {
 				throw new Error("Session worker process is no longer running");
 			}
 			observedProcessStartId = getProcessStartId(worker.descriptor.pid);
-			await this.connectWorker(worker, 2000);
+			await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
 			await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
 			await this.refreshWorkerSummaries(worker, true);
 			if (worker.descriptor.processStartId === undefined && observedProcessStartId) {
@@ -3759,6 +3818,28 @@ export class DaemonSupervisor {
 		return this.isWorkerRecoveryCandidate(worker) && worker.recovery === undefined;
 	}
 
+	/** Failed is not terminal for an identity-verified live worker: any touch retries recovery, like manual retry_worker. */
+	private canRetryFailedWorker(worker: ResidentWorker): boolean {
+		return (
+			worker.descriptor.lifecycle === "failed" &&
+			(this.workerStopCounts?.get(worker) ?? 0) === 0 &&
+			// A user-stopped worker stays stopped; only an explicit retry_worker clears the persisted stop markers.
+			!this.isWorkerStopping(worker) &&
+			this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId) === "current"
+		);
+	}
+
+	private async retryWorkerRecovery(worker: ResidentWorker): Promise<void> {
+		worker.intentionalStop = false;
+		worker.descriptor.stopRequestedAt = undefined;
+		worker.descriptor.archiveOnStop = undefined;
+		worker.descriptor.lifecycle = "recovering";
+		worker.descriptor.consecutiveFailures = 0;
+		worker.deferredRecoveryRounds = 0;
+		this.persistWorker(worker);
+		await this.recoverWorker(worker);
+	}
+
 	private isWorkerRecoveryCandidate(worker: ResidentWorker): boolean {
 		return (
 			!this.shuttingDown &&
@@ -3774,7 +3855,8 @@ export class DaemonSupervisor {
 			return;
 		}
 		// A live-but-silent worker must not probe forever: park it failed (user-visible through the
-		// roster's failed status) and keep its process alive for a manual retry_worker.
+		// roster's failed status) and keep its process alive. The park is not terminal: retry_worker,
+		// attach, and create all retry recovery while the process identity stays current.
 		worker.deferredRecoveryRounds = (worker.deferredRecoveryRounds ?? 0) + 1;
 		if (worker.deferredRecoveryRounds > MAX_DEFERRED_RECOVERY_ROUNDS) {
 			worker.descriptor.lifecycle = "failed";
@@ -3866,6 +3948,33 @@ export class DaemonSupervisor {
 				this.handleWorkerClose(worker, client, error);
 				client.close();
 			}
+		}
+	}
+
+	/** Settle a transfer anomaly with the transfer as the blast radius: the worker channel stays up and clients resync fresh. */
+	private failSnapshotTransfer(
+		worker: ResidentWorker,
+		activeSessionId: string,
+		snapshotId: string,
+		error: Error,
+		snapshotPurpose: Extract<DaemonWorkerFrameHeader, { kind: "outbound" }>["snapshotPurpose"],
+	): void {
+		const published = worker.transcriptCaches.get(activeSessionId)?.snapshotId === snapshotId;
+		this.failWorkerSnapshotCache(worker, activeSessionId, error, false, snapshotId);
+		// The published-cache drop drives the resync, not the frame's purpose: a published transfer
+		// can be serving any client's catch-up wait, whose queue entry drainClientCatchups already cleared.
+		if (published) {
+			this.queueSnapshotResync(activeSessionId, snapshotPurpose === "replacement" ? "replacement" : "catchup");
+		}
+	}
+
+	private queueSnapshotResync(activeSessionId: string, snapshotPurpose: "replacement" | "catchup"): void {
+		for (const client of this.clients) {
+			if (!client.attachedActiveSessionIds.has(activeSessionId)) continue;
+			this.queueCatchup(client, activeSessionId, snapshotPurpose === "replacement" ? "replacement" : "resync");
+			void this.catchUpClient(client).catch((error) =>
+				this.log(`Failed to catch up client ${client.id}: ${String(error)}`),
+			);
 		}
 	}
 
@@ -4032,7 +4141,7 @@ export class DaemonSupervisor {
 						(identityNow === "unknown" && worker.descriptor.processStartId === undefined);
 					if (identityCompatible) {
 						try {
-							await this.connectWorker(worker, 1500);
+							await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
 							await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
 							await this.refreshWorkerSummaries(worker, true);
 							if (this.isWorkerRecoveryCancelled(worker)) {
@@ -4178,7 +4287,11 @@ export class DaemonSupervisor {
 			const key = `${record.activeSessionId}\0${sessionFile}`;
 			let interrupted = interruptedSessions.get(key);
 			if (!interrupted) {
-				interrupted = { activeSessionId: record.activeSessionId, sessionFile, operations: new Set() };
+				interrupted = {
+					activeSessionId: record.activeSessionId,
+					sessionFile,
+					operations: new Set(),
+				};
 				interruptedSessions.set(key, interrupted);
 			}
 			interrupted.operations.add(record.operation);
@@ -4384,7 +4497,12 @@ export class DaemonSupervisor {
 	}
 
 	private async withSessionNameReservation<T>(
-		input: { name: string; depth: number; parentSessionId?: string; parentSessionPath?: string },
+		input: {
+			name: string;
+			depth: number;
+			parentSessionId?: string;
+			parentSessionPath?: string;
+		},
 		action: () => Promise<T>,
 	): Promise<T> {
 		const key = sessionNameReservationKey(input);
@@ -4809,7 +4927,12 @@ export class DaemonSupervisor {
 	private async savedSessionNameReservationInput(
 		sessionPath: string,
 		name: string,
-	): Promise<{ name: string; depth: number; parentSessionId?: string; parentSessionPath?: string }> {
+	): Promise<{
+		name: string;
+		depth: number;
+		parentSessionId?: string;
+		parentSessionPath?: string;
+	}> {
 		const targetPath = canonicalSessionPath(sessionPath);
 		const active = this.workerOwnedRosterSummaryForPath(targetPath);
 		if (active) return this.summaryNameReservationInput(active, name);
@@ -4826,7 +4949,12 @@ export class DaemonSupervisor {
 	private summaryNameReservationInput(
 		target: Pick<SessionSummary, "rlmDepth" | "parentSessionId" | "parentSessionPath">,
 		name: string,
-	): { name: string; depth: number; parentSessionId?: string; parentSessionPath?: string } {
+	): {
+		name: string;
+		depth: number;
+		parentSessionId?: string;
+		parentSessionPath?: string;
+	} {
 		const depth = target.rlmDepth ?? (target.parentSessionPath ? 1 : 0);
 		return {
 			name,
@@ -4862,7 +4990,9 @@ export class DaemonSupervisor {
 					depth: setDepth,
 					status: ledgerRow?.status ?? classifySessionRosterStatus(summary),
 					...(summary.parentSessionPath
-						? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) }
+						? {
+								parentSessionPath: canonicalSessionPath(summary.parentSessionPath),
+							}
 						: {}),
 				};
 			}),
@@ -5083,6 +5213,31 @@ export class DaemonSupervisor {
 		if (matches.length > 1) {
 			throw new Error(`Ambiguous active session "${selector}"`);
 		}
+		// Descriptors are the durable half of addressability: an unhydrated root is recovering, not unknown;
+		// failed workers stay unknown so clients take the create fallback, which reclaims or retries them.
+		const recoveringRoots = (matchesSelector: (worker: ResidentWorker) => boolean) =>
+			[...this.workers.values()].filter(
+				(worker) =>
+					matchesSelector(worker) &&
+					(!includeWorker || includeWorker(worker)) &&
+					worker.descriptor.lifecycle !== "failed" &&
+					this.isWorkerRecoveryCandidate(worker),
+			);
+		// matchWorkers' addressing rule: exact ids first, unambiguous hex suffixes second.
+		const exactRecovering = recoveringRoots(
+			(worker) => worker.descriptor.rootActiveSessionId === selector || worker.descriptor.rootSessionId === selector,
+		);
+		const recoveringMatches =
+			exactRecovering.length > 0
+				? exactRecovering
+				: recoveringRoots(
+						(worker) =>
+							matchesSessionIdSuffix(worker.descriptor.rootActiveSessionId, selector) ||
+							matchesSessionIdSuffix(worker.descriptor.rootSessionId ?? "", selector),
+					);
+		if (recoveringMatches.length === 1) {
+			throw new DaemonSessionRecoveringError(recoveringMatches[0]!.descriptor.rootActiveSessionId);
+		}
 		throw new Error(`Unknown active session: ${selector}`);
 	}
 
@@ -5207,14 +5362,30 @@ export class DaemonSupervisor {
 		command: DaemonCommand,
 		timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
 	): Promise<DaemonResponse> {
+		// Every forwarded command is a touch: a cached failed roster row must not outrank
+		// the descriptor truth that the worker is recoverable (--attach-agent's get_state preflight lands here).
+		if (this.canRetryFailedWorker(worker)) {
+			await this.retryWorkerRecovery(worker);
+		} else if (worker.recovery) {
+			// Join a concurrent touch's in-flight recovery instead of throwing mid-ladder.
+			await worker.recovery;
+		}
 		const client = this.requireAvailableWorkerClient(worker, command.type === "kill");
 		const response = await client.request(withoutCommandId(command), timeoutMs);
 		if (command.type === "get_state" && response.success && isSessionSummary(response.data)) {
-			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
+			return {
+				...response,
+				id: command.id,
+				data: this.publicSummary(worker, response.data),
+			};
 		}
 		if (command.type === "rename" && response.success && isSessionSummary(response.data)) {
 			this.writeRosterEntry(workerRosterEntryFromSummary(response.data), worker);
-			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
+			return {
+				...response,
+				id: command.id,
+				data: this.publicSummary(worker, response.data),
+			};
 		}
 		return responseWithId(response, command.id);
 	}
@@ -5223,46 +5394,47 @@ export class DaemonSupervisor {
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "attach" }>,
 	): Promise<WorkerAttachData> {
-		const ownedWorker = [...this.workers.values()].find(
+		const descriptorWorker = [...this.workers.values()].find(
 			(worker) =>
-				worker.descriptor.ownerClientId !== undefined &&
-				(worker.descriptor.rootActiveSessionId === command.activeSessionId ||
-					worker.descriptor.rootSessionId === command.activeSessionId),
+				worker.descriptor.rootActiveSessionId === command.activeSessionId ||
+				worker.descriptor.rootSessionId === command.activeSessionId,
 		);
-		if (ownedWorker) {
-			if (ownedWorker.descriptor.ownerClientId !== this.protocolClientId(client)) {
-				throw new Error(`Unknown active session: ${command.activeSessionId}`);
-			}
-			this.assertTelemetryAttachAllowed(ownedWorker, command.telemetryDisabled);
-			ownedWorker.launchEnv = command.launchEnv ?? ownedWorker.launchEnv;
-			if (!ownedWorker.client || ownedWorker.descriptor.lifecycle !== "ready") {
-				if (command.recoveryConfig) {
-					ownedWorker.transientCreateCommand = {
-						...ownedWorker.descriptor.createCommand,
-						config: {
-							...command.recoveryConfig,
-							...(ownedWorker.descriptor.telemetryDisabled === true ? { telemetryDisabled: true } : {}),
-						},
-						env: command.env,
-						launchEnv: command.launchEnv,
-						lifecycle: "client_owned",
-					};
+		if (descriptorWorker) {
+			// The descriptor lookup is universal; owner-only attach payload stays in the owned branch.
+			if (descriptorWorker.descriptor.ownerClientId !== undefined) {
+				if (descriptorWorker.descriptor.ownerClientId !== this.protocolClientId(client)) {
+					throw new Error(`Unknown active session: ${command.activeSessionId}`);
 				}
-				if (!ownedWorker.launchEnv) {
-					throw new Error("Client-owned session recovery requires the owning client environment");
+				this.assertTelemetryAttachAllowed(descriptorWorker, command.telemetryDisabled);
+				descriptorWorker.launchEnv = command.launchEnv ?? descriptorWorker.launchEnv;
+				if (!descriptorWorker.client || descriptorWorker.descriptor.lifecycle !== "ready") {
+					if (command.recoveryConfig) {
+						descriptorWorker.transientCreateCommand = {
+							...descriptorWorker.descriptor.createCommand,
+							config: {
+								...command.recoveryConfig,
+								...(descriptorWorker.descriptor.telemetryDisabled === true ? { telemetryDisabled: true } : {}),
+							},
+							env: command.env,
+							launchEnv: command.launchEnv,
+							lifecycle: "client_owned",
+						};
+					}
+					if (!descriptorWorker.launchEnv) {
+						throw new Error("Client-owned session recovery requires the owning client environment");
+					}
+					await this.retryWorkerRecovery(descriptorWorker);
 				}
-				ownedWorker.intentionalStop = false;
-				ownedWorker.descriptor.stopRequestedAt = undefined;
-				ownedWorker.descriptor.archiveOnStop = undefined;
-				ownedWorker.descriptor.lifecycle = "recovering";
-				ownedWorker.descriptor.consecutiveFailures = 0;
-				ownedWorker.deferredRecoveryRounds = 0;
-				this.persistWorker(ownedWorker);
-				await this.recoverWorker(ownedWorker);
+			} else if (this.canRetryFailedWorker(descriptorWorker)) {
+				await this.retryWorkerRecovery(descriptorWorker);
 			}
 		}
 		const match = await this.findWorkerForClient(client, command.activeSessionId);
 		this.assertTelemetryAttachAllowed(match.worker, command.telemetryDisabled);
+		if (match.worker !== descriptorWorker && this.canRetryFailedWorker(match.worker)) {
+			// Child-session attaches land here without a descriptor match; one touch runs at most one ladder.
+			await this.retryWorkerRecovery(match.worker);
+		}
 		this.requireAvailableWorkerClient(match.worker);
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
 		const duplicateValidation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
@@ -5408,7 +5580,12 @@ export class DaemonSupervisor {
 			const detachingSessions = this.detachingInputPauseSessions?.get(client);
 			detachingSessions?.delete(command.activeSessionId);
 			detachingSessions?.delete(activeSessionId);
-			return { result: publicResult, worker: match.worker, transcript, releaseTranscript };
+			return {
+				result: publicResult,
+				worker: match.worker,
+				transcript,
+				releaseTranscript,
+			};
 		} catch (error) {
 			releaseTranscript?.();
 			if (previousSessionCapabilities) {
@@ -5702,7 +5879,10 @@ export class DaemonSupervisor {
 			client.catchupActiveSessionIds?.delete(resolvedId);
 			client.catchupPurposes?.delete(resolvedId);
 			client.capabilitiesByActiveSessionId?.delete(resolvedId);
-			this.write(client, { type: "session_detached", activeSessionId: resolvedId });
+			this.write(client, {
+				type: "session_detached",
+				activeSessionId: resolvedId,
+			});
 			void this.syncWorkerClientCapabilities(resolvedId);
 			void this.evictEmptySessionOnLastDetach(resolvedId);
 		}
@@ -5795,12 +5975,12 @@ export class DaemonSupervisor {
 				const generations = this.snapshotGenerationsFor(worker, activeSessionId);
 				let generation = generations.get(begin.snapshotId);
 				if (generation?.incoming) {
-					this.failWorkerSnapshotCache(
+					this.failSnapshotTransfer(
 						worker,
 						activeSessionId,
-						new Error(`Snapshot ${begin.snapshotId} restarted before completion`),
-						true,
 						begin.snapshotId,
+						new Error(`Snapshot ${begin.snapshotId} restarted before completion`),
+						snapshotPurpose,
 					);
 					return;
 				}
@@ -5817,12 +5997,12 @@ export class DaemonSupervisor {
 					generation.result.snapshot.lastEventCursor?.generation === result.snapshot.lastEventCursor?.generation &&
 					generation.result.snapshot.lastEventCursor?.sequence === result.snapshot.lastEventCursor?.sequence;
 				if (generation?.transcript.complete && !duplicate) {
-					this.failWorkerSnapshotCache(
+					this.failSnapshotTransfer(
 						worker,
 						activeSessionId,
-						new Error(`Snapshot ${begin.snapshotId} did not match the cached transfer`),
-						true,
 						begin.snapshotId,
+						new Error(`Snapshot ${begin.snapshotId} did not match the cached transfer`),
+						snapshotPurpose,
 					);
 					return;
 				}
@@ -5931,12 +6111,12 @@ export class DaemonSupervisor {
 						generation.duplicateChunkIndex = duplicateIndex + 1;
 					}
 				} catch (error) {
-					this.failWorkerSnapshotCache(
+					this.failSnapshotTransfer(
 						worker,
 						activeSessionId,
-						error instanceof Error ? error : new Error(String(error)),
-						true,
 						generation.transcript.snapshotId,
+						error instanceof Error ? error : new Error(String(error)),
+						snapshotPurpose,
 					);
 				}
 			}
@@ -5988,12 +6168,12 @@ export class DaemonSupervisor {
 				generation.duplicateChunkIndex = undefined;
 				generation.duplicateResult = undefined;
 			} catch (error) {
-				this.failWorkerSnapshotCache(
+				this.failSnapshotTransfer(
 					worker,
 					activeSessionId,
-					error instanceof Error ? error : new Error(String(error)),
-					true,
 					transcript.snapshotId,
+					error instanceof Error ? error : new Error(String(error)),
+					snapshotPurpose,
 				);
 				return;
 			}
@@ -6003,13 +6183,7 @@ export class DaemonSupervisor {
 				transcript.dispose();
 			}
 			if (published && (snapshotPurpose === "replacement" || snapshotPurpose === "catchup")) {
-				for (const client of this.clients) {
-					if (!client.attachedActiveSessionIds.has(activeSessionId)) continue;
-					this.queueCatchup(client, activeSessionId, snapshotPurpose === "replacement" ? "replacement" : "resync");
-					void this.catchUpClient(client).catch((error) =>
-						this.log(`Failed to catch up client ${client.id}: ${String(error)}`),
-					);
-				}
+				this.queueSnapshotResync(activeSessionId, snapshotPurpose);
 			}
 			return;
 		}
@@ -6035,21 +6209,13 @@ export class DaemonSupervisor {
 				if (!generation) {
 					return;
 				}
-				const published = worker.transcriptCaches.get(activeSessionId) === generation.transcript;
-				this.failWorkerSnapshotCache(worker, activeSessionId, new Error(failed.error), false, failed.snapshotId);
-				if (published && (snapshotPurpose === "replacement" || snapshotPurpose === "catchup")) {
-					for (const client of this.clients) {
-						if (!client.attachedActiveSessionIds.has(activeSessionId)) continue;
-						this.queueCatchup(
-							client,
-							activeSessionId,
-							snapshotPurpose === "replacement" ? "replacement" : "resync",
-						);
-						void this.catchUpClient(client).catch((error) =>
-							this.log(`Failed to catch up client ${client.id}: ${String(error)}`),
-						);
-					}
-				}
+				this.failSnapshotTransfer(
+					worker,
+					activeSessionId,
+					failed.snapshotId,
+					new Error(failed.error),
+					snapshotPurpose,
+				);
 			} catch (error) {
 				this.failWorkerSnapshotCache(
 					worker,
@@ -6510,14 +6676,15 @@ export class DaemonSupervisor {
 		}
 		const path = getDaemonUpdateRestartManifestPath(this.socketPath, agentDir);
 		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-		const tempPath = `${path}.${process.pid}.tmp`;
-		writeFileSync(tempPath, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
-		chmodSync(tempPath, 0o600);
-		const validated = JSON.parse(readFileSync(tempPath, "utf8")) as DaemonUpdateRestartManifest;
-		if (!Array.isArray(validated.sessions) || validated.sessions.length !== manifest.sessions.length) {
-			throw new Error("Could not validate aggregate update manifest");
-		}
-		renameSync(tempPath, path);
+		writeFileAtomicSync(path, `${JSON.stringify(manifest)}\n`, {
+			mode: 0o600,
+			beforeRename: (tempPath) => {
+				const validated = JSON.parse(readFileSync(tempPath, "utf8")) as DaemonUpdateRestartManifest;
+				if (!Array.isArray(validated.sessions) || validated.sessions.length !== manifest.sessions.length) {
+					throw new Error("Could not validate aggregate update manifest");
+				}
+			},
+		});
 	}
 
 	/**
@@ -6692,8 +6859,7 @@ export class DaemonSupervisor {
 			if (directChild) {
 				sigkillSent = directChild.child.kill("SIGKILL");
 			} else if (this.processIdentity(entryPid, entryStartId) === "current") {
-				// Fresh, unthrottled check: the cached verdict may be up to 500ms
-				// old, long enough for the pid to be recycled.
+				// Recheck without the cache: the pid may have been recycled.
 				signalProcessGroupOrProcess(entryPid, "SIGKILL");
 				sigkillSent = true;
 			}
@@ -6806,10 +6972,8 @@ export class DaemonSupervisor {
 				break;
 			}
 			if (!killed && stoppedCanSignal && Date.now() >= sigkillDeadline) {
-				// Fresh, unthrottled identity check right before signalling: the
-				// cached verdict may be up to 500ms old, long enough for the pid
-				// to be recycled by an unrelated process. A transiently
-				// unobservable identity skips this attempt but keeps escalation
+				// Recheck without the cache before signalling a possibly recycled pid.
+				// An unobservable identity skips this attempt but keeps escalation
 				// armed so a wedged worker is still killed on a later pass.
 				const observedNow = processStartId === undefined ? undefined : getProcessStartId(pid);
 				if (processStartId === undefined || observedNow === processStartId) {
@@ -7248,7 +7412,7 @@ export class DaemonSupervisor {
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];
-			const replacement = spawn(launch.command, launch.args, {
+			const replacement = spawnHidden(launch.command, launch.args, {
 				cwd: this.defaultSessionConfig.cwd ?? process.cwd(),
 				detached: true,
 				env: environment,

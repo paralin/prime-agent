@@ -16,6 +16,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "../messages.js";
+import { completeWithProviderRetry, type ProviderRetryPolicy } from "../provider-retry.js";
 import {
 	buildSessionContext,
 	type CompactionEntry,
@@ -420,7 +421,11 @@ export function findCutPoint(
 	const cutPoints = findValidCutPoints(entries, startIndex, endIndex);
 
 	if (cutPoints.length === 0) {
-		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
+		return {
+			firstKeptEntryIndex: startIndex,
+			turnStartIndex: -1,
+			isSplitTurn: false,
+		};
 	}
 	let accumulatedTokens = 0;
 	let cutIndex = cutPoints[0]; // Default: keep from first message (not header)
@@ -431,6 +436,8 @@ export function findCutPoint(
 		const messageTokens = estimateTokens(entry.message);
 		accumulatedTokens += messageTokens;
 		if (accumulatedTokens >= keepRecentTokens) {
+			// No cut point at/after i (trailing tool results): keep only the final turn, not everything.
+			cutIndex = cutPoints[cutPoints.length - 1];
 			for (let c = 0; c < cutPoints.length; c++) {
 				if (cutPoints[c] >= i) {
 					cutIndex = cutPoints[c];
@@ -600,6 +607,7 @@ export async function generateSummary(
 	customInstructions?: string,
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
+	retry?: ProviderRetryPolicy,
 ): Promise<SummarySlice> {
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
@@ -618,10 +626,17 @@ export async function generateSummary(
 			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
 			: { maxTokens, signal, apiKey, headers };
 
-	const response = await completeSimple(
-		model,
-		{ systemPrompt: buildSummarizationPrompt(customInstructions, previousSummary), messages: summarizationMessages },
-		completionOptions,
+	const response = await completeWithProviderRetry(
+		() =>
+			completeSimple(
+				model,
+				{
+					systemPrompt: buildSummarizationPrompt(customInstructions, previousSummary),
+					messages: summarizationMessages,
+				},
+				completionOptions,
+			),
+		{ policy: retry, signal },
 	);
 
 	if (response.stopReason === "error") {
@@ -922,6 +937,7 @@ export async function compact(
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	summaryCall: SummaryCallRunner = (call) => call(headers),
+	retry?: ProviderRetryPolicy,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -955,6 +971,7 @@ export async function compact(
 							customInstructions,
 							previousSummary,
 							thinkingLevel,
+							retry,
 						),
 					)
 				: Promise.resolve<SummarySlice>({ summary: "No prior history." }),
@@ -967,6 +984,7 @@ export async function compact(
 					callHeaders,
 					signal,
 					thinkingLevel,
+					retry,
 				),
 			),
 		]);
@@ -984,6 +1002,7 @@ export async function compact(
 				customInstructions,
 				previousSummary,
 				thinkingLevel,
+				retry,
 			),
 		);
 		slices.push(result);
@@ -1022,6 +1041,7 @@ async function generateTurnPrefixSummary(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	retry?: ProviderRetryPolicy,
 ): Promise<SummarySlice> {
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 	const promptText = buildTurnPrefixRequestText(messages);
@@ -1033,17 +1053,19 @@ async function generateTurnPrefixSummary(
 		},
 	];
 
-	const response = await completeSimple(
-		model,
-		{
-			systemPrompt: `${SUMMARIZATION_SYSTEM_PROMPT}
-
-${TURN_PREFIX_SUMMARIZATION_PROMPT}`,
-			messages: summarizationMessages,
-		},
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers },
+	const response = await completeWithProviderRetry(
+		() =>
+			completeSimple(
+				model,
+				{
+					systemPrompt: `${SUMMARIZATION_SYSTEM_PROMPT}\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`,
+					messages: summarizationMessages,
+				},
+				model.reasoning && thinkingLevel && thinkingLevel !== "off"
+					? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
+					: { maxTokens, signal, apiKey, headers },
+			),
+		{ policy: retry, signal },
 	);
 
 	if (response.stopReason === "error") {

@@ -7,7 +7,7 @@
  * identical wording.
  */
 
-import { spawn } from "node:child_process";
+import { spawnHidden } from "../../utils/child-process.js";
 import { theme } from "../interactive/theme/theme.js";
 
 export interface StartupNotices {
@@ -26,7 +26,7 @@ export async function checkTmuxKeyboardSetup(): Promise<string | undefined> {
 
 	const runTmuxShow = (option: string): Promise<string | undefined> => {
 		return new Promise((resolve) => {
-			const proc = spawn("tmux", ["show", "-gv", option], {
+			const proc = spawnHidden("tmux", ["show", "-gv", option], {
 				stdio: ["ignore", "pipe", "ignore"],
 			});
 			let stdout = "";

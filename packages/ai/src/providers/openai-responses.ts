@@ -124,7 +124,6 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
-				...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
 			};
 			const { data: openaiStream, response } = await client.responses.create(params, requestOptions).withResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -239,6 +238,7 @@ function createClient(
 		baseURL: isCloudflareProvider(model.provider) ? resolveCloudflareBaseUrl(model) : model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		defaultHeaders,
+		maxRetries: 0,
 	});
 }
 
@@ -274,7 +274,8 @@ export function buildParams(model: Model<"openai-responses">, context: Context, 
 		params.temperature = options?.temperature;
 	}
 
-	// GitHub Copilot rejects service_tier with a 400 invalid_request_error.
+	// GitHub Copilot rejects the service_tier FIELD itself (400) for every value.
+	// Elsewhere it is always sent: absence means "auto" (project tier), not "default".
 	if (options?.serviceTier !== undefined && model.provider !== "github-copilot") {
 		params.service_tier = options.serviceTier;
 	}

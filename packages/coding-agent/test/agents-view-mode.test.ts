@@ -9,6 +9,7 @@ import type { AgentConnectionSavedSessionInfo } from "../src/modes/agent-connect
 import {
 	AgentsViewMode,
 	type AgentsViewPersistentState,
+	buildAgentsViewUsageLayout,
 	combineAgentsViewStartupNotices,
 	createInitialAgentsViewPersistentState,
 	runAgentsViewMode,
@@ -47,7 +48,10 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 
 vi.mock("../src/modes/agent-connection/daemon-agent-connection.js", () => ({
 	DaemonAgentConnection: Object.assign(function DaemonAgentConnection() {}, {
-		attach: vi.fn(async () => ({ prompt: modeMocks.connectionPrompt, dispose: modeMocks.dispose })),
+		attach: vi.fn(async () => ({
+			prompt: modeMocks.connectionPrompt,
+			dispose: modeMocks.dispose,
+		})),
 	}),
 }));
 
@@ -102,7 +106,10 @@ describe("AgentsViewMode", () => {
 		modeMocks.clientRequest.mockImplementation(async (command: unknown) => {
 			const request = command as { type?: string; sessionPath?: string };
 			if (request.type === "create") {
-				return { success: true, data: summary({ sessionFile: request.sessionPath }) };
+				return {
+					success: true,
+					data: summary({ sessionFile: request.sessionPath }),
+				};
 			}
 			return undefined;
 		});
@@ -143,7 +150,10 @@ describe("AgentsViewMode", () => {
 	});
 
 	it("stops instead of deleting when an idle row's subtree still works", async () => {
-		const request = vi.fn(async () => ({ success: true as const, data: { cancelled: true } }));
+		const request = vi.fn(async () => ({
+			success: true as const,
+			data: { cancelled: true },
+		}));
 		const self = {
 			requireClient: () => ({ request, supportsServerCapability: () => true }),
 			setStatusMessage: vi.fn(),
@@ -153,13 +163,21 @@ describe("AgentsViewMode", () => {
 			kind: "subagent",
 			section: "idle",
 			runningSubagentCount: 1,
-			summary: summary({ id: "crew-parent", activeSessionId: "crew-parent", sessionId: "crew-parent-session" }),
+			summary: summary({
+				id: "crew-parent",
+				activeSessionId: "crew-parent",
+				sessionId: "crew-parent-session",
+			}),
 		};
 
 		await invoke(
 			"killSubagent",
 			self,
-			{ identity: "child-row", rootActiveSessionId: "root-active", childId: "crew-parent-child" },
+			{
+				identity: "child-row",
+				rootActiveSessionId: "root-active",
+				childId: "crew-parent-child",
+			},
 			idleWithBusyCrew,
 		);
 
@@ -197,7 +215,11 @@ describe("AgentsViewMode", () => {
 				{
 					kind: "agent",
 					section: "idle",
-					summary: summary({ id: "root-active", activeSessionId: "root-active", sessionId: "root-session" }),
+					summary: summary({
+						id: "root-active",
+						activeSessionId: "root-active",
+						sessionId: "root-session",
+					}),
 					selectable: true,
 					identity: "root-row",
 				},
@@ -244,11 +266,16 @@ describe("AgentsViewMode", () => {
 			childId: "passive-child",
 		});
 		expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancel_rlm_child" }));
-		expect(self.setStatusMessage).toHaveBeenCalledWith("Subagent deleted", { render: false });
+		expect(self.setStatusMessage).toHaveBeenCalledWith("Subagent deleted", {
+			render: false,
+		});
 	});
 
 	it("uses cancel when an inactive subagent starts running during confirmation", async () => {
-		const request = vi.fn(async () => ({ success: true as const, data: { cancelled: true } }));
+		const request = vi.fn(async () => ({
+			success: true as const,
+			data: { cancelled: true },
+		}));
 		const self = {
 			requireClient: () => ({ request, supportsServerCapability: () => true }),
 			setStatusMessage: vi.fn(),
@@ -257,7 +284,11 @@ describe("AgentsViewMode", () => {
 		await invoke(
 			"killSubagent",
 			self,
-			{ identity: "child-row", rootActiveSessionId: "root-active", childId: "passive-child" },
+			{
+				identity: "child-row",
+				rootActiveSessionId: "root-active",
+				childId: "passive-child",
+			},
 			{ section: "running" },
 		);
 		expect(request).toHaveBeenCalledWith({
@@ -269,7 +300,10 @@ describe("AgentsViewMode", () => {
 	});
 
 	it("falls back to cancel-only when subagent deletion is unsupported", async () => {
-		const request = vi.fn(async () => ({ success: true as const, data: { cancelled: false } }));
+		const request = vi.fn(async () => ({
+			success: true as const,
+			data: { cancelled: false },
+		}));
 		const self = {
 			requireClient: () => ({ request, supportsServerCapability: () => false }),
 			setStatusMessage: vi.fn(),
@@ -278,7 +312,11 @@ describe("AgentsViewMode", () => {
 		await invoke(
 			"killSubagent",
 			self,
-			{ identity: "child-row", rootActiveSessionId: "root-active", childId: "passive-child" },
+			{
+				identity: "child-row",
+				rootActiveSessionId: "root-active",
+				childId: "passive-child",
+			},
 			{ section: "inactive", runningSubagentCount: 0, summary: summary() },
 		);
 		expect(request).toHaveBeenCalledWith({
@@ -321,7 +359,10 @@ describe("AgentsViewMode", () => {
 	});
 
 	it("keeps direct agents-view replies when telemetry is enabled", async () => {
-		const request = vi.fn(async () => ({ success: true as const, data: undefined }));
+		const request = vi.fn(async () => ({
+			success: true as const,
+			data: undefined,
+		}));
 		const self = {
 			options: { config: {} },
 			requireClient: () => ({ request }),
@@ -345,12 +386,19 @@ describe("AgentsViewMode", () => {
 			sessionId: "session-old",
 			sessionFile: "/tmp/old.jsonl",
 		});
-		const resumedOldSession = { ...oldSession, id: "worker-old", activeSessionId: "worker-old" };
+		const resumedOldSession = {
+			...oldSession,
+			id: "worker-old",
+			activeSessionId: "worker-old",
+		};
 		const runView = vi
 			.spyOn(AgentsViewMode.prototype, "run")
 			.mockResolvedValueOnce({ type: "open", summary: oldSession })
 			.mockResolvedValueOnce({ type: "exit" });
-		modeMocks.clientRequest.mockResolvedValueOnce({ success: true, data: resumedOldSession });
+		modeMocks.clientRequest.mockResolvedValueOnce({
+			success: true,
+			data: resumedOldSession,
+		});
 		modeMocks.interactiveRun.mockRejectedValueOnce(new Error("stop after open"));
 
 		await runAgentsViewMode({
@@ -366,7 +414,10 @@ describe("AgentsViewMode", () => {
 		});
 
 		expect(modeMocks.clientRequest).toHaveBeenCalledWith(
-			expect.objectContaining({ type: "create", sessionPath: "/tmp/old.jsonl" }),
+			expect.objectContaining({
+				type: "create",
+				sessionPath: "/tmp/old.jsonl",
+			}),
 		);
 		expect(DaemonAgentConnection.attach).toHaveBeenCalledWith(expect.anything(), "worker-old", expect.anything());
 		expect(DaemonAgentConnection.attach).not.toHaveBeenCalledWith(expect.anything(), "worker-one", expect.anything());
@@ -375,13 +426,19 @@ describe("AgentsViewMode", () => {
 
 	it("uses the opened session as the crash-path back target", async () => {
 		const opened = summary({ sessionName: "opened" });
-		const previous = summary({ id: "previous", activeSessionId: "previous", sessionId: "previous" });
+		const previous = summary({
+			id: "previous",
+			activeSessionId: "previous",
+			sessionId: "previous",
+		});
 		const runView = vi
 			.spyOn(AgentsViewMode.prototype, "run")
 			.mockResolvedValueOnce({ type: "open", summary: opened })
 			.mockImplementationOnce(function (this: AgentsViewMode) {
 				const state = (this as unknown as { persistentState: AgentsViewPersistentState }).persistentState;
-				expect(state.backSession).toMatchObject({ sessionId: opened.sessionId });
+				expect(state.backSession).toMatchObject({
+					sessionId: opened.sessionId,
+				});
 				return Promise.resolve({ type: "exit" });
 			});
 		modeMocks.interactiveRun.mockRejectedValueOnce(new Error("post-attach crash"));
@@ -399,7 +456,9 @@ describe("AgentsViewMode", () => {
 			},
 		});
 
-		expect(modeMocks.teardownSessionUi).toHaveBeenCalledWith({ preserveAltScreen: true });
+		expect(modeMocks.teardownSessionUi).toHaveBeenCalledWith({
+			preserveAltScreen: true,
+		});
 		expect(modeMocks.dispose).toHaveBeenCalledOnce();
 		expect(DaemonAgentConnection.attach).toHaveBeenCalledWith(
 			expect.anything(),
@@ -410,15 +469,33 @@ describe("AgentsViewMode", () => {
 	});
 
 	it("invalidates the persisted scope root after popping a scope frame", async () => {
-		const parent = summary({ id: "parent", activeSessionId: "parent", sessionId: "parent" });
-		const child = summary({ id: "child", activeSessionId: "child", sessionId: "child" });
+		const parent = summary({
+			id: "parent",
+			activeSessionId: "parent",
+			sessionId: "parent",
+		});
+		const child = summary({
+			id: "child",
+			activeSessionId: "child",
+			sessionId: "child",
+		});
 		const runView = vi
 			.spyOn(AgentsViewMode.prototype, "run")
 			.mockImplementationOnce(function (this: AgentsViewMode) {
 				const state = (this as unknown as { persistentState: AgentsViewPersistentState }).persistentState;
 				state.scopeFrames = [
-					{ scope: { sessionId: parent.sessionId, activeSessionId: parent.activeSessionId } },
-					{ scope: { sessionId: child.sessionId, activeSessionId: child.activeSessionId } },
+					{
+						scope: {
+							sessionId: parent.sessionId,
+							activeSessionId: parent.activeSessionId,
+						},
+					},
+					{
+						scope: {
+							sessionId: child.sessionId,
+							activeSessionId: child.activeSessionId,
+						},
+					},
 				];
 				state.scopeRootSummary = child;
 				return Promise.resolve({
@@ -450,13 +527,28 @@ describe("AgentsViewMode", () => {
 	});
 
 	it("invalidates the persisted scope root after pushing a scope frame", async () => {
-		const parent = summary({ id: "parent", activeSessionId: "parent", sessionId: "parent" });
-		const child = summary({ id: "child", activeSessionId: "child", sessionId: "child" });
+		const parent = summary({
+			id: "parent",
+			activeSessionId: "parent",
+			sessionId: "parent",
+		});
+		const child = summary({
+			id: "child",
+			activeSessionId: "child",
+			sessionId: "child",
+		});
 		const runView = vi
 			.spyOn(AgentsViewMode.prototype, "run")
 			.mockImplementationOnce(function (this: AgentsViewMode) {
 				const state = (this as unknown as { persistentState: AgentsViewPersistentState }).persistentState;
-				state.scopeFrames = [{ scope: { sessionId: parent.sessionId, activeSessionId: parent.activeSessionId } }];
+				state.scopeFrames = [
+					{
+						scope: {
+							sessionId: parent.sessionId,
+							activeSessionId: parent.activeSessionId,
+						},
+					},
+				];
 				state.scopeRootSummary = parent;
 				return Promise.resolve({ type: "open", summary: child });
 			})
@@ -502,7 +594,14 @@ describe("AgentsViewMode", () => {
 		);
 		const scopeSummary = summary();
 		const persistentState: AgentsViewPersistentState = {
-			scopeFrames: [{ scope: { sessionId: scopeSummary.sessionId, activeSessionId: scopeSummary.activeSessionId } }],
+			scopeFrames: [
+				{
+					scope: {
+						sessionId: scopeSummary.sessionId,
+						activeSessionId: scopeSummary.activeSessionId,
+					},
+				},
+			],
 		};
 		const self: Record<string, unknown> = {
 			options: { config: { cwd: "/tmp" } },
@@ -571,7 +670,14 @@ describe("AgentsViewMode", () => {
 	it("carries the resolved scope root across view remounts", () => {
 		const root = summary({ sessionName: "Scoped root" });
 		const persistentState: AgentsViewPersistentState = {
-			scopeFrames: [{ scope: { sessionId: root.sessionId, activeSessionId: root.activeSessionId } }],
+			scopeFrames: [
+				{
+					scope: {
+						sessionId: root.sessionId,
+						activeSessionId: root.activeSessionId,
+					},
+				},
+			],
 		};
 		const self: Record<string, unknown> = {
 			persistentState,
@@ -593,7 +699,9 @@ describe("AgentsViewMode", () => {
 			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
 		};
 		invoke("reconcileCatalogs", self);
-		expect(persistentState.scopeRootSummary).toMatchObject({ sessionId: root.sessionId });
+		expect(persistentState.scopeRootSummary).toMatchObject({
+			sessionId: root.sessionId,
+		});
 
 		const remount = new AgentsViewMode(
 			{
@@ -727,7 +835,11 @@ describe("AgentsViewMode", () => {
 			syncSelectedRowState: vi.fn(),
 			ui: { requestRender: vi.fn() },
 		};
-		const summaryRow = { kind: "subagent-summary", parentIdentity: "root-row", expanded: true };
+		const summaryRow = {
+			kind: "subagent-summary",
+			parentIdentity: "root-row",
+			expanded: true,
+		};
 
 		invoke("toggleSubagentList", self, summaryRow);
 		expect(expandedSubagentParents.size).toBe(0);
@@ -743,7 +855,11 @@ describe("AgentsViewMode", () => {
 
 	it("renders roster recovery and stale-worker status labels", () => {
 		const rows = buildAgentsViewRows([
-			summary({ id: "recovering", sessionId: "recovering", statusLabel: "recovering" }),
+			summary({
+				id: "recovering",
+				sessionId: "recovering",
+				statusLabel: "recovering",
+			}),
 			summary({
 				id: "stale",
 				sessionId: "stale",
@@ -761,7 +877,7 @@ describe("AgentsViewMode", () => {
 		}
 	});
 
-	it("gates usage details and defaults to the earlier row layout", () => {
+	it("gates aligned usage columns and drops the message count when enabled", () => {
 		const parent = summary({
 			id: "spender",
 			activeSessionId: "spender",
@@ -785,8 +901,17 @@ describe("AgentsViewMode", () => {
 			rosterStatus: "inactive",
 			messageCount: 7,
 		});
+		const empty = summary({
+			id: "empty-draft",
+			activeSessionId: undefined,
+			sessionId: "empty-draft-session",
+			sessionFile: "/tmp/empty-draft.jsonl",
+			rosterStatus: "inactive",
+			messageCount: 0,
+			modified: new Date(Date.now() - 120_000).toISOString(),
+		});
 		const defaultView = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
-		const usageView = new AgentsViewMode(
+		const view = new AgentsViewMode(
 			{
 				config: {},
 				uiServices: createUiServices({ agentsViewUsage: { enabled: true } }),
@@ -795,36 +920,180 @@ describe("AgentsViewMode", () => {
 		);
 
 		try {
-			const collapsed = buildAgentsViewRows([parent, child, inactive]);
-			const rows = buildAgentsViewRows([parent, child, inactive], new Set(collapsed.map((row) => row.identity)));
+			const collapsed = buildAgentsViewRows([parent, child, inactive, empty]);
+			const rows = buildAgentsViewRows(
+				[parent, child, inactive, empty],
+				new Set(collapsed.map((row) => row.identity)),
+			);
+			Reflect.set(view, "rows", rows);
 			Reflect.set(defaultView, "rows", rows);
-			Reflect.set(usageView, "rows", rows);
-			const line = (view: AgentsViewMode, row: AgentsViewRow | undefined) =>
-				stripAnsi(invoke("renderRow", view, row, 200) as string);
+			const layout = buildAgentsViewUsageLayout(rows);
+			const line = (row: AgentsViewRow | undefined) =>
+				stripAnsi(invoke("renderRow", view, row, 200, layout.details) as string);
 			const byId = (sessionId: string, kind?: string) =>
 				rows.find((row) => row.summary.sessionId === sessionId && (!kind || row.kind === kind));
+			const defaultLine = (row: AgentsViewRow | undefined) =>
+				stripAnsi(invoke("renderRow", defaultView, row, 200) as string);
 
-			expect(line(defaultView, byId("spender-session"))).not.toContain("↑");
-			const defaultInactiveLine = line(defaultView, byId("saved-only-session"));
+			expect(defaultLine(byId("spender-session"))).not.toContain("↑");
+			const defaultInactiveLine = defaultLine(byId("saved-only-session"));
 			expect(defaultInactiveLine).toContain("7 ·");
 			expect(defaultInactiveLine).not.toContain("$");
 
-			expect(line(usageView, byId("spender-session"))).toContain("↑12k ↓1.2k · $0.42 ($1.10 w/ subagents)");
-			expect(line(usageView, byId("spender-child-session", "subagent"))).toContain(
-				"↑500 ↓50 · $0.68 ($0.68 w/ subagents)",
-			);
-			const inactiveLine = line(usageView, byId("saved-only-session"));
-			expect(inactiveLine).toContain("↑0 ↓0 · $0.00 ($0.00 w/ subagents)");
+			// Shared per-section layout: every column right-aligned to
+			// max(widest section value, legend label width).
+			expect(line(byId("spender-session"))).toContain("↑12k ↓1.2k ·  $0.42 ·    1 ·  $1.10 ·");
+			expect(line(byId("spender-child-session", "subagent"))).toContain("↑500   ↓50 ·  $0.68 ·    0 ·  $0.68 ·");
+			const inactiveLine = line(byId("saved-only-session"));
+			expect(inactiveLine).toContain("↑0   ↓0 ·  $0.00 ·    0 ·  $0.00 ·");
 			expect(inactiveLine).not.toContain("7 ·");
-			const bare = { ...byId("spender-session")!, summary: { ...parent, usage: undefined } };
-			expect(line(usageView, bare)).toContain("↑0 ↓0 · $0.00 ($1.10 w/ subagents)");
+			// The ` · ` separators land in the same column for the legend and every
+			// row of its section.
+			const dotColumns = (text: string) => [...text].flatMap((ch, index) => (ch === "·" ? [index] : []));
+			for (const [section, sessionId] of [
+				["idle", "spender-session"],
+				["idle", "spender-child-session"],
+				["inactive", "saved-only-session"],
+			] as const) {
+				const detail = layout.details.get(byId(sessionId)!.identity)!;
+				expect(dotColumns(detail)).toEqual(dotColumns(layout.legends.get(section)!));
+			}
+			// Empty sessions keep the age but drop the whole usage segment.
+			const emptyLine = line(byId("empty-draft-session"));
+			expect(emptyLine).not.toContain("↑");
+			expect(emptyLine).not.toContain("$");
+			expect(emptyLine).toMatch(/\d+[smhd]\s*$/);
+			// Without a shared layout the row pads only against its own section of one.
+			const bare = {
+				...byId("spender-session")!,
+				summary: { ...parent, usage: undefined },
+			};
+			expect(stripAnsi(invoke("renderRow", view, bare, 200) as string)).toContain(
+				" ↑0   ↓0 ·  $0.00 ·    1 ·  $1.10 ·",
+			);
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
+	it("shows the bold usage legend on every section header", () => {
+		const running = (id: string, created: string) =>
+			summary({
+				id,
+				activeSessionId: id,
+				sessionId: `${id}-session`,
+				sessionName: id,
+				activity: "working",
+				isStreaming: true,
+				created,
+			});
+		const parent = running("busy-parent", "2026-01-01T00:00:00Z");
+		const child = summary({
+			id: "busy-child",
+			activeSessionId: "busy-child",
+			sessionId: "busy-child-session",
+			sessionName: "busy-child",
+			sessionFile: "/tmp/busy-child.jsonl",
+			runtimeKind: "subagent",
+			parentActiveSessionId: "busy-parent",
+		});
+		const summaries = [
+			running("busy-solo", "2026-01-02T00:00:00Z"),
+			parent,
+			child,
+			summary({
+				id: "idle-a",
+				activeSessionId: "idle-a",
+				sessionId: "idle-a-session",
+				sessionName: "idle-a",
+			}),
+			summary({
+				id: "idle-b",
+				activeSessionId: "idle-b",
+				sessionId: "idle-b-session",
+				sessionName: "idle-b",
+			}),
+		];
+		const parentIdentity = buildAgentsViewRows(summaries).find(
+			(row) => row.summary.sessionId === "busy-parent-session",
+		)!.identity;
+		const rows = buildAgentsViewRows(summaries, new Set([parentIdentity]));
+		const view = new AgentsViewMode(
+			{
+				config: {},
+				uiServices: createUiServices({ agentsViewUsage: { enabled: true } }),
+			},
+			{},
+		);
+
+		try {
+			Reflect.set(view, "rows", rows);
+			Reflect.set(view, "selectedIndex", -1);
+			Reflect.set(view, "ui", {
+				terminal: { rows: 60 },
+				requestRender: () => {},
+			});
+			const rendered = invoke("renderSessionRows", view, 120, 40) as string[];
+			const lines = rendered.map(stripAnsi);
+			const headings = lines.filter((line) => /^(Running|Idle|Inactive) \(\d+\)/.test(line));
+			expect(headings).toHaveLength(3);
+			for (const heading of headings) {
+				expect(heading).toMatch(/↑in\s+↓out ·\s+\$agent ·\s+#sub ·\s+\$total ·\s+age$/);
+			}
+			// Same bold weight for title and legend.
+			const runningLegend = buildAgentsViewUsageLayout(rows).legends.get("running")!;
+			expect(invoke("renderSectionHeading", view, "running", 120, runningLegend)).toContain(
+				theme.bold(runningLegend),
+			);
+
+			// Session rows carry no background of their own; only the selection
+			// highlight may paint one.
+			const finalized = rendered.map((line) => invoke("finalizeRenderedLine", view, line, 120) as string);
+			for (const line of finalized) {
+				expect(line).not.toContain("\x1b[48");
+			}
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
+	it("keeps a selection at the end of the list visible when the leading ellipsis is shown", () => {
+		const summaries = Array.from({ length: 12 }, (_, index) =>
+			summary({
+				id: `saved-${index}`,
+				activeSessionId: undefined,
+				sessionId: `saved-${index}-session`,
+				sessionName: `saved-${index}`,
+				sessionFile: `/tmp/saved-${index}.jsonl`,
+				rosterStatus: "inactive" as const,
+				created: `2026-01-${String(index + 1).padStart(2, "0")}T00:00:00Z`,
+			}),
+		);
+		const rows = buildAgentsViewRows(summaries);
+		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
+
+		try {
+			Reflect.set(view, "rows", rows);
+			Reflect.set(view, "selectedIndex", rows.length - 1);
+			Reflect.set(view, "ui", {
+				terminal: { rows: 13 },
+				requestRender: () => {},
+			});
+			const lines = (invoke("renderSessionRows", view, 120, 4) as string[]).map(stripAnsi);
+			expect(lines[0]).toContain("...");
+			const lastTitle = rows.at(-1)!.title;
+			expect(lines.some((line) => line.includes(lastTitle))).toBe(true);
 		} finally {
 			stopThemeWatcher();
 		}
 	});
 
 	it("renders a collapsed group's busy-subagent badge legibly instead of dimmed", () => {
-		const parent = summary({ id: "parent", activeSessionId: "parent", sessionId: "parent-session" });
+		const parent = summary({
+			id: "parent",
+			activeSessionId: "parent",
+			sessionId: "parent-session",
+		});
 		const busyChild = summary({
 			id: "busy-child",
 			activeSessionId: "busy-child",
@@ -836,13 +1105,21 @@ describe("AgentsViewMode", () => {
 			isSessionActive: true,
 			isStreaming: true,
 		});
-		const idleChild = { ...busyChild, activity: "idle" as const, isSessionActive: false, isStreaming: false };
+		const idleChild = {
+			...busyChild,
+			activity: "idle" as const,
+			isSessionActive: false,
+			isStreaming: false,
+		};
 		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
 
 		try {
 			const busyRows = buildAgentsViewRows([parent, busyChild]);
 			const busySummaryRow = busyRows.find((row) => row.kind === "subagent-summary");
-			expect(busySummaryRow).toMatchObject({ section: "idle", title: "1 subagent running" });
+			expect(busySummaryRow).toMatchObject({
+				section: "idle",
+				title: "1 subagent running",
+			});
 			Reflect.set(view, "rows", busyRows);
 			expect(invoke("renderRow", view, busySummaryRow, 160)).toContain(theme.fg("success", "▸ 1 subagent running"));
 
@@ -894,7 +1171,11 @@ describe("AgentsViewMode", () => {
 		Reflect.set(view, "deleteConfirmExpiresAt", Date.now() + 10_000);
 		const confirmLine = (row: AgentsViewRow): string => {
 			Reflect.set(view, "rows", [row]);
-			Reflect.set(view, "pendingDeleteAgent", { identity: row.identity, summary: row.summary, stopped: false });
+			Reflect.set(view, "pendingDeleteAgent", {
+				identity: row.identity,
+				summary: row.summary,
+				stopped: false,
+			});
 			return stripAnsi(invoke("renderRow", view, row, 160) as string);
 		};
 
@@ -939,7 +1220,10 @@ describe("AgentsViewMode persistent catalog state", () => {
 
 	it("applies an initial handoff scope from the first pushed roster refresh", async () => {
 		const root = summary();
-		const scope = { sessionId: root.sessionId, activeSessionId: root.activeSessionId };
+		const scope = {
+			sessionId: root.sessionId,
+			activeSessionId: root.activeSessionId,
+		};
 		const persistentState = createInitialAgentsViewPersistentState({
 			initialScopeKey: scope,
 			initialSession: root,
@@ -999,7 +1283,14 @@ describe("AgentsViewMode persistent catalog state", () => {
 			cwd: process.cwd(),
 		});
 		const persistentState: AgentsViewPersistentState = {
-			scopeFrames: [{ scope: { sessionId: root.sessionId, activeSessionId: root.activeSessionId } }],
+			scopeFrames: [
+				{
+					scope: {
+						sessionId: root.sessionId,
+						activeSessionId: root.activeSessionId,
+					},
+				},
+			],
 			lastSuccessfulLiveSummaries: [root],
 			lastSuccessfulSavedSessions: [],
 		};
@@ -1014,7 +1305,12 @@ describe("AgentsViewMode persistent catalog state", () => {
 		try {
 			await expect(invoke("refreshSessions", view, { preserveStatusOnError: true })).resolves.toBeUndefined();
 			expect(persistentState.scopeFrames).toEqual([
-				{ scope: { sessionId: root.sessionId, activeSessionId: root.activeSessionId } },
+				{
+					scope: {
+						sessionId: root.sessionId,
+						activeSessionId: root.activeSessionId,
+					},
+				},
 			]);
 		} finally {
 			stopThemeWatcher();
@@ -1024,7 +1320,12 @@ describe("AgentsViewMode persistent catalog state", () => {
 	it("keeps a live-only scope through reconnect timeout and settles it on the next successful list", async () => {
 		vi.useFakeTimers();
 		const root = summary();
-		const frame = { scope: { sessionId: root.sessionId, activeSessionId: root.activeSessionId } };
+		const frame = {
+			scope: {
+				sessionId: root.sessionId,
+				activeSessionId: root.activeSessionId,
+			},
+		};
 		const persistentState: AgentsViewPersistentState = {
 			scopeFrames: [frame],
 			lastSuccessfulLiveSummaries: [root],
@@ -1090,9 +1391,16 @@ describe("AgentsViewMode persistent catalog state", () => {
 
 	it("keeps a newly pushed scope and the existing live cache when its first poll fails", async () => {
 		const root = summary();
-		const other = summary({ id: "other-active", activeSessionId: "other-active", sessionId: "other-session" });
+		const other = summary({
+			id: "other-active",
+			activeSessionId: "other-active",
+			sessionId: "other-session",
+		});
 		const returnedRoot = { ...root, sessionName: "Updated root" };
-		const scope = { sessionId: root.sessionId, activeSessionId: root.activeSessionId };
+		const scope = {
+			sessionId: root.sessionId,
+			activeSessionId: root.activeSessionId,
+		};
 		let runs = 0;
 		vi.spyOn(AgentsViewMode.prototype, "run").mockImplementation(async function (this: AgentsViewMode) {
 			runs += 1;
@@ -1172,7 +1480,12 @@ describe("agents view startup notices", () => {
 			type: "response",
 			command: "create",
 			success: true,
-			data: { ...root, cwd: process.cwd(), activeSessionId: "resumed-active", lifecycle: "live" },
+			data: {
+				...root,
+				cwd: process.cwd(),
+				activeSessionId: "resumed-active",
+				lifecycle: "live",
+			},
 		});
 		modeMocks.interactiveRun.mockResolvedValue({
 			type: "agents_view",

@@ -508,7 +508,7 @@ describe("AgentSession Act lane", () => {
 				settings: {
 					rlmActDefaultModel: "@luna",
 					modelRoles: { luna: `${provider}/luna-model` },
-					retry: { enabled: false, provider: { maxRetries: 0 } },
+					retry: { enabled: false },
 				},
 			});
 			try {
@@ -919,7 +919,7 @@ describe("AgentSession Act lane", () => {
 				settings: {
 					rlmActDefaultModel: "@luna",
 					modelRoles: { luna: `${provider}/luna-model` },
-					retry: { enabled: false, provider: { maxRetries: 0 } },
+					retry: { enabled: false },
 				},
 			});
 			try {
@@ -1570,7 +1570,7 @@ describe("AgentSession Act lane", () => {
 			settings: {
 				rlmActDefaultModel: "@luna",
 				modelRoles: { luna: `${provider}/luna-model` },
-				retry: { enabled: false, provider: { maxRetries: 0 } },
+				retry: { enabled: false },
 			},
 		});
 		try {

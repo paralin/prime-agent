@@ -4,7 +4,7 @@
  * Spawns the agent in RPC mode and provides a typed API for all operations.
  */
 
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier } from "@earendil-works/pi-ai";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
@@ -18,6 +18,7 @@ import type {
 } from "../../core/cron-jobs.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { SessionStats } from "../../core/session-stats.js";
+import { spawnHidden } from "../../utils/child-process.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSessionEvent } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
 import type {
@@ -103,7 +104,7 @@ export class RpcClient {
 			args.push(...this.options.args);
 		}
 
-		this.process = spawn("node", [cliPath, ...args], {
+		this.process = spawnHidden("node", [cliPath, ...args], {
 			cwd: this.options.cwd,
 			env: { ...process.env, ...this.options.env },
 			stdio: ["pipe", "pipe", "pipe"],
@@ -314,7 +315,11 @@ export class RpcClient {
 	): Promise<RefinementResult> {
 		// Refinement runs an LLM pass that routinely exceeds the default 30s response
 		// timeout, so use the same extended window as the daemon refine path.
-		const command = { type: "refine", instructions: options.instructions, rollbackId: options.rollbackId } as {
+		const command = {
+			type: "refine",
+			instructions: options.instructions,
+			rollbackId: options.rollbackId,
+		} as {
 			type: "refine";
 			instructions?: string;
 			rollbackId?: string;
@@ -464,12 +469,19 @@ export class RpcClient {
 	}
 
 	async listSchedules(includeInactive?: boolean): Promise<AgentCronJob[]> {
-		const response = await this.send({ type: "list_schedules", includeInactive });
+		const response = await this.send({
+			type: "list_schedules",
+			includeInactive,
+		});
 		return this.getData<{ jobs: AgentCronJob[] }>(response).jobs;
 	}
 
 	async addSchedule(schedule: string, prompt: string): Promise<AgentCronJob> {
-		const response = await this.send({ type: "add_schedule", schedule, prompt });
+		const response = await this.send({
+			type: "add_schedule",
+			schedule,
+			prompt,
+		});
 		return this.getData<{ job: AgentCronJob }>(response).job;
 	}
 
@@ -493,7 +505,12 @@ export class RpcClient {
 		prompt: string,
 		deliveryMode?: AgentHeartbeatDeliveryMode,
 	): Promise<AgentCronJob> {
-		const response = await this.send({ type: "set_heartbeat", schedule, prompt, deliveryMode });
+		const response = await this.send({
+			type: "set_heartbeat",
+			schedule,
+			prompt,
+			deliveryMode,
+		});
 		const heartbeat = this.getData<{ heartbeat: AgentCronJob | null }>(response).heartbeat;
 		if (!heartbeat) {
 			throw new Error("Daemon did not return the created heartbeat");
@@ -511,7 +528,12 @@ export class RpcClient {
 		jobId: string,
 		action: AgentHeartbeatManagementAction,
 	): Promise<AgentCronJob> {
-		const response = await this.send({ type: "manage_heartbeat", activeSessionId, jobId, action });
+		const response = await this.send({
+			type: "manage_heartbeat",
+			activeSessionId,
+			jobId,
+			action,
+		});
 		const heartbeat = this.getData<{ heartbeat: AgentCronJob | null }>(response).heartbeat;
 		if (!heartbeat) {
 			throw new Error("Daemon did not return the managed heartbeat");

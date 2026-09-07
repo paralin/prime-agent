@@ -72,10 +72,11 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 23 adds active-only worker summaries and supervisor agent-roster queries.
 // Revision 24 adds the capability-gated agent-roster subscription and push.
 // Revision 25 adds stable mailbox identity fields to cross-worker agent-message delivery.
-// Revision 26 adds capability-gated direct worker peer transport discovery and
-// publishes own-session usage totals on session summary and saved-session rows.
-export const DAEMON_SCHEMA_REVISION = 26;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-c23b4ec8493c";
+// Revision 26 adds capability-gated direct worker peer transport discovery.
+// Revision 27 publishes own-session usage totals on session summary and saved-session rows.
+// Revision 28 adds structured session_recovering failure info for known-but-unaddressable sessions.
+export const DAEMON_SCHEMA_REVISION = 28;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-28-0e126b898241";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -1075,6 +1076,7 @@ export type DaemonErrorInfo =
 	| { code: "missing_session_cwd"; issue: SessionCwdIssue }
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
+	| { code: "session_recovering"; activeSessionId: string }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";

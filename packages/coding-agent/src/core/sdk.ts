@@ -97,7 +97,11 @@ export type {
 	ToolDefinition,
 } from "./extensions/index.js";
 export type { PromptTemplate } from "./prompt-templates.js";
-export type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
+export type {
+	CreateRlmSubagentRuntimeOptions,
+	RlmSubagentRuntime,
+	SubagentRuntimeHost,
+} from "./rlm-runtime.js";
 export type { Skill } from "./skills.js";
 export type { Tool } from "./tools/index.js";
 
@@ -159,7 +163,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// auth even on the bare SDK path (not just the CLI's createAgentSessionServices).
 	const mcpManager =
 		options.mcpManager ??
-		new McpManager({ authStorage, getUserServers: () => settingsManager.getGlobalMcpServers() });
+		new McpManager({
+			authStorage,
+			getUserServers: () => settingsManager.getGlobalMcpServers(),
+		});
 	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerUserProviders());
 
 	if (!resourceLoader) {
@@ -255,7 +262,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						if (hasImages) {
 							const filteredContent = content
 								.map((c) =>
-									c.type === "image" ? { type: "text" as const, text: "Image reading is disabled." } : c,
+									c.type === "image"
+										? {
+												type: "text" as const,
+												text: "Image reading is disabled.",
+											}
+										: c,
 								)
 								.filter(
 									(c, i, arr) =>
@@ -317,8 +329,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				...options,
 				apiKey: auth.apiKey,
 				timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
-				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
-				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
 				openRouterResponses: settingsManager.getOpenRouterResponses(),
 				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
 			});
@@ -351,7 +361,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		followUpMode: settingsManager.getFollowUpMode(),
 		transport: settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
-		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 	});
 
 	if (hasExistingSession) {

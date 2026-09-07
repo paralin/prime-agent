@@ -42,7 +42,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { spawn, spawnSync } from "child_process";
+import { spawnSync } from "child_process";
 import type { CliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	APP_NAME,
@@ -136,6 +136,7 @@ import { TOOL_ERROR_NUDGE_PREVIEW_LABEL } from "../../core/tool-error-nudge.js";
 import { type TruncationResult, truncateTail } from "../../core/tools/truncate.js";
 import { PRIME_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
+import { spawnHidden, spawnSyncHidden } from "../../utils/child-process.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { readClipboardImage } from "../../utils/clipboard-image.js";
 import { parseGitUrl } from "../../utils/git.js";
@@ -610,7 +611,10 @@ function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
 
 		const requiredToolCallIdsByMessage = new Map<
 			number,
-			{ message: Extract<AgentMessage, { role: "assistant" }>; toolCallIds: Set<string> }
+			{
+				message: Extract<AgentMessage, { role: "assistant" }>;
+				toolCallIds: Set<string>;
+			}
 		>();
 		for (let index = startIndex - 1; index >= 0 && unresolvedToolCallIds.size > 0; index--) {
 			const message = messages[index];
@@ -956,7 +960,10 @@ export class InteractiveMode {
 	private pendingSubmittedPromptStash: PromptStash | undefined;
 	private inputSubmissionGeneration = 0;
 	private inputSubmissionsPending = 0;
-	private pendingPromptStashReleases: { sessionId: string; state: PromptStashState }[] = [];
+	private pendingPromptStashReleases: {
+		sessionId: string;
+		state: PromptStashState;
+	}[] = [];
 	private readonly retainedSubmissionGenerations = new WeakMap<PromptStash, number>();
 	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
 	private agentsViewRequest: InteractiveModeRunResult["type"] | undefined;
@@ -1035,7 +1042,10 @@ export class InteractiveMode {
 	private lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	private activeActTrays = new Map<number, { actId: string; depth: number; model: string; thinkingLevel?: string }>();
 	private lateActEvents = new Map<string, ActProjectionEvent[]>();
-	private lateActEventOrder: Array<{ outerToolCallId: string; event: ActProjectionEvent }> = [];
+	private lateActEventOrder: Array<{
+		outerToolCallId: string;
+		event: ActProjectionEvent;
+	}> = [];
 	private pendingToolCreations = new Set<string>();
 	private startedToolCalls = new Set<string>();
 	private pendingToolGeneration = 0;
@@ -2051,7 +2061,11 @@ export class InteractiveMode {
 		}
 
 		if (source === "cli") {
-			return { label: "path", scopeLabel: scope === "temporary" ? "temp" : undefined, color: "muted" };
+			return {
+				label: "path",
+				scopeLabel: scope === "temporary" ? "temp" : undefined,
+				color: "muted",
+			};
 		}
 
 		const scopeLabel =
@@ -2234,7 +2248,10 @@ export class InteractiveMode {
 	}
 
 	private showLoadedResources(options?: {
-		extensions?: Array<{ path: string; sourceInfo?: AgentConnectionSourceInfo }>;
+		extensions?: Array<{
+			path: string;
+			sourceInfo?: AgentConnectionSourceInfo;
+		}>;
 		force?: boolean;
 		showDiagnosticsWhenQuiet?: boolean;
 	}): void {
@@ -2331,7 +2348,10 @@ export class InteractiveMode {
 
 			if (skills.length > 0) {
 				const groups = this.buildScopeGroups(
-					skills.map((skill) => ({ path: skill.filePath, sourceInfo: skill.sourceInfo })),
+					skills.map((skill) => ({
+						path: skill.filePath,
+						sourceInfo: skill.sourceInfo,
+					})),
 				);
 				const skillList = this.formatScopeGroups(groups, {
 					formatPath: (item) => this.formatDisplayPath(item.path),
@@ -2343,7 +2363,10 @@ export class InteractiveMode {
 
 			if (prompts.length > 0) {
 				const groups = this.buildScopeGroups(
-					prompts.map((template) => ({ path: template.filePath, sourceInfo: template.sourceInfo })),
+					prompts.map((template) => ({
+						path: template.filePath,
+						sourceInfo: template.sourceInfo,
+					})),
 				);
 				const templateByPath = new Map(prompts.map((t) => [t.filePath, t]));
 				const templateList = this.formatScopeGroups(groups, {
@@ -2495,7 +2518,9 @@ export class InteractiveMode {
 					try {
 						const result = options?.withSession
 							? await localSessionHost.fork(entryId, options)
-							: await this.agentConnection.fork(entryId, { position: options?.position });
+							: await this.agentConnection.fork(entryId, {
+									position: options?.position,
+								});
 						if (!result.cancelled) {
 							await this.renderCurrentSessionState();
 							this.editor.setText("selectedText" in result ? (result.selectedText ?? "") : "");
@@ -2793,7 +2818,9 @@ export class InteractiveMode {
 			}
 			case "message_end": {
 				const wasNewChat = this.isNewChat();
-				this.patchConnectionState({ messageCount: this.connectionState.messageCount + 1 });
+				this.patchConnectionState({
+					messageCount: this.connectionState.messageCount + 1,
+				});
 				if (wasNewChat) {
 					this.builtInHeader?.invalidate();
 					this.subagentSummaryLine.invalidate();
@@ -2952,12 +2979,17 @@ export class InteractiveMode {
 			setRegisteredThemes(this.uiServices.getThemes());
 			await this.refreshConnectionCatalog();
 			this.setupAutocompleteProvider();
-			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
+			this.showLoadedResources({
+				force: false,
+				showDiagnosticsWhenQuiet: true,
+			});
 		}
 		this.subscribeToAgent();
 		await this.subscribeToRosterBar();
 		// A session_action_update in the unsubscribed gap above is lost; re-sync the queue post-subscription.
-		this.patchConnectionState({ sessionActions: (await this.agentConnection.getState()).sessionActions });
+		this.patchConnectionState({
+			sessionActions: (await this.agentConnection.getState()).sessionActions,
+		});
 		this.refreshQueueSelectionFromState();
 		this.updatePendingMessagesDisplay();
 		await this.refreshHeartbeatCatalog().catch(() => undefined);
@@ -3130,7 +3162,10 @@ export class InteractiveMode {
 		return this.lateActEvents;
 	}
 
-	private getLateActEventOrder(): Array<{ outerToolCallId: string; event: ActProjectionEvent }> {
+	private getLateActEventOrder(): Array<{
+		outerToolCallId: string;
+		event: ActProjectionEvent;
+	}> {
 		if (!this.lateActEventOrder) this.lateActEventOrder = [];
 		return this.lateActEventOrder;
 	}
@@ -4438,7 +4473,10 @@ export class InteractiveMode {
 		const existing = [this.promptStashState.stash, ...(this.promptStashState.queuedStashes ?? [])].filter(
 			(stash): stash is PromptStash => stash !== undefined,
 		);
-		this.promptStashState.stash = { ...this.snapshotPromptStash(text), restoreOnOpen: true };
+		this.promptStashState.stash = {
+			...this.snapshotPromptStash(text),
+			restoreOnOpen: true,
+		};
 		this.promptStashState.queuedStashes = existing.length > 0 ? existing : undefined;
 	}
 
@@ -5237,7 +5275,12 @@ export class InteractiveMode {
 						streamingBehavior,
 						queueIfBusy: true,
 						images,
-						...(manualContinue ? { customMessage: createManualContinueMessage(), internalPrompt: true } : {}),
+						...(manualContinue
+							? {
+									customMessage: createManualContinueMessage(),
+									internalPrompt: true,
+								}
+							: {}),
 					});
 				} catch (error) {
 					// Generation guards editor ownership, not draft durability: a stale
@@ -6862,7 +6905,10 @@ export class InteractiveMode {
 							} else {
 								errorMessage = message.errorMessage || "Error";
 							}
-							component.updateResult({ content: [{ type: "text", text: errorMessage }], isError: true });
+							component.updateResult({
+								content: [{ type: "text", text: errorMessage }],
+								isError: true,
+							});
 						} else {
 							renderedPendingTools.set(content.id, component);
 						}
@@ -6933,7 +6979,10 @@ export class InteractiveMode {
 			thinkingLevel: snapshot.state.thinkingLevel,
 			serviceTier: snapshot.state.serviceTier,
 			model: snapshot.state.model
-				? { provider: snapshot.state.model.provider, modelId: snapshot.state.model.id }
+				? {
+						provider: snapshot.state.model.provider,
+						modelId: snapshot.state.model.id,
+					}
 				: null,
 		};
 	}
@@ -7370,7 +7419,11 @@ export class InteractiveMode {
 					if (lane[selected.index] === selected.text && target >= 0 && target < lane.length) {
 						[lane[selected.index], lane[target]] = [lane[target] as string, selected.text];
 						this.patchConnectionState({
-							sessionActions: { ...actionsBefore, steering: queue.steering, followUps: queue.followUp },
+							sessionActions: {
+								...actionsBefore,
+								steering: queue.steering,
+								followUps: queue.followUp,
+							},
 						});
 						this.updatePendingMessagesDisplay();
 					}
@@ -8621,7 +8674,9 @@ export class InteractiveMode {
 				return;
 			}
 
-			const result = await this.agentConnection.fork(leafId, { position: "at" });
+			const result = await this.agentConnection.fork(leafId, {
+				position: "at",
+			});
 			if (result.cancelled) {
 				this.ui.requestRender();
 				return;
@@ -8818,7 +8873,9 @@ export class InteractiveMode {
 							cwdOverride: selectedCwd,
 							withSession: options.withSession,
 						})
-					: await this.agentConnection.switchSession(sessionPath, { cwdOverride: selectedCwd });
+					: await this.agentConnection.switchSession(sessionPath, {
+							cwdOverride: selectedCwd,
+						});
 				if (result.cancelled) {
 					return result;
 				}
@@ -9201,7 +9258,9 @@ export class InteractiveMode {
 	private async handleShareCommand(): Promise<void> {
 		// Check if gh is available and logged in
 		try {
-			const authResult = spawnSync("gh", ["auth", "status"], { encoding: "utf-8" });
+			const authResult = spawnSyncHidden("gh", ["auth", "status"], {
+				encoding: "utf-8",
+			});
 			if (authResult.status !== 0) {
 				this.showError("GitHub CLI is not logged in. Run 'gh auth login' first.");
 				return;
@@ -9240,7 +9299,7 @@ export class InteractiveMode {
 		};
 
 		// Create a secret gist asynchronously
-		let proc: ReturnType<typeof spawn> | null = null;
+		let proc: ReturnType<typeof spawnHidden> | null = null;
 
 		loader.onAbort = () => {
 			proc?.kill();
@@ -9249,8 +9308,12 @@ export class InteractiveMode {
 		};
 
 		try {
-			const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve) => {
-				proc = spawn("gh", ["gist", "create", "--public=false", tmpFile]);
+			const result = await new Promise<{
+				stdout: string;
+				stderr: string;
+				code: number | null;
+			}>((resolve) => {
+				proc = spawnHidden("gh", ["gist", "create", "--public=false", tmpFile]);
 				let stdout = "";
 				let stderr = "";
 				proc.stdout?.on("data", (data) => {
@@ -9360,7 +9423,9 @@ export class InteractiveMode {
 		}
 
 		try {
-			const result = await this.agentConnection.setRlmMaxDepth(maxDepth, { global });
+			const result = await this.agentConnection.setRlmMaxDepth(maxDepth, {
+				global,
+			});
 			this.chatContainer.addChild(new Spacer(1));
 			this.chatContainer.addChild(
 				new Text(
@@ -9489,7 +9554,9 @@ export class InteractiveMode {
 
 	private async previewCurrentTrace(): Promise<void> {
 		const state = await this.agentConnection.getState();
-		const result = await previewAgentTraceFile({ sessionFile: state.sessionFile });
+		const result = await previewAgentTraceFile({
+			sessionFile: state.sessionFile,
+		});
 		let info: string;
 		switch (result.status) {
 			case "no_session_file":
@@ -9869,7 +9936,9 @@ export class InteractiveMode {
 			action,
 		);
 		if (updated.source === "heartbeat" && updated.activeSessionId === this.connectionState?.activeSessionId) {
-			this.patchConnectionState({ heartbeat: action === "stop" ? null : updated });
+			this.patchConnectionState({
+				heartbeat: action === "stop" ? null : updated,
+			});
 		}
 		const remaining = this.heartbeatCatalog.filter((entry) => entry.job.id !== updated.id);
 		this.applyHeartbeatCatalog(
@@ -10136,7 +10205,9 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		try {
 			// /new inherits the attached session's working directory so the fresh
 			// session continues where the user is.
-			const result = await this.agentConnection.newSession({ cwd: this.connectionState?.cwd });
+			const result = await this.agentConnection.newSession({
+				cwd: this.connectionState?.cwd,
+			});
 			if (result.cancelled) {
 				restorePrompt();
 				return;

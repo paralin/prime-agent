@@ -6,9 +6,8 @@
  * disposing the underlying agent loop.
  */
 
-import { spawn } from "node:child_process";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -107,6 +106,7 @@ import {
 } from "../../core/cron-jobs.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
+import { providerRetryPolicy } from "../../core/provider-retry.js";
 import type {
 	CreateRlmSubagentRuntimeOptions,
 	ExternalRlmSubagentTranscript,
@@ -131,6 +131,8 @@ import {
 import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
+import { isProcessAlive, spawnHidden } from "../../utils/child-process.js";
+import { tryAcquireDirLock } from "../../utils/dir-lock.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import {
 	createAgentConnectionCommands,
@@ -252,7 +254,6 @@ import {
 	createSnapshotTranscriptChunks,
 	SNAPSHOT_TARGET_CHUNK_BYTES,
 	type SnapshotTranscriptChunkSource,
-	snapshotTranscriptId,
 } from "./snapshot-transcript-cache.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
@@ -514,11 +515,21 @@ export class AgentDaemon {
 	private readonly updateRestartQueuePauses = new Map<string, { release(): void }>();
 	private readonly sessionInputPauses = new Map<
 		string,
-		{ activeSessionId: string; owner: DaemonSocketClient; leaseKey: string; pause: { release(): void } }
+		{
+			activeSessionId: string;
+			owner: DaemonSocketClient;
+			leaseKey: string;
+			pause: { release(): void };
+		}
 	>();
 	private readonly acpMcpOwners = new Map<
 		string,
-		{ client: DaemonSocketClient; ownerId: string; serverNames: string[]; release?: Promise<void> }
+		{
+			client: DaemonSocketClient;
+			ownerId: string;
+			serverNames: string[];
+			release?: Promise<void>;
+		}
 	>();
 	private readonly mutationDrain = new MutationDrainLatch();
 	private updateRestart?: {
@@ -633,7 +644,6 @@ export class AgentDaemon {
 	private rosterFlushScheduled = false;
 	private rosterHeartbeatTimer?: ReturnType<typeof setInterval>;
 	private rlmSpawnLedgerInstance?: RlmSpawnLedger;
-	private passiveRlmSubagentCache?: Promise<PassiveRlmSubagent[]>;
 	/** In-flight admission spawn appends, awaited (and consumed) by createRlmSubagentRuntime. */
 	private readonly pendingRlmSpawnAppends = new Map<string, Promise<void>>();
 
@@ -903,41 +913,13 @@ export class AgentDaemon {
 		let ownsLock = false;
 		try {
 			for (let attempt = 0; attempt < 3 && !ownsLock; attempt++) {
-				const token = randomUUID();
-				const candidateDirectory = `${lockDirectory}.candidate-${process.pid}-${token}`;
-				mkdirSync(candidateDirectory, { mode: 0o700 });
-				writeFileSync(join(candidateDirectory, "pid"), `${process.pid}\n`, {
-					mode: 0o600,
-				});
-				try {
-					renameSync(candidateDirectory, lockDirectory);
-					ownsLock = true;
-					break;
-				} catch (error) {
-					rmSync(candidateDirectory, { recursive: true, force: true });
-					const code = (error as NodeJS.ErrnoException).code;
-					if (code !== "EEXIST" && code !== "ENOTEMPTY") {
-						throw error;
-					}
-					let ownerPid: number | undefined;
-					try {
-						ownerPid = Number(readFileSync(join(lockDirectory, "pid"), "utf8").trim());
-					} catch {
-						// An invalid owner is reclaimed atomically below.
-					}
-					if (ownerPid && this.isProcessAlive(ownerPid)) {
-						return;
-					}
-					const staleDirectory = `${lockDirectory}.stale-${process.pid}-${token}`;
-					try {
-						renameSync(lockDirectory, staleDirectory);
-						rmSync(staleDirectory, { recursive: true, force: true });
-					} catch (reclaimError) {
-						if ((reclaimError as NodeJS.ErrnoException).code !== "ENOENT") {
-							throw reclaimError;
-						}
-					}
+				const result = await tryAcquireDirLock(lockDirectory, (ownerPid) =>
+					ownerPid !== undefined ? isProcessAlive(ownerPid) : false,
+				);
+				if (result === "held") {
+					return;
 				}
+				ownsLock = result === "acquired";
 			}
 			if (!ownsLock) {
 				return;
@@ -958,7 +940,7 @@ export class AgentDaemon {
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];
-			const child = spawn(launch.command, launch.args, {
+			const child = spawnHidden(launch.command, launch.args, {
 				cwd: this.options.defaultSessionConfig.cwd ?? process.cwd(),
 				detached: true,
 				env: environment,
@@ -980,15 +962,6 @@ export class AgentDaemon {
 				rmSync(lockDirectory, { recursive: true, force: true });
 			}
 			this.supervisorLaunchInProgress = false;
-		}
-	}
-
-	private isProcessAlive(pid: number): boolean {
-		try {
-			process.kill(pid, 0);
-			return true;
-		} catch (error) {
-			return (error as NodeJS.ErrnoException).code === "EPERM";
 		}
 	}
 
@@ -1064,9 +1037,7 @@ export class AgentDaemon {
 		this.invalidatePassiveRlmSubagentCache();
 	}
 
-	private invalidatePassiveRlmSubagentCache(): void {
-		this.passiveRlmSubagentCache = undefined;
-	}
+	private invalidatePassiveRlmSubagentCache(): void {}
 
 	/**
 	 * Legacy per-parent registry path. Read-only: consumed solely as fallback
@@ -1080,9 +1051,11 @@ export class AgentDaemon {
 	private readLegacyRlmSubagentRegistry(
 		path: string,
 		throwOnReadError = false,
+		onReadError?: () => void,
 	): Promise<LegacyRlmSubagentRegistryEntry[]> {
 		return readLegacyRlmSubagentRegistryFile(path, {
 			throwOnReadError,
+			onReadError,
 			log: (message) => this.log(message),
 		});
 	}
@@ -1132,7 +1105,7 @@ export class AgentDaemon {
 			this.pendingRlmSpawnAppends.set(`${parentState.activeSessionId}#${input.childId}`, spawnAppend);
 		}
 		try {
-			writeRlmSubagentDisplayEntry({
+			const written = writeRlmSubagentDisplayEntry({
 				type: "rlm_subagent",
 				childId: input.childId,
 				sessionName: input.sessionName,
@@ -1143,7 +1116,10 @@ export class AgentDaemon {
 				createdAt: input.createdAt ?? Date.now(),
 				updatedAt: new Date().toISOString(),
 			});
-			return true;
+			if (!written) {
+				this.log(`skipped RLM subagent display entry for ${input.childId}: deleted tombstone exists`);
+			}
+			return written;
 		} catch (error) {
 			this.log(
 				`failed to persist RLM subagent display entry: ${error instanceof Error ? error.message : String(error)}`,
@@ -1300,8 +1276,28 @@ export class AgentDaemon {
 		} else if (edges.length > 0) {
 			// Only tombstoned edges: the tombstones are already durable, nothing
 			// to re-append. A prior deletion may have crashed before its artifact
-			// sweep, so retry it here.
+			// sweep. Restore the display tombstone before sweeping artifacts.
 			for (const tombstoned of edges) {
+				try {
+					const currentDisplay = await readRlmSubagentDisplayEntry(dirname(tombstoned.child));
+					if (!currentDisplay || currentDisplay.status !== "deleted") {
+						writeRlmSubagentDisplayEntry({
+							type: "rlm_subagent",
+							childId,
+							sessionName: currentDisplay?.sessionName ?? tombstoned.name,
+							sessionDir: dirname(tombstoned.child),
+							sessionFile: currentDisplay?.sessionFile ?? tombstoned.child,
+							...rlmSubagentMetadataFields(currentDisplay ?? {}),
+							status: "deleted",
+							createdAt: currentDisplay?.createdAt ?? 0,
+							updatedAt: new Date().toISOString(),
+						});
+					}
+				} catch {
+					// Best-effort: the ledger tombstone is the authority; the display
+					// file is display-grade and the sweep below will remove artifacts.
+					this.log(`failed to reconcile display entry for tombstoned RLM subagent ${childId}`);
+				}
 				await this.deleteRlmSubagentArtifacts(childId, tombstoned.child);
 			}
 			return;
@@ -1358,7 +1354,11 @@ export class AgentDaemon {
 		// The ledger delete record is the topology tombstone; unlike the
 		// dual-write era it has no other writer to fall back on, so a failed
 		// append is a failed deletion.
-		await this.rlmSpawnLedger().appendDelete({ childId, child: entry.sessionFile, reason });
+		await this.rlmSpawnLedger().appendDelete({
+			childId,
+			child: entry.sessionFile,
+			reason,
+		});
 		if (this.options.worker) {
 			this.rosterReporter.removedAgentIds.set(
 				this.rosterAgentIdForRlmChild(childId, entry.parentSessionFile),
@@ -1393,6 +1393,7 @@ export class AgentDaemon {
 		edge: RlmLedgerEdge,
 		parent: { sessionId: string; sessionFile: string },
 		legacyRegistryCache?: Map<string, Promise<LegacyRlmSubagentRegistryEntry[]>>,
+		onReadError?: (path: string) => void,
 	): Promise<PassiveRlmSubagentEntry> {
 		const edgeChild = canonicalSessionPath(edge.child);
 		const base = {
@@ -1426,7 +1427,9 @@ export class AgentDaemon {
 			status: source.status,
 			createdAt: source.createdAt,
 		});
-		const display = await readRlmSubagentDisplayEntry(dirname(edge.child));
+		const display = await readRlmSubagentDisplayEntry(dirname(edge.child), () =>
+			onReadError?.(rlmSubagentDisplayPath(dirname(edge.child))),
+		);
 		if (display && display.childId === edge.childId) {
 			// A display-file child was ledger-spawned: the edge depth is real.
 			return { ...metadataFields(display), rlmDepth: edge.depth };
@@ -1434,7 +1437,7 @@ export class AgentDaemon {
 		const registryPath = this.legacyRlmSubagentRegistryPath(parent.sessionFile, parent.sessionId);
 		let registryRead = legacyRegistryCache?.get(registryPath);
 		if (!registryRead) {
-			registryRead = this.readLegacyRlmSubagentRegistry(registryPath);
+			registryRead = this.readLegacyRlmSubagentRegistry(registryPath, false, () => onReadError?.(registryPath));
 			legacyRegistryCache?.set(registryPath, registryRead);
 		}
 		const legacy = (await registryRead).find((entry) => entry.childId === edge.childId);
@@ -1442,7 +1445,10 @@ export class AgentDaemon {
 			// A seeded edge's depth may be a parent+1 guess for legacy entries
 			// without one: leave it absent so hydration falls back to the
 			// persisted header depth, exactly as the registry reader did.
-			return { ...metadataFields(legacy), ...(legacy.rlmDepth !== undefined ? { rlmDepth: legacy.rlmDepth } : {}) };
+			return {
+				...metadataFields(legacy),
+				...(legacy.rlmDepth !== undefined ? { rlmDepth: legacy.rlmDepth } : {}),
+			};
 		}
 		// Ledger-only child (metadata lost): hydratable with defaults.
 		let createdAt = 0;
@@ -1454,36 +1460,151 @@ export class AgentDaemon {
 		return { ...base, rlmDepth: edge.depth, status: "completed", createdAt };
 	}
 
-	/** List each root's passive (non-resident) descendants from the ledger, without creating runtimes. */
+	// One memoized passive-topology derivation per argument shape; all daemon
+	// consumers read the cached walk. A hit requires the ledger stat, roster,
+	// live roots, root-state identities, and every visited file input's stat
+	// (captured before its read, so mid-walk writes cost one extra re-walk,
+	// never a stale memo) to be unchanged. Same-shape walks run one at a time;
+	// a caller never joins an earlier walk.
+	private readonly passiveRlmSubagentWalks = new Map<string, Promise<PassiveRlmSubagent[]>>();
+	private readonly passiveRlmSubagentMemo = new Map<
+		string,
+		{
+			fingerprint: string;
+			inputStats: Map<string, string>;
+			result: PassiveRlmSubagent[];
+		}
+	>();
+	private static readonly PASSIVE_RLM_MEMO_MAX_KEYS = 4;
+
+	private hasPersistedResidentSession(): boolean {
+		for (const state of this.sessions.values()) {
+			if (state.runtime.session.sessionFile) return true;
+		}
+		return false;
+	}
+
+	private async passiveRlmTopologyFingerprint(savedRootInfos: SessionInfo[]): Promise<string> {
+		const ledgerStat = await this.passiveRlmStatString(this.rlmSpawnLedger().ledgerPath);
+		const resident = [...this.sessions.values()]
+			.map((state) => `${state.activeSessionId}:${state.runtime.session.sessionFile ?? ""}`)
+			.sort();
+		const roots = savedRootInfos.map((info) => resolve(info.path)).sort();
+		return `${ledgerStat}|${resident.join(",")}|${roots.join(",")}`;
+	}
+
+	private async passiveRlmStatString(path: string): Promise<string> {
+		try {
+			const stats = await stat(path);
+			return `${stats.size}:${stats.mtimeMs}:${stats.ino}`;
+		} catch {
+			return "absent";
+		}
+	}
+
+	private async passiveRlmInputStatsUnchanged(inputStats: Map<string, string>): Promise<boolean> {
+		const checks = await Promise.all(
+			[...inputStats].map(async ([path, statString]) => (await this.passiveRlmStatString(path)) === statString),
+		);
+		return checks.every(Boolean);
+	}
+
+	private passiveRlmRootsStillResident(result: PassiveRlmSubagent[]): boolean {
+		return result.every(
+			(passive) =>
+				!passive.rootParentState ||
+				this.sessions.get(passive.rootParentState.activeSessionId) === passive.rootParentState,
+		);
+	}
+
 	private listPassiveRlmSubagents(
 		savedRoots: SessionInfo[] = [],
 		includeResident = false,
 	): Promise<PassiveRlmSubagent[]> {
-		if (savedRoots.length > 0 || includeResident) {
-			return this.loadPassiveRlmSubagents(savedRoots, includeResident);
+		const savedRootInfos = savedRoots.filter((rootInfo) => inactiveLifecycleForSession(rootInfo) === "live");
+		if (savedRootInfos.length === 0 && !this.hasPersistedResidentSession()) {
+			// Keep the empty topology IO-free: no roots means no walk, no ledger stat.
+			return Promise.resolve([]);
 		}
-		if (!this.passiveRlmSubagentCache) {
-			const load = this.loadPassiveRlmSubagents([], false);
-			this.passiveRlmSubagentCache = load;
-			void load.catch(() => {
-				if (this.passiveRlmSubagentCache === load) this.passiveRlmSubagentCache = undefined;
-			});
-		}
-		return this.passiveRlmSubagentCache;
+		const key = `${includeResident}|${savedRootInfos
+			.map((info) => resolve(info.path))
+			.sort()
+			.join(",")}`;
+		const run = async (): Promise<PassiveRlmSubagent[]> => {
+			const before = await this.passiveRlmTopologyFingerprint(savedRootInfos);
+			const memo = this.passiveRlmSubagentMemo.get(key);
+			if (
+				memo &&
+				memo.fingerprint === before &&
+				this.passiveRlmRootsStillResident(memo.result) &&
+				(await this.passiveRlmInputStatsUnchanged(memo.inputStats))
+			) {
+				return memo.result;
+			}
+			const walked = await this.walkPassiveRlmSubagents(savedRootInfos, includeResident);
+			// Only a walk whose inputs held still qualifies as a memo: not the
+			// ledger-seeding first walk, not a degraded one.
+			const after = await this.passiveRlmTopologyFingerprint(savedRootInfos);
+			if (after === before && !walked.degraded) {
+				this.passiveRlmSubagentMemo.delete(key);
+				this.passiveRlmSubagentMemo.set(key, {
+					fingerprint: after,
+					inputStats: walked.inputStats,
+					result: walked.result,
+				});
+				for (const staleKey of this.passiveRlmSubagentMemo.keys()) {
+					if (this.passiveRlmSubagentMemo.size <= AgentDaemon.PASSIVE_RLM_MEMO_MAX_KEYS) break;
+					this.passiveRlmSubagentMemo.delete(staleKey);
+				}
+			} else {
+				this.passiveRlmSubagentMemo.delete(key);
+			}
+			return walked.result;
+		};
+		const previous = this.passiveRlmSubagentWalks.get(key);
+		const walk = previous ? previous.then(run, run) : run();
+		this.passiveRlmSubagentWalks.set(key, walk);
+		// Not finally(): its discarded promise would turn a rejecting walk into a
+		// daemon-crashing unhandled rejection. The caller still sees the rejection.
+		const cleanup = () => {
+			if (this.passiveRlmSubagentWalks.get(key) === walk) this.passiveRlmSubagentWalks.delete(key);
+		};
+		walk.then(cleanup, cleanup);
+		return walk;
 	}
 
-	private async loadPassiveRlmSubagents(
-		savedRoots: SessionInfo[],
+	/** List each root's passive (non-resident) descendants from the ledger, without creating runtimes. */
+	private async walkPassiveRlmSubagents(
+		savedRootInfos: SessionInfo[],
 		includeResident: boolean,
-	): Promise<PassiveRlmSubagent[]> {
-		const residentRoots: Array<{ parentState: ActiveSessionState; sessionFile: string }> = [];
+	): Promise<{
+		result: PassiveRlmSubagent[];
+		inputStats: Map<string, string>;
+		degraded: boolean;
+	}> {
+		// Captured before each read: the identity can only be older than the content.
+		const inputStats = new Map<string, string>();
+		let degraded = false;
+		const recordInputStat = async (path: string): Promise<string> => {
+			const resolved = resolve(path);
+			const existing = inputStats.get(resolved);
+			if (existing !== undefined) return existing;
+			const statString = await this.passiveRlmStatString(path);
+			inputStats.set(resolved, statString);
+			return statString;
+		};
+		const residentRoots: Array<{
+			parentState: ActiveSessionState;
+			sessionFile: string;
+		}> = [];
 		for (const parentState of this.sessions.values()) {
 			const parentFile = parentState.runtime.session.sessionFile;
 			// An in-memory session cannot own persisted children.
 			if (parentFile) residentRoots.push({ parentState, sessionFile: parentFile });
 		}
-		const savedRootInfos = savedRoots.filter((rootInfo) => inactiveLifecycleForSession(rootInfo) === "live");
-		if (residentRoots.length === 0 && savedRootInfos.length === 0) return [];
+		if (residentRoots.length === 0 && savedRootInfos.length === 0) {
+			return { result: [], inputStats, degraded };
+		}
 		const edges = await this.rlmSpawnLedger().edges();
 		const childrenByParent = new Map<string, RlmLedgerEdge[]>();
 		for (const edge of edges) {
@@ -1501,19 +1622,29 @@ export class AgentDaemon {
 			visited: Set<string>,
 		): Promise<void> => {
 			for (const edge of childrenByParent.get(canonicalSessionPath(parent.sessionFile)) ?? []) {
+				await recordInputStat(rlmSubagentDisplayPath(dirname(edge.child)));
+				await recordInputStat(this.legacyRlmSubagentRegistryPath(parent.sessionFile, parent.sessionId));
 				// The ledger stores realpath-canonical paths while the rest of the
 				// daemon keys by resolve(): work with the writer-recorded path from
 				// the metadata entry so passive rows keep matching residency,
 				// opens, and passivation bookkeeping.
-				const entry = await this.passiveRlmSubagentEntryForEdge(edge, parent, legacyRegistryCache);
+				const entry = await this.passiveRlmSubagentEntryForEdge(edge, parent, legacyRegistryCache, (path) => {
+					// A present metadata file may recover without a stat change.
+					if (inputStats.get(resolve(path)) !== "absent") degraded = true;
+				});
 				const sessionKey = resolve(entry.sessionFile);
 				if (entry.status === "deleted" || visited.has(sessionKey)) continue;
 				visited.add(sessionKey);
-				const info = await readSessionInfo(entry.sessionFile);
-				if (!info) continue;
-				// A resident child walks its own subtree as an outer root below. Avoid
-				// both duplicate rows and attributing its descendants to an ancestor.
+				// A resident child walks as an outer root below; skipping before the
+				// stat capture keeps its streamed transcript out of the input set.
 				if (!includeResident && this.findSessionBySessionFile(entry.sessionFile)) continue;
+				const childStat = await recordInputStat(entry.sessionFile);
+				const info = await readSessionInfo(entry.sessionFile);
+				if (!info) {
+					// A present file that fails to list may recover without a stat change.
+					if (childStat !== "absent") degraded = true;
+					continue;
+				}
 				const chain = [...parentChain, entry];
 				passive.push({ ...root, entry, info, chain });
 				await visit(root, { sessionId: info.id, sessionFile: entry.sessionFile }, chain, visited);
@@ -1535,7 +1666,7 @@ export class AgentDaemon {
 			if (residentRootPaths.has(rootPath)) continue;
 			await visit({ rootInfo }, { sessionId: rootInfo.id, sessionFile: rootInfo.path }, [], new Set([rootPath]));
 		}
-		return passive;
+		return { result: passive, inputStats, degraded };
 	}
 
 	private async passiveRlmSubagentsByPath(
@@ -2694,7 +2825,9 @@ export class AgentDaemon {
 				try {
 					try {
 						if (state) {
-							await this.closeSession(state, "killed", false, true, undefined, { kernelSnapshot: false });
+							await this.closeSession(state, "killed", false, true, undefined, {
+								kernelSnapshot: false,
+							});
 						} else {
 							await session?.disposeAsync({ kernelSnapshot: false });
 						}
@@ -4264,10 +4397,7 @@ export class AgentDaemon {
 					});
 				}
 				if (streamsSnapshot) {
-					const snapshotId = snapshotTranscriptId(
-						`${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`,
-						result.snapshot.messages,
-					);
+					const snapshotId = snapshotTransferId(result.snapshot);
 					let transcript: SnapshotTranscriptChunkSource;
 					try {
 						transcript = createSnapshotTranscriptChunks({
@@ -4732,6 +4862,7 @@ export class AgentDaemon {
 						}
 					},
 					command.previousTurns,
+					providerRetryPolicy(state.runtime.session.settingsManager),
 				);
 				this.sideQuestionRuns.set(command.sideQuestionId, {
 					run,
@@ -4829,7 +4960,9 @@ export class AgentDaemon {
 						entry.leaseKey === command.leaseKey,
 				);
 				if (existing) {
-					return success(command.id, "acquire_session_input_pause", { pauseId: existing[0] });
+					return success(command.id, "acquire_session_input_pause", {
+						pauseId: existing[0],
+					});
 				}
 				const state = this.getSessionState(command.activeSessionId);
 				const pauseId = randomUUID();
@@ -5134,9 +5267,15 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				const session = state.runtime.session;
 				const availableModels = await session.modelRegistry.refreshAvailableModels();
-				const model = availableModels.find((candidate) => {
-					return candidate.provider === command.provider && candidate.id === command.modelId;
-				});
+				const model =
+					availableModels.find(
+						(candidate) => candidate.provider === command.provider && candidate.id === command.modelId,
+					) ??
+					// Stale-auth providers are excluded from the available list; the lookup
+					// never mutates stale state (session.setModel owns the clear).
+					(session.modelRegistry.getProviderAuthStatus(command.provider).source === "stale"
+						? session.modelRegistry.find(command.provider, command.modelId)
+						: undefined);
 				if (!model) {
 					throw new Error(`Model not found: ${command.provider}/${command.modelId}`);
 				}
@@ -5798,9 +5937,12 @@ export class AgentDaemon {
 		const client = new DaemonClient(supervisorSocketPath);
 		try {
 			await client.connect(1000);
-			await client.waitForHello(1000);
+			await client.waitForHello();
 			const response = await client.request(
-				{ type: "list_agent_peers", workerToken: this.options.worker.authenticationToken },
+				{
+					type: "list_agent_peers",
+					workerToken: this.options.worker.authenticationToken,
+				},
 				5000,
 			);
 			if (!response.success) throw deserializeDaemonError(response);
@@ -5981,7 +6123,12 @@ export class AgentDaemon {
 	}
 
 	private async withSessionNameReservation<T>(
-		input: { name: string; depth: number; parentSessionId?: string; parentSessionPath?: string },
+		input: {
+			name: string;
+			depth: number;
+			parentSessionId?: string;
+			parentSessionPath?: string;
+		},
 		action: () => Promise<T>,
 	): Promise<T> {
 		const key = sessionNameReservationKey(input);
@@ -6004,7 +6151,7 @@ export class AgentDaemon {
 		const client = new DaemonClient(supervisorSocketPath);
 		try {
 			await client.connect(1000);
-			await client.waitForHello(1000);
+			await client.waitForHello();
 			const response = await client.request(
 				{
 					type: "set_session_name",
@@ -6149,7 +6296,9 @@ export class AgentDaemon {
 				: {}),
 			...(parentSessionPath ? { parentSessionPath: canonicalSessionPath(parentSessionPath) } : {}),
 			...(state.runtime.session.sessionFile
-				? { sessionPath: canonicalSessionPath(state.runtime.session.sessionFile) }
+				? {
+						sessionPath: canonicalSessionPath(state.runtime.session.sessionFile),
+					}
 				: {}),
 		};
 	}
@@ -6552,7 +6701,10 @@ export class AgentDaemon {
 				},
 			};
 			if (typeof session.acceptAgentMessagePrompt === "function") {
-				await session.acceptAgentMessagePrompt(prompt, { ...promptOptions, customMessage: message });
+				await session.acceptAgentMessagePrompt(prompt, {
+					...promptOptions,
+					customMessage: message,
+				});
 			} else {
 				await session.prompt(prompt, promptOptions);
 			}
@@ -7164,7 +7316,9 @@ export class AgentDaemon {
 	}
 
 	private archiveSession(state: ActiveSessionState): void {
-		state.runtime.session.sessionManager.appendSessionState({ status: "archived" });
+		state.runtime.session.sessionManager.appendSessionState({
+			status: "archived",
+		});
 	}
 
 	private async abortBashForClose(state: ActiveSessionState): Promise<void> {
@@ -7238,7 +7392,11 @@ export class AgentDaemon {
 		for (const client of state.clients) {
 			abortClientSnapshotStreaming(client, state.activeSessionId);
 		}
-		this.broadcastToSession(state, { type: "session_closed", activeSessionId: state.activeSessionId, reason });
+		this.broadcastToSession(state, {
+			type: "session_closed",
+			activeSessionId: state.activeSessionId,
+			reason,
+		});
 		for (const client of state.clients) {
 			client.attachedActiveSessionIds.delete(state.activeSessionId);
 			removeDaemonClientSessionCapabilities(client, state.activeSessionId);
@@ -7386,6 +7544,7 @@ export class AgentDaemon {
 			type: "attach",
 			activeSessionId: state.activeSessionId,
 		});
+		const snapshotId = snapshotTransferId(result.snapshot);
 		if (this.sessions.get(state.activeSessionId) !== state) {
 			finishClientSnapshotStreaming(client, state.activeSessionId);
 			if (!client.snapshotStreaming && client.catchupActiveSessionIds?.size) {
@@ -7395,10 +7554,6 @@ export class AgentDaemon {
 			}
 			return;
 		}
-		const snapshotId = snapshotTranscriptId(
-			`${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`,
-			result.snapshot.messages,
-		);
 		const transcript = createSnapshotTranscriptChunks({
 			activeSessionId: state.activeSessionId,
 			snapshotId,
@@ -7537,7 +7692,11 @@ export class AgentDaemon {
 			parentSessionPath: parentSession.sessionFile,
 			rlmChildId: child.id,
 		};
-		return { agentId: rosterAgentIdForSummary(summary), queuedChild: true, summary };
+		return {
+			agentId: rosterAgentIdForSummary(summary),
+			queuedChild: true,
+			summary,
+		};
 	}
 
 	private scheduleRosterFlush(): void {
@@ -7791,10 +7950,7 @@ export class AgentDaemon {
 							),
 						});
 					}
-					const snapshotId = snapshotTranscriptId(
-						`${activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`,
-						result.snapshot.messages,
-					);
+					const snapshotId = snapshotTransferId(result.snapshot);
 					const snapshotSignal = markClientSnapshotStreaming(client, activeSessionId);
 					let transcript: SnapshotTranscriptChunkSource;
 					try {
@@ -7843,7 +7999,12 @@ export class AgentDaemon {
 								messages: result.snapshot.messages,
 								meta,
 							}
-						: { type: "session_resynced", activeSessionId, snapshot: result.snapshot, meta };
+						: {
+								type: "session_resynced",
+								activeSessionId,
+								snapshot: result.snapshot,
+								meta,
+							};
 				if (!this.write(client, catchup)) {
 					for (const remaining of pending.slice(index + 1)) {
 						this.queueClientCatchup(client, remaining.activeSessionId, remaining.purpose);
@@ -8075,6 +8236,16 @@ const ROSTER_SESSION_EVENT_TRIGGERS = new Set([
 	"session_info_changed",
 	"thinking_level_changed",
 ]);
+
+/**
+ * The transfer id must name the cursor observed at materialization, not the live session cursor:
+ * events appended in between would let two different byte streams share one snapshot id.
+ */
+function snapshotTransferId(snapshot: DaemonSessionSnapshot): string {
+	// createSessionSnapshot always sets lastEventCursor; it is optional only on the wire.
+	const cursor = snapshot.lastEventCursor!;
+	return `${snapshot.activeSessionId}-${cursor.generation}-${cursor.sequence}`;
+}
 
 function hasDaemonOutboundActiveSessionId(
 	message: DaemonOutbound,

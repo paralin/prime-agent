@@ -22,12 +22,13 @@ import {
 } from "@earendil-works/pi-ai";
 import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
 import { registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { dirname, join } from "path";
 import { type Static, type TProperties, Type } from "typebox";
 import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
+import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
 import { fetchMergeGatewayModels } from "./merge-gateway-models.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
@@ -339,7 +340,10 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.name !== undefined) result.name = override.name;
 	if (override.reasoning !== undefined) result.reasoning = override.reasoning;
 	if (override.thinkingLevelMap !== undefined) {
-		result.thinkingLevelMap = { ...model.thinkingLevelMap, ...override.thinkingLevelMap };
+		result.thinkingLevelMap = {
+			...model.thinkingLevelMap,
+			...override.thinkingLevelMap,
+		};
 	}
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
 	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
@@ -390,7 +394,7 @@ function readOpenAICodexAccountId(token: string): string | undefined {
  *
  * Catalog behaviour measured 2026-08-13; see #702.
  */
-const OPENAI_CODEX_CLIENT_VERSION = "0.147.0";
+const OPENAI_CODEX_CLIENT_VERSION = "0.153.4";
 
 function openAICodexModelsUrl(baseUrl: string): string {
 	const normalized = baseUrl.replace(/\/+$/, "");
@@ -407,7 +411,10 @@ function openAICodexModelsUrl(baseUrl: string): string {
 	return url.toString();
 }
 
-function readOpenAICodexModelPage(value: unknown): { modelIds: Set<string>; nextCursor?: string } {
+function readOpenAICodexModelPage(value: unknown): {
+	modelIds: Set<string>;
+	nextCursor?: string;
+} {
 	if (!value || typeof value !== "object" || !("models" in value) || !Array.isArray(value.models)) {
 		throw new Error("Invalid OpenAI Codex model catalog");
 	}
@@ -500,14 +507,22 @@ export class ModelRegistry {
 		this.providerRequestConfigs.clear();
 		this.modelRequestHeaders.clear();
 		this.lastProviderAuthSourceTokens.clear();
-		this.authorizedPrivatePrimeInferenceModelIds.clear();
-		this.authorizedPrivatePrimeInferenceTeamId = undefined;
 		this.explicitPrivatePrimeInferenceModelIds.clear();
 		this.loadError = undefined;
 
 		// Credentials may have been written by another process (e.g. the UI
 		// process saving a login while the session lives in the daemon).
 		this.authStorage.reload();
+		const teamId = this.authStorage.getProviderHeaders(PRIME_INFERENCE_PROVIDER_ID)?.["X-Prime-Team-ID"];
+		// Direct refreshes must preserve same-team stale recovery, but invalidate changed auth immediately.
+		if (
+			this.authStorage.getAuthStatus(PRIME_INFERENCE_PROVIDER_ID).source !== "stale" ||
+			!teamId ||
+			teamId !== this.authorizedPrivatePrimeInferenceTeamId
+		) {
+			this.authorizedPrivatePrimeInferenceModelIds.clear();
+			this.authorizedPrivatePrimeInferenceTeamId = undefined;
+		}
 		resetApiProviders();
 		resetOAuthProviders();
 		// reset drops everything but model-provider built-ins; re-add MCP integrations
@@ -664,7 +679,12 @@ export class ModelRegistry {
 				}
 			}
 
-			return { models: this.parseModels(config), overrides, modelOverrides, error: undefined };
+			return {
+				models: this.parseModels(config),
+				overrides,
+				modelOverrides,
+				error: undefined,
+			};
 		} catch (error) {
 			if (error instanceof SyntaxError) {
 				return emptyCustomModelsResult(`Failed to parse models.json: ${error.message}\n\nFile: ${modelsJsonPath}`);
@@ -750,7 +770,12 @@ export class ModelRegistry {
 				const compat = mergeCompat(providerConfig.compat, modelDef.compat);
 				this.storeModelHeaders(providerName, modelDef.id, modelDef.headers);
 
-				const defaultCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+				const defaultCost = {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+				};
 				models.push({
 					id: modelDef.id,
 					name: modelDef.name ?? modelDef.id,
@@ -786,11 +811,7 @@ export class ModelRegistry {
 	 */
 	getAvailable(): Model<Api>[] {
 		return this.models.filter((model) => {
-			if (
-				isPrivatePrimeInferenceModel(model) &&
-				!this.explicitPrivatePrimeInferenceModelIds.has(model.id) &&
-				!this.authorizedPrivatePrimeInferenceModelIds.has(model.id)
-			) {
+			if (isPrivatePrimeInferenceModel(model) && !this.isAuthorizedPrivatePrimeInferenceModel(model)) {
 				return false;
 			}
 			return this.hasConfiguredAuth(model);
@@ -798,14 +819,30 @@ export class ModelRegistry {
 	}
 
 	async refreshAvailableModels(): Promise<Model<Api>[]> {
-		const previousPrivateModelIds = new Set(this.authorizedPrivatePrimeInferenceModelIds);
-		const previousTeamId = this.authorizedPrivatePrimeInferenceTeamId;
-		this.refresh();
-		await Promise.all([
-			this.refreshPrivatePrimeInferenceAuthorization(previousPrivateModelIds, previousTeamId),
-			this.refreshMergeGatewayModels(),
-		]);
-		return this.getAvailable();
+		// Serialized: a concurrent call snapshotting between this call's clear
+		// (inside refresh()) and its restore would capture an empty entitlement
+		// set and lose the cached private-model authorization for good.
+		return this.runSerializedEntitlementRefresh(async () => {
+			const previousPrivateModelIds = new Set(this.authorizedPrivatePrimeInferenceModelIds);
+			const previousTeamId = this.authorizedPrivatePrimeInferenceTeamId;
+			this.refresh();
+			await Promise.all([
+				this.refreshPrivatePrimeInferenceAuthorization(previousPrivateModelIds, previousTeamId),
+				this.refreshMergeGatewayModels(),
+			]);
+			return this.getAvailable();
+		});
+	}
+
+	private entitlementRefreshChain: Promise<unknown> = Promise.resolve();
+
+	private runSerializedEntitlementRefresh<T>(task: () => Promise<T>): Promise<T> {
+		const run = this.entitlementRefreshChain.then(task, task);
+		this.entitlementRefreshChain = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		return run;
 	}
 
 	private async refreshMergeGatewayModels(): Promise<void> {
@@ -835,6 +872,17 @@ export class ModelRegistry {
 		const teamHeaders = this.authStorage.getProviderHeaders(PRIME_INFERENCE_PROVIDER_ID);
 		const teamId = teamHeaders?.["X-Prime-Team-ID"];
 		if (!apiKey || !teamHeaders || !teamId) {
+			// Stale is not logout: keep fetched entitlements for explicit re-selection
+			// (the auth filter still hides the models while stale) — but only for
+			// the team they were fetched for; a team switch invalidates them.
+			if (
+				this.authStorage.getAuthStatus(PRIME_INFERENCE_PROVIDER_ID).source === "stale" &&
+				teamId === previousTeamId
+			) {
+				this.authorizedPrivatePrimeInferenceModelIds = previousPrivateModelIds;
+				this.authorizedPrivatePrimeInferenceTeamId = previousTeamId;
+				return;
+			}
 			this.authorizedPrivatePrimeInferenceModelIds.clear();
 			this.authorizedPrivatePrimeInferenceTeamId = undefined;
 			return;
@@ -874,7 +922,11 @@ export class ModelRegistry {
 		if (authorizedIds) {
 			this.authorizedPrivatePrimeInferenceModelIds = authorizedIds;
 			this.authorizedPrivatePrimeInferenceTeamId = teamId;
-			this.writePrivatePrimeAuthorizationCache({ fingerprint, modelIds: authorizedIds, refreshedAt: Date.now() });
+			this.writePrivatePrimeAuthorizationCache({
+				fingerprint,
+				modelIds: authorizedIds,
+				refreshedAt: Date.now(),
+			});
 		} else if (teamId === previousTeamId) {
 			this.authorizedPrivatePrimeInferenceModelIds = previousPrivateModelIds;
 			this.authorizedPrivatePrimeInferenceTeamId = teamId;
@@ -912,7 +964,11 @@ export class ModelRegistry {
 				}
 				this.authorizedPrivatePrimeInferenceModelIds = authorizedIds;
 				this.authorizedPrivatePrimeInferenceTeamId = teamId;
-				this.writePrivatePrimeAuthorizationCache({ fingerprint, modelIds: authorizedIds, refreshedAt: Date.now() });
+				this.writePrivatePrimeAuthorizationCache({
+					fingerprint,
+					modelIds: authorizedIds,
+					refreshedAt: Date.now(),
+				});
 			} catch {
 				// Keep the cached authorization.
 			}
@@ -947,7 +1003,9 @@ export class ModelRegistry {
 		}
 		try {
 			const parsed = JSON.parse(readFileSync(cachePath, "utf8")) as Partial<
-				Omit<PrivatePrimeAuthorizationCache, "modelIds"> & { modelIds: string[] }
+				Omit<PrivatePrimeAuthorizationCache, "modelIds"> & {
+					modelIds: string[];
+				}
 			>;
 			if (
 				typeof parsed.fingerprint !== "string" ||
@@ -972,9 +1030,7 @@ export class ModelRegistry {
 			return;
 		}
 		try {
-			const tmpPath = `${cachePath}.${process.pid}.tmp`;
-			writeFileSync(tmpPath, JSON.stringify({ ...cache, modelIds: [...cache.modelIds] }), { mode: 0o600 });
-			renameSync(tmpPath, cachePath);
+			writeFileAtomicSync(cachePath, JSON.stringify({ ...cache, modelIds: [...cache.modelIds] }), { mode: 0o600 });
 		} catch {
 			// A failed cache write only requires a later refetch.
 		}
@@ -994,7 +1050,12 @@ export class ModelRegistry {
 		};
 	}
 
-	async canUseModel(model: Model<Api>): Promise<boolean> {
+	/** `assumeAuthConfigured` validates an explicit stale-provider selection BEFORE the clear commits. */
+	async canUseModel(model: Model<Api>, options?: { assumeAuthConfigured?: boolean }): Promise<boolean> {
+		if (options?.assumeAuthConfigured) {
+			// Must be side-effect-free: a keyless refresh would drop the cached entitlements it needs.
+			return !isPrivatePrimeInferenceModel(model) || this.isAuthorizedPrivatePrimeInferenceModel(model);
+		}
 		if (!this.hasConfiguredAuth(model)) {
 			return false;
 		}
@@ -1006,8 +1067,15 @@ export class ModelRegistry {
 		return availableModels.some((candidate) => candidate.provider === model.provider && candidate.id === model.id);
 	}
 
+	private isAuthorizedPrivatePrimeInferenceModel(model: Model<Api>): boolean {
+		return (
+			this.explicitPrivatePrimeInferenceModelIds.has(model.id) ||
+			this.authorizedPrivatePrimeInferenceModelIds.has(model.id)
+		);
+	}
+
 	async getExecutableModels(): Promise<Model<Api>[]> {
-		await this.refreshPrivatePrimeInferenceAuthorization();
+		await this.runSerializedEntitlementRefresh(() => this.refreshPrivatePrimeInferenceAuthorization());
 		const availableModels = this.getAvailable();
 		const codexModels = availableModels.filter((model) => model.provider === "openai-codex");
 		if (codexModels.length === 0) {
@@ -1054,7 +1122,11 @@ export class ModelRegistry {
 				seenCursors.add(page.nextCursor);
 				modelsUrl.searchParams.set("cursor", page.nextCursor);
 			}
-			this.openAICodexModelsCache = { authFingerprint, modelIds, refreshedAt: Date.now() };
+			this.openAICodexModelsCache = {
+				authFingerprint,
+				modelIds,
+				refreshedAt: Date.now(),
+			};
 			return filterModelsByOpenAICodexCatalog(availableModels, modelIds);
 		} catch {
 			if (cached?.authFingerprint === authFingerprint && Date.now() - cached.refreshedAt < 300_000) {
@@ -1251,6 +1323,12 @@ export class ModelRegistry {
 		return token ? this.markProviderAuthSourceStale(token) : false;
 	}
 
+	/** Forget stale-auth markings; a structured auth failure on the next request re-marks the provider. */
+	clearProviderAuthStale(provider: string): void {
+		this.staleProviderRequestAuthSources.delete(provider);
+		this.authStorage.clearAuthStale(provider);
+	}
+
 	getCurrentProviderAuthSourceToken(provider: string): AuthSourceToken | undefined {
 		const lastRequestToken = this.lastProviderAuthSourceTokens.get(provider);
 		if (lastRequestToken) {
@@ -1267,7 +1345,9 @@ export class ModelRegistry {
 			return undefined;
 		}
 		const resolvedApiKey = resolveConfigValueUncached(providerApiKey);
-		const source = this.getProviderRequestAuthSource(provider, { resolvedApiKey });
+		const source = this.getProviderRequestAuthSource(provider, {
+			resolvedApiKey,
+		});
 		const valueFingerprint = source?.valueFingerprint ?? source?.resolveValueFingerprint?.();
 		if (!source || !valueFingerprint || this.isProviderRequestAuthStale(provider, source)) {
 			return undefined;
@@ -1379,12 +1459,20 @@ export class ModelRegistry {
 
 			let headers =
 				model.headers || authStorageHeaders || providerHeaders || modelHeaders
-					? { ...model.headers, ...authStorageHeaders, ...providerHeaders, ...modelHeaders }
+					? {
+							...model.headers,
+							...authStorageHeaders,
+							...providerHeaders,
+							...modelHeaders,
+						}
 					: undefined;
 
 			if (providerConfig?.authHeader) {
 				if (!apiKey) {
-					return { ok: false, error: `No API key found for "${model.provider}"` };
+					return {
+						ok: false,
+						error: `No API key found for "${model.provider}"`,
+					};
 				}
 				headers = { ...headers, Authorization: `Bearer ${apiKey}` };
 			}
@@ -1465,7 +1553,9 @@ export class ModelRegistry {
 			this.setLastProviderAuthSourceToken(provider, undefined);
 			return undefined;
 		}
-		const source = this.getProviderRequestAuthSource(provider, { resolvedApiKey });
+		const source = this.getProviderRequestAuthSource(provider, {
+			resolvedApiKey,
+		});
 		if (!source || this.isProviderRequestAuthStale(provider, source)) {
 			this.setLastProviderAuthSourceToken(provider, undefined);
 			return undefined;
@@ -1640,7 +1730,12 @@ export interface ProviderConfigInput {
 		reasoning: boolean;
 		thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
 		input: ("text" | "image")[];
-		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+		cost: {
+			input: number;
+			output: number;
+			cacheRead: number;
+			cacheWrite: number;
+		};
 		contextWindow: number;
 		maxTokens: number;
 		headers?: Record<string, string>;

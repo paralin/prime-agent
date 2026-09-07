@@ -268,6 +268,15 @@ import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import { renderScratchHandoffCloseoutMessage, SCRATCH_HANDOFF_CLOSEOUT_GUIDANCE } from "./prompts/scratch-handoff.js";
 import {
+	isAgentLifecycleFailure,
+	isFauxProviderQueueExhausted,
+	isPermanentProviderFailureKind,
+	providerRetryDelay,
+	providerRetryPolicy,
+	providerStreamFailureKind,
+	providerStreamFailureRetryAfterMs,
+} from "./provider-retry.js";
+import {
 	createReasoningOutputNudgeMessage,
 	REASONING_OUTPUT_NUDGE_CUSTOM_TYPE,
 	REASONING_OUTPUT_NUDGE_PREVIEW_LABEL,
@@ -351,8 +360,10 @@ import type {
 	ActTerminalEntry,
 	ActTerminalStatus,
 	BranchSummaryEntry,
+	ChildUsageAttributionEntry,
 	CompactionEntry,
 	SessionContext,
+	SessionEntry,
 	SessionMessageEntry,
 } from "./session-manager.js";
 import {
@@ -1088,6 +1099,10 @@ interface RlmChildRun {
 	deletionReservation: AgentMessageDeferred;
 	deletionCleanupFailed?: boolean;
 	deletionRunFinished?: boolean;
+	deletionNotice?: Promise<void>;
+	deletionFailureNotice?: Promise<void>;
+	deletionNeedsCompletionNotice?: boolean;
+	completeDeletion?: () => Promise<void>;
 	reportDeletionCleanupFailure?: (error: unknown) => Promise<void>;
 	emitUpdate?: () => void;
 	lastEmittedUpdate?: string;
@@ -1253,6 +1268,26 @@ function waitForPromiseOrAbort<T>(
 	});
 }
 
+// Bounds how much accumulated child usage a parent process crash can lose.
+const RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS = 60_000;
+
+/** Label a child completion's usage by the nearest preceding prompt that triggered it. */
+function rlmChildUsageOrigin(
+	messages: readonly AgentMessage[],
+	assistant: AssistantMessage,
+): ChildUsageAttributionEntry["origin"] {
+	for (let index = messages.lastIndexOf(assistant) - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "user" && message.role !== "custom") continue;
+		return message.role === "custom" && isAgentSessionMessage(message)
+			? message.details.id.startsWith("spawn:")
+				? "spawn_task"
+				: "agent_message"
+			: "direct_user";
+	}
+	return "direct_user";
+}
+
 function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 	const parentContextTokens =
 		parentUsage.totalTokens ||
@@ -1353,6 +1388,8 @@ export class AgentSession {
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
 	private _retryAttemptOnCurrentModel = 0;
+	/** Bumped by every retry resolution; stale scheduled-continue callbacks check it before touching retry state. */
+	private _retryGeneration = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
 	private _retryAuthFailureSources: AuthSourceToken[] = [];
@@ -1441,6 +1478,10 @@ export class AgentSession {
 	private _activeActCompletion?: Promise<void>;
 	private _actTeardownPromise?: Promise<void>;
 	private readonly _startClaudeCodeQuery?: StartClaudeCodeQuery;
+	// Shared by children charged to the same assistant; excludes usage not yet attributed on disk.
+	private _rlmDurableParentUsage = new WeakMap<AssistantMessage, Usage>();
+	// Child usage not yet represented by an indexed attribution, including a delayed parent entry.
+	private _rlmUnindexedChildUsage = new WeakMap<AssistantMessage, Usage>();
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
 	private _unsettledRlmChildRuns = new Set<RlmChildRun>();
 	private _abandonedRlmQuiescenceChildIds = new Set<string>();
@@ -1646,7 +1687,10 @@ export class AgentSession {
 			const activeToolNames = this.getActiveToolNames().filter((name) => !removedToolNames.has(name));
 			for (const name of removedToolNames) this._allowedToolNames?.delete(name);
 			this._acpMcpTools = [];
-			this._refreshToolRegistry({ activeToolNames, includeAllExtensionTools: true });
+			this._refreshToolRegistry({
+				activeToolNames,
+				includeAllExtensionTools: true,
+			});
 			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
 		}
@@ -4281,6 +4325,7 @@ export class AgentSession {
 	}
 
 	private _resolveRetry(): void {
+		this._retryGeneration += 1;
 		this._semanticEdges.clearTurnRetry();
 		if (this._retryResolve) {
 			this._retryResolve();
@@ -7860,11 +7905,26 @@ export class AgentSession {
 	 * @throws Error if the model is not available
 	 */
 	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
-		if (!this._modelRegistry.hasConfiguredAuth(model)) {
+		// Explicit selection recovers from a stale-auth lockout, but only a fully
+		// validated switch commits the clear (single owner): failed selections never unlock.
+		const staleOnly =
+			!this._modelRegistry.hasConfiguredAuth(model) &&
+			this._modelRegistry.getProviderAuthStatus(model.provider).source === "stale";
+		if (!staleOnly && !this._modelRegistry.hasConfiguredAuth(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
-		if (!(await this._modelRegistry.canUseModel(model))) {
+		if (
+			!(await this._modelRegistry.canUseModel(model, {
+				assumeAuthConfigured: staleOnly,
+			}))
+		) {
 			throw new Error(`Model "${model.provider}/${model.id}" is not available for the current Prime team.`);
+		}
+		if (staleOnly) {
+			this._modelRegistry.clearProviderAuthStale(model.provider);
+			if (!this._modelRegistry.hasConfiguredAuth(model)) {
+				throw new Error(`No API key for ${model.provider}/${model.id}`);
+			}
 		}
 
 		const previousModel = this.model;
@@ -8400,7 +8460,10 @@ export class AgentSession {
 					return call(headers);
 				}
 				try {
-					const result = await call({ ...headers, ...modelRequestHeaders(requestId) });
+					const result = await call({
+						...headers,
+						...modelRequestHeaders(requestId),
+					});
 					// A slice resolving after a sibling's rejection already settled the
 					// compaction would push into a drained list and stay in-flight forever.
 					if (compactionSettled) {
@@ -8447,6 +8510,7 @@ export class AgentSession {
 						signal,
 						this.thinkingLevel,
 						summaryCall,
+						providerRetryPolicy(this.settingsManager),
 					);
 				} catch (error) {
 					if (signal.aborted || nativeCompactionError === undefined) throw error;
@@ -8572,7 +8636,9 @@ export class AgentSession {
 		};
 		const closeout = this._scratchCloseout;
 		if (latestPersistedScratchHandoffPath(branch) !== displayPath) {
-			this.sessionManager.appendCustomEntry(SCRATCH_HANDOFF_PATH_CUSTOM_TYPE, { path: displayPath });
+			this.sessionManager.appendCustomEntry(SCRATCH_HANDOFF_PATH_CUSTOM_TYPE, {
+				path: displayPath,
+			});
 		}
 
 		const prompt = `${renderScratchHandoffCloseoutMessage(displayPath, create)}\n\n${SCRATCH_KERNEL_GUIDANCE}`;
@@ -9144,6 +9210,7 @@ export class AgentSession {
 			headers,
 			signal,
 			this.thinkingLevel,
+			providerRetryPolicy(this.settingsManager),
 		);
 	}
 
@@ -9379,7 +9446,7 @@ export class AgentSession {
 			history,
 			model,
 			apiKey,
-			options,
+			{ ...options, retry: providerRetryPolicy(this.settingsManager) },
 			headers,
 			signal,
 			this.thinkingLevel,
@@ -9742,8 +9809,18 @@ export class AgentSession {
 			this._compactionOperation = operation;
 			const startAfter = this._agentEventQueue;
 			void startAfter.then(
-				() => this._runAutoCompaction(reason, willRetry, { controller, operation, resolveOperation }),
-				() => this._runAutoCompaction(reason, willRetry, { controller, operation, resolveOperation }),
+				() =>
+					this._runAutoCompaction(reason, willRetry, {
+						controller,
+						operation,
+						resolveOperation,
+					}),
+				() =>
+					this._runAutoCompaction(reason, willRetry, {
+						controller,
+						operation,
+						resolveOperation,
+					}),
 			);
 			return true;
 		}
@@ -10889,7 +10966,6 @@ export class AgentSession {
 			sessionId: sessionManager.getSessionId(),
 			thinkingBudgets: this.settingsManager.getThinkingBudgets(),
 			transport: this.settingsManager.getTransport(),
-			maxRetryDelayMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 			toolExecution: this.agent.toolExecution,
 		});
 		const session = new AgentSession({
@@ -11312,7 +11388,6 @@ export class AgentSession {
 			sessionId: childSessionManager.getSessionId(),
 			thinkingBudgets: this.settingsManager.getThinkingBudgets(),
 			transport: this.settingsManager.getTransport(),
-			maxRetryDelayMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 			toolExecution: this.agent.toolExecution,
 		});
 
@@ -11824,6 +11899,7 @@ export class AgentSession {
 				// resolved child. A failed preflight must leave the prior retry boundary
 				// intact so a later call can acquire it.
 				run.deletionCleanupFailed = false;
+				run.deletionFailureNotice = undefined;
 				run.deletionReservation = createAgentMessageDeferred();
 			}
 			// The detached task remains the sole lifecycle owner. Mark deletion before
@@ -12851,6 +12927,74 @@ export class AgentSession {
 			});
 		}
 		const parentAssistantForUsage = this._findLastAssistantMessage();
+		if (parentAssistantForUsage && !this._rlmDurableParentUsage.has(parentAssistantForUsage)) {
+			this._rlmDurableParentUsage.set(parentAssistantForUsage, cloneUsage(parentAssistantForUsage.usage));
+		}
+		// Child completions accumulate per origin and flush one durable entry per
+		// settle boundary (agent_end, settlement); the staleness checkpoints and
+		// timer bound crash loss to one window of accumulated usage.
+		const pendingChildUsage = new Map<ChildUsageAttributionEntry["origin"], Usage>();
+		let pendingChildUsageSince = 0;
+		let pendingChildUsageTimer: ReturnType<typeof setTimeout> | undefined;
+		let parentEntryDrainScheduled = false;
+		const flushPendingChildUsageAttribution = (afterParentDrain = false) => {
+			if (pendingChildUsageTimer !== undefined) {
+				clearTimeout(pendingChildUsageTimer);
+				pendingChildUsageTimer = undefined;
+			}
+			if (pendingChildUsage.size === 0 || !parentAssistantForUsage) return;
+			const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
+			if (!parentEntry) {
+				if (!afterParentDrain && !parentEntryDrainScheduled) {
+					parentEntryDrainScheduled = true;
+					const flushAfterParentDrain = () => {
+						parentEntryDrainScheduled = false;
+						flushPendingChildUsageAttribution(true);
+					};
+					// A message_end extension may still be holding the parent assistant before its append.
+					// The parent drain owns this retry; child settlement never waits for that queue.
+					this._agentEventQueue = this._agentEventQueue.then(flushAfterParentDrain, flushAfterParentDrain);
+					this._agentEventQueue.catch(() => {});
+				}
+				return;
+			}
+			const batches = [...pendingChildUsage.entries()];
+			pendingChildUsage.clear();
+			for (const [origin, childUsage] of batches) {
+				const aggregateUsage = cloneUsage(this._rlmDurableParentUsage.get(parentAssistantForUsage)!);
+				attributeChildUsage(aggregateUsage, childUsage);
+				const liveUsage = parentAssistantForUsage.usage;
+				const entryCount = this.sessionManager.getEntries().length;
+				try {
+					this.sessionManager.appendChildUsageAttribution(parentEntry.id, childUsage, aggregateUsage, origin);
+					this._rlmDurableParentUsage.set(parentAssistantForUsage, aggregateUsage);
+				} catch {
+					// Attribution is recoverable bookkeeping; a failed append must not break run settlement.
+				} finally {
+					// The manager updates this same message; retain siblings' still-pending live usage.
+					parentAssistantForUsage.usage = liveUsage;
+					const indexed = this.sessionManager.getEntries()[entryCount];
+					const unindexedUsage = this._rlmUnindexedChildUsage.get(parentAssistantForUsage);
+					// _persist can throw after indexing. That row already participates in live own-usage subtraction.
+					if (
+						indexed?.type === "child_usage_attributed" &&
+						indexed.targetId === parentEntry.id &&
+						unindexedUsage
+					) {
+						subtractAssistantUsage(unindexedUsage, childUsage);
+					}
+					this._ownUsageMemo = undefined;
+				}
+			}
+		};
+		const flushPendingChildUsageIfStale = () => {
+			if (
+				pendingChildUsage.size > 0 &&
+				Date.now() - pendingChildUsageSince >= RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS
+			) {
+				flushPendingChildUsageAttribution();
+			}
+		};
 		let runningToolCount = 0;
 		let childSession: AgentSession | undefined;
 		const run: RlmChildRun = {
@@ -12917,14 +13061,17 @@ export class AgentSession {
 
 		run.reportDeletionCleanupFailure = (error) => {
 			if (run.suppressTerminalNotice || this._disposed || this._disposing) return Promise.resolve();
+			if (run.deletionFailureNotice) return run.deletionFailureNotice;
 			const cleanupError = error instanceof Error ? error.message : String(error);
-			return deliverTerminalMessageToParent(
+			const notice = deliverTerminalMessageToParent(
 				createRlmChildFailureMessage({
 					childId: run.id,
 					sessionName,
 					error: `Deletion cleanup failed; retry rlm.delete_subagent("${run.id}") before completion: ${cleanupError}`,
 				}),
 			);
+			run.deletionFailureNotice = notice;
+			return notice;
 		};
 
 		// Runtime startup and the task run are deliberately detached. The public
@@ -12951,34 +13098,35 @@ export class AgentSession {
 						run.activity = { kind: "waiting" };
 						emitChildUpdate();
 					} else if (event.type === "agent_end") {
+						flushPendingChildUsageAttribution();
 						run.activity = undefined;
 						emitChildUpdate();
 					} else if (event.type === "message_end" && event.message.role === "assistant") {
 						const assistant = event.message as AssistantMessage;
 						if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
+							// Flush before the fold: a persisted aggregate may only include
+							// completions whose childUsage is durable with or before it.
+							flushPendingChildUsageIfStale();
 							attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
 							if (parentAssistantForUsage) {
-								const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
-								if (parentEntry) {
-									const messages = child.messages;
-									const assistantIndex = messages.lastIndexOf(assistant);
-									const precedingPrompt = messages
-										.slice(0, assistantIndex)
-										.reverse()
-										.find((message) => message.role === "user" || message.role === "custom");
-									const origin =
-										precedingPrompt?.role === "custom" && isAgentSessionMessage(precedingPrompt)
-											? precedingPrompt.details.id.startsWith("spawn:")
-												? "spawn_task"
-												: "agent_message"
-											: "direct_user";
-									this.sessionManager.appendChildUsageAttribution(
-										parentEntry.id,
-										assistant.usage,
-										parentAssistantForUsage.usage,
-										origin,
+								const unindexedUsage =
+									this._rlmUnindexedChildUsage.get(parentAssistantForUsage) ?? emptyUsage();
+								addAssistantUsage(unindexedUsage, assistant.usage);
+								this._rlmUnindexedChildUsage.set(parentAssistantForUsage, unindexedUsage);
+								this._ownUsageMemo = undefined;
+								const origin = rlmChildUsageOrigin(child.messages, assistant);
+								if (pendingChildUsage.size === 0) {
+									pendingChildUsageSince = Date.now();
+									// Wall-clock backstop for long tool runs without checkpoints.
+									pendingChildUsageTimer = setTimeout(
+										flushPendingChildUsageAttribution,
+										RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS,
 									);
+									pendingChildUsageTimer.unref?.();
 								}
+								const bucket = pendingChildUsage.get(origin) ?? emptyUsage();
+								addAssistantUsage(bucket, assistant.usage);
+								pendingChildUsage.set(origin, bucket);
 							}
 						}
 						const text = compactRlmText(readAssistantText(assistant));
@@ -12992,6 +13140,7 @@ export class AgentSession {
 							emitChildUpdate();
 						}
 					} else if (event.type === "tool_execution_start") {
+						flushPendingChildUsageIfStale();
 						run.toolUseCount += 1;
 						runningToolCount += 1;
 						run.activity = { kind: "executing", toolName: event.toolName };
@@ -13156,6 +13305,7 @@ export class AgentSession {
 					}
 				}
 			} finally {
+				flushPendingChildUsageAttribution();
 				if (run.detachedDeletion) {
 					run.deletionRunFinished = true;
 					if (!run.settled) {
@@ -13240,11 +13390,11 @@ export class AgentSession {
 	}
 
 	private _isFauxProviderQueueExhausted(message: AssistantMessage): boolean {
-		return message.provider === "faux" && message.errorMessage === "No more faux responses queued";
+		return isFauxProviderQueueExhausted(message);
 	}
 
 	private _isAgentLifecycleFailure(message: AssistantMessage): boolean {
-		return message.diagnostics?.some((diagnostic) => diagnostic.type === "agent_lifecycle_failure") ?? false;
+		return isAgentLifecycleFailure(message);
 	}
 
 	private _isAgentRepetitionLoop(message: AssistantMessage): boolean {
@@ -13261,13 +13411,7 @@ export class AgentSession {
 	}
 
 	private _getProviderStreamFailureKind(message: AssistantMessage): string | undefined {
-		const kind = this._getProviderStreamFailureDetails(message)?.kind;
-		return typeof kind === "string" ? kind : undefined;
-	}
-
-	private _isStructuredPermanentProviderFailure(message: AssistantMessage): boolean {
-		const kind = this._getProviderStreamFailureKind(message);
-		return kind === "auth" || kind === "invalid_request" || kind === "refusal";
+		return providerStreamFailureKind(message);
 	}
 
 	private _hasReplayUnsafeProviderFailureOutput(message: AssistantMessage): boolean {
@@ -13311,29 +13455,10 @@ export class AgentSession {
 	}
 
 	private _isStructuredPermanentProviderRetryExhausted(message: AssistantMessage): boolean {
-		return this._retryAttemptOnCurrentModel > 0 && this._isStructuredPermanentProviderFailure(message);
-	}
-
-	private _getProviderStreamFailureAuthStatus(message: AssistantMessage): number | undefined {
-		const details = this._getProviderStreamFailureDetails(message);
-		if (!details) {
-			return undefined;
-		}
-
-		const kind = details.kind;
-		if (kind !== "auth") {
-			return undefined;
-		}
-
-		const status = details.status;
-		if (typeof status === "number") {
-			return status;
-		}
-		if (typeof status === "string") {
-			const parsed = Number(status);
-			return Number.isInteger(parsed) ? parsed : undefined;
-		}
-		return undefined;
+		return isPermanentProviderFailureKind(
+			this._getProviderStreamFailureKind(message),
+			this._retryAttemptOnCurrentModel,
+		);
 	}
 
 	private _isOpenAICodexUsageExhaustion(message: AssistantMessage): boolean {
@@ -13356,20 +13481,8 @@ export class AgentSession {
 
 	private _isConcreteProviderAuthFailure(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
-
-		const structuredStatus = this._getProviderStreamFailureAuthStatus(message);
-		if (structuredStatus === 401 || structuredStatus === 403) {
-			return true;
-		}
-
-		if (/\b(?:401|403)\b/.test(message.errorMessage) && /\bstatus code\b/i.test(message.errorMessage)) {
-			return true;
-		}
-
-		return (
-			/\b(?:401|403)\b/.test(message.errorMessage) &&
-			/auth|unauthori[sz]ed|forbidden|api.?key|token|credential/i.test(message.errorMessage)
-		);
+		// Only the provider's structured classification counts as an auth failure.
+		return this._getProviderStreamFailureKind(message) === "auth";
 	}
 
 	private _captureRetryAuthFailureSource(message: AssistantMessage): AuthSourceToken | undefined {
@@ -13491,7 +13604,28 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = switchedModel ? 0 : settings.baseDelayMs * 2 ** (this._retryAttemptOnCurrentModel - 1);
+		// Server-requested waits are honored, capped by retry.provider.maxRetryDelayMs (0 disables).
+		const maxRetryDelayMs = this.settingsManager.getProviderRetrySettings().maxRetryDelayMs;
+		const delay = providerRetryDelay(this._retryAttemptOnCurrentModel, providerStreamFailureRetryAfterMs(message), {
+			baseDelayMs: settings.baseDelayMs,
+			maxRetryDelayMs,
+		});
+		if (delay.kind === "exceeds-cap") {
+			this._markProviderAuthStaleForRetryFailure(message, options);
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: this._retryAttempt - 1,
+				finalError: `Provider requested a ${Math.ceil(delay.retryAfterMs / 1000)}s wait before retrying (above retry.provider.maxRetryDelayMs=${maxRetryDelayMs}ms): ${message.errorMessage || "unknown error"}`,
+			});
+			this._retryAttempt = 0;
+			this._retryAttemptOnCurrentModel = 0;
+			this._retryAuthFailureSources = [];
+			this._resolveRetry();
+			return false;
+		}
+
+		const delayMs = switchedModel ? 0 : delay.delayMs;
 		// Park now: the retry re-issues the failed call and must reuse its Idempotency-Key.
 		// Payload hooks mutate the wire body after the hash point, so reuse is forfeited.
 		if (!this._extensionRunner.hasHandlers("before_provider_request")) {
@@ -13532,14 +13666,27 @@ export class AgentSession {
 		}
 		this._retryAbortController = undefined;
 
+		const retryGeneration = this._retryGeneration;
 		setTimeout(() => {
 			this._rootForeground
 				.run("root-turn", () => {
 					if (this._disposed || this._disposing) return Promise.resolve();
 					return this.agent.continue();
 				})
-				.catch(() => {
-					// Retry failed - will be caught by next agent_end
+				.catch((error: unknown) => {
+					if (this._retryGeneration !== retryGeneration || !this.isRetrying) return;
+					this._markProviderAuthStaleForRetryFailure(message, options);
+					const attempt = this._retryAttempt;
+					this._retryAttempt = 0;
+					this._retryAttemptOnCurrentModel = 0;
+					this._retryAuthFailureSources = [];
+					this._emit({
+						type: "auto_retry_end",
+						success: false,
+						attempt,
+						finalError: error instanceof Error ? error.message : String(error),
+					});
+					this._resolveRetry();
 				});
 		}, 0);
 
@@ -14080,6 +14227,7 @@ export class AgentSession {
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
+					retry: providerRetryPolicy(this.settingsManager),
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };
@@ -14306,7 +14454,19 @@ export class AgentSession {
 		return (provider, modelId) => this._modelRegistry.find(provider, modelId)?.contextWindow;
 	}
 
-	private _ownUsageMemo?: { count: number; tailId: string | undefined; usage: SessionUsageSummary | undefined };
+	private _subtractUnindexedChildUsage(ownUsage: Usage, entries: SessionEntry[]): void {
+		for (const entry of entries) {
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const unindexedUsage = this._rlmUnindexedChildUsage.get(entry.message);
+			if (unindexedUsage) subtractAssistantUsage(ownUsage, unindexedUsage);
+		}
+	}
+
+	private _ownUsageMemo?: {
+		count: number;
+		tailId: string | undefined;
+		usage: SessionUsageSummary | undefined;
+	};
 
 	// Whole-file own spend, identical to the catalog scan so rows never shift at passivation.
 	getOwnUsageSummary(): SessionUsageSummary | undefined {
@@ -14317,6 +14477,7 @@ export class AgentSession {
 			return memo.usage;
 		}
 		const { ownUsage } = computeOwnAndTotalUsage(entries, entries);
+		this._subtractUnindexedChildUsage(ownUsage, entries);
 		const usage = sessionUsageSummaryFrom(ownUsage);
 		this._ownUsageMemo = { count: entries.length, tailId, usage };
 		return usage;
@@ -14332,6 +14493,7 @@ export class AgentSession {
 		const resolveContextWindow = this._contextWindowResolver();
 		const branch = this.sessionManager.getBranch();
 		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(branch, this.sessionManager.getEntries());
+		this._subtractUnindexedChildUsage(ownUsage, branch);
 
 		const children: ContextTreeNode[] = [];
 		const actDepths = new Set<number>(this._actLanes.keys());

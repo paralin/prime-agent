@@ -19,6 +19,7 @@ import { basename, dirname, join } from "path";
 import { CONFIG_DIR_NAME, getAgentDir, getBinDir, getSessionsDir } from "./config.js";
 import { migrateKeybindingsConfig } from "./core/keybindings.js";
 import { parseSettingsDocument, resolveSettingsFile, stringifySettingsDocument } from "./settings-files.js";
+import { realpathIfPresentSync, writeFileAtomicSync } from "./utils/atomic-file.js";
 import { readFirstLineSync } from "./utils/file-lines.js";
 
 const MIGRATION_GUIDE_URL =
@@ -42,7 +43,7 @@ export function migrateAuthToAuthJson(): string[] {
 	const migrated: Record<string, unknown> = {};
 	const providers: string[] = [];
 
-	// Migrate oauth.json
+	let oauthReadable = false;
 	if (existsSync(oauthPath)) {
 		try {
 			const oauth = JSON.parse(readFileSync(oauthPath, "utf-8"));
@@ -50,18 +51,21 @@ export function migrateAuthToAuthJson(): string[] {
 				migrated[provider] = { type: "oauth", ...(cred as object) };
 				providers.push(provider);
 			}
-			renameSync(oauthPath, `${oauthPath}.migrated`);
+			oauthReadable = true;
 		} catch {
 			// Skip on error
 		}
 	}
 
-	// Migrate legacy apiKeys from the active JSON or YAML settings document.
+	let settingsWithoutApiKeys: string | undefined;
+	let settingsMode: number | undefined;
+	let settingsPath: string | undefined;
 	try {
 		const settingsFile = resolveSettingsFile(agentDir);
 		if (settingsFile.exists) {
-			const content = readFileSync(settingsFile.path, "utf-8");
-			const settings = parseSettingsDocument(content);
+			settingsPath = settingsFile.path;
+			settingsMode = statSync(settingsPath).mode & 0o777;
+			const settings = parseSettingsDocument(readFileSync(settingsPath, "utf-8"));
 			if (settings.apiKeys && typeof settings.apiKeys === "object") {
 				for (const [provider, key] of Object.entries(settings.apiKeys)) {
 					if (!migrated[provider] && typeof key === "string") {
@@ -70,16 +74,40 @@ export function migrateAuthToAuthJson(): string[] {
 					}
 				}
 				delete settings.apiKeys;
-				writeFileSync(settingsFile.path, stringifySettingsDocument(settings, settingsFile.format));
+				settingsWithoutApiKeys = stringifySettingsDocument(settings, settingsFile.format);
 			}
 		}
 	} catch {
 		// Skip on error
 	}
 
+	// The destination must be durable before any source is destroyed.
 	if (Object.keys(migrated).length > 0) {
 		mkdirSync(dirname(authPath), { recursive: true });
-		writeFileSync(authPath, JSON.stringify(migrated, null, 2), { mode: 0o600 });
+		writeFileAtomicSync(realpathIfPresentSync(authPath), JSON.stringify(migrated, null, 2), {
+			mode: 0o600,
+			fsync: true,
+			fsyncDir: true,
+		});
+	}
+	// Source cleanup is best-effort: with auth.json durable, leftovers are inert.
+	try {
+		if (oauthReadable) {
+			renameSync(oauthPath, `${oauthPath}.migrated`);
+		}
+	} catch {
+		// Skip on error
+	}
+	try {
+		if (settingsWithoutApiKeys !== undefined && settingsPath !== undefined) {
+			writeFileAtomicSync(
+				realpathIfPresentSync(settingsPath),
+				settingsWithoutApiKeys,
+				settingsMode === undefined ? {} : { mode: settingsMode },
+			);
+		}
+	} catch {
+		// Skip on error
 	}
 
 	return providers;

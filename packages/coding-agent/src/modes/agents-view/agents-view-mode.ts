@@ -68,7 +68,7 @@ import {
 	type AgentsViewSelectionKey,
 	buildAgentsViewRows,
 	buildUnifiedSessionIndex,
-	computeRecursiveCosts,
+	computeRecursiveRollups,
 	createUnattachableChildOpenResult,
 	filterUnifiedSessions,
 	formatHeartbeatBadge,
@@ -77,6 +77,7 @@ import {
 	getAgentsViewSummaryIdentity as getSummaryIdentity,
 	getUnifiedSessionAncestorSessionIds,
 	hasUnifiedSessionChildren,
+	isEmptyAgentsViewSession,
 	isSubagentSummary,
 	migrateAgentsViewIdentitySet,
 	reconcileUnifiedSessions,
@@ -358,7 +359,11 @@ async function openAgentsViewSession(
 			reconnectTimeoutMs: options.reconnectTimeoutMs,
 			telemetryDisabled: options.config.telemetryDisabled,
 		});
-		return { connection, summary: resumed.summary, cwdFallbackNotice: resumed.cwdFallbackNotice };
+		return {
+			connection,
+			summary: resumed.summary,
+			cwdFallbackNotice: resumed.cwdFallbackNotice,
+		};
 	} catch (error) {
 		client.close();
 		throw error;
@@ -374,7 +379,11 @@ async function resumeSavedAgentsViewSession(
 	client: DaemonClient,
 	config: AgentSessionRuntimeConfig,
 	summary: SessionSummary,
-): Promise<{ summary: SessionSummary; activeSessionId: string; cwdFallbackNotice?: string }> {
+): Promise<{
+	summary: SessionSummary;
+	activeSessionId: string;
+	cwdFallbackNotice?: string;
+}> {
 	if (!summary.sessionFile) {
 		throw new Error("Cannot resume a session without a saved session file");
 	}
@@ -502,7 +511,10 @@ async function runAgentsViewLoop(
 					persistentState.selectedSessionKey = getAgentsViewSelectionKey(returnedSession);
 				}
 				if (interactiveResult.type === "scoped_agents_view") {
-					const nextScope = { sessionId: source.sessionId, activeSessionId: source.activeSessionId };
+					const nextScope = {
+						sessionId: source.sessionId,
+						activeSessionId: source.activeSessionId,
+					};
 					persistentState.scopeFrames = transitionAgentsViewScope(persistentState.scopeFrames ?? [], {
 						type: "push",
 						scope: nextScope,
@@ -624,7 +636,12 @@ export function resolveCurrentReplyTargetSummary(
 	// A persisted target missing from the current live catalog can still be
 	// resumed from its captured file, but its captured runtime id is stale.
 	if (target.summary.sessionFile && target.summary.activeSessionId) {
-		return { ...target.summary, activeSessionId: undefined, lifecycle: "archived", activity: "idle" };
+		return {
+			...target.summary,
+			activeSessionId: undefined,
+			lifecycle: "archived",
+			activity: "idle",
+		};
 	}
 	return target.summary;
 }
@@ -686,8 +703,16 @@ export class AgentsViewMode implements Component, Focusable {
 	private replyHeaderTime = "";
 	private pendingDeleteAgent: PendingDeleteAgent | undefined;
 	private pendingKillSubagent: PendingKillSubagent | undefined;
-	private renameTarget: { activeSessionId?: string; sessionFile?: string; summary: SessionSummary } | undefined;
+	private renameTarget:
+		| {
+				activeSessionId?: string;
+				sessionFile?: string;
+				summary: SessionSummary;
+		  }
+		| undefined;
 	private actionModeSearchQuery: string | undefined;
+	/** Session the view was entered from; exempt from the empty-session sort demotion. */
+	private readonly anchorSessionId: string | undefined;
 	private readonly inactiveAgentIdentities = new Set<string>();
 	private rosterStore: AgentsViewRosterStore | undefined;
 	private unsubscribeRosterUpdate: (() => void) | undefined;
@@ -709,6 +734,7 @@ export class AgentsViewMode implements Component, Focusable {
 				persistentState.backSession ?? options.initialSession,
 			);
 		persistentState.scopeFrames = initialFrames;
+		this.anchorSessionId = (persistentState.backSession ?? options.initialSession)?.sessionId;
 		this.scopeKey = initialFrames.at(-1)?.scope;
 		this.scopeRootSummary = persistentState.scopeRootSummary;
 		this.selectedRowIdentity = persistentState.selectedRowIdentity;
@@ -836,7 +862,10 @@ export class AgentsViewMode implements Component, Focusable {
 					const root = this.scopeRootSummary;
 					return [
 						{ label: "agents", value: this.getAgentCountsText() },
-						{ label: "scope", value: root ? getAgentsViewSessionTitle(root) : "global" },
+						{
+							label: "scope",
+							value: root ? getAgentsViewSessionTitle(root) : "global",
+						},
 						{ label: "depth", value: String(getAgentsViewDepth(root)) },
 					];
 				},
@@ -1145,7 +1174,11 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private setStatusMessage(
 		message: string | undefined,
-		options: { render?: boolean; tone?: "muted" | "error" | "warning"; sticky?: boolean } = {},
+		options: {
+			render?: boolean;
+			tone?: "muted" | "error" | "warning";
+			sticky?: boolean;
+		} = {},
 	): void {
 		const statusLine = message === undefined ? undefined : formatAgentsViewStatusLine(message);
 		if (this.statusMessageTimer) {
@@ -1270,7 +1303,8 @@ export class AgentsViewMode implements Component, Focusable {
 			this.expandedSubagentParents,
 			this.programShownParents,
 			this.scopeKey,
-			computeRecursiveCosts(this.unifiedRecords, this.unifiedIndex),
+			computeRecursiveRollups(this.unifiedRecords, this.unifiedIndex),
+			this.anchorSessionId,
 		);
 		const index =
 			selectedIdentity === undefined ? -1 : this.rows.findIndex((row) => row.identity === selectedIdentity);
@@ -1343,7 +1377,10 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private getSavedSessionCatalogContext(): DaemonSavedSessionCatalogContext {
-		return { cwd: this.getSavedSessionCwd(), sessionDir: this.options.config.sessionDir };
+		return {
+			cwd: this.getSavedSessionCwd(),
+			sessionDir: this.options.config.sessionDir,
+		};
 	}
 
 	private openSelected(): void {
@@ -1633,7 +1670,11 @@ export class AgentsViewMode implements Component, Focusable {
 		try {
 			if (summary.activeSessionId) {
 				requireDaemonData(
-					await this.requireClient().request({ type: "rename", activeSessionId: summary.activeSessionId, name }),
+					await this.requireClient().request({
+						type: "rename",
+						activeSessionId: summary.activeSessionId,
+						name,
+					}),
 				);
 			} else if (summary.sessionFile) {
 				await renameDaemonSavedSession(
@@ -1643,7 +1684,9 @@ export class AgentsViewMode implements Component, Focusable {
 					name,
 				);
 			} else {
-				this.setStatusMessage("This session cannot be renamed", { tone: "warning" });
+				this.setStatusMessage("This session cannot be renamed", {
+					tone: "warning",
+				});
 				return false;
 			}
 			await this.refreshSessions();
@@ -1760,7 +1803,10 @@ export class AgentsViewMode implements Component, Focusable {
 				if (this.stopped) {
 					if (created.activeSessionId) {
 						await client
-							.request({ type: "kill", activeSessionId: created.activeSessionId })
+							.request({
+								type: "kill",
+								activeSessionId: created.activeSessionId,
+							})
 							.catch(() => undefined);
 					}
 					return false;
@@ -1794,7 +1840,9 @@ export class AgentsViewMode implements Component, Focusable {
 				case "name": {
 					const name = command.args.trim();
 					if (!name) {
-						this.setStatusMessage("Usage: /name <session name>", { tone: "warning" });
+						this.setStatusMessage("Usage: /name <session name>", {
+							tone: "warning",
+						});
 						return false;
 					}
 					const renamed = await this.renameSession(target, name);
@@ -1808,7 +1856,10 @@ export class AgentsViewMode implements Component, Focusable {
 					}
 					try {
 						requireDaemonData(
-							await this.requireClient().request({ type: "kill", activeSessionId: target.activeSessionId }),
+							await this.requireClient().request({
+								type: "kill",
+								activeSessionId: target.activeSessionId,
+							}),
 						);
 					} catch (error) {
 						// As in deactivatePendingAgent: an agent that already finished counts as stopped.
@@ -2157,7 +2208,8 @@ export class AgentsViewMode implements Component, Focusable {
 			this.expandedSubagentParents,
 			this.programShownParents,
 			this.scopeKey,
-			computeRecursiveCosts(this.unifiedRecords, this.unifiedIndex),
+			computeRecursiveRollups(this.unifiedRecords, this.unifiedIndex),
+			this.anchorSessionId,
 		);
 		this.applyPendingAncestorExpansion();
 		this.restoreSelection();
@@ -2391,7 +2443,10 @@ export class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		if (!this.reconnectTimedOut) {
-			this.setStatusMessage("Daemon connection lost; reconnecting…", { tone: "warning", sticky: true });
+			this.setStatusMessage("Daemon connection lost; reconnecting…", {
+				tone: "warning",
+				sticky: true,
+			});
 		}
 		const reconnectPromise = this.reconnectClient(client, error).finally(() => {
 			if (this.reconnectPromise === reconnectPromise) {
@@ -2411,7 +2466,9 @@ export class AgentsViewMode implements Component, Focusable {
 				if (!this.rosterStore || !(await this.rosterStore.attach(client))) {
 					throw new Error("Daemon lost the agent_roster capability during reconnect");
 				}
-				const heartbeatsRefreshed = await this.refreshHeartbeats({ duringReconnect: true });
+				const heartbeatsRefreshed = await this.refreshHeartbeats({
+					duringReconnect: true,
+				});
 				if (!heartbeatsRefreshed) throw new Error("Heartbeat catalog did not refresh during reconnect");
 				const sessions = this.rosterStore.summaries();
 				this.daemonShutdownReceived = false;
@@ -2460,13 +2517,19 @@ export class AgentsViewMode implements Component, Focusable {
 			return [];
 		}
 		if (this.rows.length === 0) {
-			return [theme.bold(sectionTitle("running")), theme.fg("dim", "  No sessions match your search.")].slice(
-				0,
-				maxRows,
-			);
+			const emptyLegend = this.options.uiServices.settingsManager.getAgentsViewUsageEnabled()
+				? (buildAgentsViewUsageLayout([]).legends.get("running") ?? "")
+				: "";
+			return [
+				this.renderSectionHeading("running", width, emptyLegend),
+				theme.fg("dim", "  No sessions match your search."),
+			].slice(0, maxRows);
 		}
 
 		const displayItems = buildDisplayItems(this.rows);
+		const usageLayout = this.options.uiServices.settingsManager.getAgentsViewUsageEnabled()
+			? buildAgentsViewUsageLayout(this.rows)
+			: undefined;
 		const selectedIdentity = this.rows[this.selectedIndex]?.identity;
 		const selectedDisplayIndex = displayItems.findIndex(
 			(item) => item.type === "row" && item.row.identity === selectedIdentity,
@@ -2485,18 +2548,22 @@ export class AgentsViewMode implements Component, Focusable {
 			0,
 			visibleRows - (showLeadingEllipsis ? 1 : 0) - (showTrailingEllipsis ? 1 : 0),
 		);
-		const visibleItems = displayItems.slice(start, start + contentVisibleRows);
+		// The prepended ellipsis consumes a viewport line; shift the window down
+		// so a selection at the very end is not pushed out of the slice.
+		const sliceStart =
+			selectedDisplayIndex >= start + contentVisibleRows ? selectedDisplayIndex - contentVisibleRows + 1 : start;
+		const visibleItems = displayItems.slice(sliceStart, sliceStart + contentVisibleRows);
 		const lines = visibleItems.map((item) => {
 			if (item.type === "spacer") {
 				return "";
 			}
 			if (item.type === "heading") {
-				return theme.bold(sectionTitle(item.section));
+				return this.renderSectionHeading(item.section, width, usageLayout?.legends.get(item.section) ?? "");
 			}
 			if (item.type === "empty") {
 				return theme.fg("dim", "  No agents");
 			}
-			return this.renderRow(item.row, width);
+			return this.renderRow(item.row, width, usageLayout?.details);
 		});
 		if (showLeadingEllipsis) {
 			lines.unshift(theme.fg("dim", "  ..."));
@@ -2507,8 +2574,9 @@ export class AgentsViewMode implements Component, Focusable {
 		return lines;
 	}
 
-	private renderRow(row: AgentsViewRow, width: number): string {
+	private renderRow(row: AgentsViewRow, width: number, rowDetails?: ReadonlyMap<string, string>): string {
 		const selected = row.selectable && row.identity === this.rows[this.selectedIndex]?.identity;
+		const markRow = (line: string): string => (selected ? `${SELECTED_ROW_MARKER}${line}` : line);
 		if (row.kind === "subagent-code") {
 			return this.renderCodeRow(row);
 		}
@@ -2518,17 +2586,17 @@ export class AgentsViewMode implements Component, Focusable {
 			const titleColor = row.runningSubagentCount > 0 ? ("success" as const) : ("dim" as const);
 			const label = `${theme.fg(titleColor, `${row.expanded ? "▾" : "▸"} ${row.title}`)}${hint}`;
 			const line = padLine(truncateToWidth(`${indent}${label}`, width, ""), width);
-			return selected ? `${SELECTED_ROW_MARKER}${line}` : line;
+			return markRow(line);
 		}
 		const pendingDelete = row.kind === "agent" && this.isPendingDeleteRow(row);
 		const pendingKill = row.kind === "subagent" && this.isPendingKillSubagentRow(row);
 		const rawIcon = this.getRowIcon(row.section);
 		const icon = this.formatRowIcon(row.section, rawIcon);
 		const indent = "  ".repeat(row.depth);
-		const age = formatSessionDuration(row.summary);
 		const showUsage = this.options.uiServices.settingsManager.getAgentsViewUsageEnabled();
+		const age = formatSessionDuration(row.summary);
 		const details = showUsage
-			? `${formatRowUsage(row)} · ${age}`
+			? ((rowDetails ?? buildAgentsViewUsageLayout([row]).details).get(row.identity) ?? "")
 			: row.section === "inactive"
 				? `${row.summary.messageCount} · ${age}`
 				: age;
@@ -2577,7 +2645,20 @@ export class AgentsViewMode implements Component, Focusable {
 		];
 		const base = `${indent}${cells[0]} ${heartbeatCell ? `${heartbeatCell} ` : ""}${cells[1]} ${cells[2]}`;
 		const line = padLine(truncateToWidth(base, width, ""), width);
-		return selected ? `${SELECTED_ROW_MARKER}${line}` : line;
+		return markRow(line);
+	}
+
+	// Bold like the section title so the legend reads as part of the header line.
+	// The legend is right-aligned to the same edge as the row details cells, so
+	// its columns sit exactly above the row columns.
+	private renderSectionHeading(section: AgentsViewSection, width: number, legend: string): string {
+		const counts = countRowsBySection(this.rows);
+		const title = `${sectionTitle(section)} (${counts[section]})`;
+		const gap = width - visibleWidth(title) - visibleWidth(legend);
+		if (legend.length === 0 || gap < 2) {
+			return theme.bold(truncateToWidth(title, width, ""));
+		}
+		return `${theme.bold(title)}${" ".repeat(gap)}${theme.bold(legend)}`;
 	}
 
 	// Spawn-code rows are read-only context. They render deemphasized — muted
@@ -2818,11 +2899,101 @@ function hasLiveWork(row: AgentsViewRow): boolean {
 	return row.section === "running" || row.runningSubagentCount > 0 || row.summary.hasRunningRlmChildren === true;
 }
 
-function formatRowUsage(row: AgentsViewRow): string {
-	const usage = row.summary.usage;
-	return `↑${formatTokenCount(usage?.inputTokens ?? 0)} ↓${formatTokenCount(usage?.outputTokens ?? 0)} · $${(
-		usage?.cost ?? 0
-	).toFixed(2)} ($${row.recursiveCost.toFixed(2)} w/ subagents)`;
+interface AgentsViewUsageParts {
+	inTokens: string;
+	outTokens: string;
+	agentCost: string;
+	count: string;
+	totalCost: string;
+	age: string;
+}
+
+const AGENTS_VIEW_USAGE_LABELS: AgentsViewUsageParts = {
+	inTokens: "↑in",
+	outTokens: "↓out",
+	agentCost: "$agent",
+	count: "#sub",
+	totalCost: "$total",
+	age: "age",
+};
+
+const AGENTS_VIEW_USAGE_COLUMNS = Object.keys(AGENTS_VIEW_USAGE_LABELS) as (keyof AgentsViewUsageParts)[];
+
+export interface AgentsViewUsageLayout {
+	/** Legend line per section, padded to that section's column widths. */
+	legends: ReadonlyMap<AgentsViewSection, string>;
+	/** Details string per row identity, padded to its section's column widths. */
+	details: ReadonlyMap<string, string>;
+}
+
+/**
+ * One shared column layout per section for the header legend and every row:
+ * each column is as wide as the section's widest value or its legend label,
+ * everything right-aligned, so the ` · ` separators land in the same terminal
+ * column for the legend and every row. Empty sessions render only the age,
+ * aligned to the age column.
+ */
+export function buildAgentsViewUsageLayout(rows: readonly AgentsViewRow[]): AgentsViewUsageLayout {
+	const rowsBySection = new Map<AgentsViewSection, AgentsViewRow[]>();
+	// Nested rows render inside their top-level agent's section block, so group
+	// by the block's section rather than each row's own.
+	let blockSection: AgentsViewSection = "running";
+	for (const row of rows) {
+		if (row.depth === 0) blockSection = row.section;
+		if (row.kind !== "agent" && row.kind !== "subagent") continue;
+		const sectionRows = rowsBySection.get(blockSection) ?? [];
+		sectionRows.push(row);
+		rowsBySection.set(blockSection, sectionRows);
+	}
+	const legends = new Map<AgentsViewSection, string>();
+	const details = new Map<string, string>();
+	for (const section of ["running", "idle", "inactive"] as const) {
+		const entries = (rowsBySection.get(section) ?? []).map((row) => {
+			const usage = row.summary.usage;
+			const parts: AgentsViewUsageParts = {
+				inTokens: `↑${formatTokenCount(usage?.inputTokens ?? 0)}`,
+				outTokens: `↓${formatTokenCount(usage?.outputTokens ?? 0)}`,
+				agentCost: `$${(usage?.cost ?? 0).toFixed(2)}`,
+				count: String(row.descendantCount),
+				totalCost: `$${row.recursiveCost.toFixed(2)}`,
+				age: formatSessionDuration(row.summary),
+			};
+			return {
+				identity: row.identity,
+				empty: isEmptyAgentsViewSession(row.summary),
+				parts,
+			};
+		});
+		const widths = {} as Record<keyof AgentsViewUsageParts, number>;
+		for (const column of AGENTS_VIEW_USAGE_COLUMNS) {
+			let width = visibleWidth(AGENTS_VIEW_USAGE_LABELS[column]);
+			for (const entry of entries) {
+				// Empty sessions render no usage segment; only their age takes space.
+				if (entry.empty && column !== "age") continue;
+				width = Math.max(width, visibleWidth(entry.parts[column]));
+			}
+			widths[column] = width;
+		}
+		const pad = (parts: AgentsViewUsageParts, column: keyof AgentsViewUsageParts): string =>
+			padCellStart(parts[column], widths[column]);
+		const formatLine = (parts: AgentsViewUsageParts): string =>
+			[
+				`${pad(parts, "inTokens")} ${pad(parts, "outTokens")}`,
+				pad(parts, "agentCost"),
+				pad(parts, "count"),
+				pad(parts, "totalCost"),
+				pad(parts, "age"),
+			].join(" · ");
+		legends.set(section, formatLine(AGENTS_VIEW_USAGE_LABELS));
+		for (const entry of entries) {
+			details.set(entry.identity, entry.empty ? pad(entry.parts, "age") : formatLine(entry.parts));
+		}
+	}
+	return { legends, details };
+}
+
+function padCellStart(value: string, width: number): string {
+	return " ".repeat(Math.max(0, width - visibleWidth(value))) + value;
 }
 
 // Explicit session names read bold so they stand out from fallback titles

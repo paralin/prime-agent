@@ -1,5 +1,5 @@
 import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
-import { existsSync, type FSWatcher, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, type FSWatcher, mkdirSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
@@ -11,6 +11,7 @@ import {
 	type SettingsFileFormat,
 	stringifySettingsDocument,
 } from "../settings-files.js";
+import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import { closeWatcher, FS_WATCH_RETRY_DELAY_MS, watchWithErrorHandler } from "../utils/fs-watch.js";
 
 const SETTINGS_RELOAD_DEBOUNCE_MS = 100;
@@ -65,8 +66,7 @@ export interface AutoRefineSettings {
 
 export interface ProviderRetrySettings {
 	timeoutMs?: number; // SDK/provider request timeout in milliseconds
-	maxRetries?: number; // SDK/provider retry attempts
-	maxRetryDelayMs?: number; // default: 60000 (max server-requested delay before failing)
+	maxRetryDelayMs?: number; // default: 60000 (max server-requested retry delay before failing; 0 disables the cap)
 }
 
 export interface RetrySettings {
@@ -266,7 +266,10 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 			baseValue !== null &&
 			!Array.isArray(baseValue)
 		) {
-			(result as Record<string, unknown>)[key] = { ...baseValue, ...overrideValue };
+			(result as Record<string, unknown>)[key] = {
+				...baseValue,
+				...overrideValue,
+			};
 		} else {
 			(result as Record<string, unknown>)[key] = overrideValue;
 		}
@@ -400,20 +403,20 @@ export class FileSettingsStorage implements SettingsStorage {
 				release = this.acquireLockSyncWithRetry(path);
 			}
 			const current = settingsFile.exists ? readFileSync(path, "utf-8") : undefined;
-			const next = fn(current);
+			let next = fn(current);
 			if (next !== undefined) {
 				if (!existsSync(dir)) {
 					mkdirSync(dir, { recursive: true });
 				}
 				if (!release) {
 					release = this.acquireLockSyncWithRetry(path);
+					// The first-write read ran unlocked; a racing first writer may have landed since.
+					if (existsSync(path)) {
+						next = fn(readFileSync(path, "utf-8"));
+					}
 				}
-				const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-				try {
-					writeFileSync(temporaryPath, next, { encoding: "utf-8", mode: 0o600 });
-					renameSync(temporaryPath, path);
-				} finally {
-					if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+				if (next !== undefined) {
+					writeFileAtomicSync(path, next, { mode: 0o600 });
 				}
 			}
 		} finally {
@@ -570,7 +573,10 @@ export class SettingsManager {
 		scope: SettingsScope,
 	): { settings: Settings; error: Error | null } {
 		try {
-			return { settings: SettingsManager.loadFromStorage(storage, scope), error: null };
+			return {
+				settings: SettingsManager.loadFromStorage(storage, scope),
+				error: null,
+			};
 		} catch (error) {
 			return { settings: {}, error: error as Error };
 		}
@@ -1174,7 +1180,12 @@ export class SettingsManager {
 		};
 	}
 
-	getAutoRefineSettings(): { enabled: boolean; turnInterval: number; compact: boolean; cooldownMs: number } {
+	getAutoRefineSettings(): {
+		enabled: boolean;
+		turnInterval: number;
+		compact: boolean;
+		cooldownMs: number;
+	} {
 		const turnInterval = this.settings.autoRefine?.turnInterval;
 		const cooldownMs = this.settings.autoRefine?.cooldownMs;
 		return {
@@ -1215,7 +1226,11 @@ export class SettingsManager {
 		this.save();
 	}
 
-	getRetrySettings(): { enabled: boolean; maxRetries: number; baseDelayMs: number } {
+	getRetrySettings(): {
+		enabled: boolean;
+		maxRetries: number;
+		baseDelayMs: number;
+	} {
 		return {
 			enabled: this.getRetryEnabled(),
 			maxRetries: this.settings.retry?.maxRetries ?? 3,
@@ -1223,10 +1238,9 @@ export class SettingsManager {
 		};
 	}
 
-	getProviderRetrySettings(): { timeoutMs?: number; maxRetries?: number; maxRetryDelayMs: number } {
+	getProviderRetrySettings(): { timeoutMs?: number; maxRetryDelayMs: number } {
 		return {
 			timeoutMs: this.settings.retry?.provider?.timeoutMs,
-			maxRetries: this.settings.retry?.provider?.maxRetries,
 			maxRetryDelayMs: this.settings.retry?.provider?.maxRetryDelayMs ?? 60000,
 		};
 	}
@@ -1510,7 +1524,10 @@ export class SettingsManager {
 		if (this.globalSettings.mcpServers?.[name] && !force) {
 			throw new Error(`MCP server "${name}" already exists. Use --force to replace it.`);
 		}
-		this.globalSettings.mcpServers = { ...(this.globalSettings.mcpServers ?? {}), [name]: structuredClone(config) };
+		this.globalSettings.mcpServers = {
+			...(this.globalSettings.mcpServers ?? {}),
+			[name]: structuredClone(config),
+		};
 		this.markModified("mcpServers", name);
 		this.save();
 	}

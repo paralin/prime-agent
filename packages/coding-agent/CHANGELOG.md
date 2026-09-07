@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed cross-worker message compatibility checks across divergent daemon schema revisions.
+
 - Fixed `send --steer` and `send --follow-up` rejecting the advertised delivery options.
 
 - Extended English reminders to assistant thinking and Python tool-call code while preserving original code and quoted data.
@@ -25,9 +27,6 @@
 - Stopped automatic retries after a provider reports that reasoning exhausted the output budget.
 - Told the agent to preserve completed results, follow the newest user instruction, and take a distinct action instead of repeating a tool call.
 - Fixed live Merge Gateway model discovery dropping the session-affinity headers used by the bootstrap models.
-- Added native callable tools for MCP servers supplied by ACP clients. ([#2002](https://github.com/PrimeIntellect-ai/prime-agent/pull/2002))
-- Registered the per-session semantic-edge ledger with the agent-traces outbox as its own kind-tagged entry: durable upload intent at persist, an append-only byte cursor that never re-counts unchanged ledgers, startup catch-up counting, and pruning when a ledger is deleted with its session. No delivery endpoint exists yet, so pending ledgers are counted but never sent.
-- Added an ACP semantic-edges-v1 producer: each agent session appends an append-only `semantic-edges.jsonl` ledger beside its session artifacts, every provider turn and compaction summary call carries one opaque request ID on `X-ACP-Model-Request-ID` and `Idempotency-Key` (minted before the call, committed or failed when its stream resolves, and stable across retry attempts of the same call body), spawned subagents record their parent session and spawning request while successful children record their return, and `deriveSemanticEdges` folds a session tree's ledgers into commit-gated `continuation`/`subagent_call`/`subagent_return`/`compaction` edges matching the verifiers semantic-edges-v1 schema. Derivation only — nothing publishes or reads the ledger yet.
 - Running `prime-agent` with a running daemon opens the agents view instead of the most recently running agent. A launch with an initial prompt still opens a chat directly.
 - Made agents-list token and cost details opt-in with `agentsViewUsage.enabled`; the earlier age and message-count row details are now the default.
 - Aligned the generated system prompt with workspace-owned routing, publication, skill, and delegation policy.
@@ -47,14 +46,7 @@
 - Fixed daemon snapshot transfers serving stale transcript bytes when a replacement worker reused the previous worker's event sequence numbers; snapshot ids now derive from the serialized message content.
 - Fixed the daemon supervisor exiting on an unhandled rejection when a worker request timed out during send backpressure: the timeout now reaches the caller while the process stays alive and the same client remains usable.
 - A child agent's message to a parent that was just aborted is now parked and delivered as context on the parent's next turn, instead of failing with "Cannot admit a session action while queued session input is suspended". The child receives a queued receipt.
-- Reworked agent-trace upload scheduling as a disk-cursor outbox: upload intent and per-session uploaded-content cursors persist as one small entry file per session under `agent-traces-outbox/` in the agent dir, a startup catch-up uploads anything a previous process never finished (pruning cursors of deleted session files), scheduled and catch-up uploads never re-send unchanged sessions (the explicit `/traces upload` command still force-uploads), and rate-limited uploads reschedule (honoring an advertised Retry-After) instead of sleeping. Session disposal and process exit no longer wait on trace uploads at all, and upload timers never keep the process alive; the exit drain barrier is gone (the startup catch-up replaces it).
-- Fixed sessions with armed heartbeats showing as Running forever in the agents view; between firings they now list as Idle with the heartbeat badge and a `heartbeat · next <time>` label.
-- Added a dimmed heartbeat badge for sessions whose only heartbeats are paused.
-- Added an armed-heartbeat warning to the agents-view delete confirmation for sessions and subagents.
-- Changed sessions with armed heartbeats to passivate like any idle session; the daemon now wakes them when the next heartbeat is due, including after a daemon restart.
-- Fixed heartbeats of passivated sessions disappearing from the heartbeat list and agents-view badges.
 - Steered an English reminder and dropped Chinese assistant text blocks (not thinking traces) when the model replied in Chinese.
-- Extracted the RLM spawn ledger's crash-safety mechanics (single O_APPEND writes with optional fsync, bounded fail-closed replay, torn-final-line tolerance, repair-on-append) into a shared append-only event-log substrate; ledger behavior and public API are unchanged.
 - Added background event watches to the session status surfaces: a tray label and `/watches` menu next to heartbeats, and a distinct slow idle spinner when the agent is idle but watched jobs or heartbeats can still wake it.
 - Added bounded, event-driven kernel host admission for external session messages, including stable event-ID coalescing and existing steer/follow-up delivery.
 - Fixed Claude Code RLM spawns returning admission handles before the child runtime initialized.
@@ -88,7 +80,6 @@
 - `/new` now creates the new session in the terminal process working directory instead of the attached session directory.
 - `/new` (and daemon `new_session` without a parent) no longer replaces the current session in place. It creates a fresh resident session in the daemon and rebinds the connection to it, leaving the previous session running exactly as if you had opened a different session from the agents list.
 - Fixed the agents view opening the new session when selecting the previous session after `/new`.
-- Fixed the stable installer failing under npm 12 when resolving verified release dependencies. ([Discussion #1988](https://github.com/PrimeIntellect-ai/prime-agent/discussions/1988))
 - Improved large-session responsiveness by incrementally indexing transcripts, skipping resident and bookkeeping scans, avoiding duplicate snapshot context, bounding initial UI work, passivating inactive children under resident pressure, and caching unchanged Git context.
 - Reduced large-session memory by keeping superseded provider-native compaction histories on disk until replay requires them.
 - Released completed child IPython processes immediately while preserving lazy snapshot restoration for follow-up work.
@@ -99,12 +90,6 @@
 - Told agents to pass remote hosts and OpenSSH options through `bash()` parameters instead of nesting an `ssh` executable in the command body.
 - Removed the `/update` slash command and its startup update-available notices; updates now run through the top-level `prime-agent update` CLI command.
 - Recovered from repetition loops by cancelling the provider request and queueing a visible system notice that tells the model to step back and continue, instead of compacting.
-- Fixed finished agents lingering in the agents view Running section as "classifying" when their status summary text did not change.
-- Fixed the agents view undercounting running subagents: the "N subagents running" indicator now counts busy descendants at any depth, stays visible on collapsed groups, and idle sessions with busy subagents sort above plain idle sessions.
-- Changed the agents view Running section to mean the session's own work: sessions whose only activity is delegated to subagents now list as Idle with the running-subagents badge.
-- Added token and cost details to agents view rows: input/output tokens plus the session's own cost and its recursive total including all subagents; the message-count detail is gone.
-- Daemon- and runtime-hosted subagents record their spawn lineage again (the production runtime factory dropped it), and a compaction summary slice that resolves after a sibling already failed the compaction settles as failed instead of staying in-flight forever.
-- Fixed stopping or deleting an agent whose tree holds finished intermediate subagents: the walk no longer re-visits subtrees exponentially (which could freeze the worker on deep trees), and one cancel press reliably reaches every running descendant.
 - Fixed RLM agents attempting to spawn a child with `rlm(...)` when asked to message an existing agent: the system prompt now states that `rlm(...)` only spawns children, direct delivery to a reachable parent, sibling, or child uses `await agent_message.send(...)`, and `help(agent_message)` documents the messaging API.
 - Fixed daemon-hosted RLM model roles retrying only their first provider instead of advancing through the configured fallback chain.
 - Changed scratch handoff to use exact first and later closeout prompts and to preserve the old context when checkpoint creation, reading, or cancellation fails.
@@ -115,9 +100,37 @@
 - `switchSession` and `fork` no longer tear down the source session in place. They now create (or reuse) a resident worker for the target session and rebind the connection, so the source session stays alive and its identity is never recycled.
 - Sanded the default system prompt into the project letter's voice: ordinary words, the running program as truth, one positive long-work path, and no stacked detach-denial list.
 - Told the model to reason in thinking blocks and to put a short IPython cell comment stating intent and expected outcome.
-- Fixed daemon session creation after macOS timezone changes ([#879](https://github.com/PrimeIntellect-ai/prime-agent/issues/879))
 - Nudged the model after three consecutive `bash()` or Python syntax errors with no thinking in between, asking it to step back and check the syntax before retrying.
 - Added Venice AI as a built-in provider with display name "Venice AI" and default model `stealth-ox-alpha`; Venice stays last in default-provider precedence so it never outranks an already-selected provider when both credentials exist.
+
+## [0.9.3] - 2026-09-06
+
+- Fixed ChatGPT OAuth model discovery hiding GPT-6 Astra by advertising Codex CLI 0.153.4 instead of 0.147.0.
+
+## [0.9.2] - 2026-09-05
+
+- Fixed daemon session creation after macOS timezone changes ([#879](https://github.com/PrimeIntellect-ai/prime-agent/issues/879))
+- Fixed the stable installer failing under npm 12 when resolving verified release dependencies. ([Discussion #1988](https://github.com/PrimeIntellect-ai/prime-agent/discussions/1988))
+- Added native callable tools for MCP servers supplied by ACP clients. ([#2002](https://github.com/PrimeIntellect-ai/prime-agent/pull/2002))
+- Reworked agent-trace upload scheduling as a disk-cursor outbox: upload intent and per-session uploaded-content cursors persist as one small entry file per session under `agent-traces-outbox/` in the agent dir, a startup catch-up uploads anything a previous process never finished (pruning cursors of deleted session files), scheduled and catch-up uploads never re-send unchanged sessions (the explicit `/traces upload` command still force-uploads), and rate-limited uploads reschedule (honoring an advertised Retry-After) instead of sleeping. Session disposal and process exit no longer wait on trace uploads at all, and upload timers never keep the process alive; the exit drain barrier is gone (the startup catch-up replaces it).
+- Fixed finished agents lingering in the agents view Running section as "classifying" when their status summary text did not change.
+- Extracted the RLM spawn ledger's crash-safety mechanics (single O_APPEND writes with optional fsync, bounded fail-closed replay, torn-final-line tolerance, repair-on-append) into a shared append-only event-log substrate; ledger behavior and public API are unchanged.
+- Fixed sessions with armed heartbeats showing as Running forever in the agents view; between firings they now list as Idle with the heartbeat badge and a `heartbeat · next <time>` label.
+- Added a dimmed heartbeat badge for sessions whose only heartbeats are paused.
+- Added an armed-heartbeat warning to the agents-view delete confirmation for sessions and subagents.
+- Changed sessions with armed heartbeats to passivate like any idle session; the daemon now wakes them when the next heartbeat is due, including after a daemon restart.
+- Fixed heartbeats of passivated sessions disappearing from the heartbeat list and agents-view badges.
+- Added an ACP semantic-edges-v1 producer: each agent session appends an append-only `semantic-edges.jsonl` ledger beside its session artifacts, every provider turn and compaction summary call carries one opaque request ID on `X-ACP-Model-Request-ID` and `Idempotency-Key` (minted before the call, committed or failed when its stream resolves, and stable across retry attempts of the same call body), spawned subagents record their parent session and spawning request while successful children record their return, and `deriveSemanticEdges` folds a session tree's ledgers into commit-gated `continuation`/`subagent_call`/`subagent_return`/`compaction` edges matching the verifiers semantic-edges-v1 schema. Derivation only — nothing publishes or reads the ledger yet.
+- Registered the per-session semantic-edge ledger with the agent-traces outbox as its own kind-tagged entry: durable upload intent at persist, an append-only byte cursor that never re-counts unchanged ledgers, startup catch-up counting, and pruning when a ledger is deleted with its session. No delivery endpoint exists yet, so pending ledgers are counted but never sent.
+- Fixed the agents view undercounting running subagents: the "N subagents running" indicator now counts busy descendants at any depth, stays visible on collapsed groups, and idle sessions with busy subagents sort above plain idle sessions.
+- Changed the agents view Running section to mean the session's own work: sessions whose only activity is delegated to subagents now list as Idle with the running-subagents badge.
+- Daemon- and runtime-hosted subagents record their spawn lineage again (the production runtime factory dropped it), and a compaction summary slice that resolves after a sibling already failed the compaction settles as failed instead of staying in-flight forever.
+- Added token and cost details to agents view rows: input/output tokens plus the session's own cost and its recursive total including all subagents; the message-count detail is gone.
+- Fixed stopping or deleting an agent whose tree holds finished intermediate subagents: the walk no longer re-visits subtrees exponentially (which could freeze the worker on deep trees), and one cancel press reliably reaches every running descendant.
+- Kernel process stderr now lands in `kernel-stderr.log` in the session artifact directory (rotated at kernel start and capped by a 5 MiB per-spawn write budget), and the in-memory diagnostics tail is bounded instead of growing for the kernel's lifetime.
+- Changed agents-view row usage to aligned `↑in ↓out · $agent · #sub · $total · age` columns with an explicit total-subagent count; empty sessions show only their age.
+- Added a bold usage legend and session count to every agents-view section header, sharing one column layout with the rows.
+- Changed empty sessions to sort last within their agents-view section, except the session the view was entered from.
 
 ## [0.9.1] - 2026-09-01
 - Fixed a v0.9.0 regression: the agents view's Inactive section was empty on a fresh view until a search was typed. The saved-session catalog now loads (progressively) when the view opens; it was previously deferred to search because the roster's boot seed carried the saved corpus, which the seed scoping removed.

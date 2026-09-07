@@ -30,8 +30,8 @@ async function collectEvents(stream: AsyncIterable<AssistantMessageEvent>): Prom
 	return events;
 }
 
-describe("OpenAI completions retry delay", () => {
-	it("returns long Retry-After responses without sleeping", async () => {
+describe("OpenAI completions retry ownership", () => {
+	it("reports long Retry-After responses without provider-level retries", async () => {
 		let requests = 0;
 		const server = http.createServer((_request, response) => {
 			requests++;
@@ -50,8 +50,6 @@ describe("OpenAI completions retry delay", () => {
 			const events = await collectEvents(
 				streamOpenAICompletions(testModel(`http://127.0.0.1:${port}`), context, {
 					apiKey: "test-key",
-					maxRetries: 2,
-					maxRetryDelayMs: 10,
 				}),
 			);
 
@@ -60,8 +58,10 @@ describe("OpenAI completions retry delay", () => {
 			const terminal = events.at(-1);
 			expect(terminal?.type).toBe("error");
 			if (terminal?.type !== "error") throw new Error("expected provider error");
-			expect(terminal.error.errorMessage).toContain("Provider requested a 3600000ms retry delay");
-			expect(terminal.error.errorMessage).toContain("above the 10ms maximum");
+			expect(terminal.error.diagnostics?.[0]).toMatchObject({
+				type: "provider_stream_failure",
+				details: { kind: "rate_limit", status: 429, retryAfterMs: 3_600_000 },
+			});
 		} finally {
 			server.closeAllConnections();
 			server.close();

@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed HTTP 429 responses being classified as permanent refusals when a gateway supplies a conflicting error label.
 - Excluded legacy and error-normalized reasoning-exhausted responses from same-model and cross-model replay while preserving useful partial answers and tool calls.
 - Added sanitized Merge Gateway request-control and serving-vendor diagnostics to session responses.
 - Fixed Merge Gateway replay of legacy native reasoning and reasoning-only responses without turning internal plans into assistant text.

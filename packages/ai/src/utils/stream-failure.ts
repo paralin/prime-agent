@@ -68,6 +68,8 @@ export function streamFailureMessage(info: StreamFailureInfo, detail?: string): 
 }
 
 export function classifyStreamFailure(providerErrorType?: string, status?: number): StreamFailureKind {
+	// HTTP rate limits remain retryable even when a gateway attaches a refusal or safety label.
+	if (status === 429) return "rate_limit";
 	const type = providerErrorType?.toLowerCase() ?? "";
 	if (type === "refusal") return "refusal";
 	if (/sensitive|safety|prohibited_content|blocklist|spii|recitation|content.?filter|guardrail|flagged/.test(type)) {
@@ -75,7 +77,7 @@ export function classifyStreamFailure(providerErrorType?: string, status?: numbe
 	}
 	if (type.includes("overloaded") || status === 529) return "overloaded";
 	// usage_not_included is Codex's plan-entitlement rejection, not bad credentials.
-	if (/rate_limit|usage_limit|usage_not_included|throttl/.test(type) || status === 429) {
+	if (/rate_limit|usage_limit|usage_not_included|throttl/.test(type)) {
 		return "rate_limit";
 	}
 	// Permission/403 shapes are entitlement or policy denials, not bad credentials: never auth-stale.

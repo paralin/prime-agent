@@ -41,6 +41,12 @@ describe("provider retry ownership", () => {
 			{ status: 429, headers: { "retry-after": "30" } },
 			{ kind: "rate_limit", status: 429, retryAfterMs: 30000 },
 		],
+		[
+			"keeps a gateway 429 retryable despite a refusal label",
+			{ type: "refusal", message: "temporarily throttled" },
+			{ status: 429, headers: { "retry-after": "2" } },
+			{ kind: "rate_limit", status: 429, retryAfterMs: 2000 },
+		],
 	] as const)("%s", async (_name, errorBody, init, expectedDetails) => {
 		const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: errorBody }), init));
 		global.fetch = fetchMock as typeof fetch;

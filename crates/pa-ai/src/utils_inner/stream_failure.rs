@@ -568,6 +568,8 @@ pub fn classify_stream_failure(
     provider_error_type: Option<&str>,
     status: Option<u16>,
 ) -> StreamFailureKind {
+    // Rate limits remain retryable even when a gateway attaches a refusal or safety label.
+    if status == Some(429) { return StreamFailureKind::RateLimit; }
     let type_lower = provider_error_type.unwrap_or("").to_lowercase();
     // A 402 is a payment failure regardless of the body's `error.type`
     // text: gateways surface wallet drains as `insufficient_credits`,
@@ -595,7 +597,7 @@ pub fn classify_stream_failure(
     // usage_not_included is Codex's plan-entitlement rejection, not bad credentials.
     let rate_limit = regex::Regex::new(r"rate_limit|usage_limit|usage_not_included|throttl")
         .expect("static regex");
-    if rate_limit.is_match(&type_lower) || status == Some(429) {
+    if rate_limit.is_match(&type_lower) {
         return StreamFailureKind::RateLimit;
     }
     // Permission/403 shapes are entitlement or policy denials, not bad credentials: never auth-stale.

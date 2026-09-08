@@ -102,6 +102,7 @@ const RECONNECT_RETRY_MS = 1000;
 const EXIT_HINT_DURATION_MS = 2000;
 const DELETE_CONFIRM_DURATION_MS = 2000;
 const STATUS_MESSAGE_DURATION_MS = 4500;
+const SAVED_CATALOG_RENDER_INTERVAL_MS = 100;
 const SEARCH_PROMPT_PLACEHOLDER = "Search sessions";
 const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "Write a reply to this agent";
 const RESUME_PROMPT_PLACEHOLDER = "Write a prompt to resume this session";
@@ -2185,7 +2186,10 @@ export class AgentsViewMode implements Component, Focusable {
 			shouldShowAgentsViewSession(summary, this.inactiveAgentIdentities.has(getSummaryIdentity(summary))),
 		);
 		this.lastVisibleSummaries = this.withPendingDeleteSession(visibleSessions);
-		this.unifiedRecords = reconcileUnifiedSessions(this.lastVisibleSummaries, this.savedSessions, this.heartbeats);
+		// Archival hides a saved row; a resident runtime remains authoritative if
+		// the user explicitly resumed a transcript carrying an old archive marker.
+		const savedSessions = this.savedSessions.filter((session) => session.state?.status !== "archived");
+		this.unifiedRecords = reconcileUnifiedSessions(this.lastVisibleSummaries, savedSessions, this.heartbeats);
 		this.unifiedIndex = buildUnifiedSessionIndex(this.unifiedRecords);
 		migrateAgentsViewIdentitySet(this.expandedSubagentParents, this.unifiedIndex.byKey);
 		migrateAgentsViewIdentitySet(this.programShownParents, this.unifiedIndex.byKey);
@@ -2235,10 +2239,16 @@ export class AgentsViewMode implements Component, Focusable {
 		const progressiveSessions = new Map(
 			successfulSessions.map((session) => [resolvePath(canonicalizePath(session.path)), session]),
 		);
+		let lastRenderAt = -Infinity;
 		try {
 			const onSession = (session: AgentConnectionSavedSessionInfo) => {
 				if (generation !== this.savedCatalogGeneration) return;
 				progressiveSessions.set(resolvePath(canonicalizePath(session.path)), session);
+				// Reconcile at most once per display interval, not once per transcript.
+				// The final response always publishes the complete catalog below.
+				const now = performance.now();
+				if (now - lastRenderAt < SAVED_CATALOG_RENDER_INTERVAL_MS) return;
+				lastRenderAt = now;
 				this.savedSessions = [...progressiveSessions.values()];
 				this.persistentState.savedSessions = this.savedSessions;
 				this.reconcileCatalogs();

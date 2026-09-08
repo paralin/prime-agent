@@ -75,6 +75,62 @@ function privateMethod<T>(name: string): T {
 }
 
 describe("#502 unified session view regressions", () => {
+	test("archived saved sessions stay hidden while resumed runtimes remain visible", () => {
+		const archived = { ...rawSavedSession("archived"), state: { status: "archived" } };
+		const resumed = { ...summary("resumed"), sessionId: "archived", sessionFile: archived.path };
+		const harness = {
+			lastListedSummaries: [resumed],
+			inactiveAgentIdentities: new Set(),
+			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			savedSessions: [archived, { ...archived, id: "hidden", path: "/tmp/hidden.jsonl" }],
+			heartbeats: [],
+			expandedSubagentParents: new Set(),
+			programShownParents: new Set(),
+			persistentState: {},
+			savedCatalogReady: true,
+			getFilteredRecords: () => [],
+			applyPendingAncestorExpansion: vi.fn(),
+			restoreSelection: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			unifiedRecords: [] as Array<{ daemon?: SessionSummary }>,
+		};
+		privateMethod<(this: typeof harness) => void>("reconcileCatalogs").call(harness);
+		expect(harness.unifiedRecords.map((record) => record.daemon?.sessionId)).toEqual(["archived"]);
+	});
+
+	test("a burst of saved sessions publishes progressively without rebuilding for each item", async () => {
+		const sessions = Array.from({ length: 1000 }, (_, index) => rawSavedSession(String(index)));
+		const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+		try {
+			const client = {
+				request: async (
+					_command: unknown,
+					_timeout: unknown,
+					options: { onProgress: (update: { type: string; session: unknown }) => void },
+				) => {
+					for (const session of sessions) {
+						options.onProgress({ type: "session_list_item", session });
+					}
+					return { success: true, data: { sessions } };
+				},
+			};
+			const harness = {
+				...refreshHarness(),
+				savedSessions: [],
+				lastSuccessfulSavedSessions: [],
+				requireClient: () => client,
+				getSavedSessionCatalogContext: () => ({ cwd: "/tmp/project" }),
+			};
+			expect(
+				await privateMethod<(this: typeof harness) => Promise<boolean>>("refreshSavedSessions").call(harness),
+			).toBe(true);
+			expect(harness.reconcileCatalogs).toHaveBeenCalledTimes(2);
+			expect(harness.savedSessions).toHaveLength(1000);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
 	test("an older overlapping heartbeat poll cannot overwrite the newer response", async () => {
 		const old = deferred<unknown>();
 		const newer = { job: { id: "new" } };
@@ -432,6 +488,7 @@ describe("#502 unified session view regressions", () => {
 		};
 		const harness = {
 			rows: [inactive],
+			options: { uiServices: { settingsManager: { getAgentsViewUsageEnabled: () => true } } },
 			selectedIndex: 0,
 			isPendingDeleteRow: () => false,
 			isPendingKillSubagentRow: () => false,
@@ -476,6 +533,7 @@ describe("#502 unified session view regressions", () => {
 		};
 		const harness = {
 			rows: [subagent],
+			options: { uiServices: { settingsManager: { getAgentsViewUsageEnabled: () => true } } },
 			selectedIndex: -1,
 			isPendingDeleteRow: () => false,
 			isPendingKillSubagentRow: () => false,

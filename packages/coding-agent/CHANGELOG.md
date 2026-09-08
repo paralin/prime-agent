@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed archived sessions reappearing in the startup list and batched saved-session updates to keep large catalogs responsive.
+
 - Fixed cross-worker message compatibility checks across divergent daemon schema revisions.
 
 - Fixed `send --steer` and `send --follow-up` rejecting the advertised delivery options.

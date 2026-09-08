@@ -14,7 +14,8 @@ impl AgentsViewMode {
     /// The unified records the view runs on (reconciled from the live
     /// roster and the saved catalog).
     pub(super) fn records(&self) -> Vec<crate::agents_view_state::UnifiedRecord> {
-        reconcile_unified_sessions(&self.roster, &self.saved)
+        let saved: Vec<_> = self.saved.iter().filter(|row| row.pointer("/state/status").and_then(Value::as_str) != Some("archived")).cloned().collect();
+        reconcile_unified_sessions(&self.roster, &saved)
     }
 
     /// Rebuild rows from the current roster, catalog, and query (TS

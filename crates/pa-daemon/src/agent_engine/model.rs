@@ -325,6 +325,20 @@ impl AgentSessionEngine {
         // switched model keeps resolving when no provider credential is
         // visible to the worker, and the turn's run-start auth validation
         // reports the missing credential with the TS message instead.
+        if model_name.starts_with('@') {
+            let settings = pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
+            let candidates = pa_core::models::resolve_cli_role(selection.provider.as_deref(), model_name, &registry, &settings.get_model_roles())?;
+            self.create_resources.write().expect("create resources lock").rlm_model_candidates = candidates.iter().map(|candidate| {
+                let reference = format!("{}/{}", candidate.model.provider, candidate.model.id);
+                candidate.thinking_level.map_or(reference.clone(), |level| format!("{reference}:{}", level.wire_name()))
+            }).collect();
+            let first = &candidates[0];
+            let mut selection = self.selection.write().expect("model selection lock");
+            selection.provider = Some(first.model.provider.clone());
+            selection.model = Some(first.model.id.clone());
+            if selection.thinking.is_none() { selection.thinking = first.thinking_level; }
+            return Ok(first.model.clone());
+        }
         let all: Vec<Model> = registry.get_all().to_vec();
         let resolved =
             pa_core::models::resolve_cli_model(selection.provider.as_deref(), model_name, &all);

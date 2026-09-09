@@ -104,3 +104,16 @@ pub fn resolve_rlm_role_candidates(
     }
     Ok(candidates)
 }
+
+/// Resolve configured CLI roles to native candidates with configured credentials, in preference order.
+/// Returns an error for a provider override, a Claude Code role, or an unavailable role.
+pub fn resolve_cli_role(provider: Option<&str>, selector: &str, registry: &super::ModelRegistry, roles: &BTreeMap<String, ModelRoleSelector>) -> Result<Vec<super::ScopedModel>> {
+    if provider.is_some() { bail!("--provider cannot override a named model role"); }
+    let candidates = resolve_rlm_role_candidates(selector.trim_start_matches('@'), roles)?;
+    if candidates[0].runtime != RlmRuntimeKind::Native { bail!("Model role \"{selector}\" requires the Claude Code subagent runtime"); }
+    let models: Vec<_> = candidates.into_iter().filter_map(|candidate| {
+        super::find_exact_model_reference_match(&candidate.model_reference, registry.get_all()).map(|model| super::ScopedModel { model: model.clone(), thinking_level: candidate.thinking_level })
+    }).collect();
+    let first = models.iter().position(|candidate| registry.has_configured_auth(&candidate.model)).with_context(|| format!("Model role \"{selector}\" has no available candidates"))?;
+    Ok(models.into_iter().skip(first).collect())
+}

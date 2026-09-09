@@ -494,11 +494,15 @@ async fn build_headless_engine_with(
     let mut registry =
         pa_core::models::ModelRegistry::create(auth, config.agent_dir.join("models.json"));
     registry.load_private_authorization_from_cache();
-    let model = select_model(
+    let role_models = config.model.as_deref().filter(|name| name.starts_with('@')).map(|selector| {
+        let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
+        pa_core::models::resolve_cli_role(config.provider.as_deref(), selector, &registry, &settings.get_model_roles()).map_err(|error| error.to_string())
+    }).transpose()?;
+    let model = if let Some(candidates) = &role_models { candidates[0].model.clone() } else { select_model(
         &mut registry,
         config.provider.as_deref(),
         config.model.as_deref(),
-    )?;
+    )? };
 
     // Resolve request auth once (single-shot mode): the merged headers
     // ship on the request (the TS `getApiKeyAndHeaders` single-owner path;
@@ -598,7 +602,7 @@ async fn build_headless_engine_with(
             agent_dir: config.agent_dir.clone(),
             mcp_manager: Some(mcp_manager),
             model: Some(agent_model),
-            thinking_level: Some(resolve_thinking_level(config, &model)),
+            thinking_level: Some(role_models.as_ref().and_then(|candidates| candidates[0].thinking_level).filter(|_| config.thinking.is_none()).map(map_thinking_level).unwrap_or_else(|| resolve_thinking_level(config, &model))),
             stream_fn: Some(stream_fn),
             tools: builtin_tools(&config.cwd),
             custom_system_prompt: config.system_prompt.clone(),

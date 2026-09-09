@@ -406,6 +406,7 @@ export async function resolveModelScope(patterns: string[], modelRegistry: Model
 
 export interface ResolveCliModelResult {
 	model: Model<Api> | undefined;
+	modelCandidates?: ScopedModel[];
 	thinkingLevel?: ThinkingLevel;
 	warning: string | undefined;
 	/**
@@ -421,6 +422,7 @@ export interface ResolveCliModelResult {
  * Supports:
  * - --provider <provider> --model <pattern>
  * - --model <provider>/<pattern>
+ * - --model @<role> using configured native candidates in order
  * - Fuzzy matching (same rules as model scoping: exact id, then partial id/name)
  *
  * Note: This does not apply the thinking level by itself, but it may *parse* and
@@ -430,11 +432,36 @@ export function resolveCliModel(options: {
 	cliProvider?: string;
 	cliModel?: string;
 	modelRegistry: ModelRegistry;
+	modelRoles?: Readonly<Record<string, ModelRoleSelector>>;
 }): ResolveCliModelResult {
 	const { cliProvider, cliModel, modelRegistry } = options;
 
 	if (!cliModel) {
 		return { model: undefined, warning: undefined, error: undefined };
+	}
+	if (cliModel.startsWith("@")) {
+		try {
+			if (cliProvider) throw new Error("--provider cannot override a named model role");
+			const candidates = resolveRlmRoleCandidates(cliModel.slice(1), options.modelRoles ?? {});
+			if (candidates[0]?.runtime !== "native") {
+				throw new Error(`Model role "${cliModel}" requires the Claude Code subagent runtime`);
+			}
+			const models = modelRegistry.getAll();
+			const modelCandidates = candidates.flatMap((candidate) => {
+				const model = findExactModelReferenceMatch(candidate.modelReference, models);
+				return model ? [{ model, thinkingLevel: candidate.thinkingLevel }] : [];
+			});
+			const first = modelCandidates.findIndex((candidate) => modelRegistry.hasConfiguredAuth(candidate.model));
+			if (first < 0) throw new Error(`Model role "${cliModel}" has no available candidates`);
+			return {
+				...modelCandidates[first]!,
+				modelCandidates: modelCandidates.slice(first),
+				warning: undefined,
+				error: undefined,
+			};
+		} catch (error) {
+			return { model: undefined, warning: undefined, error: error instanceof Error ? error.message : String(error) };
+		}
 	}
 
 	// Important: use *all* models here, not just models with pre-configured auth.

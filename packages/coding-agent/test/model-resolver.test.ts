@@ -135,6 +135,57 @@ describe("resolveModelScopeFromModels", () => {
 });
 
 describe("resolveCliModel", () => {
+	test("resolves a named role in configured order and retains its fallback and effort", () => {
+		const registry = {
+			getAll: () => allModels,
+			hasConfiguredAuth: () => true,
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const result = resolveCliModel({
+			cliModel: "@worker",
+			modelRegistry: registry,
+			modelRoles: { worker: ["openai/gpt-4o:low", "anthropic/claude-sonnet-4-5:high"] },
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model).toBe(mockModels[1]);
+		expect(result.thinkingLevel).toBe("low");
+		expect(result.modelCandidates).toEqual([
+			{ model: mockModels[1], thinkingLevel: "low" },
+			{ model: mockModels[0], thinkingLevel: "high" },
+		]);
+	});
+
+	test("skips unconfigured providers without fuzzy matching a role candidate", () => {
+		const registry = {
+			getAll: () => allModels,
+			hasConfiguredAuth: (model: Model<"anthropic-messages">) => model.provider === "anthropic",
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const result = resolveCliModel({
+			cliModel: "@worker",
+			modelRegistry: registry,
+			modelRoles: { worker: ["anthropic/sonnet", "openai/gpt-4o", "anthropic/claude-sonnet-4-5:high"] },
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.modelCandidates).toEqual([{ model: mockModels[0], thinkingLevel: "high" }]);
+	});
+
+	test.each([
+		["missing", {}],
+		["empty", { empty: [] }],
+		["unavailable", { unavailable: "openai/missing" }],
+		["claude", { claude: "claude-code/claude-opus-4-7" }],
+	])("rejects the %s role instead of selecting a default", (role, modelRoles) => {
+		const registry = {
+			getAll: () => allModels,
+			hasConfiguredAuth: () => true,
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const result = resolveCliModel({ cliModel: `@${role}`, modelRegistry: registry, modelRoles });
+
+		expect(result.model).toBeUndefined();
+		expect(result.error).toBeTruthy();
+	});
+
 	test("resolves --model provider/id without --provider", () => {
 		const registry = {
 			getAll: () => allModels,

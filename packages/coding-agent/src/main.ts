@@ -563,6 +563,7 @@ function buildSessionOptions(
 			cliProvider: config.provider,
 			cliModel: config.model,
 			modelRegistry,
+			modelRoles: settingsManager.getModelRoles(),
 		});
 		if (resolved.warning) {
 			diagnostics.push({ type: "warning", message: resolved.warning });
@@ -572,6 +573,7 @@ function buildSessionOptions(
 		}
 		if (resolved.model) {
 			options.model = resolved.model;
+			options.rlmModelCandidates = resolved.modelCandidates;
 			// Allow "--model <pattern>:<thinking>" as a shorthand.
 			// Explicit --thinking still takes precedence (applied later).
 			if (!config.thinking && resolved.thinkingLevel) {
@@ -761,7 +763,7 @@ export function resolveRuntimeSessionOptions(
 		rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,
 		rlmParentNodeId: runtimeSessionOptions?.rlmParentNodeId,
 		rlmParentAgent: runtimeSessionOptions?.rlmParentAgent,
-		rlmModelCandidates: runtimeSessionOptions?.rlmModelCandidates,
+		rlmModelCandidates: runtimeSessionOptions?.rlmModelCandidates ?? sessionOptions.rlmModelCandidates,
 		semanticParentSessionId: runtimeSessionOptions?.semanticParentSessionId,
 		semanticSpawnedByRequestId: runtimeSessionOptions?.semanticSpawnedByRequestId,
 		subagentRuntimeHost: runtimeSessionOptions?.subagentRuntimeHost,

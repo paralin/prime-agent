@@ -234,7 +234,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 				type: "worker_passivate_idle_children",
 				idleEvictionMinutes: 90,
 				now,
-				limit: 8,
+				limit: 2,
 			},
 			30_000,
 		);

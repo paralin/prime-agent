@@ -1261,7 +1261,7 @@ export class DaemonSupervisor {
 		isStillEligible: () => boolean,
 		describeEvicted: () => string,
 	): Promise<void> {
-		await this.refreshWorkerSummaries(worker);
+		await this.refreshWorkerSummaries(worker, false, true);
 		if (!isStillEligible()) return;
 		await this.stopWorker(worker, true);
 		this.log(describeEvicted());
@@ -1280,10 +1280,8 @@ export class DaemonSupervisor {
 			return;
 		}
 		try {
-			await this.refreshWorkerSummaries(worker);
-			console.log("DBG detach refresh done");
-		} catch (error) {
-			console.log("DBG detach refresh failed", String(error));
+			await this.refreshWorkerSummaries(worker, false, true);
+		} catch {
 			return;
 		}
 		if (!this.isEmptyDetachEvictionCandidate(worker)) return;
@@ -4402,13 +4400,15 @@ export class DaemonSupervisor {
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
+		const pullSource = worker.client;
+		const epochAtStart = worker.rosterEpoch ?? 0;
 		const useActiveOnly =
 			!includePassive &&
 			(worker.schemaRevision ?? 0) >=
 				DAEMON_WORKER_COMMAND_COMPATIBILITY.worker_list_active_sessions.minSchemaRevision;
 		const response = useActiveOnly
-			? await worker.client.requestWorker({ type: "worker_list_active_sessions" }, 5000)
-			: await worker.client.request({ type: "list" }, 5000);
+			? await pullSource.requestWorker({ type: "worker_list_active_sessions" }, 5000)
+			: await pullSource.request({ type: "list" }, 5000);
 		const summaries = sessionSummariesFromResponse(response);
 		const next = this.mergeWorkerSummaries(worker.summaries, summaries, useActiveOnly);
 		if (recovery && !next.has(worker.descriptor.rootActiveSessionId)) {
@@ -4416,8 +4416,10 @@ export class DaemonSupervisor {
 			throw new Error(`Session worker omitted its root session during recovery`);
 		}
 		worker.summaries = next;
-		if (worker.rosterEpoch !== undefined) {
-			await this.chainWorkerRosterApply(worker, worker.client!, () => this.syncRosterFromWorkerSummaries(worker));
+		if (includePassive || worker.rosterEpoch !== undefined) {
+			await this.chainWorkerRosterApply(worker, pullSource, () => {
+				if ((worker.rosterEpoch ?? 0) === epochAtStart) this.syncRosterFromWorkerSummaries(worker);
+			});
 		}
 		for (const summary of summaries) {
 			const activeSessionId = summary.activeSessionId ?? summary.id;
@@ -4432,7 +4434,8 @@ export class DaemonSupervisor {
 			if (recovery) {
 				await this.assertRecoveryAllowed();
 			}
-			await this.chainWorkerRosterApply(worker, worker.client!, () => {
+			await this.chainWorkerRosterApply(worker, pullSource, () => {
+				if ((worker.rosterEpoch ?? 0) !== epochAtStart) return;
 				worker.descriptor.rootSessionId = root.sessionId;
 				worker.descriptor.sessionFile = root.sessionFile;
 				worker.descriptor.createCommand = durableDaemonCreateCommand({

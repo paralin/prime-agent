@@ -56,7 +56,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	// Venice must stay last: findPreferredDefaultModel picks the first
 	// provider with a matching default, and Venice should never outrank a
 	// provider that was already selected just because both keys exist.
-	venice: "stealth-ox-alpha",
+	venice: "inkling",
 };
 
 export interface ScopedModel {

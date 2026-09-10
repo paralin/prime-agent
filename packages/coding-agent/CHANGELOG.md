@@ -103,7 +103,7 @@
 - Sanded the default system prompt into the project letter's voice: ordinary words, the running program as truth, one positive long-work path, and no stacked detach-denial list.
 - Told the model to reason in thinking blocks and to put a short IPython cell comment stating intent and expected outcome.
 - Nudged the model after three consecutive `bash()` or Python syntax errors with no thinking in between, asking it to step back and check the syntax before retrying.
-- Added Venice AI as a built-in provider with display name "Venice AI" and default model `stealth-ox-alpha`; Venice stays last in default-provider precedence so it never outranks an already-selected provider when both credentials exist.
+- Added Venice AI as a built-in provider with display name "Venice AI" and default model `inkling`; Venice stays last in default-provider precedence so it never outranks an already-selected provider when both credentials exist.
 
 ## [0.9.4] - 2026-09-08
 

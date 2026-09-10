@@ -6,6 +6,10 @@
 - Stopped on reasoning exhaustion without automatically increasing the output allowance or retrying the same context.
 - Stopped a third consecutive identical tool-call batch with unchanged results before executing it.
 
+## [0.9.4] - 2026-09-08
+
+- Removed the unused `maxRetryDelayMs` agent option; retry delays are owned by the session retry loop.
+
 ## [0.8.0] - 2026-08-21
 
 - Added `AgentContinueError` with stable codes (`busy`, `nothing-to-continue`) for `Agent.continue()` precondition failures, so callers classify without matching message text.

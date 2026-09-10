@@ -25,7 +25,7 @@ export const DAEMON_WORKER_COMMAND_COMPATIBILITY = {
 	worker_list_active_sessions: { minSchemaRevision: 23 },
 	// Schema revision at which worker_deliver_message carries stable mailbox identity
 	// fields; older workers drop unknown fields, so senders must gate on this revision.
-	worker_deliver_message: { minSchemaRevision: 28 },
+	worker_deliver_message: { minSchemaRevision: 29 },
 } as const;
 // Worker->supervisor roster frames live outside the client-facing DaemonOutbound schema.
 export type DaemonWorkerRosterOutbound =

@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from types import FunctionType, SimpleNamespace
 from unittest import mock
 
 from rlm import bash, rg, rsync, ssh_forward
@@ -44,8 +45,6 @@ def _win_spawn(procs=None, resume=True):
         return proc
 
     return spawn_in_job
-
-
 
 
 def _fake_ssh(directory: str) -> str:
@@ -107,8 +106,12 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             haystack = os.path.join(tmp, "hay stack.txt")
             with open(haystack, "w", encoding="utf-8") as stream:
                 stream.write("needle here\n")
-            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
-                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": os.path.join(tmp, "capture")}
+            with (
+                mock.patch.object(bash_module, "_ssh_executable", return_value=fake),
+                mock.patch.dict(
+                    os.environ,
+                    {"PRIME_AGENT_TEST_SSH_CAPTURE": os.path.join(tmp, "capture")},
+                ),
             ):
                 result = await rg("needle", haystack, ssh="core@thumper", cwd=tmp)
             self.assertEqual(result.exit_code, 0)
@@ -127,7 +130,12 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                 rg("needle", ssh=None, **kwargs)
 
     async def test_rsync_ssh_builds_a_batchmode_remote_shell(self):
-        handle = rsync("src/", "core@thumper:dst/", ssh="core@thumper", ssh_options=["-J", "jump host"])
+        handle = rsync(
+            "src/",
+            "core@thumper:dst/",
+            ssh="core@thumper",
+            ssh_options=["-J", "jump host"],
+        )
         self.assertIn("-e", handle.command)
         self.assertIn("ssh -oBatchMode=yes", handle.command)
         self.assertIn("jump host", handle.command)
@@ -141,7 +149,9 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             os.mkdir(src)
             with open(os.path.join(src, "file.txt"), "w", encoding="utf-8") as stream:
                 stream.write("payload\n")
-            result = await rsync(src + "/", dst + "/", options=("-a", "--dry-run"), ssh="core@thumper")
+            result = await rsync(
+                src + "/", dst + "/", options=("-a", "--dry-run"), ssh="core@thumper"
+            )
             self.assertEqual(result.exit_code, 0)
 
     async def test_ssh_chain_nests_each_hop_and_streams_to_the_final_host(self):
@@ -169,10 +179,16 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                 )
             os.chmod(fake, 0o755)
             marker = os.path.join(tmp, "chain-marker.txt")
-            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
-                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": os.path.join(tmp, "capture")}
+            with (
+                mock.patch.object(bash_module, "_ssh_executable", return_value=fake),
+                mock.patch.dict(
+                    os.environ,
+                    {"PRIME_AGENT_TEST_SSH_CAPTURE": os.path.join(tmp, "capture")},
+                ),
             ):
-                result = await bash("printf chain-ok", ssh=["hop-a", "hop-b", "core@thumper"])
+                result = await bash(
+                    "printf chain-ok", ssh=["hop-a", "hop-b", "core@thumper"]
+                )
             self.assertEqual(result.exit_code, 0)
             self.assertIn("chain-ok", result.output)
             # capture.argv holds the innermost invocation: the final hop; the
@@ -201,7 +217,9 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         serve_once = threading.Thread(
             target=lambda: (
                 listener.settimeout(10),
-                (lambda conn: (conn.sendall(b"through-the-tunnel\n"), conn.close()))(listener.accept()[0]),
+                (lambda conn: (conn.sendall(b"through-the-tunnel\n"), conn.close()))(
+                    listener.accept()[0]
+                ),
             ),
             daemon=True,
         )
@@ -209,10 +227,16 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             fake = _fake_ssh(tmp)
-            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
-                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": os.path.join(tmp, "capture")}
+            with (
+                mock.patch.object(bash_module, "_ssh_executable", return_value=fake),
+                mock.patch.dict(
+                    os.environ,
+                    {"PRIME_AGENT_TEST_SSH_CAPTURE": os.path.join(tmp, "capture")},
+                ),
             ):
-                handle = ssh_forward("core@thumper", f"{listener_port + 1}:127.0.0.1:{listener_port}")
+                handle = ssh_forward(
+                    "core@thumper", f"{listener_port + 1}:127.0.0.1:{listener_port}"
+                )
                 capture = os.path.join(tmp, "capture.argv")
                 for _ in range(100):
                     if os.path.exists(capture):
@@ -260,13 +284,16 @@ Unicode: 雪
 PAYLOAD
 pwd
 """
-            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
-                os.environ,
-                {
-                    "PRIME_AGENT_TEST_SSH_CAPTURE": capture,
-                    "LOCAL_SECRET_NOT_FOR_REMOTE": "secret",
-                    "HOME": tmp,
-                },
+            with (
+                mock.patch.object(bash_module, "_ssh_executable", return_value=fake),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "PRIME_AGENT_TEST_SSH_CAPTURE": capture,
+                        "LOCAL_SECRET_NOT_FOR_REMOTE": "secret",
+                        "HOME": tmp,
+                    },
+                ),
             ):
                 handle = bash(
                     script,
@@ -302,10 +329,13 @@ pwd
         with tempfile.TemporaryDirectory() as tmp:
             capture = os.path.join(tmp, "capture")
             fake = _fake_ssh(tmp)
-            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
-                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}
+            with (
+                mock.patch.object(bash_module, "_ssh_executable", return_value=fake),
+                mock.patch.dict(os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}),
             ):
-                result = await bash("printf 'before\n'; false; printf 'after\n'", ssh="host")
+                result = await bash(
+                    "printf 'before\n'; false; printf 'after\n'", ssh="host"
+                )
             self.assertEqual(result.exit_code, 0)
             self.assertEqual(result.output, "before\nafter\n")
             self.assertFalse(result.transport_error)
@@ -314,8 +344,9 @@ pwd
         with tempfile.TemporaryDirectory() as tmp:
             capture = os.path.join(tmp, "capture")
             fake = _fake_ssh(tmp)
-            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
-                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}
+            with (
+                mock.patch.object(bash_module, "_ssh_executable", return_value=fake),
+                mock.patch.dict(os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}),
             ):
                 failed = await bash("printf never", ssh="connection-failure")
                 remote_255 = await bash("printf remote-255; exit 255", ssh="host")
@@ -332,25 +363,33 @@ pwd
             capture = os.path.join(tmp, "capture")
             fake = _fake_ssh(tmp)
             script = ("# payload\n" * 200_000) + "printf large-complete"
-            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
-                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}
+            with (
+                mock.patch.object(bash_module, "_ssh_executable", return_value=fake),
+                mock.patch.dict(os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}),
             ):
                 started = time.monotonic()
                 handle = bash(script, ssh="slow-reader")
                 self.assertLess(time.monotonic() - started, 0.3)
                 result = await asyncio.wait_for(handle, timeout=10)
             self.assertEqual(result.output, "large-complete")
-            self.assertTrue(Path(capture + ".stdin").read_bytes().endswith(script.encode()))
+            self.assertTrue(
+                Path(capture + ".stdin").read_bytes().endswith(script.encode())
+            )
 
     async def test_ssh_cwd_failure_prevents_script_execution(self):
         with tempfile.TemporaryDirectory() as tmp:
             capture = os.path.join(tmp, "capture")
             marker = os.path.join(tmp, "must-not-exist")
             fake = _fake_ssh(tmp)
-            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
-                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}
+            with (
+                mock.patch.object(bash_module, "_ssh_executable", return_value=fake),
+                mock.patch.dict(os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}),
             ):
-                result = await bash(f"touch {shlex.quote(marker)}", ssh="host", cwd="/missing/remote/path")
+                result = await bash(
+                    f"touch {shlex.quote(marker)}",
+                    ssh="host",
+                    cwd="/missing/remote/path",
+                )
             self.assertEqual(result.exit_code, 128)
             self.assertFalse(result.transport_error)
             self.assertFalse(os.path.exists(marker))
@@ -359,10 +398,14 @@ pwd
         with tempfile.TemporaryDirectory() as tmp:
             capture = os.path.join(tmp, "capture")
             fake = _fake_ssh(tmp)
-            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.object(
-                bash_module, "_record_journal", return_value=False
-            ), mock.patch.dict(os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}):
-                with self.assertRaisesRegex(RuntimeError, "orphan-journal enrollment failed"):
+            with (
+                mock.patch.object(bash_module, "_ssh_executable", return_value=fake),
+                mock.patch.object(bash_module, "_record_journal", return_value=False),
+                mock.patch.dict(os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "orphan-journal enrollment failed"
+                ):
                     bash("touch should-never-run", ssh="host")
             stdin_path = Path(capture + ".stdin")
             if stdin_path.exists():
@@ -372,8 +415,9 @@ pwd
         with tempfile.TemporaryDirectory() as tmp:
             capture = os.path.join(tmp, "capture")
             fake = _fake_ssh(tmp)
-            with mock.patch.object(bash_module, "_ssh_executable", return_value=fake), mock.patch.dict(
-                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}
+            with (
+                mock.patch.object(bash_module, "_ssh_executable", return_value=fake),
+                mock.patch.dict(os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}),
             ):
                 handle = bash("trap '' TERM; sleep 30", ssh="host", timeout=0.1)
                 with self.assertRaises(TimeoutError):
@@ -454,28 +498,43 @@ pwd
                     "PRIME_AGENT_KERNEL_OWNER_PID": str(os.getpid()),
                 },
             ):
-                with self.assertRaisesRegex(RuntimeError, "orphan-journal enrollment failed"):
+                with self.assertRaisesRegex(
+                    RuntimeError, "orphan-journal enrollment failed"
+                ):
                     bash_module._argv_handle(
-                        [sys.executable, "-c", "from pathlib import Path; Path(__import__('sys').argv[1]).touch()", marker],
+                        [
+                            sys.executable,
+                            "-c",
+                            "from pathlib import Path; Path(__import__('sys').argv[1]).touch()",
+                            marker,
+                        ],
                         None,
                     )
             self.assertFalse(os.path.exists(marker))
 
     def test_rg_builds_an_argv_search_and_reuses_bash_handle_custody(self):
         handle = object()
-        with mock.patch.object(bash_module, "_tool_path", return_value="/tools/rg"), mock.patch.object(
-            bash_module, "_argv_handle", return_value=handle
-        ) as runner:
-            result = rg("single ' quote", "dir with space", options=("--hidden",), timeout=3)
+        with (
+            mock.patch.object(bash_module, "_tool_path", return_value="/tools/rg"),
+            mock.patch.object(
+                bash_module, "_argv_handle", return_value=handle
+            ) as runner,
+        ):
+            result = rg(
+                "single ' quote", "dir with space", options=("--hidden",), timeout=3
+            )
         self.assertIs(result, handle)
         runner.assert_called_once_with(
             ["/tools/rg", "--hidden", "-e", "single ' quote", "--", "dir with space"], 3
         )
 
     def test_rg_defaults_to_the_current_directory_and_validates_argv(self):
-        with mock.patch.object(bash_module, "_tool_path", return_value="/tools/rg"), mock.patch.object(
-            bash_module, "_argv_handle", return_value=object()
-        ) as runner:
+        with (
+            mock.patch.object(bash_module, "_tool_path", return_value="/tools/rg"),
+            mock.patch.object(
+                bash_module, "_argv_handle", return_value=object()
+            ) as runner,
+        ):
             rg("needle")
         runner.assert_called_once_with(["/tools/rg", "-e", "needle", "--", "."], None)
         with self.assertRaises(TypeError):
@@ -486,17 +545,21 @@ pwd
             rg("needle", options=("--",))
         with self.assertRaises(ValueError):
             rg("needle", options=("--pre=cat",))
-        with mock.patch.dict(os.environ, {"PRIME_AGENT_RG": "/missing/rg"}), mock.patch.object(
-            bash_module.shutil, "which", return_value=None
+        with (
+            mock.patch.dict(os.environ, {"PRIME_AGENT_RG": "/missing/rg"}),
+            mock.patch.object(bash_module.shutil, "which", return_value=None),
         ):
             with self.assertRaisesRegex(RuntimeError, "PRIME_AGENT_RG"):
                 rg("needle")
 
     def test_rsync_builds_a_protected_archive_argv_and_reuses_bash_handle_custody(self):
         handle = object()
-        with mock.patch.object(bash_module, "_tool_path", return_value="/tools/rsync"), mock.patch.object(
-            bash_module, "_argv_handle", return_value=handle
-        ) as runner:
+        with (
+            mock.patch.object(bash_module, "_tool_path", return_value="/tools/rsync"),
+            mock.patch.object(
+                bash_module, "_argv_handle", return_value=handle
+            ) as runner,
+        ):
             result = rsync("source dir/", "host:target dir/", timeout=9)
         self.assertIs(result, handle)
         runner.assert_called_once_with(
@@ -512,18 +575,65 @@ pwd
         )
 
     def test_rsync_allows_native_defaults_and_rejects_unsafe_or_incomplete_calls(self):
-        with mock.patch.object(bash_module, "_tool_path", return_value="/tools/rsync"), mock.patch.object(
-            bash_module, "_argv_handle", return_value=object()
-        ) as runner:
+        with (
+            mock.patch.object(bash_module, "_tool_path", return_value="/tools/rsync"),
+            mock.patch.object(
+                bash_module, "_argv_handle", return_value=object()
+            ) as runner,
+        ):
             rsync("source", "target", options=(), protect_args=False)
         runner.assert_called_once_with(["/tools/rsync", "--", "source", "target"], None)
         with self.assertRaises(ValueError):
             rsync("source")
         with self.assertRaises(TypeError):
             rsync("source", "target", protect_args="yes")  # type: ignore[arg-type]
-        for options in (("-e", "ssh -J jump"), ("-avze",), ("--rsh=ssh",), ("--daemon",), ("--",)):
+        for options in (
+            ("-e", "ssh -J jump"),
+            ("-avze",),
+            ("--rsh=ssh",),
+            ("--daemon",),
+            ("--",),
+        ):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 rsync("source", "target", options=options)
+
+    def test_construction_cleanup_uses_windows_signal_without_sigkill(self):
+        failure = RuntimeError("task construction failed")
+        loop = mock.Mock()
+        loop.create_task.side_effect = failure
+        bridge = SimpleNamespace(emit=mock.Mock())
+        namespace = dict(
+            bash_module.BashHandle._schedule_background_completion_notice.__globals__
+        )
+
+        def isolated_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if level == 1 and name == "" and fromlist == ("repl",):
+                return SimpleNamespace(repl=bridge)
+            return __import__(name, globals, locals, fromlist, level)
+
+        namespace.update(
+            _IS_POSIX=False,
+            signal=SimpleNamespace(SIGTERM=15),
+            asyncio=SimpleNamespace(get_running_loop=lambda: loop),
+            __builtins__={
+                **vars(__import__("builtins")),
+                "__import__": isolated_import,
+            },
+        )
+        schedule = FunctionType(
+            bash_module.BashHandle._schedule_background_completion_notice.__code__,
+            namespace,
+        )
+        handle = mock.Mock(_pid=42)
+        with self.assertRaises(RuntimeError) as caught:
+            schedule(handle)
+        self.assertIs(caught.exception, failure)
+        handle.kill.assert_called_once_with(15)
+        handle._notify_background_completion.return_value.close.assert_called_once_with()
+        activity = bridge.emit.call_args_list[0].args[0]
+        mime = "application/vnd.prime-agent.bash-activity+json"
+        self.assertTrue(activity[mime]["active"])
+        bridge.emit.assert_called_with({mime: {**activity[mime], "active": False}})
 
     async def test_status_pipe_survives_high_fds_and_strict_posix_shell(self):
         # Regression: dash rejects multi-digit fds in redirections at parse
@@ -735,7 +845,9 @@ pwd
         tasks = [asyncio.ensure_future(bash("sleep 0.5")._wait()) for _ in range(3)]
         await asyncio.sleep(0.1)
         # Old executor-parked waits would deadlock this 1-thread pool.
-        value = await asyncio.wait_for(loop.run_in_executor(None, lambda: 42), timeout=0.3)
+        value = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: 42), timeout=0.3
+        )
         self.assertEqual(value, 42)
         results = await asyncio.gather(*tasks)
         self.assertTrue(all(r.exit_code == 0 for r in results))
@@ -780,10 +892,14 @@ pwd
                             handle.kill()
                     taskkill = os.path.join(r"C:\WinTest", "System32", "taskkill.exe")
                     self.assertEqual(
-                        run.call_args.args[0], [taskkill, "/PID", str(handle.pid), "/T", "/F"]
+                        run.call_args.args[0],
+                        [taskkill, "/PID", str(handle.pid), "/T", "/F"],
                     )
                     self.assertEqual(
-                        run.call_args.kwargs["env"]["NoDefaultCurrentDirectoryInExePath"], "1"
+                        run.call_args.kwargs["env"][
+                            "NoDefaultCurrentDirectoryInExePath"
+                        ],
+                        "1",
                     )
                     proc_kill.assert_not_called()
                     # No SystemRoot in the env falls back to C:\Windows.
@@ -793,7 +909,9 @@ pwd
                             handle.kill()
                     self.assertTrue(run.call_args.args[0][0].startswith(r"C:\Windows"))
                     # taskkill unavailable or failing must fall back to Popen.kill().
-                    with mock.patch.object(bash_module.subprocess, "run", side_effect=OSError):
+                    with mock.patch.object(
+                        bash_module.subprocess, "run", side_effect=OSError
+                    ):
                         handle.kill()
                     proc_kill.assert_called_once()
         finally:
@@ -841,7 +959,9 @@ pwd
 
         with mock.patch.object(bash_module.socket, "socketpair", capturing_socketpair):
             with mock.patch.object(bash_module.os, "close", recording_close):
-                with mock.patch.object(bash_module.os, "pipe", side_effect=OSError("boom")):
+                with mock.patch.object(
+                    bash_module.os, "pipe", side_effect=OSError("boom")
+                ):
                     with self.assertRaises(OSError):
                         bash("echo never")
         self.assertEqual(len(acquired), 2)
@@ -855,13 +975,19 @@ pwd
                 with mock.patch.object(
                     bash_module.subprocess, "run", return_value=completed
                 ) as run:
-                    self.assertEqual(bash_module._process_start_id(1234), "win:638000000000000000")
+                    self.assertEqual(
+                        bash_module._process_start_id(1234), "win:638000000000000000"
+                    )
         argv = run.call_args.args[0]
         self.assertEqual(
             argv[0],
-            os.path.join(r"C:\WinTest", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+            os.path.join(
+                r"C:\WinTest", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+            ),
         )
-        self.assertEqual(run.call_args.kwargs["env"]["NoDefaultCurrentDirectoryInExePath"], "1")
+        self.assertEqual(
+            run.call_args.kwargs["env"]["NoDefaultCurrentDirectoryInExePath"], "1"
+        )
         self.assertIn("GetProcessById(1234)", argv[-1])
         garbage = mock.Mock(stdout="not a number\n")
         with mock.patch.object(bash_module.os, "name", "nt"):
@@ -910,7 +1036,9 @@ pwd
                 await bash(f"trap '' TERM; sleep 1.0; touch {marker}; sleep 30")
 
             with mock.patch.object(bash_module, "_CANCEL_TERM_GRACE", 0.2):
-                with mock.patch.object(bash_module.BashHandle, "__init__", capturing_init):
+                with mock.patch.object(
+                    bash_module.BashHandle, "__init__", capturing_init
+                ):
                     task = asyncio.ensure_future(run_oneshot())
                     await asyncio.sleep(0.2)
                     task.cancel()
@@ -1021,13 +1149,17 @@ pwd
             original_write(buffer_self, chunk)
 
         with mock.patch.object(bash_module._BoundedBuffer, "write", delayed_write):
-            result = await asyncio.wait_for(bash("printf delayed-output-complete"), timeout=5)
+            result = await asyncio.wait_for(
+                bash("printf delayed-output-complete"), timeout=5
+            )
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(result.output, "delayed-output-complete")
 
     async def test_completion_marker_split_across_reads_is_removed(self):
         with mock.patch.object(bash_module, "_READ_CHUNK", 7):
-            result = await asyncio.wait_for(bash("printf exact-pre-fence-output"), timeout=5)
+            result = await asyncio.wait_for(
+                bash("printf exact-pre-fence-output"), timeout=5
+            )
         self.assertEqual(result.output, "exact-pre-fence-output")
 
     async def test_slow_pump_does_not_lose_foreground_output(self):
@@ -1055,7 +1187,9 @@ pwd
         with mock.patch.object(bash_module.secrets, "token_hex", return_value=token):
             result = await asyncio.wait_for(bash(command), timeout=5)
         actual_marker = (
-            bash_module._COMPLETION_PREFIX + token.encode() + bash_module._COMPLETION_SUFFIX
+            bash_module._COMPLETION_PREFIX
+            + token.encode()
+            + bash_module._COMPLETION_SUFFIX
         )
         self.assertIn(raw_lookalike, result.output)
         self.assertIn("after-sentinel-lookalike", result.output)
@@ -1115,8 +1249,12 @@ pwd
                 },
             ):
                 with mock.patch.object(bash_module, "_IS_POSIX", False):
-                    with mock.patch.object(bash_module._winjob, "spawn_in_job", _win_spawn()):
-                        with mock.patch.object(bash_module._winjob, "create_job", return_value=7):
+                    with mock.patch.object(
+                        bash_module._winjob, "spawn_in_job", _win_spawn()
+                    ):
+                        with mock.patch.object(
+                            bash_module._winjob, "create_job", return_value=7
+                        ):
                             with mock.patch.object(
                                 bash_module._winjob, "terminate", return_value=True
                             ):
@@ -1148,7 +1286,9 @@ pwd
             proc.resume = mock.Mock(side_effect=lambda: order.append("resume") or True)
             return proc
 
-        self.enterContext(mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"}))
+        self.enterContext(
+            mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"})
+        )
         with mock.patch.object(bash_module, "_IS_POSIX", False):
             with mock.patch.object(bash_module._winjob, "spawn_in_job", spawn):
                 with mock.patch.object(bash_module, "_record_journal", journal):
@@ -1166,7 +1306,9 @@ pwd
                         ["/bin/sh", "-c", bash_module._with_prefix("sleep 30")],
                     )
                     spawned[-1].resume.assert_called_once_with()
-                    self.assertEqual(order, ["create_job", "spawn", "journal", "resume"])
+                    self.assertEqual(
+                        order, ["create_job", "spawn", "journal", "resume"]
+                    )
                     self.assertEqual(handle._job, sentinel)
                 finally:
                     handle._job = None
@@ -1175,23 +1317,22 @@ pwd
 
     async def test_windows_argv_spawn_uses_the_existing_job_container(self):
         spawned = []
-        with mock.patch.object(bash_module, "_IS_POSIX", False), mock.patch.object(
-            bash_module._winjob, "create_job", return_value=5150
-        ), mock.patch.object(
-            bash_module._winjob, "spawn_in_job", _win_spawn(spawned)
-        ), mock.patch.object(
-            bash_module._winjob, "terminate", return_value=True
-        ), mock.patch.object(
-            bash_module._winjob, "close"
-        ), mock.patch.object(
-            bash_module, "_record_journal", return_value=True
+        with (
+            mock.patch.object(bash_module, "_IS_POSIX", False),
+            mock.patch.object(bash_module._winjob, "create_job", return_value=5150),
+            mock.patch.object(bash_module._winjob, "spawn_in_job", _win_spawn(spawned)),
+            mock.patch.object(bash_module._winjob, "terminate", return_value=True),
+            mock.patch.object(bash_module._winjob, "close"),
+            mock.patch.object(bash_module, "_record_journal", return_value=True),
         ):
             result = await bash_module._argv_handle(
                 [sys.executable, "-c", "print('windows-argv')"], None
             )
 
         self.assertEqual(result.output.strip(), "windows-argv")
-        self.assertEqual(spawned[0].spawn_argv, [sys.executable, "-c", "print('windows-argv')"])
+        self.assertEqual(
+            spawned[0].spawn_argv, [sys.executable, "-c", "print('windows-argv')"]
+        )
         self.assertIsNone(spawned[0].stdin)
 
     async def test_windows_ssh_spawn_uses_job_contained_stdin_pipe(self):
@@ -1199,14 +1340,17 @@ pwd
             capture = os.path.join(tmp, "capture")
             fake = _fake_ssh(tmp)
             spawned = []
-            with mock.patch.object(bash_module, "_IS_POSIX", False), mock.patch.object(
-                bash_module, "_ssh_executable", return_value=fake
-            ), mock.patch.object(bash_module._winjob, "create_job", return_value=5151), mock.patch.object(
-                bash_module._winjob, "spawn_in_job", _win_spawn(spawned)
-            ), mock.patch.object(bash_module._winjob, "terminate", return_value=True), mock.patch.object(
-                bash_module._winjob, "close"
-            ), mock.patch.object(bash_module, "_record_journal", return_value=True), mock.patch.dict(
-                os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}
+            with (
+                mock.patch.object(bash_module, "_IS_POSIX", False),
+                mock.patch.object(bash_module, "_ssh_executable", return_value=fake),
+                mock.patch.object(bash_module._winjob, "create_job", return_value=5151),
+                mock.patch.object(
+                    bash_module._winjob, "spawn_in_job", _win_spawn(spawned)
+                ),
+                mock.patch.object(bash_module._winjob, "terminate", return_value=True),
+                mock.patch.object(bash_module._winjob, "close"),
+                mock.patch.object(bash_module, "_record_journal", return_value=True),
+                mock.patch.dict(os.environ, {"PRIME_AGENT_TEST_SSH_CAPTURE": capture}),
             ):
                 result = await bash("printf windows-remote", ssh="host")
 
@@ -1222,11 +1366,15 @@ pwd
             journal_calls.append((pid, active))
             return True
 
-        self.enterContext(mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"}))
+        self.enterContext(
+            mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"})
+        )
         with mock.patch.object(bash_module, "_IS_POSIX", False):
             with mock.patch.object(bash_module._winjob, "spawn_in_job") as spawn:
                 with mock.patch.object(bash_module, "_record_journal", journal):
-                    with mock.patch.object(bash_module._winjob, "create_job", return_value=None):
+                    with mock.patch.object(
+                        bash_module._winjob, "create_job", return_value=None
+                    ):
                         with self.assertRaisesRegex(RuntimeError, "job containment"):
                             bash("sleep 30")
         # A create_job failure aborts before spawn_in_job: nothing spawned, nothing journaled.
@@ -1247,7 +1395,9 @@ pwd
             spawned[0].kill()
             return True
 
-        self.enterContext(mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"}))
+        self.enterContext(
+            mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"})
+        )
         with mock.patch.object(bash_module, "_IS_POSIX", False):
             with mock.patch.object(
                 bash_module._winjob, "spawn_in_job", _win_spawn(spawned, resume=False)
@@ -1259,14 +1409,20 @@ pwd
                         with mock.patch.object(
                             bash_module._winjob, "terminate", side_effect=terminate
                         ) as term:
-                            with mock.patch.object(bash_module._winjob, "close") as close:
-                                with self.assertRaisesRegex(RuntimeError, "job containment"):
+                            with mock.patch.object(
+                                bash_module._winjob, "close"
+                            ) as close:
+                                with self.assertRaisesRegex(
+                                    RuntimeError, "job containment"
+                                ):
                                     bash("sleep 30")
         term.assert_called_once_with(sentinel)
         close.assert_called_once_with(sentinel)
         self.assertIsNotNone(spawned[0].poll())
         spawned[0].close.assert_called_once()
-        self.assertEqual(journal_calls, [(spawned[0].pid, True), (spawned[0].pid, False)])
+        self.assertEqual(
+            journal_calls, [(spawned[0].pid, True), (spawned[0].pid, False)]
+        )
 
     async def test_windows_journal_enrollment_failure_kills_suspended_leader(self):
         # A journal failure must kill the suspended, job-contained leader and retire the record.
@@ -1282,9 +1438,13 @@ pwd
             spawned[0].kill()
             return True
 
-        self.enterContext(mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"}))
+        self.enterContext(
+            mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"})
+        )
         with mock.patch.object(bash_module, "_IS_POSIX", False):
-            with mock.patch.object(bash_module._winjob, "spawn_in_job", _win_spawn(spawned)):
+            with mock.patch.object(
+                bash_module._winjob, "spawn_in_job", _win_spawn(spawned)
+            ):
                 with mock.patch.object(bash_module, "_record_journal", journal):
                     with mock.patch.object(
                         bash_module._winjob, "create_job", return_value=sentinel
@@ -1292,14 +1452,20 @@ pwd
                         with mock.patch.object(
                             bash_module._winjob, "terminate", side_effect=terminate
                         ) as term:
-                            with mock.patch.object(bash_module._winjob, "close") as close:
-                                with self.assertRaisesRegex(RuntimeError, "journal enrollment"):
+                            with mock.patch.object(
+                                bash_module._winjob, "close"
+                            ) as close:
+                                with self.assertRaisesRegex(
+                                    RuntimeError, "journal enrollment"
+                                ):
                                     bash("sleep 30")
         term.assert_called_once_with(sentinel)
         close.assert_called_once_with(sentinel)
         spawned[0].resume.assert_not_called()
         self.assertIsNotNone(spawned[0].poll())
-        self.assertEqual(journal_calls, [(spawned[0].pid, True), (spawned[0].pid, False)])
+        self.assertEqual(
+            journal_calls, [(spawned[0].pid, True), (spawned[0].pid, False)]
+        )
 
     async def test_windows_spawn_failure_closes_precreated_job(self):
         # A spawn_in_job failure must close the pre-created job and never touch the journal.
@@ -1313,7 +1479,9 @@ pwd
         def spawn(job, argv, cwd, env):
             raise OSError("spawn failed")
 
-        self.enterContext(mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"}))
+        self.enterContext(
+            mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"})
+        )
         with mock.patch.object(bash_module, "_IS_POSIX", False):
             with mock.patch.object(bash_module._winjob, "spawn_in_job", spawn):
                 with mock.patch.object(bash_module, "_record_journal", journal):
@@ -1326,7 +1494,9 @@ pwd
         close.assert_called_once_with(sentinel)
         self.assertEqual(journal_calls, [])
 
-    async def test_windows_watch_taskkill_fallback_runs_before_process_handle_close(self):
+    async def test_windows_watch_taskkill_fallback_runs_before_process_handle_close(
+        self,
+    ):
         # PID-reuse guard: every taskkill-by-pid must run before the handle closes.
         order = []
         spawned = []
@@ -1352,26 +1522,37 @@ pwd
             order.append(("taskkill", spawned[0].close.called))
             return True
 
-        self.enterContext(mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"}))
+        self.enterContext(
+            mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"})
+        )
         with mock.patch.object(bash_module, "_IS_POSIX", False):
             with mock.patch.object(bash_module._winjob, "spawn_in_job", spawn):
-                with mock.patch.object(bash_module._winjob, "create_job", return_value=777):
+                with mock.patch.object(
+                    bash_module._winjob, "create_job", return_value=777
+                ):
                     with mock.patch.object(bash_module._winjob, "terminate", terminate):
                         with mock.patch.object(
-                            bash_module._winjob, "close",
+                            bash_module._winjob,
+                            "close",
                             side_effect=lambda job: order.append("job-close"),
                         ):
-                            with mock.patch.object(bash_module, "_taskkill_tree", taskkill):
+                            with mock.patch.object(
+                                bash_module, "_taskkill_tree", taskkill
+                            ):
                                 handle = bash("echo hi")
                                 handle_box.append(handle)
                                 ready.set()
                                 await asyncio.wait_for(handle, timeout=5)
-                                self.assertTrue(await asyncio.to_thread(closed_done.wait, 5))
+                                self.assertTrue(
+                                    await asyncio.to_thread(closed_done.wait, 5)
+                                )
         self.assertEqual(
             order, ["terminate", "job-close", ("taskkill", False), ("proc-close", True)]
         )
 
-    async def test_windows_kill_blocked_during_watch_reap_never_taskkills_after_close(self):
+    async def test_windows_kill_blocked_during_watch_reap_never_taskkills_after_close(
+        self,
+    ):
         # kill() blocked on the reap lock must become a no-op, never a raw-pid taskkill.
         spawned = []
         entered, release = threading.Event(), threading.Event()
@@ -1384,18 +1565,26 @@ pwd
             assert release.wait(timeout=10)
             return True
 
-        self.enterContext(mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"}))
+        self.enterContext(
+            mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"})
+        )
         with mock.patch.object(bash_module, "_IS_POSIX", False):
             with mock.patch.object(bash_module._winjob, "spawn_in_job", spawn):
-                with mock.patch.object(bash_module._winjob, "create_job", return_value=778):
+                with mock.patch.object(
+                    bash_module._winjob, "create_job", return_value=778
+                ):
                     with mock.patch.object(
                         bash_module._winjob, "terminate", side_effect=terminate
                     ) as term:
                         with mock.patch.object(bash_module._winjob, "close"):
-                            with mock.patch.object(bash_module, "_taskkill_tree") as taskkill:
+                            with mock.patch.object(
+                                bash_module, "_taskkill_tree"
+                            ) as taskkill:
                                 handle = bash("echo hi")
                                 await asyncio.wait_for(handle, timeout=5)
-                                self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+                                self.assertTrue(
+                                    await asyncio.to_thread(entered.wait, 5)
+                                )
                                 fut = asyncio.get_running_loop().run_in_executor(
                                     None, handle.kill
                                 )
@@ -1421,7 +1610,9 @@ pwd
             with mock.patch.object(bash_module, "_IS_POSIX", False):
                 with mock.patch.object(bash_module._winjob, "terminate") as term:
                     with mock.patch.object(bash_module, "_taskkill_tree") as taskkill:
-                        with mock.patch.object(bash_module, "_record_journal") as journal:
+                        with mock.patch.object(
+                            bash_module, "_record_journal"
+                        ) as journal:
                             bash_module._kill_live_handles()
         finally:
             with bash_module._live_lock:
@@ -1474,26 +1665,35 @@ pwd
             assert tk_release.wait(timeout=10)
             return True
 
-        self.enterContext(mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"}))
+        self.enterContext(
+            mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "/bin/sh"})
+        )
         loop = asyncio.get_running_loop()
         with mock.patch.object(bash_module, "_IS_POSIX", False):
             with mock.patch.object(bash_module._winjob, "spawn_in_job", spawn):
-                with mock.patch.object(bash_module._winjob, "create_job", return_value=900):
+                with mock.patch.object(
+                    bash_module._winjob, "create_job", return_value=900
+                ):
                     with mock.patch.object(
                         bash_module._winjob, "terminate", side_effect=terminate
                     ) as term:
                         with mock.patch.object(
-                            bash_module._winjob, "close",
+                            bash_module._winjob,
+                            "close",
                             side_effect=lambda job: order.append("abort-jobclose"),
                         ):
-                            with mock.patch.object(bash_module, "_record_journal", journal):
+                            with mock.patch.object(
+                                bash_module, "_record_journal", journal
+                            ):
                                 with mock.patch.object(
                                     bash_module, "_taskkill_tree", side_effect=taskkill
                                 ):
                                     ctor = loop.run_in_executor(
                                         None, lambda: bash("echo hi")
                                     )
-                                    self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+                                    self.assertTrue(
+                                        await asyncio.to_thread(entered.wait, 5)
+                                    )
                                     # Phase 1: abort holds _kill_lock -> the killer blocks.
                                     killer = loop.run_in_executor(
                                         None, bash_module._kill_live_handles
@@ -1516,14 +1716,23 @@ pwd
                                     # Phase 3: taskkill returns, killer releases the lock,
                                     # abort's reaped+close section finally runs.
                                     tk_release.set()
-                                    with self.assertRaisesRegex(RuntimeError, "journal"):
+                                    with self.assertRaisesRegex(
+                                        RuntimeError, "journal"
+                                    ):
                                         await asyncio.wait_for(ctor, timeout=10)
                                     await asyncio.wait_for(killer, timeout=10)
         self.assertEqual(
             order,
-            ["abort-terminate", "abort-jobclose", ("killer-taskkill", False), "proc-close"],
+            [
+                "abort-terminate",
+                "abort-jobclose",
+                ("killer-taskkill", False),
+                "proc-close",
+            ],
         )
-        self.assertEqual(spawned[0].close.call_count, 1)  # once, only after taskkill returned
+        self.assertEqual(
+            spawned[0].close.call_count, 1
+        )  # once, only after taskkill returned
         term.assert_called_once()  # the killer saw _job None; no second terminate
         spawned[0].kill.assert_not_called()
         pid = spawned[0].pid
@@ -1536,11 +1745,17 @@ pwd
         try:
             with mock.patch.object(bash_module, "_IS_POSIX", False):
                 with mock.patch.object(bash_module, "_taskkill_tree") as taskkill:
-                    with mock.patch.object(bash_module._winjob, "terminate", return_value=True) as term:
+                    with mock.patch.object(
+                        bash_module._winjob, "terminate", return_value=True
+                    ) as term:
                         with mock.patch.object(bash_module._winjob, "close") as close:
-                            with mock.patch.object(bash_module._winjob, "is_empty", return_value=False):
+                            with mock.patch.object(
+                                bash_module._winjob, "is_empty", return_value=False
+                            ):
                                 self.assertTrue(handle._group_alive())
-                            with mock.patch.object(bash_module._winjob, "is_empty", return_value=True):
+                            with mock.patch.object(
+                                bash_module._winjob, "is_empty", return_value=True
+                            ):
                                 self.assertFalse(handle._group_alive())
                             handle.kill()
                             term.assert_called_once_with(job)
@@ -1566,7 +1781,9 @@ pwd
         handle._job = job
         try:
             with mock.patch.object(bash_module, "_IS_POSIX", False):
-                with mock.patch.object(bash_module._winjob, "terminate", return_value=False):
+                with mock.patch.object(
+                    bash_module._winjob, "terminate", return_value=False
+                ):
                     with mock.patch.object(bash_module._winjob, "close") as close:
                         with mock.patch.object(
                             bash_module, "_taskkill_tree", return_value=True
@@ -1599,7 +1816,9 @@ pwd
         handle._job = 999
         try:
             with mock.patch.object(bash_module, "_IS_POSIX", False):
-                with mock.patch.object(bash_module._winjob, "terminate", return_value=False):
+                with mock.patch.object(
+                    bash_module._winjob, "terminate", return_value=False
+                ):
                     with mock.patch.object(bash_module._winjob, "close"):
                         with mock.patch.object(
                             bash_module, "_taskkill_tree", return_value=False
@@ -1613,9 +1832,12 @@ pwd
         completed = mock.Mock(stdout="Mon Jan  1 00:00:00 2026\n")
         with mock.patch.object(bash_module.sys, "platform", "darwin"):
             with mock.patch("builtins.open", side_effect=OSError):
-                with mock.patch.object(bash_module.subprocess, "run", return_value=completed) as run:
+                with mock.patch.object(
+                    bash_module.subprocess, "run", return_value=completed
+                ) as run:
                     self.assertEqual(
-                        bash_module._process_start_id(1234), "ps:Mon Jan  1 00:00:00 2026"
+                        bash_module._process_start_id(1234),
+                        "ps:Mon Jan  1 00:00:00 2026",
                     )
         self.assertEqual(run.call_args.args[0][0], "/bin/ps")
 
@@ -1635,9 +1857,13 @@ pwd
                 try:
                     records = await _poll_journal(journal, count=1)
                     self.assertTrue(records[-1]["active"])
-                    with mock.patch.object(bash_module, "_signal_group", return_value=False):
+                    with mock.patch.object(
+                        bash_module, "_signal_group", return_value=False
+                    ):
                         bash_module._kill_live_handles()
-                    await asyncio.sleep(0.2)  # give any (wrong) inactive write time to land
+                    await asyncio.sleep(
+                        0.2
+                    )  # give any (wrong) inactive write time to land
                     records = await _poll_journal(journal, count=1)
                     self.assertEqual(len(records), 1)
                     self.assertTrue(records[-1]["active"])
@@ -1648,7 +1874,9 @@ pwd
     async def test_signal_group_reports_delivery(self):
         if not bash_module._IS_POSIX:
             self.skipTest("POSIX signal-delivery semantics")
-        with mock.patch.object(bash_module.os, "killpg", side_effect=ProcessLookupError):
+        with mock.patch.object(
+            bash_module.os, "killpg", side_effect=ProcessLookupError
+        ):
             self.assertTrue(bash_module._signal_group(1234567, signal.SIGKILL))
         with mock.patch.object(bash_module.os, "killpg", side_effect=PermissionError):
             self.assertFalse(bash_module._signal_group(1234567, signal.SIGKILL))
@@ -1673,7 +1901,9 @@ pwd
                     "PRIME_AGENT_KERNEL_OWNER_PID": str(os.getpid()),
                 },
             ):
-                with mock.patch.object(bash_module.subprocess, "Popen", capturing_popen):
+                with mock.patch.object(
+                    bash_module.subprocess, "Popen", capturing_popen
+                ):
                     with self.assertRaises(RuntimeError):
                         bash(f"touch {marker}")
             await _poll_group_dead(pids[0])
@@ -1705,7 +1935,9 @@ pwd
                     "PRIME_AGENT_KERNEL_OWNER_PID": str(os.getpid()),
                 },
             ):
-                with mock.patch.object(bash_module, "_process_start_id", return_value=None):
+                with mock.patch.object(
+                    bash_module, "_process_start_id", return_value=None
+                ):
                     with self.assertRaises(RuntimeError):
                         bash("sleep 30")
 
@@ -1726,7 +1958,9 @@ pwd
                 },
             ):
                 with mock.patch.object(bash_module.os, "write", short_write):
-                    self.assertFalse(bash_module._record_journal(os.getpid(), active=False))
+                    self.assertFalse(
+                        bash_module._record_journal(os.getpid(), active=False)
+                    )
 
     async def test_journal_partial_writes_complete_the_record(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1745,7 +1979,9 @@ pwd
                 },
             ):
                 with mock.patch.object(bash_module.os, "write", partial_write):
-                    self.assertTrue(bash_module._record_journal(os.getpid(), active=False))
+                    self.assertTrue(
+                        bash_module._record_journal(os.getpid(), active=False)
+                    )
             with open(journal) as f:
                 record = json.loads(f.read())
             self.assertEqual(record["pid"], os.getpid())

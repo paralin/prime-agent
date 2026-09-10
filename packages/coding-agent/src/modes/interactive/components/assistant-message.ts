@@ -1,3 +1,5 @@
+import { resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	type Component,
@@ -27,6 +29,7 @@ const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
 const LOGIN_RECOVERY_SUFFIX = `\n\n${LOGIN_RECOVERY_MESSAGE}`;
 
 export interface AssistantMessageComponentOptions {
+	cwd?: string;
 	expanded?: boolean;
 	precededByToolActivity?: boolean;
 	/** Replaces Mermaid code blocks in assistant text (never thinking) with Unicode diagrams. */
@@ -130,6 +133,7 @@ export class AssistantMessageComponent extends Container {
 	private lastBlockTexts = new Map<number, string>();
 	private precededByToolActivity: boolean;
 	private mermaidTransform?: MermaidMarkdownTransform;
+	private baseUrl?: string;
 	private isStreaming = false;
 	private streaming: boolean;
 
@@ -149,6 +153,7 @@ export class AssistantMessageComponent extends Container {
 		this.precededByToolActivity = options.precededByToolActivity ?? false;
 		this.mermaidTransform = options.mermaidTransform;
 		this.streaming = options.streaming ?? false;
+		this.baseUrl = options.cwd ? pathToFileURL(`${resolve(options.cwd)}${sep}`).href : undefined;
 
 		// Container for text/thinking content
 		this.contentContainer = new Container();
@@ -308,6 +313,7 @@ export class AssistantMessageComponent extends Container {
 				const mermaidTransform = this.mermaidTransform;
 				const isStreaming = this.isStreaming;
 				const markdown = new Markdown(content.text.trim(), 1, 0, this.markdownTheme, undefined, {
+					baseUrl: this.baseUrl,
 					transform:
 						mermaidTransform && ((md, availableWidth) => mermaidTransform(md, availableWidth, isStreaming)),
 				});
@@ -347,6 +353,7 @@ export class AssistantMessageComponent extends Container {
 						{
 							color: (text: string) => theme.fg("thinkingText", text),
 						},
+						{ baseUrl: this.baseUrl },
 					);
 					this.blockMarkdowns.set(i, markdown);
 					this.lastBlockTexts.set(i, content.thinking.trim());

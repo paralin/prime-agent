@@ -36,13 +36,13 @@ import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
-import { getOpenCodeSessionHeaders } from "../utils/opencode-headers.js";
 import { getOpenRouterHeaders } from "../utils/openrouter-headers.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { recordStreamFailure } from "../utils/stream-failure.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { streamSimpleOpenAIResponses } from "./openai-responses.js";
+import { withOpenCodeHeaders } from "./opencode-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -767,7 +767,7 @@ function createClient(
 	context: Context,
 	apiKey?: string,
 	optionsHeaders?: Record<string, string>,
-	sessionId?: string,
+	cacheSessionId?: string,
 	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
 	conversationId?: string,
 ) {
@@ -784,7 +784,6 @@ function createClient(
 	if (model.provider === "openrouter") {
 		Object.assign(headers, getOpenRouterHeaders());
 	}
-	Object.assign(headers, getOpenCodeSessionHeaders(model.provider, conversationId));
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
 		const copilotHeaders = buildCopilotDynamicHeaders({
@@ -799,12 +798,12 @@ function createClient(
 		if (teamId) headers["X-Prime-Team-ID"] = teamId;
 	}
 
-	if (sessionId && compat.sendSessionAffinityHeaders) {
+	if (cacheSessionId && compat.sendSessionAffinityHeaders) {
 		const names =
 			compat.sendSessionAffinityHeaders === true
 				? ["session_id", "x-client-request-id", "x-session-affinity"]
 				: compat.sendSessionAffinityHeaders;
-		for (const name of names) headers[name] = sessionId;
+		for (const name of names) headers[name] = cacheSessionId;
 	}
 
 	if (optionsHeaders) {
@@ -824,7 +823,7 @@ function createClient(
 		apiKey,
 		baseURL: isCloudflareProvider(model.provider) ? resolveCloudflareBaseUrl(model) : model.baseUrl,
 		dangerouslyAllowBrowser: true,
-		defaultHeaders,
+		defaultHeaders: withOpenCodeHeaders(model.provider, conversationId, defaultHeaders),
 		maxRetries: 0,
 	});
 }

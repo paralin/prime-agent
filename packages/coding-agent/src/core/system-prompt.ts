@@ -3,7 +3,6 @@
  */
 
 import { buildChildAgentDoctrine, buildRlmPrompt } from "./prompts/index.js";
-import { formatHarnessStateForPrompt, type HarnessState, REFINE_SKILL_NAME } from "./refinement/index.js";
 import { formatSkillsForPrompt, getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 
 const CHAT_WORKSPACE_PRECEDENCE = `# Instruction Precedence
@@ -52,8 +51,6 @@ export interface BuildSystemPromptOptions {
 	rlmParentAgent?: string;
 	/** Model currently executing this prompt. */
 	currentModel?: { provider: string; id: string; name?: string };
-	/** Local and global Continual Harness state to inject as compact persistent context. */
-	harnessState?: HarnessState;
 	/** Enabled user-configured servers available through the generic kernel MCP API. */
 	genericMcpServers?: string[];
 }
@@ -71,7 +68,6 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		skills: providedSkills,
 		allowRecursion,
 		actEnabled,
-		harnessState,
 	} = options;
 	const promptCwd = cwd.replace(/\\/g, "/");
 	const promptMessagesPath = (messagesPath ?? "not persisted").replace(/\\/g, "/");
@@ -89,10 +85,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const skills = providedSkills ?? [];
 	const tools = selectedTools ?? ["ipython"];
 	const hasIpython = tools.includes("ipython");
-	const hasBash = tools.includes("bash");
 	const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
 	const visiblePythonSkillImportNames = getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName);
-	const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
 	const genericMcpSection = hasIpython ? formatGenericMcpGuidance(options.genericMcpServers) : "";
 
 	if (customPrompt) {
@@ -132,10 +126,6 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 			prompt += `\n\n${childDoctrine}`;
 		}
 
-		if (harnessState) {
-			prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash, includeRefineExamples: hasIpython && hasRefineSkill })}`;
-		}
-
 		if (genericMcpSection) {
 			prompt += `\n\n${genericMcpSection}`;
 		}
@@ -162,10 +152,6 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 	if (modelSection) {
 		prompt += `\n\n${modelSection}`;
-	}
-
-	if (harnessState) {
-		prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash, includeRefineExamples: hasIpython && hasRefineSkill })}`;
 	}
 
 	if (genericMcpSection) {

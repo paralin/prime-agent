@@ -95,6 +95,7 @@ import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import { runMcpManagementCommand } from "../../core/mcp/mcp-command.js";
 import {
+	ASYNC_BASH_COMPLETION_PREVIEW_LABEL,
 	bashOutputToText,
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
@@ -206,6 +207,7 @@ import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybin
 import { createMermaidMarkdownTransform } from "./components/mermaid.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
+import { styleArgumentTokens } from "./components/prompt-highlight.js";
 import {
 	MalformedRefinementOutcomeMessageComponent,
 	RefinementOutcomeMessageComponent,
@@ -319,7 +321,8 @@ function isLabeledQueuedPreview(message: string): boolean {
 		message.startsWith(`${REPETITION_NOTICE_PREVIEW_LABEL}: `) ||
 		message.startsWith(`${TOOL_ERROR_NUDGE_PREVIEW_LABEL}: `) ||
 		message.startsWith(`${ENGLISH_OUTPUT_NUDGE_PREVIEW_LABEL}: `) ||
-		message.startsWith(`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `)
+		message.startsWith(`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `) ||
+		message.startsWith(`${ASYNC_BASH_COMPLETION_PREVIEW_LABEL}: `)
 	);
 }
 
@@ -333,9 +336,12 @@ export function styleQueuedMessagePreview(
 	isRecognizedSlashCommand: (name: string) => boolean,
 ): string {
 	const preview = formatQueuedMessagePreview(message, label);
-	if (!isLeadingSlashCommand(message, isRecognizedSlashCommand)) return theme.fg("dim", preview);
+	const styleDim = (segment: string) => theme.fg("dim", segment);
+	if (!isLeadingSlashCommand(message, isRecognizedSlashCommand)) return styleArgumentTokens(preview, styleDim);
 	const prefix = preview.slice(0, preview.length - message.length);
-	return `${theme.fg("dim", prefix)}${styleSlashCommandText(message, (rest) => theme.fg("dim", rest))}`;
+	return `${theme.fg("dim", prefix)}${styleSlashCommandText(message, (rest, includeBareSeparator) =>
+		styleArgumentTokens(rest, styleDim, includeBareSeparator),
+	)}`;
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -6059,6 +6065,7 @@ export class InteractiveMode {
 					this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 					this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
 				mermaidTransform: this.mermaidMarkdownTransform,
+				cwd: this.getCurrentCwd(),
 			},
 		);
 		this.streamingMessage = message;
@@ -6731,6 +6738,7 @@ export class InteractiveMode {
 							this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 							this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
 						mermaidTransform: this.mermaidMarkdownTransform,
+						cwd: this.getCurrentCwd(),
 					},
 				);
 				this.chatContainer.addChild(assistantComponent);
@@ -8988,7 +8996,7 @@ export class InteractiveMode {
 				);
 			}
 		} else if (!selectedModel) {
-			this.showError("Prime Inference login succeeded, but the default GLM 5.2 model is unavailable.");
+			this.showError("Prime Inference login succeeded, but the default GLM 5.3 model is unavailable.");
 		}
 
 		return true;

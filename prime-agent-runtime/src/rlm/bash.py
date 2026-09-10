@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import functools
 import json
 import math
 import os
@@ -46,11 +47,130 @@ _COMPLETION_SUFFIX = b"\x1f"
 # wait for a confirmed group exit before CancelledError propagates.
 _CANCEL_TERM_GRACE = 0.5
 _CANCEL_KILL_WAIT = 2.0
+_COMPLETION_NOTICE_COMMAND_CAP = 1000
+_ASYNCIO_WRAPPER_CALLBACKS = {
+    ("asyncio.tasks", "gather.<locals>._done_callback"),
+    ("asyncio.tasks", "shield.<locals>._inner_done_callback"),
+    ("asyncio.tasks", "_wait.<locals>._on_completion"),
+    ("asyncio.tasks", "as_completed.<locals>._on_completion"),
+    ("asyncio.tasks", "_release_waiter"),
+}
 
 _live_handles: set["BashHandle"] = set()
 _live_lock = threading.Lock()
 _hook_installed = False
 _hook_lock = threading.Lock()
+
+
+def _current_cell_completion_context() -> (
+    tuple[asyncio.Event, asyncio.Task[Any] | None] | None
+):
+    """Get the creating REPL cell's lifecycle without coupling standalone use to repl."""
+    try:
+        from . import repl
+
+        if repl.is_active():
+            return repl.current_cell_completion_context()
+    except (ImportError, RuntimeError):
+        pass
+    return None
+
+
+def _consume_notice_task(task: asyncio.Task[None]) -> None:
+    """Retrieve detached notifier failures so they never become loop warnings."""
+    if not task.cancelled():
+        task.exception()
+
+
+def _completion_reaches(
+    start: asyncio.Future[Any], targets: tuple[asyncio.Future[Any], ...]
+) -> bool:
+    """Follow asyncio's wrapper and TaskGroup ownership callbacks."""
+    pending = [start]
+    seen_futures: set[int] = set()
+    seen_values: set[int] = set()
+
+    def collect(value: Any, depth: int = 0) -> None:
+        if isinstance(value, asyncio.Future):
+            pending.append(value)
+            return
+        identity = id(value)
+        if depth >= 4 or identity in seen_values:
+            return
+        seen_values.add(identity)
+
+        nested: list[Any] = []
+        if isinstance(value, asyncio.Queue):
+            pending.extend(value._getters)
+        elif isinstance(value, functools.partial):
+            nested.extend((value.func, value.args, value.keywords))
+        elif isinstance(value, dict):
+            nested.extend(value.keys())
+            nested.extend(value.values())
+        elif isinstance(value, (tuple, list, set, frozenset)):
+            nested.extend(value)
+        else:
+            closure = getattr(value, "__closure__", None) or ()
+            for cell in closure:
+                try:
+                    nested.append(cell.cell_contents)
+                except ValueError:
+                    pass
+            bound_self = getattr(value, "__self__", None)
+            if bound_self is not None:
+                nested.append(bound_self)
+        for item in nested:
+            collect(item, depth + 1)
+
+    while pending:
+        future = pending.pop()
+        if any(future is target for target in targets):
+            return True
+        if id(future) in seen_futures:
+            continue
+        seen_futures.add(id(future))
+        for entry in getattr(future, "_callbacks", None) or ():
+            callback = entry[0] if isinstance(entry, tuple) else entry
+            base = (
+                callback.func if isinstance(callback, functools.partial) else callback
+            )
+            identity = (
+                getattr(base, "__module__", None),
+                getattr(base, "__qualname__", None),
+            )
+            if identity in _ASYNCIO_WRAPPER_CALLBACKS:
+                collect(callback)
+            elif identity == (
+                "asyncio.tasks",
+                "_AsCompletedIterator._handle_completion",
+            ):
+                collect(base.__self__._done)
+            elif identity == (None, "Task.task_wakeup"):
+                task = getattr(callback, "__self__", None)
+                if isinstance(task, asyncio.Task):
+                    pending.append(task)
+            elif identity == ("asyncio.taskgroups", "TaskGroup._on_task_done"):
+                parent = getattr(
+                    getattr(callback, "__self__", None), "_parent_task", None
+                )
+                if isinstance(parent, asyncio.Future):
+                    pending.append(parent)
+    return False
+
+
+def _creating_cell_waits_for(
+    owner: asyncio.Task[Any] | None, awaiter: asyncio.Task[Any] | None
+) -> bool:
+    """Return whether the cell owner directly or transitively waits for awaiter."""
+    if owner is None or awaiter is None:
+        return False
+    if owner is awaiter:
+        return True
+    waiter = getattr(owner, "_fut_waiter", None)
+    targets: tuple[asyncio.Future[Any], ...] = (owner,)
+    if isinstance(waiter, asyncio.Future):
+        targets += (waiter,)
+    return _completion_reaches(awaiter, targets)
 
 
 @dataclass(frozen=True)
@@ -124,7 +244,11 @@ class _BoundedBuffer:
         if not dropped:
             return (head + tail).decode("utf-8", errors="replace")
         marker = f"\n... [{dropped} bytes dropped] ...\n"
-        return head.decode("utf-8", errors="replace") + marker + tail.decode("utf-8", errors="replace")
+        return (
+            head.decode("utf-8", errors="replace")
+            + marker
+            + tail.decode("utf-8", errors="replace")
+        )
 
 
 class BashHandle:
@@ -151,6 +275,12 @@ class BashHandle:
         self._argv_transport = argv_transport
         if ssh_transport is not None and argv_transport is not None:
             raise ValueError("a BashHandle process can have only one transport")
+        completion_context = _current_cell_completion_context()
+        self._creating_cell_finished = (
+            completion_context[0] if completion_context else None
+        )
+        self._creating_cell_task = completion_context[1] if completion_context else None
+        self._awaited_by_creating_cell = False
         self._buffer = _BoundedBuffer()
         self._done = threading.Event()
         self._eof = threading.Event()
@@ -164,6 +294,7 @@ class BashHandle:
         self._reaped = False
         self._result: BashResult | None = None
         self._callbacks: list[Callable[[], None]] = []
+        self._reap_callback: Callable[[], None] | None = None
         self._callback_lock = threading.Lock()
         self._timed_out = False
         self._timeout_timer: threading.Timer | None = None
@@ -185,7 +316,9 @@ class BashHandle:
             completion_token = secrets.token_hex(32)
             token_midpoint = len(completion_token) // 2
             self._completion_marker = (
-                _COMPLETION_PREFIX + completion_token.encode("ascii") + _COMPLETION_SUFFIX
+                _COMPLETION_PREFIX
+                + completion_token.encode("ascii")
+                + _COMPLETION_SUFFIX
             )
             remote_command = _ssh_remote_command(
                 ssh_transport.shell,
@@ -230,7 +363,9 @@ class BashHandle:
             # Halves stop passive echoes; a deliberate forgery freezes only this call while later bytes stay live.
             token_midpoint = len(completion_token) // 2
             self._completion_marker = (
-                _COMPLETION_PREFIX + completion_token.encode("ascii") + _COMPLETION_SUFFIX
+                _COMPLETION_PREFIX
+                + completion_token.encode("ascii")
+                + _COMPLETION_SUFFIX
             )
             script = _status_script(
                 _with_prefix(command),
@@ -244,12 +379,18 @@ class BashHandle:
             self._job = _winjob.create_job()
             if self._job is None:
                 # Nothing spawned yet, so nothing can leak: refuse to start.
-                raise RuntimeError("bash(): Windows job containment could not be established")
+                raise RuntimeError(
+                    "bash(): Windows job containment could not be established"
+                )
         try:
             self._proc: subprocess.Popen[bytes] | _winjob.JobProcess
             if argv_transport is not None and _IS_POSIX:
                 self._proc = subprocess.Popen(
-                    [sys.executable, os.path.join(os.path.dirname(__file__), "_exec.py"), *argv_transport.argv],
+                    [
+                        sys.executable,
+                        os.path.join(os.path.dirname(__file__), "_exec.py"),
+                        *argv_transport.argv,
+                    ],
                     cwd=os.getcwd(),
                     env=_child_env(),
                     stdin=subprocess.PIPE,
@@ -279,15 +420,25 @@ class BashHandle:
                 )
             elif argv_transport is not None:
                 self._proc = _winjob.spawn_in_job(
-                    self._job, list(argv_transport.argv), cwd=os.getcwd(), env=_child_env()
+                    self._job,
+                    list(argv_transport.argv),
+                    cwd=os.getcwd(),
+                    env=_child_env(),
                 )
             elif ssh_transport is not None:
                 self._proc = _winjob.spawn_in_job(
-                    self._job, ssh_argv, cwd=os.getcwd(), env=_child_env(), pipe_stdin=True
+                    self._job,
+                    ssh_argv,
+                    cwd=os.getcwd(),
+                    env=_child_env(),
+                    pipe_stdin=True,
                 )
             else:
                 self._proc = _winjob.spawn_in_job(
-                    self._job, [_shell(), "-c", script], cwd=os.getcwd(), env=_child_env()
+                    self._job,
+                    [_shell(), "-c", script],
+                    cwd=os.getcwd(),
+                    env=_child_env(),
                 )
         except BaseException:
             for fd in (self._status_read, self._wake_read, self._wake_write):
@@ -337,7 +488,9 @@ class BashHandle:
             # child: fail closed via the assigned job.
             if not cast("_winjob.JobProcess", self._proc).resume():
                 self._abort_spawn()
-                raise RuntimeError("bash(): Windows job containment could not be established")
+                raise RuntimeError(
+                    "bash(): Windows job containment could not be established"
+                )
         threading.Thread(target=self._pump, daemon=True).start()
         if argv_transport is not None:
             threading.Thread(target=self._watch_argv, daemon=True).start()
@@ -353,6 +506,7 @@ class BashHandle:
             self._timeout_timer = threading.Timer(timeout, self._expire)
             self._timeout_timer.daemon = True
             self._timeout_timer.start()
+        self._schedule_background_completion_notice()
 
     @property
     def ssh(self) -> str | None:
@@ -600,6 +754,10 @@ class BashHandle:
             if not _IS_POSIX:
                 # Reaped: pid fallbacks are gone, so the handle may finally close.
                 cast("_winjob.JobProcess", self._proc).close()
+        with self._callback_lock:
+            callback, self._reap_callback = self._reap_callback, None
+        if callback is not None:
+            callback()
         if delivered:
             _record_journal(self._pid, active=False)
         with _live_lock:
@@ -679,7 +837,9 @@ class BashHandle:
         if stdout is None:
             return False
         try:
-            pending = struct.unpack("i", fcntl.ioctl(stdout.fileno(), termios.FIONREAD, struct.pack("i", 0)))[0]
+            pending = struct.unpack(
+                "i", fcntl.ioctl(stdout.fileno(), termios.FIONREAD, struct.pack("i", 0))
+            )[0]
         except (OSError, ValueError):
             return False
         return pending > 0
@@ -723,6 +883,106 @@ class BashHandle:
                 self._callbacks.append(callback)
                 return
         callback()
+
+    def _schedule_background_completion_notice(self) -> None:
+        cell_finished = self._creating_cell_finished
+        if cell_finished is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        from . import repl
+
+        activity = {"id": secrets.token_hex(16), "pid": self._pid, "active": True}
+        # Publish synchronously before bash() returns and the creating cell can end.
+        repl.emit({"application/vnd.prime-agent.bash-activity+json": activity})
+        notice = self._notify_background_completion(cell_finished, activity)
+        try:
+            task = loop.create_task(notice)
+        except BaseException:
+            self.kill(signal.SIGKILL if _IS_POSIX else signal.SIGTERM)
+            notice.close()
+            repl.emit(
+                {
+                    "application/vnd.prime-agent.bash-activity+json": {
+                        **activity,
+                        "active": False,
+                    }
+                }
+            )
+            raise
+        task.add_done_callback(_consume_notice_task)
+
+    async def _notify_background_completion(
+        self, cell_finished: asyncio.Event, activity: dict[str, Any]
+    ) -> None:
+        from . import repl
+
+        try:
+            result = await self._wait()
+            await self._wait_reaped()
+            # The cell may do other work before awaiting this handle. Do not classify
+            # it as detached until that whole cell has crossed its completion barrier.
+            await cell_finished.wait()
+            if self._awaited_by_creating_cell or not repl.is_active():
+                return
+            command = self.command
+            if len(command) > _COMPLETION_NOTICE_COMMAND_CAP:
+                command = (
+                    command[:_COMPLETION_NOTICE_COMMAND_CAP]
+                    + "\n... [command truncated]"
+                )
+            reply = await repl.host_request(
+                {
+                    "type": "bash.completed",
+                    "pid": self._pid,
+                    "command": command,
+                    "exitCode": result.exit_code,
+                }
+            )
+            if not isinstance(reply, dict) or reply.get("status") != "ok":
+                sys.stderr.write(
+                    f"Background bash completion follow-up for pid {self._pid} was not accepted. "
+                    "Inspect the saved handle with poll(), output(), or tail().\n"
+                )
+        except (OSError, RuntimeError):
+            # Standalone runtimes have no host handler, and teardown can close
+            # the bridge while a process is finishing. Shell results stay usable.
+            return
+        finally:
+            # Reap and deliver (or report rejection) before releasing kernel residency.
+            repl.emit(
+                {
+                    "application/vnd.prime-agent.bash-activity+json": {
+                        **activity,
+                        "active": False,
+                    }
+                }
+            )
+
+    async def _wait_reaped(self) -> None:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+
+        def wake() -> None:
+            try:
+                loop.call_soon_threadsafe(
+                    lambda: future.done() or future.set_result(None)
+                )
+            except RuntimeError:
+                pass
+
+        with self._callback_lock:
+            if self._reaped:
+                return
+            self._reap_callback = wake
+        try:
+            await future
+        finally:
+            with self._callback_lock:
+                if self._reap_callback is wake:
+                    self._reap_callback = None
 
     async def _wait(self) -> BashResult:
         # Asyncio-native wakeup: no executor thread is parked for the command's
@@ -853,10 +1113,27 @@ class BashHandle:
         # A handle awaited before any other API use is a one-shot command tied
         # to the await (kill-on-cancel); touching the handle API first marks it
         # as a deliberate background handle whose awaits only wait.
-        if self._released:
-            return self._wait().__await__()
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        creating_cell_waited = _creating_cell_waits_for(
+            self._creating_cell_task, current_task
+        )
+        owned = not self._released
+        wait = self._wait_owned() if owned else self._wait()
         self._released = True
-        return self._wait_owned().__await__()
+        completed = False
+        try:
+            result = yield from wait.__await__()
+            completed = True
+            return result
+        finally:
+            if (completed or owned) and (
+                creating_cell_waited
+                or _creating_cell_waits_for(self._creating_cell_task, current_task)
+            ):
+                self._awaited_by_creating_cell = True
 
     def __repr__(self) -> str:
         state = f"exit_code={self._result.exit_code}" if self._result else "running"
@@ -916,9 +1193,13 @@ def _validate_ssh_options(options: Sequence[str] | None) -> list[str]:
     expects_argument = False
     for index, option in enumerate(result):
         if not isinstance(option, str):
-            raise TypeError(f"ssh_options[{index}] must be str, got {type(option).__name__}")
+            raise TypeError(
+                f"ssh_options[{index}] must be str, got {type(option).__name__}"
+            )
         if not option or "\0" in option or "\n" in option or "\r" in option:
-            raise ValueError(f"ssh_options[{index}] must be a non-empty single-line argv value")
+            raise ValueError(
+                f"ssh_options[{index}] must be a non-empty single-line argv value"
+            )
         if expects_argument:
             expects_argument = False
             continue
@@ -935,12 +1216,16 @@ def _validate_ssh_options(options: Sequence[str] | None) -> list[str]:
                 raise ValueError("ssh option '-o' requires a value")
             key = re.split(r"[=\s]", config, maxsplit=1)[0].lower()
             if key in _SSH_FORBIDDEN_CONFIG:
-                raise ValueError(f"ssh option {config!r} conflicts with script transport")
+                raise ValueError(
+                    f"ssh option {config!r} conflicts with script transport"
+                )
             continue
         short_flags = option[1:]
         for position, flag in enumerate(short_flags):
             if f"-{flag}" in _SSH_FORBIDDEN_OPTIONS:
-                raise ValueError(f"ssh option {option!r} conflicts with script transport")
+                raise ValueError(
+                    f"ssh option {option!r} conflicts with script transport"
+                )
             if flag in _SSH_OPTIONS_WITH_ARGUMENT:
                 expects_argument = position == len(short_flags) - 1
                 break
@@ -951,7 +1236,9 @@ def _validate_ssh_options(options: Sequence[str] | None) -> list[str]:
             config = result[index + 1]
             key = re.split(r"[=\s]", config, maxsplit=1)[0].lower()
             if key in _SSH_FORBIDDEN_CONFIG:
-                raise ValueError(f"ssh option {config!r} conflicts with script transport")
+                raise ValueError(
+                    f"ssh option {config!r} conflicts with script transport"
+                )
     return result
 
 
@@ -966,7 +1253,9 @@ def _remote_cwd(cwd: str) -> str:
     return shlex.quote(cwd)
 
 
-def _remote_script(command: str, cwd: str | None, env: Mapping[str, str] | None) -> bytes:
+def _remote_script(
+    command: str, cwd: str | None, env: Mapping[str, str] | None
+) -> bytes:
     lines = ["export NO_COLOR=1 TERM=dumb CLICOLOR=0 FORCE_COLOR=0"]
     if cwd is not None:
         if not isinstance(cwd, str):
@@ -1005,7 +1294,11 @@ def _ssh_remote_command(shell: str, completion_a: str, completion_b: str) -> str
 def _ssh_destination(value: object, label: str = "ssh") -> str:
     if not isinstance(value, str):
         raise TypeError(f"{label} must be str, got {type(value).__name__}")
-    if not value or value.startswith("-") or any(character in value for character in "\0\n\r"):
+    if (
+        not value
+        or value.startswith("-")
+        or any(character in value for character in "\0\n\r")
+    ):
         raise ValueError(f"{label} must be a non-empty host or user@host argv value")
     return value
 
@@ -1035,10 +1328,16 @@ def _ssh_transport(
     if not isinstance(tty, bool):
         raise TypeError(f"tty must be bool, got {type(tty).__name__}")
     if tty:
-        raise ValueError("tty=True is incompatible with exact script transport; use an interactive SSH client")
+        raise ValueError(
+            "tty=True is incompatible with exact script transport; use an interactive SSH client"
+        )
     if not isinstance(shell, str):
         raise TypeError(f"ssh_shell must be str, got {type(shell).__name__}")
-    if not shell or shell.startswith("-") or any(character in shell for character in "\0\n\r"):
+    if (
+        not shell
+        or shell.startswith("-")
+        or any(character in shell for character in "\0\n\r")
+    ):
         raise ValueError("ssh_shell must be a non-empty single-line executable path")
     options = _validate_ssh_options(ssh_options)
     argv = (_ssh_executable(), "-oBatchMode=yes", *options, "-T", "--", hosts[0])
@@ -1108,8 +1407,16 @@ def bash(
     timeout = _validated_timeout(timeout)
     transport = None
     if ssh is None:
-        if cwd is not None or env is not None or ssh_options is not None or tty or ssh_shell != "bash":
-            raise ValueError("cwd, env, ssh_options, tty, and ssh_shell require ssh=...")
+        if (
+            cwd is not None
+            or env is not None
+            or ssh_options is not None
+            or tty
+            or ssh_shell != "bash"
+        ):
+            raise ValueError(
+                "cwd, env, ssh_options, tty, and ssh_shell require ssh=..."
+            )
     else:
         transport = _ssh_transport(command, ssh, cwd, env, ssh_options, tty, ssh_shell)
     _install_shutdown_hook()
@@ -1128,10 +1435,14 @@ def _argv_values(values: Sequence[str | os.PathLike[str]], label: str) -> list[s
     result: list[str] = []
     for index, value in enumerate(values):
         if not isinstance(value, (str, os.PathLike)):
-            raise TypeError(f"{label}[{index}] must be str or PathLike, got {type(value).__name__}")
+            raise TypeError(
+                f"{label}[{index}] must be str or PathLike, got {type(value).__name__}"
+            )
         argument = os.fspath(value)
         if not isinstance(argument, str) or not argument or "\0" in argument:
-            raise ValueError(f"{label}[{index}] must be a non-empty path or argument without NUL")
+            raise ValueError(
+                f"{label}[{index}] must be a non-empty path or argument without NUL"
+            )
         result.append(argument)
     return result
 
@@ -1140,7 +1451,9 @@ def _tool_path(name: str, environment_name: str) -> str:
     configured = os.environ.get(environment_name, name)
     executable = shutil.which(configured)
     if executable is None:
-        raise RuntimeError(f"{name}() requires the {name} executable; install it or set {environment_name}")
+        raise RuntimeError(
+            f"{name}() requires the {name} executable; install it or set {environment_name}"
+        )
     return executable
 
 
@@ -1186,10 +1499,19 @@ def rg(
     if ssh is None:
         if cwd is not None or ssh_options is not None:
             raise ValueError("cwd and ssh_options require ssh=...")
-        argv = [_tool_path("rg", "PRIME_AGENT_RG"), *arguments, "-e", pattern, "--", *requested_paths]
+        argv = [
+            _tool_path("rg", "PRIME_AGENT_RG"),
+            *arguments,
+            "-e",
+            pattern,
+            "--",
+            *requested_paths,
+        ]
         return _argv_handle(argv, timeout)
     remote_argv = ["rg", *arguments, "-e", pattern, "--", *requested_paths]
-    return bash(shlex.join(remote_argv), timeout, ssh=ssh, ssh_options=ssh_options, cwd=cwd)
+    return bash(
+        shlex.join(remote_argv), timeout, ssh=ssh, ssh_options=ssh_options, cwd=cwd
+    )
 
 
 _RSYNC_FORBIDDEN_OPTIONS = ("-e", "--daemon", "--rsh", "--rsync-path")
@@ -1200,10 +1522,17 @@ def _validate_rsync_options(options: Sequence[str]) -> list[str]:
     if "--" in arguments:
         raise ValueError("rsync options must not contain the end-of-options marker")
     for option in arguments:
-        if option == "-e" or (option.startswith("-") and not option.startswith("--") and "e" in option[1:]):
+        if option == "-e" or (
+            option.startswith("-") and not option.startswith("--") and "e" in option[1:]
+        ):
             raise ValueError(f"rsync option {option!r} can replace the remote shell")
-        if any(option == forbidden or option.startswith(f"{forbidden}=") for forbidden in _RSYNC_FORBIDDEN_OPTIONS[1:]):
-            raise ValueError(f"rsync option {option!r} conflicts with managed process custody")
+        if any(
+            option == forbidden or option.startswith(f"{forbidden}=")
+            for forbidden in _RSYNC_FORBIDDEN_OPTIONS[1:]
+        ):
+            raise ValueError(
+                f"rsync option {option!r} conflicts with managed process custody"
+            )
     return arguments
 
 
@@ -1242,14 +1571,24 @@ def rsync(
             hosts: Sequence[str] = (ssh,)
         else:
             hosts = _ssh_host_chain(ssh)
-        remote_shell_parts = ["ssh", "-oBatchMode=yes", *(_validate_ssh_options(ssh_options))]
+        remote_shell_parts = [
+            "ssh",
+            "-oBatchMode=yes",
+            *(_validate_ssh_options(ssh_options)),
+        ]
         if len(hosts) > 1:
             remote_shell_parts += ["-J", ",".join(hosts[1:])]
         remote_shell = " ".join(shlex.quote(part) for part in remote_shell_parts)
         arguments = [*arguments, "-e", remote_shell]
     requested_paths = _argv_values(paths, "paths")
     protected = ["--protect-args"] if protect_args else []
-    argv = [_tool_path("rsync", "PRIME_AGENT_RSYNC"), *arguments, *protected, "--", *requested_paths]
+    argv = [
+        _tool_path("rsync", "PRIME_AGENT_RSYNC"),
+        *arguments,
+        *protected,
+        "--",
+        *requested_paths,
+    ]
     return _argv_handle(argv, timeout)
 
 
@@ -1277,7 +1616,13 @@ def ssh_forward(
         raise ValueError("ssh_forward requires at least one forward")
     forward_args: list[str] = []
     for forward in forwards:
-        if not isinstance(forward, str) or not forward or "\0" in forward or "\n" in forward or "\r" in forward:
+        if (
+            not isinstance(forward, str)
+            or not forward
+            or "\0" in forward
+            or "\n" in forward
+            or "\r" in forward
+        ):
             raise TypeError("each forward must be a non-empty single-line str")
         if forward.startswith("R:"):
             forward_args += ["-R", forward[2:]]
@@ -1357,7 +1702,13 @@ def _status_script(command: str, completion_a: str, completion_b: str) -> str:
 
 
 def _child_env() -> dict[str, str]:
-    return {**os.environ, "NO_COLOR": "1", "TERM": "dumb", "CLICOLOR": "0", "FORCE_COLOR": "0"}
+    return {
+        **os.environ,
+        "NO_COLOR": "1",
+        "TERM": "dumb",
+        "CLICOLOR": "0",
+        "FORCE_COLOR": "0",
+    }
 
 
 def _signal_group(pid: int, sig: int) -> bool:
@@ -1433,7 +1784,10 @@ def _process_start_id(pid: int) -> str | None:
         # absolute path (bare `ps` stays only as the exotic-POSIX last resort).
         ps = "/bin/ps" if sys.platform == "darwin" else "ps"
         out = subprocess.run(
-            [ps, "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, timeout=5
+            [ps, "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            timeout=5,
         ).stdout.strip()
         return f"ps:{out}" if out else None
     except (OSError, subprocess.SubprocessError):

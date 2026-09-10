@@ -16,7 +16,6 @@ import type {
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
-import { getOpenCodeSessionHeaders } from "../utils/opencode-headers.js";
 import { getOpenRouterHeaders } from "../utils/openrouter-headers.js";
 import {
 	formatStreamFailureMessage,
@@ -26,6 +25,7 @@ import {
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
+import { withOpenCodeHeaders } from "./opencode-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode", "openrouter", "xai"]);
@@ -187,7 +187,7 @@ function createClient(
 	context: Context,
 	apiKey?: string,
 	optionsHeaders?: Record<string, string>,
-	sessionId?: string,
+	cacheSessionId?: string,
 	conversationId?: string,
 ) {
 	if (!apiKey) {
@@ -204,7 +204,6 @@ function createClient(
 	if (model.provider === "openrouter") {
 		Object.assign(headers, getOpenRouterHeaders());
 	}
-	Object.assign(headers, getOpenCodeSessionHeaders(model.provider, conversationId));
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
 		const copilotHeaders = buildCopilotDynamicHeaders({
@@ -214,11 +213,11 @@ function createClient(
 		Object.assign(headers, copilotHeaders);
 	}
 
-	if (sessionId) {
+	if (cacheSessionId) {
 		if (compat.sendSessionIdHeader) {
-			headers.session_id = sessionId;
+			headers.session_id = cacheSessionId;
 		}
-		headers["x-client-request-id"] = sessionId;
+		headers["x-client-request-id"] = cacheSessionId;
 	}
 	if (optionsHeaders) {
 		Object.assign(headers, optionsHeaders);
@@ -237,7 +236,7 @@ function createClient(
 		apiKey,
 		baseURL: isCloudflareProvider(model.provider) ? resolveCloudflareBaseUrl(model) : model.baseUrl,
 		dangerouslyAllowBrowser: true,
-		defaultHeaders,
+		defaultHeaders: withOpenCodeHeaders(model.provider, conversationId, defaultHeaders),
 		maxRetries: 0,
 	});
 }

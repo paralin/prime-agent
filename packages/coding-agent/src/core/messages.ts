@@ -11,7 +11,12 @@ import { isReasoningExhaustedResponse } from "@earendil-works/pi-ai";
 import type { AgentCronJob } from "./cron-jobs.js";
 import { ENGLISH_OUTPUT_NUDGE_CUSTOM_TYPE, ENGLISH_OUTPUT_NUDGE_PROMPT } from "./english-output-nudge.js";
 import { REASONING_OUTPUT_NUDGE_CUSTOM_TYPE } from "./reasoning-output-nudge.js";
-import type { AppliedRefinementEdit, HarnessScope, RefinementResult } from "./refinement/refinement.js";
+import {
+	type AppliedRefinementEdit,
+	formatRefinementNoticeBody,
+	type HarnessScope,
+	type RefinementResult,
+} from "./refinement/refinement.js";
 import { isSessionSlashCommandName, parseSessionSlashCommand, type SessionSlashCommand } from "./slash-commands.js";
 import { TOOL_ERROR_NUDGE_CUSTOM_TYPE } from "./tool-error-nudge.js";
 
@@ -41,6 +46,8 @@ export const SESSION_SLASH_COMMAND_CUSTOM_TYPE = "session_slash_command";
 export const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE = "session_slash_command_result";
 export const COMPACTION_OUTCOME_CUSTOM_TYPE = "compaction_outcome";
 export const REFINEMENT_OUTCOME_CUSTOM_TYPE = "refinement_outcome";
+export const REFINEMENT_NOTICE_CUSTOM_TYPE = "refinement_notice";
+export const HARNESS_DIGEST_CUSTOM_TYPE = "harness_digest";
 export const RLM_CHILD_FAILURE_CUSTOM_TYPE = "rlm_child_failure";
 export const RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE = "rlm_child_terminal_notice";
 export const MANUAL_CONTINUE_CUSTOM_TYPE = "manual_continue";
@@ -53,6 +60,8 @@ Continue.
 - If interrupted mid-step, continue from that point.
 - Do not pause to summarize progress, reconfirm the plan, or ask whether to proceed.
 </system-notice>`;
+export const ASYNC_BASH_COMPLETION_CUSTOM_TYPE = "async_bash_completion";
+export const ASYNC_BASH_COMPLETION_PREVIEW_LABEL = "Shell message received";
 
 export interface SessionSlashCommandDetails {
 	command: SessionSlashCommand;
@@ -107,6 +116,45 @@ export interface RefinementOutcomeMessage extends CustomMessage<RefinementOutcom
 	details: RefinementOutcomeDetails;
 }
 
+/** How a refinement was initiated: reviewer-triggered auto-refine, the /refine slash command, or the model's own refine.run(). */
+export type RefinementSource = "auto" | "user" | "self";
+
+export interface RefinementNoticeDetails extends RefinementOutcomeDetails {
+	source: RefinementSource;
+}
+
+export interface RefinementNoticeMessage extends CustomMessage<RefinementNoticeDetails> {
+	customType: typeof REFINEMENT_NOTICE_CUSTOM_TYPE;
+	content: string;
+	details: RefinementNoticeDetails;
+}
+
+export interface HarnessDigestDetails {
+	digest: string;
+}
+
+export const HARNESS_DIGEST_PREFIX = `The persistent memories produced across this session so far:
+
+<harness_state>
+`;
+
+export const HARNESS_DIGEST_SUFFIX = `
+</harness_state>`;
+
+export function createHarnessDigestMessage(
+	digest: string,
+	timestamp = Date.now(),
+): CustomMessage<HarnessDigestDetails> {
+	return {
+		role: "custom",
+		customType: HARNESS_DIGEST_CUSTOM_TYPE,
+		content: HARNESS_DIGEST_PREFIX + digest + HARNESS_DIGEST_SUFFIX,
+		display: false,
+		details: { digest },
+		timestamp,
+	};
+}
+
 export interface RlmChildFailureDetails {
 	childId: string;
 	sessionName: string;
@@ -126,6 +174,36 @@ export type RlmChildTerminalNoticeDetails =
 			sessionName: string;
 			lastAssistantTextPreview?: string;
 	  };
+
+export interface AsyncBashCompletionDetails {
+	pid: number;
+	command: string;
+	exitCode: number;
+}
+
+interface AsyncBashCompletionMessage extends CustomMessage<AsyncBashCompletionDetails> {
+	customType: typeof ASYNC_BASH_COMPLETION_CUSTOM_TYPE;
+	content: string;
+}
+
+export function createAsyncBashCompletionMessage(
+	details: AsyncBashCompletionDetails,
+	timestamp = Date.now(),
+): AsyncBashCompletionMessage {
+	return {
+		role: "custom",
+		customType: ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
+		content: `${ASYNC_BASH_COMPLETION_PREVIEW_LABEL}.
+Source: bash
+Command completed (pid ${details.pid}, exit code ${details.exitCode}).
+Command: ${JSON.stringify(details.command)}
+
+Inspect the saved BashHandle with .poll(), .output(), or .tail(), then continue the task.`,
+		display: true,
+		details,
+		timestamp,
+	};
+}
 
 export function createRlmChildFailureMessage(
 	details: RlmChildFailureDetails,
@@ -218,6 +296,8 @@ export interface CompactionSummaryMessage {
 	providerPayload?: ProviderPayload;
 	/** User instructions that guided the summary (from `/compact <instructions>`) */
 	customInstructions?: string;
+	/** Harness digest snapshot rendered before the summary in LLM context. Attached mechanically at compaction, never summarized. */
+	harnessDigest?: string;
 	timestamp: number;
 }
 
@@ -284,6 +364,7 @@ export function createCompactionSummaryMessage(
 	customInstructions?: string,
 	retainedMessageCount?: number,
 	providerPayload?: ProviderPayload,
+	harnessDigest?: string,
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
@@ -292,6 +373,7 @@ export function createCompactionSummaryMessage(
 		retainedMessageCount,
 		providerPayload,
 		customInstructions,
+		harnessDigest,
 		timestamp: new Date(timestamp).getTime(),
 	};
 }
@@ -388,6 +470,29 @@ export function createRefinementOutcomeMessage(
 			scope: result.scope ?? "local",
 			...(result.rollbackOf ? { rollbackOf: result.rollbackOf } : {}),
 			edits: result.appliedEdits,
+		},
+		timestamp,
+	};
+}
+
+/** Model-facing refinement notice: passes convertToLlm (unlike the refinement_outcome audit entry); display false because the TUI renders the outcome message. */
+export function createRefinementNoticeMessage(
+	result: RefinementResult,
+	source: RefinementSource,
+	timestamp = Date.now(),
+): RefinementNoticeMessage {
+	return {
+		role: "custom",
+		customType: REFINEMENT_NOTICE_CUSTOM_TYPE,
+		content: `[${source}-refinement]\n\n${formatRefinementNoticeBody(result)}`,
+		display: false,
+		details: {
+			refinementId: result.id,
+			summary: result.summary,
+			scope: result.scope ?? "local",
+			...(result.rollbackOf ? { rollbackOf: result.rollbackOf } : {}),
+			edits: result.appliedEdits,
+			source,
 		},
 		timestamp,
 	};
@@ -606,7 +711,10 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						};
 					}
 					if (
-						(!m.display && m.customType !== MODEL_CONTEXT_CUSTOM_TYPE) ||
+						(!m.display &&
+							m.customType !== MODEL_CONTEXT_CUSTOM_TYPE &&
+							m.customType !== REFINEMENT_NOTICE_CUSTOM_TYPE &&
+							m.customType !== HARNESS_DIGEST_CUSTOM_TYPE) ||
 						m.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
 						m.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE ||
 						m.customType === COMPACTION_OUTCOME_CUSTOM_TYPE ||
@@ -627,15 +735,22 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						content: [{ type: "text" as const, text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX }],
 						timestamp: m.timestamp,
 					};
-				case "compactionSummary":
+				case "compactionSummary": {
+					const digestBlock = m.harnessDigest
+						? `${HARNESS_DIGEST_PREFIX}${m.harnessDigest}${HARNESS_DIGEST_SUFFIX}\n\n`
+						: "";
 					return {
 						role: "user",
 						content: [
-							{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
+							{
+								type: "text" as const,
+								text: digestBlock + COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX,
+							},
 						],
 						providerPayload: m.providerPayload,
 						timestamp: m.timestamp,
 					};
+				}
 				case "assistant":
 					if (isRepetitionLoopAssistant(m) || isReasoningExhaustedResponse(m)) return undefined;
 					return m;

@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
+import { type Api, findEnvKeys, getLogger, type Model } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	appendRotatingLog,
@@ -108,9 +108,11 @@ import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import { providerRetryPolicy } from "../../core/provider-retry.js";
 import type {
+	CreateRlmRootSessionOptions,
 	CreateRlmSubagentRuntimeOptions,
 	ExternalRlmSubagentTranscript,
 	ExternalRlmSubagentTranscriptOptions,
+	RlmCreateSessionResult,
 	SubagentRuntimeHost,
 } from "../../core/rlm-runtime.js";
 import {
@@ -130,8 +132,9 @@ import {
 } from "../../core/session-manager.js";
 import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
+import { SettingsManager } from "../../core/settings-manager.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
-import { isProcessAlive, spawnHidden } from "../../utils/child-process.js";
+import { isProcessAlive, spawnHidden, waitForChildProcess } from "../../utils/child-process.js";
 import { tryAcquireDirLock } from "../../utils/dir-lock.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import {
@@ -142,6 +145,7 @@ import {
 import { createAgentConnectionToolDefinition } from "../agent-connection/tool-definition.js";
 import type { AgentConnectionHeartbeat, AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
 import { waitForHeadlessCompletion } from "../headless-completion.js";
+import { initTheme } from "../interactive/theme/theme.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import { encodePrivateFrame, PrivateFrameDecoder } from "../session-worker/private-framing.js";
 import {
@@ -164,6 +168,7 @@ import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
 import {
+	collectDaemonLaunchEnv,
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
@@ -655,6 +660,11 @@ export class AgentDaemon {
 			throw new Error("Daemon config is missing agentDir");
 		}
 		this.agentDir = options.defaultSessionConfig.agentDir;
+		// Hosted extensions get ctx.ui.theme; init it headlessly (no TTY, watcher off) or their first access kills the worker.
+		initTheme(
+			SettingsManager.create(options.defaultSessionConfig.cwd ?? process.cwd(), this.agentDir).getTheme(),
+			false,
+		);
 		this.cronStore = options.worker
 			? AgentCronJobStore.forSessionArtifacts()
 			: new AgentCronJobStore(getCronJobsPath(this.agentDir));
@@ -946,15 +956,48 @@ export class AgentDaemon {
 				env: environment,
 				stdio: "ignore",
 			});
+			const childExited = waitForChildProcess(child);
+			void childExited.catch(() => undefined);
 			child.unref();
 			const deadline = Date.now() + 10_000;
 			while (!this.shuttingDown && Date.now() < deadline) {
-				if (await this.canConnectToSupervisor(supervisorSocketPath)) {
-					this.log(`launched replacement supervisor on ${supervisorSocketPath}`);
+				if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+					await childExited;
+					return;
+				}
+				for (const [client, boundClaim] of this.supervisorClaims) {
+					const { claim } = boundClaim;
+					if (
+						claim.supervisorSocketPath !== supervisorSocketPath ||
+						!client.authenticated ||
+						client.socket.destroyed
+					)
+						continue;
+					try {
+						await this.assertSupervisorClaimCurrent(claim);
+					} catch {
+						continue;
+					}
+					if (
+						this.shuttingDown ||
+						Date.now() >= deadline ||
+						this.supervisorClaims.get(client) !== boundClaim ||
+						!client.authenticated ||
+						client.socket.destroyed
+					)
+						continue;
+					if (claim.supervisorPid === child.pid) {
+						this.log(`launched replacement supervisor on ${supervisorSocketPath}`);
+						return;
+					}
+					if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+					await waitForPromptAdmission(childExited, AbortSignal.timeout(Math.max(1, deadline - Date.now())));
+					this.log(`stopped losing replacement supervisor ${child.pid} on ${supervisorSocketPath}`);
 					return;
 				}
 				await delay(50);
 			}
+			this.log(`replacement supervisor ${child.pid} left running without a current authenticated supervisor`);
 		} catch (error) {
 			this.log(`failed to launch replacement supervisor: ${String(error)}`);
 		} finally {
@@ -2706,6 +2749,7 @@ export class AgentDaemon {
 			createRlmSubagentRuntime: async (options) => this.createRlmSubagentRuntime(parentState, options),
 			createExternalRlmSubagentTranscript: async (options) =>
 				this.createExternalRlmSubagentTranscript(parentState, options),
+			createRlmRootSession: async (options) => this.createRlmRootSession(parentState, options),
 			completeRlmSubagentRuntime: (childId, session) => {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
@@ -2860,6 +2904,95 @@ export class AgentDaemon {
 				}
 			},
 		};
+	}
+
+	private async createRlmRootSession(
+		parentState: ActiveSessionState,
+		options: CreateRlmRootSessionOptions,
+	): Promise<RlmCreateSessionResult> {
+		const supervisorSocketPath = this.supervisorSocketPathFromEnv();
+		if (!this.options.worker || !supervisorSocketPath) {
+			throw new Error("rlm.create_session requires a daemon worker connected to its supervisor");
+		}
+
+		const client = new DaemonClient(supervisorSocketPath);
+		let activeSessionId: string | undefined;
+		try {
+			await client.connect(3000);
+			await client.waitForHello(3000);
+			const runtimeConfig = parentState.runtime.runtimeConfig;
+			const inheritsProvider = options.model.provider === parentState.runtime.session.model?.provider;
+			const authSource = parentState.runtime.services.authStorage.getAuthStatus(options.model.provider).source;
+			const apiKey =
+				inheritsProvider &&
+				authSource === "runtime" &&
+				(runtimeConfig?.provider ?? parentState.runtime.session.model?.provider) === options.model.provider
+					? runtimeConfig?.apiKey
+					: undefined;
+			const launchEnv = collectDaemonLaunchEnv({ PATH: process.env.PATH });
+			const envKey = authSource === "environment" ? findEnvKeys(options.model.provider)?.[0] : undefined;
+			if (envKey && process.env[envKey]) launchEnv[envKey] = process.env[envKey];
+			if (options.model.provider === "prime-inference" && process.env.PRIME_TEAM_ID !== undefined) {
+				launchEnv.PRIME_TEAM_ID = process.env.PRIME_TEAM_ID;
+			}
+			const createResponse = await client.request(
+				{
+					type: "create",
+					lifecycle: "resident",
+					launchEnv,
+					...(options.sessionName ? { name: options.sessionName } : {}),
+					config: {
+						cwd: options.cwd,
+						agentDir: parentState.runtime.services.agentDir,
+						...(runtimeConfig?.sessionDir ? { sessionDir: runtimeConfig.sessionDir } : {}),
+						provider: options.model.provider,
+						model: options.model.id,
+						...(apiKey ? { apiKey } : {}),
+						thinking: options.thinkingLevel,
+						...(runtimeConfig?.telemetryDisabled ? { telemetryDisabled: true as const } : {}),
+					},
+				},
+				120_000,
+			);
+			if (!createResponse.success) throw deserializeDaemonError(createResponse);
+			const summary = createResponse.data as Partial<SessionSummary> | undefined;
+			activeSessionId = summary?.activeSessionId ?? summary?.id;
+			if (
+				!activeSessionId ||
+				typeof summary?.sessionId !== "string" ||
+				!summary.sessionId ||
+				typeof summary.sessionFile !== "string" ||
+				!summary.sessionFile ||
+				(summary.rlmDepth !== undefined && summary.rlmDepth !== 0)
+			) {
+				throw new Error("Daemon supervisor returned an invalid depth-0 session summary");
+			}
+
+			const promptResponse = await client.request(
+				{
+					type: "prompt",
+					activeSessionId,
+					message: options.prompt,
+					source: "rpc",
+				},
+				30_000,
+			);
+			if (!promptResponse.success) throw deserializeDaemonError(promptResponse);
+			return {
+				active_session_id: activeSessionId,
+				session_id: summary.sessionId,
+				name: summary.sessionName ?? activeSessionId,
+				session_file: summary.sessionFile,
+				model: `${options.model.provider}/${options.model.id}`,
+			};
+		} catch (error) {
+			if (activeSessionId) {
+				await client.request({ type: "kill", activeSessionId }, 30_000).catch(() => undefined);
+			}
+			throw error;
+		} finally {
+			client.close();
+		}
 	}
 
 	private async createRlmSubagentRuntime(

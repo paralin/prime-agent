@@ -15,7 +15,7 @@ import type { ModelRoleSelector } from "./settings-manager.js";
 
 const log = getLogger("coding-agent.model-resolver");
 
-export const PRIME_INFERENCE_DEFAULT_MODEL_ID = "z-ai/glm-5.2";
+export const PRIME_INFERENCE_DEFAULT_MODEL_ID = "z-ai/glm-5.3";
 
 /** Default model IDs for each known provider */
 export const defaultModelPerProvider: Record<KnownProvider, string> = {

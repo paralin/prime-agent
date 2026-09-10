@@ -37,7 +37,18 @@ DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
 
 # Names the session bootstrap re-creates on every start; never snapshotted.
-_ALWAYS_SKIP = {"rlm", "mcp", "bash", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open"}
+_ALWAYS_SKIP = {
+    "rlm",
+    "mcp",
+    "bash",
+    "asyncio",
+    "In",
+    "Out",
+    "get_ipython",
+    "exit",
+    "quit",
+    "open",
+}
 # IPython-injected names that may appear in a snapshot payload; never restored.
 _RESTORE_SKIP = {"In", "Out", "get_ipython"}
 
@@ -45,14 +56,26 @@ _protocol_fd: int = -1
 _write_lock = threading.Lock()
 _loop: asyncio.AbstractEventLoop | None = None
 _serve_task: asyncio.Task[Any] | None = None
-# Attribution rides task context: asyncio tasks copy it at creation, so a
-# detached task spawned by a cell keeps writing under that cell's id after
-# the cell finishes. Threads start with a fresh context and emit id null.
-_current_cell: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_cell", default=None)
-_captured_output: contextvars.ContextVar[dict[str, list[str]] | None] = contextvars.ContextVar(
-    "_captured_output", default=None
+
+
+class _CellExecution:
+    def __init__(self) -> None:
+        self.finished = asyncio.Event()
+        self.owner: asyncio.Task[Any] | None = None
+
+
+# Asyncio tasks copy cell context at creation, so detached tasks retain their
+# output attribution and completion barrier. Threads start with a fresh context.
+_current_cell: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_current_cell", default=None
+)
+_captured_output: contextvars.ContextVar[dict[str, list[str]] | None] = (
+    contextvars.ContextVar("_captured_output", default=None)
 )
 _user_namespace: dict[str, Any] | None = None
+_current_cell_execution: contextvars.ContextVar[_CellExecution | None] = (
+    contextvars.ContextVar("_current_cell_execution", default=None)
+)
 _active: dict[str, Any] = {"task": None, "rid": None, "interrupted": False}
 _cell_counter = 0
 _pending_host: dict[str, "HostExchange"] = {}
@@ -86,7 +109,11 @@ def emit(data: dict[str, Any]) -> None:
 
     Thread-safe; the event is tagged with the cell running at call time.
     """
-    if not isinstance(data, dict) or not data or not all(isinstance(k, str) for k in data):
+    if (
+        not isinstance(data, dict)
+        or not data
+        or not all(isinstance(k, str) for k in data)
+    ):
         raise TypeError("emit() requires a non-empty dict keyed by MIME type strings")
     # Strict-dumps validation: default allow_nan=True would let NaN/Infinity
     # serialize as non-JSON text and tear the host's protocol framing (a
@@ -109,7 +136,9 @@ class HostExchange:
         if _loop is None:
             raise RuntimeError("repl runtime is not serving")
         if _host_closed:
-            raise RuntimeError("host connection closed; host_request cannot be answered")
+            raise RuntimeError(
+                "host connection closed; host_request cannot be answered"
+            )
         self.id = uuid.uuid4().hex
         self._messages: asyncio.Queue[dict[str, Any] | BaseException] = asyncio.Queue()
         self._closed = False
@@ -148,6 +177,16 @@ def open_host_exchange(data: dict[str, Any]) -> HostExchange:
     return HostExchange(data)
 
 
+def current_cell_completion_context() -> (
+    tuple[asyncio.Event, asyncio.Task[Any] | None] | None
+):
+    """Return the calling cell's completion barrier and owning execution task."""
+    execution = _current_cell_execution.get()
+    if execution is None:
+        return None
+    return execution.finished, execution.owner
+
+
 async def host_request(data: dict[str, Any]) -> dict[str, Any]:
     """Send one typed request to the host and await its raw reply dict."""
     exchange = open_host_exchange(data)
@@ -163,7 +202,9 @@ def _fail_pending_host_requests() -> None:
     global _host_closed
     _host_closed = True
     for exchange in tuple(_pending_host.values()):
-        exchange.fail(RuntimeError("host connection closed; host_request cannot be answered"))
+        exchange.fail(
+            RuntimeError("host connection closed; host_request cannot be answered")
+        )
 
 
 def _deliver_host_message(rid: str, data: dict[str, Any]) -> None:
@@ -399,7 +440,9 @@ def _request_interrupt(target: str | None) -> None:
             # either way the rid still owns the interrupt (parking here would
             # leak it onto the next request); the handler decides delivery.
             _sigint_target = rid
-        elif _finishing_rid is not None and (target is None or target == _finishing_rid):
+        elif _finishing_rid is not None and (
+            target is None or target == _finishing_rid
+        ):
             _sigint_target = _finishing_rid
         elif target is not None:
             if target in _inflight:
@@ -479,10 +522,14 @@ def _cell_stack(stack: traceback.StackSummary) -> traceback.StackSummary | None:
 
     Returns None when no cell frame exists (e.g. a compile-time SyntaxError).
     """
-    start = next((i for i, f in enumerate(stack) if f.filename.startswith("<cell-")), None)
+    start = next(
+        (i for i, f in enumerate(stack) if f.filename.startswith("<cell-")), None
+    )
     if start is None:
         return None
-    return traceback.StackSummary.from_list([f for f in stack[start:] if f.filename != _RUNTIME_FILE])
+    return traceback.StackSummary.from_list(
+        [f for f in stack[start:] if f.filename != _RUNTIME_FILE]
+    )
 
 
 def _safe_str(exc: BaseException) -> str:
@@ -518,12 +565,23 @@ def _interrupt_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
         lines = ["Traceback (most recent call last):\n"]
         lines.extend(stack.format())
     lines.append("KeyboardInterrupt\n")
-    return {"event": "error", "id": cell_id, "ename": "KeyboardInterrupt", "evalue": "", "traceback": lines}
+    return {
+        "event": "error",
+        "id": cell_id,
+        "ename": "KeyboardInterrupt",
+        "evalue": "",
+        "traceback": lines,
+    }
 
 
 def _compile_cell(code: str, filename: str) -> tuple[list[types.CodeType], bool]:
     """Compile a cell; a trailing expression compiles separately in eval mode."""
-    linecache.cache[filename] = (len(code), None, code.splitlines(keepends=True), filename)
+    linecache.cache[filename] = (
+        len(code),
+        None,
+        code.splitlines(keepends=True),
+        filename,
+    )
     tree = ast.parse(code, filename)
     trailing: ast.Expression | None = None
     if tree.body and isinstance(tree.body[-1], ast.Expr):
@@ -533,7 +591,9 @@ def _compile_cell(code: str, filename: str) -> tuple[list[types.CodeType], bool]
     if tree.body:
         codes.append(compile(tree, filename, "exec", flags=flags, dont_inherit=True))
     if trailing is not None:
-        codes.append(compile(trailing, filename, "eval", flags=flags, dont_inherit=True))
+        codes.append(
+            compile(trailing, filename, "eval", flags=flags, dont_inherit=True)
+        )
     return codes, trailing is not None
 
 
@@ -546,7 +606,9 @@ async def _run_codes(codes: list[types.CodeType], ns: dict[str, Any]) -> Any:
     return value
 
 
-async def _run_shared_cell(code: str) -> tuple[Any, bool, str, str, BaseException | None]:
+async def _run_shared_cell(
+    code: str,
+) -> tuple[Any, bool, str, str, BaseException | None]:
     """Execute one nested Act cell in the live user namespace."""
     global _cell_counter
     if _user_namespace is None:
@@ -564,10 +626,18 @@ async def _run_shared_cell(code: str) -> tuple[Any, bool, str, str, BaseExceptio
         error = exc
     finally:
         _captured_output.reset(token)
-    return value, has_trailing, "".join(captured["stdout"]), "".join(captured["stderr"]), error
+    return (
+        value,
+        has_trailing,
+        "".join(captured["stdout"]),
+        "".join(captured["stderr"]),
+        error,
+    )
 
 
-async def _run_guarded(task: asyncio.Task[Any], rid: str) -> tuple[str, Any, dict[str, Any] | None]:
+async def _run_guarded(
+    task: asyncio.Task[Any], rid: str
+) -> tuple[str, Any, dict[str, Any] | None]:
     """Await a request task; returns (status, value, error event or None)."""
     with _interrupt_lock:
         _active["interrupted"] = False
@@ -603,13 +673,14 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
     cell_id = req["id"]
     _cell_counter += 1
     filename = f"<cell-{_cell_counter}>"
-    # The cell task (created below) copies this context, so writes made from
-    # the cell and from asyncio tasks it spawns carry this cell's id.
-    token = _current_cell.set(cell_id)
+    execution = _CellExecution()
+    cell_token = _current_cell.set(cell_id)
+    execution_token = _current_cell_execution.set(execution)
     try:
         codes, has_trailing = _compile_cell(req["code"], filename)
         assert _loop is not None
         task = _loop.create_task(_run_codes(codes, ns))
+        execution.owner = task
         status, value, error = await _run_guarded(task, cell_id)
         result_text: str | None = None
         try:
@@ -634,7 +705,10 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
             _send(error)
         _send({"event": "done", "id": cell_id, "status": status})
     finally:
-        _current_cell.reset(token)
+        execution.owner = None
+        execution.finished.set()
+        _current_cell_execution.reset(execution_token)
+        _current_cell.reset(cell_token)
 
 
 def _drain_output() -> None:
@@ -708,23 +782,38 @@ def _snapshot_state(
             skipped.append({"name": name, "reason": "deleted during snapshot"})
             continue
         remaining = max_bytes - total
-        limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, remaining)
+        limit = (
+            max_variable_bytes
+            if prune_oversized
+            else min(max_variable_bytes, remaining)
+        )
         buffer = _SnapshotBuffer(limit)
         try:
             SnapshotPickler(buffer).dump(value)
             blob = buffer.getvalue()
         except _SnapshotSizeLimitExceeded:
             if not prune_oversized and remaining < max_variable_bytes:
-                skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
+                skipped.append(
+                    {"name": name, "reason": "exceeds aggregate snapshot size cap"}
+                )
             else:
-                skipped.append({"name": name, "reason": "exceeds per-variable snapshot size cap"})
+                skipped.append(
+                    {"name": name, "reason": "exceeds per-variable snapshot size cap"}
+                )
                 oversized.append(name)
             continue
         except Exception as err:  # noqa: BLE001 - one unpicklable name must not abort the snapshot
-            skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+            skipped.append(
+                {
+                    "name": name,
+                    "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}",
+                }
+            )
             continue
         if total + len(blob) > max_bytes:
-            skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
+            skipped.append(
+                {"name": name, "reason": "exceeds aggregate snapshot size cap"}
+            )
             continue
         payload[name] = blob
         total += len(blob)
@@ -736,7 +825,9 @@ def _snapshot_state(
         # Unique same-directory temps: a fixed '.tmp' name could alias the other
         # final path (clobbering it) or collide with a concurrent snapshot.
         fd, name = tempfile.mkstemp(
-            dir=os.path.dirname(target) or ".", prefix=os.path.basename(target) + ".", suffix=".tmp"
+            dir=os.path.dirname(target) or ".",
+            prefix=os.path.basename(target) + ".",
+            suffix=".tmp",
         )
         temps.append(name)
         try:
@@ -767,6 +858,7 @@ def _snapshot_state(
     previous = None
     try:
         try:
+
             def serialize(candidate: dict[str, bytes]) -> bytes | None:
                 buffer = _SnapshotBuffer(max_bytes)
                 try:
@@ -780,7 +872,9 @@ def _snapshot_state(
                 items = list(payload.items())
                 serialized_payload = serialize({})
                 if serialized_payload is None:
-                    return {"error": "write failed: snapshot exceeds aggregate snapshot size cap"}
+                    return {
+                        "error": "write failed: snapshot exceeds aggregate snapshot size cap"
+                    }
                 # Keep the largest insertion-order prefix whose complete pickle fits.
                 # Prefix pickle size is monotonic because each prefix only adds a string key and bytes value.
                 low, high = 0, len(items) - 1
@@ -793,7 +887,9 @@ def _snapshot_state(
                         low = mid
                         serialized_payload = candidate
                 for name, _ in items[low:]:
-                    skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
+                    skipped.append(
+                        {"name": name, "reason": "exceeds aggregate snapshot size cap"}
+                    )
                 payload = dict(items[:low])
 
             fh, tmp = stage_temp(path, "wb")
@@ -803,7 +899,11 @@ def _snapshot_state(
                 os.fsync(fh.fileno())
             bytes_written = len(serialized_payload)
             saved = sorted(payload.keys())
-            pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
+            pruned = (
+                sorted(name for name in oversized if name in ns)
+                if prune_oversized
+                else []
+            )
             manifest = {
                 "version": 1,
                 "savedNames": saved,
@@ -827,7 +927,9 @@ def _snapshot_state(
         # A SIGINT-raised KeyboardInterrupt anywhere from the first commit through the
         # last cleanup removal would desync payload/manifest/namespace or misreport a
         # committed snapshot: park SIGINT until the end; it is consumed, see below.
-        previous = signal.signal(signal.SIGINT, lambda signum, frame: parked.append(signum))
+        previous = signal.signal(
+            signal.SIGINT, lambda signum, frame: parked.append(signum)
+        )
         handler_installed = True
         try:
             os.replace(tmp, path)
@@ -842,7 +944,12 @@ def _snapshot_state(
             return {"error": f"manifest write failed: {err}"}
         for name in pruned:
             ns.pop(name, None)
-        result = {"saved": saved, "skipped": skipped, "pruned": pruned, "bytes": bytes_written}
+        result = {
+            "saved": saved,
+            "skipped": skipped,
+            "pruned": pruned,
+            "bytes": bytes_written,
+        }
         # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
         if committed is not None:
             committed.append(result)
@@ -901,7 +1008,12 @@ def _restore_state(
                 raise TypeError("snapshot value is not a pickle blob")
             staged[name] = _safe_snapshot_load(io.BytesIO(blob), dill)
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
-            failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+            failed.append(
+                {
+                    "name": name,
+                    "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}",
+                }
+            )
     result = {"restored": sorted(staged), "failed": failed}
     # Park SIGINT across the whole apply so it is all-or-nothing; the parked interrupt is consumed by the commit (as in snapshot).
     previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
@@ -930,7 +1042,9 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
                 # Any present value must be a non-negative int; a JSON null is not a valid way to ask
                 # for the default, and a negative cap would prune every user variable from ns.
                 if field in req and (
-                    isinstance(req[field], bool) or not isinstance(req[field], int) or req[field] < 0
+                    isinstance(req[field], bool)
+                    or not isinstance(req[field], int)
+                    or req[field] < 0
                 ):
                     return {"error": f"{field} must be a non-negative integer"}
             # realpath resolves symlinks, so aliased paths cannot silently clobber the payload.
@@ -967,7 +1081,11 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
             try:
                 outcome = ("ok", task.result(), None)
             except asyncio.CancelledError as exc:
-                event = _interrupt_event(rid, exc) if _active["interrupted"] else _error_event(rid, exc)
+                event = (
+                    _interrupt_event(rid, exc)
+                    if _active["interrupted"]
+                    else _error_event(rid, exc)
+                )
                 outcome = ("error", None, event)
             except BaseException as exc:  # noqa: BLE001 - every request failure becomes an error event
                 outcome = ("error", None, _error_event(rid, exc))
@@ -981,13 +1099,17 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
         # Recover only a protocol interrupt that landed after the commit; a user KeyboardInterrupt keeps interrupted reporting.
         status, result, error = "ok", committed[0], None
     if status != "ok":
-        reason = "interrupted" if error and error.get("ename") == "KeyboardInterrupt" else (
-            f"{error.get('ename')}: {error.get('evalue')}" if error else "failed"
+        reason = (
+            "interrupted"
+            if error and error.get("ename") == "KeyboardInterrupt"
+            else (f"{error.get('ename')}: {error.get('evalue')}" if error else "failed")
         )
         _send({"event": "done", "id": rid, "status": "error", "reason": reason})
         return
     if "error" in result:
-        _send({"event": "done", "id": rid, "status": "error", "reason": result["error"]})
+        _send(
+            {"event": "done", "id": rid, "status": "error", "reason": result["error"]}
+        )
         return
     _send({"event": "done", "id": rid, "status": "ok", **result})
 
@@ -996,7 +1118,11 @@ def _list_names(ns: dict[str, Any]) -> list[str]:
     """User-defined top-level names, filtered like the snapshot."""
     # Non-string keys (globals()[1] = 1) are not user-listable names.
     return sorted(
-        name for name in ns if isinstance(name, str) and not name.startswith("_") and name not in _ALWAYS_SKIP
+        name
+        for name in ns
+        if isinstance(name, str)
+        and not name.startswith("_")
+        and name not in _ALWAYS_SKIP
     )
 
 
@@ -1041,7 +1167,10 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
                 try:
                     await mcp_mod.close()
                 except BaseException as exc:
-                    print(f"MCP shutdown failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+                    print(
+                        f"MCP shutdown failed: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
             # Kill live bash children now; atexit would wait on parked executor threads.
             _kill_live_handles()
             if isinstance(rid, str):
@@ -1065,7 +1194,15 @@ _REQUIRED_FIELDS = {
 
 
 def _protocol_error(message: str) -> None:
-    _send({"event": "error", "id": None, "ename": "ProtocolError", "evalue": message, "traceback": []})
+    _send(
+        {
+            "event": "error",
+            "id": None,
+            "ename": "ProtocolError",
+            "evalue": message,
+            "traceback": [],
+        }
+    )
 
 
 def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> None:
@@ -1247,7 +1384,13 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sigint_handler)
     threading.Thread(target=_read_requests, args=(stdin_fd, queue), daemon=True).start()
 
-    _send({"event": "ready", "protocol": PROTOCOL_VERSION, "python": platform.python_version()})
+    _send(
+        {
+            "event": "ready",
+            "protocol": PROTOCOL_VERSION,
+            "python": platform.python_version(),
+        }
+    )
 
     _serve_task = _loop.create_task(_serve(queue, user_module.__dict__))
     # A KeyboardInterrupt escaping a cell or background task stops

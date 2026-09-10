@@ -36,6 +36,7 @@ const IPYTHON_CONTROL_PROMPT = [
 	"Use the available edit tool or ordinary Python for file changes, and `rsync(...)` when remote synchronization is needed. For a multiline shell command, choose a Python string delimiter that does not occur inside the command; an inner matching triple quote ends the outer string.",
 	"",
 	"`bash(command)` starts a shell command in the background and returns a handle immediately: `h = bash('npm test')`. Use `h.pid` / `h.running` for liveness, `h.tail(n)` / `h.output()` for combined stdout+stderr so far, `h.poll()` for a non-blocking result, `h.kill()` to terminate (SIGTERM, escalating to SIGKILL; on Windows kill() uses taskkill /T and detached or reparented descendants may survive), and `await h` (or `await bash('cmd')`) for the completed result with exit_code, output, and duration. Prefer bash() for long-running commands so the turn keeps working. Run shell commands with `bash()`, not `subprocess`/`os.system`: subprocess calls block the kernel, show the user nothing while they run, and spawn processes the harness cannot see or stop.",
+	"A `bash()` handle left running beyond its creating cell sends a completion follow-up when the command exits.",
 	"Do not install project dependencies into the IPython kernel to make an external project import or run. Use the project's documented command and environment, such as `uv run ...`, `.venv/bin/python ...`, or the active project interpreter from the repository root. A failure in that environment is the relevant result.",
 	"Start long work with `bash(...)`, keep the handle, and use the installed external-event watcher when the work will outlive the turn. Without a completion watcher, await the BashHandle. Use the command's completion signal instead of bash `sleep`, `asyncio.sleep`, or a file-poll loop to wait for it.",
 	"",
@@ -171,6 +172,13 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	if (hasAgentObserve && hasIpython) {
 		parts.push(
 			"Agent observation reaches only you, your parent, siblings, and direct children. Root agents are siblings. Inspection of a deeper descendant relays through its parent.",
+		);
+	}
+
+	if (depth === 0 && hasIpython) {
+		parts.push(
+			"",
+			"From a daemon-backed depth-0 session, use `await rlm.create_session('task', name='researcher')` to start a separate top-level session. The call returns after the daemon creates the session and accepts its first prompt. Inline and nested sessions cannot use it. `rlm(...)` still creates a child.",
 		);
 	}
 

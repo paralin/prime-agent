@@ -12,16 +12,26 @@ from typing import Any, AsyncIterator
 
 from ._act import _ActCellResult, _ActInterrupted, _run_cells, done
 from .bash import BashHandle, BashResult, bash, rg, rsync, ssh_forward
-from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
+from .harness import (
+    HarnessEntry,
+    HarnessScope,
+    HarnessState,
+    RefinementEvent,
+    get_harness_state,
+)
 
-ACT_CANCELLATION_CAPABILITY = "posix-managed" if os.name == "posix" else "cooperative-only"
+ACT_CANCELLATION_CAPABILITY = (
+    "posix-managed" if os.name == "posix" else "cooperative-only"
+)
 RLM_SERVICE_TIERS = ("auto", "default", "flex", "scale", "priority")
 
 
 def _validate_service_tier(value: Any) -> None:
     if value is None or value in RLM_SERVICE_TIERS:
         return
-    raise ValueError(f"service_tier must be one of {', '.join(RLM_SERVICE_TIERS)} or None")
+    raise ValueError(
+        f"service_tier must be one of {', '.join(RLM_SERVICE_TIERS)} or None"
+    )
 
 
 class ActError(RuntimeError):
@@ -39,6 +49,15 @@ class RLMSpawnHandle:
     rlm_child_id: str
     name: str
     session_dir: Path
+    model: str
+
+
+@dataclass(frozen=True)
+class RLMCreateSessionHandle:
+    active_session_id: str
+    session_id: str
+    name: str
+    session_file: Path
     model: str
 
 
@@ -71,7 +90,10 @@ def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
     name = payload.get("name")
     session_dir = payload.get("session_dir")
     model = payload.get("model")
-    if not all(isinstance(value, str) and value for value in (child_id, name, session_dir, model)):
+    if not all(
+        isinstance(value, str) and value
+        for value in (child_id, name, session_dir, model)
+    ):
         raise RuntimeError("rlm.run returned an invalid spawn handle")
     return RLMSpawnHandle(
         rlm_child_id=child_id,
@@ -102,7 +124,8 @@ class _ActExchange:
                 if message.get("status") == "ok" and isinstance(result, dict):
                     message = {"status": "ok", **result}
                 if message.get("status") == "aborted" or (
-                    message.get("status") == "ok" and message.get("outcome") == "cancelled"
+                    message.get("status") == "ok"
+                    and message.get("outcome") == "cancelled"
                 ):
                     self._cancelled.set()
                 self._messages.put_nowait(message)
@@ -212,16 +235,44 @@ async def act(prompt: str, model: str | None = None) -> Any:
         exchange.close()
 
 
+def _create_session_handle_from_payload(payload: Any) -> RLMCreateSessionHandle:
+    if not isinstance(payload, dict):
+        raise RuntimeError("rlm.create_session returned an invalid payload")
+    active_session_id = payload.get("active_session_id")
+    session_id = payload.get("session_id")
+    name = payload.get("name")
+    session_file = payload.get("session_file")
+    model = payload.get("model")
+    if not all(
+        isinstance(value, str) and value
+        for value in (active_session_id, session_id, name, session_file, model)
+    ):
+        raise RuntimeError("rlm.create_session returned an invalid payload structure")
+    return RLMCreateSessionHandle(
+        active_session_id=active_session_id,
+        session_id=session_id,
+        name=name,
+        session_file=Path(session_file),
+        model=model,
+    )
+
+
 def _parse_host_reply(request_type: str, reply: dict[str, Any]) -> dict[str, Any]:
     status = reply.get("status")
     if status == "ok":
         return reply["result"]
     if status == "error":
-        raise RuntimeError(str(reply.get("error") or f"host request {request_type} failed"))
-    raise RuntimeError(f"host request {request_type} returned unexpected status: {status!r}")
+        raise RuntimeError(
+            str(reply.get("error") or f"host request {request_type} failed")
+        )
+    raise RuntimeError(
+        f"host request {request_type} returned unexpected status: {status!r}"
+    )
 
 
-async def host_request(request_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+async def host_request(
+    request_type: str, payload: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Send a typed request to the Prime Agent host and await its reply.
 
     This is the kernel side of the generic host bridge: Python skills call
@@ -268,10 +319,15 @@ def _model_from_payload(payload: Any) -> RLMModel:
     model_id = payload.get("id")
     name = payload.get("name")
     selector = payload.get("selector")
-    if not all(isinstance(value, str) and value for value in (provider, model_id, name, selector)):
+    if not all(
+        isinstance(value, str) and value
+        for value in (provider, model_id, name, selector)
+    ):
         raise RuntimeError("rlm.find_models returned an invalid model entry")
     concrete_selector = payload.get("concreteSelector")
-    if concrete_selector is not None and (not isinstance(concrete_selector, str) or not concrete_selector):
+    if concrete_selector is not None and (
+        not isinstance(concrete_selector, str) or not concrete_selector
+    ):
         raise RuntimeError("rlm.find_models returned an invalid model entry")
     available = payload.get("available")
     if available is not None and not isinstance(available, bool):
@@ -284,6 +340,35 @@ def _model_from_payload(payload: Any) -> RLMModel:
         concrete_selector=concrete_selector,
         available=available,
     )
+
+
+async def create_session(
+    prompt: str,
+    name: str | None = None,
+    model: str | None = None,
+    thinking: str | None = None,
+    cwd: str | None = None,
+) -> RLMCreateSessionHandle:
+    """Create and prompt a resident depth-0 daemon session.
+
+    Only daemon-backed depth-0 sessions support this operation. The optional
+    arguments set the session name, model, thinking level, and working directory.
+    """
+    if not isinstance(prompt, str):
+        raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
+    kwargs: dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if model is not None:
+        kwargs["model"] = model
+    if thinking is not None:
+        kwargs["thinking"] = thinking
+    if cwd is not None:
+        kwargs["cwd"] = cwd
+    payload = await host_request(
+        "rlm.create_session", {"prompt": prompt, "kwargs": kwargs}
+    )
+    return _create_session_handle_from_payload(payload)
 
 
 async def find_models(query: str = "", limit: int = 8) -> list[RLMModel]:
@@ -299,7 +384,9 @@ async def find_models(query: str = "", limit: int = 8) -> list[RLMModel]:
     return [_model_from_payload(model) for model in models]
 
 
-def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") -> RLMSubagent:
+def _subagent_from_payload(
+    payload: Any, operation: str = "rlm.list_subagents"
+) -> RLMSubagent:
     if not isinstance(payload, dict):
         raise RuntimeError(f"{operation} returned an invalid subagent entry")
     child_id = payload.get("rlm_child_id")
@@ -352,7 +439,9 @@ async def delete_subagent(target: str | RLMSubagent | RLMSpawnHandle) -> RLMSuba
         if not selector:
             raise ValueError("target must not be empty")
     else:
-        raise TypeError(f"target must be str or RLMSubagent or RLMSpawnHandle, got {type(target).__name__}")
+        raise TypeError(
+            f"target must be str or RLMSubagent or RLMSpawnHandle, got {type(target).__name__}"
+        )
     payload = await host_request("rlm.delete_subagent", {"target": selector})
     return _subagent_from_payload(payload.get("subagent"), "rlm.delete_subagent")
 
@@ -419,13 +508,27 @@ class _RLMCallable:
     async def run(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
         return await run(prompt, **kwargs)
 
+    async def create_session(
+        self,
+        prompt: str,
+        name: str | None = None,
+        model: str | None = None,
+        thinking: str | None = None,
+        cwd: str | None = None,
+    ) -> RLMCreateSessionHandle:
+        return await create_session(
+            prompt, name=name, model=model, thinking=thinking, cwd=cwd
+        )
+
     async def find_models(self, query: str = "", limit: int = 8) -> list[RLMModel]:
         return await find_models(query, limit)
 
     async def list_subagents(self) -> list[RLMSubagent]:
         return await list_subagents()
 
-    async def delete_subagent(self, target: str | RLMSubagent | RLMSpawnHandle) -> RLMSubagent:
+    async def delete_subagent(
+        self, target: str | RLMSubagent | RLMSpawnHandle
+    ) -> RLMSubagent:
         return await delete_subagent(target)
 
     async def __call__(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
@@ -455,9 +558,11 @@ __all__ = [
     "McpIntegration",
     "McpToolError",
     "NotEnabled",
+    "RLMCreateSessionHandle",
     "RLMModel",
     "RLMSpawnHandle",
     "RLMSubagent",
+    "create_session",
     "RefinementEvent",
     "act",
     "bash",

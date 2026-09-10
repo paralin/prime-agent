@@ -14,6 +14,7 @@ import {
 	ACT_CELL_INTERRUPT_GRACE_MS,
 	AGENT_MESSAGE_DISPLAY_MIME,
 	ATTACHMENT_DISPLAY_MIME,
+	BASH_ACTIVITY_DISPLAY_MIME,
 	createDeferred,
 	createKernelStartupAbortError,
 	DEFAULT_MAX_OUTPUT_CHARS,
@@ -261,6 +262,7 @@ export class ReplKernelManager {
 	private readonly hostRequestAbortControllers = new Map<string, AbortController>();
 	private readonly hostRequestChannels = new Map<string, ReplHostRequestChannel>();
 	private readonly pendingGraceInterrupts = new Set<Promise<void>>();
+	private readonly backgroundBashHandles = new Map<string, number>();
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
 	/** Bumped by every teardown so a stale in-flight doStart can never touch a newer kernel. */
 	private startGeneration = 0;
@@ -304,6 +306,10 @@ export class ReplKernelManager {
 
 	get ownerSessionId(): string | undefined {
 		return this.options.sessionId;
+	}
+
+	get hasBackgroundWork(): boolean {
+		return this.backgroundBashHandles.size > 0;
 	}
 
 	private appendKernelDiagnostic(message: string): void {
@@ -444,6 +450,7 @@ export class ReplKernelManager {
 			buffered += decoder.write(buf);
 			let newline = buffered.indexOf("\n");
 			while (newline !== -1) {
+				if (this.child !== child) return;
 				const line = buffered.slice(0, newline);
 				buffered = buffered.slice(newline + 1);
 				newline = buffered.indexOf("\n");
@@ -819,6 +826,27 @@ export class ReplKernelManager {
 
 	private handleEvent(event: Record<string, unknown>): void {
 		const type = event.event;
+		if (type === "display" && isRecord(event.data) && BASH_ACTIVITY_DISPLAY_MIME in event.data) {
+			const activity = event.data[BASH_ACTIVITY_DISPLAY_MIME];
+			if (
+				isRecord(activity) &&
+				typeof activity.id === "string" &&
+				/^[a-f0-9]{32}$/.test(activity.id) &&
+				typeof activity.pid === "number" &&
+				Number.isSafeInteger(activity.pid) &&
+				activity.pid > 0 &&
+				typeof activity.active === "boolean"
+			) {
+				if (activity.active) {
+					if (!this.backgroundBashHandles.has(activity.id)) {
+						this.backgroundBashHandles.set(activity.id, activity.pid);
+					}
+				} else if (this.backgroundBashHandles.get(activity.id) === activity.pid) {
+					this.backgroundBashHandles.delete(activity.id);
+				}
+			}
+			return;
+		}
 		if (type === "ready") {
 			this.readyDeferred?.resolve(typeof event.protocol === "number" ? event.protocol : -1);
 			return;
@@ -1433,6 +1461,7 @@ export class ReplKernelManager {
 		this.clearSnapshotTimer();
 		this.lateSentAgentMessageHandlers.clear();
 		this.pendingDoneWaiters.clear();
+		this.backgroundBashHandles.clear();
 		// Stale pre-teardown background output must not surface after a restart.
 		this.pendingBackgroundOutput = "";
 		this.pendingBackgroundOutputTruncated = false;

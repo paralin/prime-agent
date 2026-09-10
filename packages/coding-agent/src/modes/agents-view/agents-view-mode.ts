@@ -78,7 +78,6 @@ import {
 	getUnifiedSessionAncestorSessionIds,
 	hasUnifiedSessionChildren,
 	isEmptyAgentsViewSession,
-	isSubagentSummary,
 	migrateAgentsViewIdentitySet,
 	reconcileUnifiedSessions,
 	resolveAgentsViewLeftResult,
@@ -274,12 +273,16 @@ export function createInitialAgentsViewPersistentState(
 	options: Pick<AgentsViewModeOptions, "initialScopeKey" | "initialSession">,
 ): AgentsViewPersistentState {
 	const initialSession = options.initialSession;
+	// A scoped view excludes its root from its own rows, so anchoring the
+	// selection on the entered-from chat could never resolve there and would
+	// only arm the pending-anchor state for the whole catalog scan.
+	const seedSelection = initialSession && !options.initialScopeKey;
 	return {
-		...(initialSession
+		...(initialSession ? { backSession: initialSession } : {}),
+		...(seedSelection
 			? {
 					selectedRowIdentity: getSummaryIdentity(initialSession),
 					selectedSessionKey: getAgentsViewSelectionKey(initialSession),
-					backSession: initialSession,
 				}
 			: {}),
 		...(options.initialScopeKey
@@ -670,6 +673,8 @@ export class AgentsViewMode implements Component, Focusable {
 	private deleteConfirmTimer: ReturnType<typeof setTimeout> | undefined;
 	private workingIconFrame = 0;
 	private rows: AgentsViewRow[] = [];
+	private allRows: AgentsViewRow[] = [];
+	private showActions = false;
 	private lastListedSummaries: SessionSummary[] = [];
 	private lastVisibleSummaries: SessionSummary[] = [];
 	private savedSessions: AgentConnectionSavedSessionInfo[] = [];
@@ -936,6 +941,12 @@ export class AgentsViewMode implements Component, Focusable {
 
 	handleInput(data: string): void {
 		this.clearStickyStatusMessage();
+		if (this.showActions) {
+			this.showActions = false;
+			this.ui.requestRender();
+			if (this.keybindings.matches(data, "app.shortcuts") || this.keybindings.matches(data, "tui.select.cancel"))
+				return;
+		}
 		if (this.renameTarget) {
 			if (this.keybindings.matches(data, "tui.select.cancel")) {
 				this.exitRenameMode();
@@ -979,6 +990,18 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.editor.getText().length === 0 && this.keybindings.matches(data, "app.agents.program")) {
 			this.cycleProgramForSelected();
 			return;
+		}
+		if (!this.replyTarget && this.editor.getText().length === 0) {
+			if (this.keybindings.matches(data, "app.shortcuts")) {
+				this.showActions = !this.showActions;
+				this.ui.requestRender();
+				return;
+			}
+			if (this.keybindings.matches(data, "app.agents.expand")) {
+				const row = this.rows[this.selectedIndex];
+				if (row && row.descendantCount > 0) this.toggleSubagentList(row);
+				return;
+			}
 		}
 		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.open")) {
 			if (this.editor.getText().length === 0 || this.isSearchCursorAtEnd()) {
@@ -1285,9 +1308,9 @@ export class AgentsViewMode implements Component, Focusable {
 		this.persistentState.query = this.editor.getText();
 		this.armSavedSearchFetch();
 		this.rebuildRows();
-		// Typing must not claim the visible fallback row while the restored
-		// anchor is still waiting for its catalog row.
-		if (!this.selectionAnchorPending) this.syncSelectedRowState();
+		// Searching is explicit user intent: claim the visible row as the new
+		// anchor even if a remembered one is still waiting for its catalog row.
+		this.syncSelectedRowState();
 		this.ui.requestRender();
 	}
 
@@ -1299,7 +1322,7 @@ export class AgentsViewMode implements Component, Focusable {
 	/** Rebuild rows from the last fetched summaries, keeping selection on the same row. */
 	private rebuildRows(): void {
 		const selectedIdentity = this.rows[this.selectedIndex]?.identity;
-		this.rows = buildAgentsViewRows(
+		this.allRows = buildAgentsViewRows(
 			this.getFilteredRecords(),
 			this.expandedSubagentParents,
 			this.programShownParents,
@@ -1307,6 +1330,7 @@ export class AgentsViewMode implements Component, Focusable {
 			computeRecursiveRollups(this.unifiedRecords, this.unifiedIndex),
 			this.anchorSessionId,
 		);
+		this.rows = compactSessionRows(this.allRows);
 		const index =
 			selectedIdentity === undefined ? -1 : this.rows.findIndex((row) => row.identity === selectedIdentity);
 		if (index >= 0) {
@@ -1389,14 +1413,6 @@ export class AgentsViewMode implements Component, Focusable {
 		if (!row?.selectable || this.isPendingDeleteRow(row)) {
 			return;
 		}
-		if (this.selectionAnchorPending) {
-			this.setStatusMessage("Waiting for the selected session to load");
-			return;
-		}
-		if (row.kind === "subagent-summary") {
-			this.toggleSubagentList(row);
-			return;
-		}
 		if (row.kind === "subagent") {
 			this.openSelectedSubagent(row);
 			return;
@@ -1417,16 +1433,12 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private toggleSubagentList(row: AgentsViewRow): void {
-		if (!row.parentIdentity) {
-			return;
-		}
-		if (this.expandedSubagentParents.has(row.parentIdentity)) {
-			this.expandedSubagentParents.delete(row.parentIdentity);
-			// A collapsed agent's revealed program collapses with it, so reopening
-			// starts from the hidden state rather than a stale reveal.
-			this.programShownParents.delete(row.parentIdentity);
+		const target = row.identity;
+		if (this.expandedSubagentParents.has(target)) {
+			this.expandedSubagentParents.delete(target);
+			this.programShownParents.delete(target);
 		} else {
-			this.expandedSubagentParents.add(row.parentIdentity);
+			this.expandedSubagentParents.add(target);
 		}
 		this.rebuildRows();
 		this.syncSelectedRowState();
@@ -1465,7 +1477,7 @@ export class AgentsViewMode implements Component, Focusable {
 
 	/** Whether any subagent under the given agent identity carries spawn code. */
 	private targetHasSpawnCode(target: string): boolean {
-		for (const row of this.rows) {
+		for (const row of this.allRows) {
 			if (row.parentIdentity !== target) {
 				continue;
 			}
@@ -1477,16 +1489,6 @@ export class AgentsViewMode implements Component, Focusable {
 			}
 		}
 		return false;
-	}
-
-	/** True when the selected row exposes the "show program" affordance. */
-	private selectedRowCanShowProgram(): boolean {
-		const row = this.rows[this.selectedIndex];
-		if (!row) {
-			return false;
-		}
-		const target = row.kind === "agent" ? row.identity : row.parentIdentity;
-		return target !== undefined && this.targetHasSpawnCode(target);
 	}
 
 	private openSelectedSubagent(row: AgentsViewRow): void {
@@ -2207,7 +2209,7 @@ export class AgentsViewMode implements Component, Focusable {
 			}
 		}
 		this.scopedRecords = scopeToSessionSubtree(this.unifiedRecords, this.scopeKey, this.unifiedIndex);
-		this.rows = buildAgentsViewRows(
+		this.allRows = buildAgentsViewRows(
 			this.getFilteredRecords(),
 			this.expandedSubagentParents,
 			this.programShownParents,
@@ -2215,6 +2217,7 @@ export class AgentsViewMode implements Component, Focusable {
 			computeRecursiveRollups(this.unifiedRecords, this.unifiedIndex),
 			this.anchorSessionId,
 		);
+		this.rows = compactSessionRows(this.allRows);
 		this.applyPendingAncestorExpansion();
 		this.restoreSelection();
 		this.ui.requestRender();
@@ -2518,86 +2521,95 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private getAgentCountsText(): string {
-		const counts = countRowsBySection(this.rows);
+		const counts = countRowsBySection(this.allRows);
 		return `${counts.running} running, ${counts.idle} idle, ${counts.inactive} inactive`;
 	}
 
 	private renderSessionRows(width: number, maxRows: number): string[] {
-		if (maxRows <= 0) {
-			return [];
+		if (maxRows <= 0) return [];
+		if (this.showActions) return this.renderActions(width).slice(0, maxRows);
+		const showDetailedUsage = this.options.uiServices.settingsManager.getAgentsViewUsageEnabled();
+		const compactLayout = showDetailedUsage ? undefined : buildCompactAgentsViewLayout(this.rows, width);
+		const displayItems: DisplayItem[] = [];
+		const counts = countRowsBySection(this.allRows.length > 0 ? this.allRows : this.rows);
+		for (const section of ["running", "idle", "inactive"] as const) {
+			if (counts[section] === 0) continue;
+			if (displayItems.length > 0) displayItems.push({ type: "spacer" });
+			displayItems.push({ type: "heading", section });
+			for (const row of getDisplayRowsForSection(this.rows, section)) {
+				displayItems.push({ type: "row", row });
+				if (
+					(row.kind === "agent" || row.kind === "subagent") &&
+					row.runningSubagentCount > 0 &&
+					!this.expandedSubagentParents.has(row.identity)
+				) {
+					displayItems.push({ type: "running-subagents", row });
+				}
+			}
 		}
-		if (this.rows.length === 0) {
-			const emptyLegend = this.options.uiServices.settingsManager.getAgentsViewUsageEnabled()
-				? (buildAgentsViewUsageLayout([]).legends.get("running") ?? "")
-				: "";
+		if (displayItems.length === 0) {
+			if (compactLayout) return [theme.fg("dim", "No sessions match your search.")];
+			const emptyLegend = showDetailedUsage ? (buildAgentsViewUsageLayout([]).legends.get("running") ?? "") : "";
 			return [
 				this.renderSectionHeading("running", width, emptyLegend),
 				theme.fg("dim", "  No sessions match your search."),
 			].slice(0, maxRows);
 		}
 
-		const displayItems = buildDisplayItems(this.rows);
-		const usageLayout = this.options.uiServices.settingsManager.getAgentsViewUsageEnabled()
-			? buildAgentsViewUsageLayout(this.rows)
-			: undefined;
+		const usageLayout = showDetailedUsage ? buildAgentsViewUsageLayout(this.rows) : undefined;
+		const headerRows = compactLayout && maxRows > 1 ? 1 : 0;
+		const visibleRows = maxRows - headerRows;
 		const selectedIdentity = this.rows[this.selectedIndex]?.identity;
 		const selectedDisplayIndex = displayItems.findIndex(
 			(item) => item.type === "row" && item.row.identity === selectedIdentity,
 		);
-		const visibleRows = Math.min(maxRows, this.visibleListRows());
 		const start = Math.max(
 			0,
 			Math.min(displayItems.length - visibleRows, selectedDisplayIndex - Math.floor(visibleRows / 2)),
 		);
-		const showLeadingEllipsis = start > 0;
-		let showTrailingEllipsis = start + visibleRows < displayItems.length;
-		if ((showLeadingEllipsis ? 1 : 0) + (showTrailingEllipsis ? 1 : 0) >= visibleRows) {
-			showTrailingEllipsis = false;
-		}
-		const contentVisibleRows = Math.max(
-			0,
-			visibleRows - (showLeadingEllipsis ? 1 : 0) - (showTrailingEllipsis ? 1 : 0),
-		);
-		// The prepended ellipsis consumes a viewport line; shift the window down
-		// so a selection at the very end is not pushed out of the slice.
-		const sliceStart =
-			selectedDisplayIndex >= start + contentVisibleRows ? selectedDisplayIndex - contentVisibleRows + 1 : start;
-		const visibleItems = displayItems.slice(sliceStart, sliceStart + contentVisibleRows);
-		const lines = visibleItems.map((item) => {
-			if (item.type === "spacer") {
-				return "";
+		const showLeadingEllipsis = start > 0 && visibleRows > 1;
+		const showTrailingEllipsis = start + visibleRows < displayItems.length && visibleRows > 2;
+		const contentRows = visibleRows - Number(showLeadingEllipsis) - Number(showTrailingEllipsis);
+		const sliceStart = selectedDisplayIndex >= start + contentRows ? selectedDisplayIndex - contentRows + 1 : start;
+		const lines = displayItems.slice(sliceStart, sliceStart + contentRows).map((item) => {
+			if (item.type === "spacer") return "";
+			if (item.type === "running-subagents") {
+				const count = item.row.runningSubagentCount;
+				const indent = "  ".repeat(item.row.depth + 1);
+				return theme.fg(
+					"success",
+					truncateToWidth(`${indent}${count} subagent${count === 1 ? "" : "s"} running`, width),
+				);
 			}
 			if (item.type === "heading") {
-				return this.renderSectionHeading(item.section, width, usageLayout?.legends.get(item.section) ?? "");
+				return compactLayout
+					? theme.bold(truncateToWidth(`${sectionTitle(item.section)} (${counts[item.section]})`, width))
+					: this.renderSectionHeading(item.section, width, usageLayout?.legends.get(item.section) ?? "");
 			}
-			if (item.type === "empty") {
-				return theme.fg("dim", "  No agents");
-			}
-			return this.renderRow(item.row, width, usageLayout?.details);
+			return this.renderRow(item.row, width, usageLayout?.details, compactLayout);
 		});
-		if (showLeadingEllipsis) {
-			lines.unshift(theme.fg("dim", "  ..."));
-		}
-		if (showTrailingEllipsis) {
-			lines.push(theme.fg("dim", "  ..."));
-		}
+		if (showLeadingEllipsis) lines.unshift(theme.fg("dim", "  ..."));
+		if (showTrailingEllipsis) lines.push(theme.fg("dim", "  ..."));
+		if (compactLayout && headerRows > 0) lines.unshift(theme.fg("muted", compactLayout.legend));
 		return lines;
 	}
 
-	private renderRow(row: AgentsViewRow, width: number, rowDetails?: ReadonlyMap<string, string>): string {
+	private renderRow(
+		row: AgentsViewRow,
+		width: number,
+		rowDetails?: ReadonlyMap<string, string>,
+		compactLayout?: CompactAgentsViewLayout,
+	): string {
+		if (!this.options.uiServices.settingsManager.getAgentsViewUsageEnabled()) {
+			return this.renderCompactRow(
+				row,
+				width,
+				compactLayout ?? buildCompactAgentsViewLayout(this.rows.length > 0 ? this.rows : [row], width),
+			);
+		}
 		const selected = row.selectable && row.identity === this.rows[this.selectedIndex]?.identity;
 		const markRow = (line: string): string => (selected ? `${SELECTED_ROW_MARKER}${line}` : line);
-		if (row.kind === "subagent-code") {
-			return this.renderCodeRow(row);
-		}
-		if (row.kind === "subagent-summary") {
-			const indent = "  ".repeat(row.depth);
-			const hint = row.hasSpawnCode ? theme.fg("dim", ` · ${keyText("app.agents.program")} show program`) : "";
-			const titleColor = row.runningSubagentCount > 0 ? ("success" as const) : ("dim" as const);
-			const label = `${theme.fg(titleColor, `${row.expanded ? "▾" : "▸"} ${row.title}`)}${hint}`;
-			const line = padLine(truncateToWidth(`${indent}${label}`, width, ""), width);
-			return markRow(line);
-		}
+		if (row.kind === "subagent-code") return this.renderCodeRow(row);
 		const pendingDelete = row.kind === "agent" && this.isPendingDeleteRow(row);
 		const pendingKill = row.kind === "subagent" && this.isPendingKillSubagentRow(row);
 		const rawIcon = this.getRowIcon(row.section);
@@ -2634,7 +2646,7 @@ export class AgentsViewMode implements Component, Focusable {
 		// Keep stable model information ahead of the variable summary so narrow rows truncate the summary first.
 		const summaryText = !pendingDelete && !pendingKill ? row.summary.summary : undefined;
 		const modelLabel =
-			isSubagentSummary(row.summary) && !pendingDelete && !pendingKill && row.summary.model
+			!pendingDelete && !pendingKill && row.summary.model
 				? `${row.summary.model.provider}/${row.summary.model.id}${row.summary.thinkingLevel && row.summary.thinkingLevel !== "off" ? `:${row.summary.thinkingLevel}` : ""}`
 				: undefined;
 		const statusLabel =
@@ -2658,9 +2670,41 @@ export class AgentsViewMode implements Component, Focusable {
 		return markRow(line);
 	}
 
+	private renderCompactRow(row: AgentsViewRow, width: number, layout: CompactAgentsViewLayout): string {
+		const selected = row.selectable && row.identity === this.rows[this.selectedIndex]?.identity;
+		const markRow = (line: string): string => (selected ? `${SELECTED_ROW_MARKER}${line}` : line);
+		if (row.kind === "subagent-code") return this.renderCodeRow(row);
+		const pendingDelete = row.kind === "agent" && this.isPendingDeleteRow(row);
+		const pendingKill = row.kind === "subagent" && this.isPendingKillSubagentRow(row);
+		if (pendingDelete || pendingKill) {
+			const armed = row.summary.hasActiveHeartbeat === true || (row.heartbeat?.activeCount ?? 0) > 0;
+			const title =
+				(armed ? "has an armed heartbeat — " : "") +
+				(pendingDelete
+					? this.getPendingDeleteTitle()
+					: `${keyText("app.agents.delete")} again to ${hasLiveWork(row) ? "stop" : "delete"}`);
+			return markRow(formatTableCell(theme.fg("error", title), width));
+		}
+		const icon = this.formatRowIcon(row.section, this.getRowIcon(row.section));
+		const expand = row.descendantCount > 0 ? (this.expandedSubagentParents.has(row.identity) ? "▾" : "▸") : " ";
+		const badge = formatHeartbeatBadge(row.heartbeat);
+		const heartbeat = badge ? `${theme.fg((row.heartbeat?.activeCount ?? 0) > 0 ? "error" : "dim", badge)} ` : "";
+		const title = `${"  ".repeat(row.depth)}${icon}${expand} ${heartbeat}${styleRowTitle(row)}`;
+		const status =
+			row.summary.statusLabel !== undefined || row.summary.lastHeardFromAt !== undefined
+				? row.statusLabel
+				: undefined;
+		const activity = [status, row.summary.summary].filter(Boolean).join(" · ");
+		const cells = [
+			formatTableCell(title, layout.nameWidth),
+			formatTableCell(theme.fg("muted", formatSessionModel(row)), layout.modelWidth),
+		];
+		if (layout.activityWidth > 0) cells.push(formatTableCell(theme.fg("dim", activity), layout.activityWidth));
+		cells.push(theme.fg("muted", layout.details.get(row.identity) ?? ""));
+		return markRow(formatTableCell(cells.join("  "), width));
+	}
+
 	// Bold like the section title so the legend reads as part of the header line.
-	// The legend is right-aligned to the same edge as the row details cells, so
-	// its columns sit exactly above the row columns.
 	private renderSectionHeading(section: AgentsViewSection, width: number, legend: string): string {
 		const counts = countRowsBySection(this.rows);
 		const title = `${sectionTitle(section)} (${counts[section]})`;
@@ -2669,6 +2713,35 @@ export class AgentsViewMode implements Component, Focusable {
 			return theme.bold(truncateToWidth(title, width, ""));
 		}
 		return `${theme.bold(title)}${" ".repeat(gap)}${theme.bold(legend)}`;
+	}
+
+	private renderActions(width: number): string[] {
+		const row = this.rows[this.selectedIndex];
+		const actions = [
+			`${keyText("tui.select.confirm")} open   ${keyText("app.agents.open")} open   ${keyText("app.agents.new")} new`,
+			`${keyText("app.agents.expand")} expand/collapse subagents   ${keyText("app.agents.program")} program`,
+			`${keyText("app.agents.reply")} reply/resume   ${keyText("app.agents.rename")} rename   ${keyText("app.agents.delete")} stop/delete`,
+			`${keyText("app.shortcuts")} close actions`,
+		];
+		if (row) {
+			const model = row.summary.model;
+			const savedModel = row.record?.saved?.model;
+			const modelLabel = model
+				? `${model.provider}/${model.id}`
+				: savedModel
+					? `${savedModel.provider}/${savedModel.modelId}`
+					: "unknown";
+			const usage = row.summary.usage;
+			actions.push(
+				"",
+				row.title,
+				`Model: ${modelLabel}${row.summary.thinkingLevel ? ` · ${row.summary.thinkingLevel}` : ""}`,
+				`Directory: ${row.summary.cwd}`,
+				`Tokens: ${usage?.inputTokens ?? 0} in · ${usage?.outputTokens ?? 0} out`,
+				`Cost: $${(usage?.cost ?? 0).toFixed(2)} session · $${row.recursiveCost.toFixed(2)} including subagents`,
+			);
+		}
+		return actions.flatMap((line) => wrapTextWithAnsi(theme.fg("muted", line), width));
 	}
 
 	// Spawn-code rows are read-only context. They render deemphasized — muted
@@ -2726,7 +2799,14 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private renderPrompt(width: number): string[] {
-		return this.editor.render(width);
+		const inline = !this.replyTarget && !this.renameTarget;
+		// A transparent surface preserves the editor's padding, scroll hints, and cursor without input chrome.
+		this.editor.backgroundColor = inline ? (text) => text : theme.getEditorBackgroundColor();
+		const lines = this.editor.render(width);
+		if (!inline) return lines;
+		return lines
+			.filter((line, index) => (index > 0 && index < lines.length - 1) || line.trim().length > 0)
+			.map((line) => theme.fg("muted", line));
 	}
 
 	private renderDock(width: number): string[] {
@@ -2750,32 +2830,7 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.replyTarget) {
 			return truncateToWidth(theme.fg("muted", this.renderReplyComposerHints()), width);
 		}
-		// Replying is reserved for top-level agents; subagents can be stopped or deleted.
-		const selectedRow = this.rows[this.selectedIndex];
-		const selectedAgent = selectedRow?.kind === "agent";
-		const selectedSubagent = selectedRow?.kind === "subagent";
-		const selectedSummary = selectedRow?.kind === "subagent-summary";
-		const hints = [
-			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
-			selectedSummary
-				? `${keyText("tui.select.confirm")} ${selectedRow?.expanded ? "collapse" : "expand"}`
-				: `${keyText("tui.select.confirm")} open`,
-			selectedSummary ? undefined : `${keyText("app.agents.open")} open`,
-			selectedAgent
-				? `${keyText("app.agents.reply")} ${selectedRow?.section === "inactive" ? "resume" : "reply"}`
-				: undefined,
-			`${keyText("app.agents.new")} new`,
-			selectedAgent ? `${keyText("app.agents.rename")} rename` : undefined,
-			selectedAgent
-				? `${keyText("app.agents.delete")} ${selectedRow?.section === "inactive" ? "delete" : "stop/deactivate"}`
-				: undefined,
-			selectedSubagent
-				? `${keyText("app.agents.delete")} ${selectedRow.section === "running" ? "stop" : "delete"}`
-				: undefined,
-			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
-		]
-			.filter((hint): hint is string => hint !== undefined)
-			.join("   ");
+		const hints = `${keyText("tui.select.up")}/${keyText("tui.select.down")} navigate   ${keyText("tui.select.confirm")} open   ${keyText("app.agents.new")} new   ${keyText("app.shortcuts")} actions`;
 		return truncateToWidth(theme.fg("muted", hints), width);
 	}
 
@@ -2847,27 +2902,12 @@ export class AgentsViewMode implements Component, Focusable {
 type DisplayItem =
 	| { type: "spacer" }
 	| { type: "heading"; section: AgentsViewSection }
-	| { type: "empty"; section: AgentsViewSection }
+	| { type: "running-subagents"; row: AgentsViewRow }
 	| { type: "row"; row: AgentsViewRow };
 
-function buildDisplayItems(rows: readonly AgentsViewRow[]): DisplayItem[] {
-	const items: DisplayItem[] = [];
-	const sections: AgentsViewSection[] = ["running", "idle", "inactive"];
-	for (const [index, section] of sections.entries()) {
-		if (index > 0) {
-			items.push({ type: "spacer" });
-		}
-		items.push({ type: "heading", section });
-		const sectionRows = getDisplayRowsForSection(rows, section);
-		if (sectionRows.length === 0) {
-			items.push({ type: "empty", section });
-			continue;
-		}
-		for (const row of sectionRows) {
-			items.push({ type: "row", row });
-		}
-	}
-	return items;
+// Summary rows fold into the running-subagents display items.
+function compactSessionRows(rows: readonly AgentsViewRow[]): AgentsViewRow[] {
+	return rows.filter((row) => row.kind !== "subagent-summary");
 }
 
 // Nested rows (subagent summaries and expanded subagents) always render in
@@ -2930,10 +2970,44 @@ const AGENTS_VIEW_USAGE_LABELS: AgentsViewUsageParts = {
 const AGENTS_VIEW_USAGE_COLUMNS = Object.keys(AGENTS_VIEW_USAGE_LABELS) as (keyof AgentsViewUsageParts)[];
 
 export interface AgentsViewUsageLayout {
-	/** Legend line per section, padded to that section's column widths. */
 	legends: ReadonlyMap<AgentsViewSection, string>;
-	/** Details string per row identity, padded to its section's column widths. */
 	details: ReadonlyMap<string, string>;
+}
+
+export interface CompactAgentsViewLayout {
+	legend: string;
+	details: ReadonlyMap<string, string>;
+	nameWidth: number;
+	modelWidth: number;
+	activityWidth: number;
+}
+
+export function buildCompactAgentsViewLayout(rows: readonly AgentsViewRow[], width = 120): CompactAgentsViewLayout {
+	const sessions = rows.filter((row) => row.kind === "agent" || row.kind === "subagent");
+	const entries = sessions.map((row) => ({
+		identity: row.identity,
+		cost: `$${row.recursiveCost.toFixed(2)}`,
+		age: formatSessionDuration(row.summary),
+	}));
+	const costWidth = entries.reduce((size, entry) => Math.max(size, visibleWidth(entry.cost)), 4);
+	const ageWidth = entries.reduce((size, entry) => Math.max(size, visibleWidth(entry.age)), 3);
+	const detailsWidth = costWidth + 2 + ageWidth;
+	const available = Math.max(0, width - detailsWidth - 4);
+	const desiredModelWidth = sessions.reduce((size, row) => Math.max(size, visibleWidth(formatSessionModel(row))), 12);
+	const modelWidth = Math.min(desiredModelWidth, 32, Math.max(0, available - 12));
+	const nameWidth = Math.min(28, Math.max(0, available - modelWidth));
+	const activityWidth = Math.max(0, available - modelWidth - nameWidth - 2);
+	const detailLine = (cost: string, age: string) => `${padCellStart(cost, costWidth)}  ${padCellStart(age, ageWidth)}`;
+	const headings = [formatTableCell("Session", nameWidth), formatTableCell("Model", modelWidth)];
+	if (activityWidth > 0) headings.push(formatTableCell("Activity", activityWidth));
+	headings.push(detailLine("Cost", "Age"));
+	return {
+		legend: formatTableCell(headings.join("  "), width),
+		details: new Map(entries.map((entry) => [entry.identity, detailLine(entry.cost, entry.age)])),
+		nameWidth,
+		modelWidth,
+		activityWidth,
+	};
 }
 
 /**
@@ -3026,6 +3100,10 @@ function formatTableCell(value: string, width: number): string {
 function formatRightTableCell(value: string, width: number): string {
 	const truncated = truncateToWidth(value, width, "");
 	return " ".repeat(Math.max(0, width - visibleWidth(truncated))) + truncated;
+}
+
+function formatSessionModel(row: AgentsViewRow): string {
+	return row.summary.model?.id ?? row.record?.saved?.model?.modelId ?? "-";
 }
 
 function formatSessionDuration(summary: SessionSummary): string {

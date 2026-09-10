@@ -35,7 +35,6 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.js";
-import { getOpenCodeSessionHeaders } from "../utils/opencode-headers.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import {
 	classifyStreamFailure,
@@ -49,6 +48,7 @@ import {
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
+import { withOpenCodeHeaders } from "./opencode-headers.js";
 import { adjustMaxTokensForThinking, buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -862,12 +862,8 @@ function createClient(
 	useFineGrainedToolStreamingBeta: boolean,
 	optionsHeaders?: Record<string, string>,
 	dynamicHeaders?: Record<string, string>,
-	conversationId?: string,
+	sessionId?: string,
 ): { client: Anthropic; isOAuthToken: boolean } {
-	optionsHeaders = {
-		...getOpenCodeSessionHeaders(model.provider, conversationId),
-		...optionsHeaders,
-	};
 	// Adaptive thinking models (Opus 4.6, Sonnet 4.6) have interleaved thinking built-in.
 	// The beta header is deprecated on Opus 4.6 and redundant on Sonnet 4.6, so skip it.
 	const needsInterleavedBeta = interleavedThinking && !supportsAdaptiveThinking(model.id);
@@ -953,14 +949,18 @@ function createClient(
 		apiKey,
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
-		defaultHeaders: mergeHeaders(
-			{
-				accept: "application/json",
-				"anthropic-dangerous-direct-browser-access": "true",
-				...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
-			},
-			model.headers,
-			optionsHeaders,
+		defaultHeaders: withOpenCodeHeaders(
+			model.provider,
+			sessionId,
+			mergeHeaders(
+				{
+					accept: "application/json",
+					"anthropic-dangerous-direct-browser-access": "true",
+					...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
+				},
+				model.headers,
+				optionsHeaders,
+			),
 		),
 	});
 

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AnthropicMessagesCompat, Api, Context, Model, OpenAICompletionsCompat } from "@earendil-works/pi-ai";
-import { getApiProvider } from "@earendil-works/pi-ai";
+import { getApiProvider, getModels } from "@earendil-works/pi-ai";
 import { getOAuthProvider, registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
@@ -21,6 +21,7 @@ describe("ModelRegistry", () => {
 	});
 
 	afterEach(() => {
+		vi.unstubAllGlobals();
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });
 		}
@@ -602,6 +603,96 @@ describe("ModelRegistry", () => {
 			const anthropicModels = getModelsForProvider(registry, "anthropic");
 			expect(anthropicModels.some((m) => m.id === "claude-custom")).toBe(false);
 			expect(anthropicModels.some((m) => m.id.includes("claude"))).toBe(true);
+		});
+	});
+
+	describe("live Prime Inference models", () => {
+		test("loads the cache without replacing external providers and applies local overrides", () => {
+			const bundled = getModels("prime-inference") as Model<"openai-completions">[];
+			const catalogEntries = bundled.map((model) => ({
+				id: model.id,
+				display_name: `Live ${model.name}`,
+				pricing: { input_usd_per_mtok: model.cost.input, output_usd_per_mtok: model.cost.output },
+				specs: {
+					context_window: model.contextWindow,
+					max_output_tokens: model.maxTokens,
+					modalities: { input: model.input, output: ["text"] },
+					supports_reasoning: model.reasoning,
+				},
+			}));
+			catalogEntries.push({
+				id: "test/live-added",
+				display_name: "Live Added",
+				pricing: { input_usd_per_mtok: 1, output_usd_per_mtok: 2 },
+				specs: {
+					context_window: 200_000,
+					max_output_tokens: 20_000,
+					modalities: { input: ["text"], output: ["text"] },
+					supports_reasoning: false,
+				},
+			});
+			writeFileSync(
+				join(tempDir, "prime-inference-models-cache.json"),
+				JSON.stringify({ object: "list", data: catalogEntries }),
+			);
+			writeRawModelsJson({
+				"prime-inference": {
+					baseUrl: "https://local-proxy.example.com/v1",
+					modelOverrides: { "test/live-added": { name: "Local Added", contextWindow: 123_456 } },
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.find("prime-inference", "test/live-added")).toMatchObject({
+				name: "Local Added",
+				baseUrl: "https://local-proxy.example.com/v1",
+				contextWindow: 123_456,
+				cost: { input: 1, output: 2 },
+			});
+			expect(getModelsForProvider(registry, "openrouter")).toHaveLength(getModels("openrouter").length);
+		});
+
+		test("restores cached authorized deployment metadata without waiting for the network", async () => {
+			const privateRoute = {
+				id: "vendor/model:deployment",
+				display_name: "Private Deployment",
+				pricing: { input_usd_per_mtok: 1, output_usd_per_mtok: 2 },
+				specs: {
+					context_window: 200_000,
+					max_output_tokens: 20_000,
+					modalities: { input: ["text"], output: ["text"] },
+					supports_reasoning: false,
+				},
+			};
+			authStorage.set("prime-inference", {
+				type: "api_key",
+				key: "prime-key",
+				primeTeam: { teamId: "research-team", name: "Research" },
+			});
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(
+					async (_url: string | URL | Request, init?: RequestInit) =>
+						new Response(
+							JSON.stringify({ data: new Headers(init?.headers).has("Authorization") ? [privateRoute] : [] }),
+						),
+				),
+			);
+			const firstRegistry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(
+				(await firstRegistry.refreshAvailableModels()).find((model) => model.id === privateRoute.id),
+			).toMatchObject({ name: "Private Deployment", contextWindow: 200_000 });
+
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => {
+					throw new Error("offline");
+				}),
+			);
+			const restoredRegistry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(
+				(await restoredRegistry.refreshAvailableModels()).find((model) => model.id === privateRoute.id),
+			).toMatchObject({ name: "Private Deployment", contextWindow: 200_000 });
 		});
 	});
 
@@ -1519,22 +1610,39 @@ describe("ModelRegistry", () => {
 				writeFileSync(configPath, JSON.stringify({ api_key: "prime-test-key", team_id: "team-a" }));
 				const cliAuth = AuthStorage.inMemory({}, { primeCliConfigPath: configPath });
 				const registry = ModelRegistry.create(cliAuth, modelsJsonPath);
-				const model = registry
-					.getAll()
-					.find((candidate) => candidate.provider === "prime-inference" && candidate.id.startsWith("internal/"))!;
-				expect(model).toBeDefined();
-				const fetchSpy = vi
-					.spyOn(globalThis, "fetch")
-					.mockImplementation(async () => new Response(JSON.stringify({ data: [{ id: model.id }] })));
+				const modelId = "internal/live-private-model";
+				const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+					async () =>
+						new Response(
+							JSON.stringify({
+								data: [
+									{
+										id: modelId,
+										pricing: { input_usd_per_mtok: 1, output_usd_per_mtok: 2 },
+										specs: {
+											context_window: 200_000,
+											max_output_tokens: 20_000,
+											supports_reasoning: true,
+											modalities: { input: ["text"], output: ["text"] },
+										},
+									},
+								],
+							}),
+						),
+				);
 				try {
 					registry.registerProvider("unrelated-extension", { baseUrl: "https://unused.invalid" });
-					expect(await registry.refreshAvailableModels()).toContainEqual(model);
-					expect(fetchSpy).toHaveBeenCalledTimes(1);
+					const model = (await registry.refreshAvailableModels()).find((candidate) => candidate.id === modelId)!;
+					expect(model).toBeDefined();
+					expect(
+						fetchSpy.mock.calls.filter(([, init]) => new Headers(init?.headers).has("Authorization")),
+					).toHaveLength(1);
 					expect(registry.markProviderAuthStale("prime-inference")).toBe(true);
 
 					registry.unregisterProvider("unrelated-extension");
 					await expect(registry.canUseModel(model, { assumeAuthConfigured: true })).resolves.toBe(true);
-					await registry.refreshAvailableModels();
+					await Promise.all([registry.refreshAvailableModels(), registry.refreshAvailableModels()]);
+					expect(registry.find("prime-inference", modelId)).toEqual(model);
 
 					expect(cliAuth.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "team-a" });
 					expect(registry.hasConfiguredAuth(model)).toBe(false);
@@ -1566,8 +1674,11 @@ describe("ModelRegistry", () => {
 							break;
 					}
 					registry.refresh();
+					expect(registry.find("prime-inference", modelId)).toBeUndefined();
 					await expect(registry.canUseModel(model, { assumeAuthConfigured: true })).resolves.toBe(false);
-					expect(fetchSpy).toHaveBeenCalledTimes(1);
+					expect(
+						fetchSpy.mock.calls.filter(([, init]) => new Headers(init?.headers).has("Authorization")),
+					).toHaveLength(1);
 				} finally {
 					fetchSpy.mockRestore();
 					vi.unstubAllEnvs();
@@ -1600,7 +1711,12 @@ describe("ModelRegistry", () => {
 			test("concurrent stale-auth refreshes do not drop preserved entitlements", async () => {
 				authStorage.setRuntimeApiKey("prime-inference", "prime-key");
 				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
-				const internals = registry as unknown as { authorizedPrivatePrimeInferenceModelIds: Set<string> };
+				vi.spyOn(authStorage, "getProviderHeaders").mockReturnValue({ "X-Prime-Team-ID": "team-a" });
+				const internals = registry as unknown as {
+					authorizedPrivatePrimeInferenceModelIds: Set<string>;
+					authorizedPrivatePrimeInferenceTeamId: string | undefined;
+				};
+				internals.authorizedPrivatePrimeInferenceTeamId = "team-a";
 				internals.authorizedPrivatePrimeInferenceModelIds.add("internal/private-model");
 				expect(registry.markProviderAuthStale("prime-inference")).toBe(true);
 

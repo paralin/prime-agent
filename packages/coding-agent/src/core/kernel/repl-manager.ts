@@ -443,6 +443,12 @@ export class ReplKernelManager {
 	}
 
 	private wireChild(child: ChildProcess): void {
+		// Failed writes reject through their callbacks and also emit on the pipe.
+		// Keep the listener through destruction, when a queued error can still arrive.
+		child.stdin?.on("error", (error) => {
+			if (this.child !== child) return;
+			this.appendKernelDiagnostic(`stdin error: ${error.message}`);
+		});
 		const decoder = new StringDecoder("utf8");
 		let buffered = "";
 		child.stdout?.on("data", (buf: Buffer) => {

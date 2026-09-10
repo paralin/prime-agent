@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { type HostRequestHandlers, ReplKernelManager } from "../src/core/kernel/index.js";
 
@@ -17,7 +18,7 @@ type ShutdownInternals = {
 		signalCode: NodeJS.Signals | null;
 		kill: (signal?: NodeJS.Signals | number) => boolean;
 		pid?: number;
-		stdin: { destroyed: boolean; destroy: () => void };
+		stdin: EventEmitter & { destroyed: boolean; destroy: () => void };
 		stdout?: { destroy: () => void; on: (event: string, listener: (...args: unknown[]) => void) => void };
 		stderr?: {
 			destroy: () => void;
@@ -46,7 +47,7 @@ function configuredManager(
 		signalCode: null,
 		kill: vi.fn(() => true),
 		pid: undefined,
-		stdin: { destroyed: false, destroy: vi.fn() },
+		stdin: Object.assign(new EventEmitter(), { destroyed: false, destroy: vi.fn() }),
 		stdout: { destroy: vi.fn(), on: vi.fn() },
 		stderr: { destroy: vi.fn(), on: vi.fn(), once: vi.fn() },
 	});
@@ -61,6 +62,27 @@ function configuredManager(
 }
 
 describe("ReplKernelManager graceful shutdown", () => {
+	it.skipIf(process.platform === "win32")("survives shutdown after the runtime closes its input pipe", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "prime-agent-closed-stdin-"));
+		const python = join(cwd, "python");
+		writeFileSync(
+			python,
+			["#!/bin/sh", "exec 0<&-", `echo '{"event":"ready","protocol":4}'`, "exec sleep 60", ""].join("\n"),
+			{ mode: 0o755 },
+		);
+		const manager = new ReplKernelManager({ python, cwd });
+		try {
+			await manager.start();
+			await expect(manager.shutdown()).resolves.toBe(true);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(manager.isDefunct).toBe(true);
+			expect((manager as unknown as ShutdownInternals).kernelStderr).toContain("EPIPE");
+		} finally {
+			await manager.kill();
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it.each([
 		["optional policy", {}],
 		["snapshot-and-drain policy", { snapshot: true, drainHostRequests: true }],

@@ -7,6 +7,7 @@ import atexit
 import functools
 import json
 import math
+import ntpath
 import os
 import re
 import secrets
@@ -1547,7 +1548,12 @@ def rsync(
         remote_shell = " ".join(shlex.quote(part) for part in remote_shell_parts)
         arguments = [*arguments, "-e", remote_shell]
     requested_paths = _argv_values(paths, "paths")
-    protected = ["--protect-args"] if protect_args else []
+    has_remote_path = any(
+        path.startswith("rsync://")
+        or (not ntpath.splitdrive(path)[0] and ":" in path and "/" not in path.split(":", maxsplit=1)[0])
+        for path in requested_paths
+    )
+    protected = ["--protect-args"] if protect_args and has_remote_path else []
     argv = [_tool_path("rsync", "PRIME_AGENT_RSYNC"), *arguments, *protected, "--", *requested_paths]
     return _argv_handle(argv, timeout)
 

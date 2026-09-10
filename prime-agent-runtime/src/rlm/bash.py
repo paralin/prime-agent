@@ -7,6 +7,7 @@ import atexit
 import functools
 import json
 import math
+import ntpath
 import os
 import re
 import secrets
@@ -1546,11 +1547,12 @@ def rsync(
 ) -> BashHandle:
     """Synchronize two or more paths through the existing BashHandle process owner.
 
-    Archive mode and rsync's protected-arguments protocol are enabled by
-    default. Pass ``options=()`` or ``protect_args=False`` only when the peer's
-    contract requires native rsync defaults or a pre-3.0 remote. Remote paths
-    retain rsync's standard ``host:path`` syntax; remote-shell replacement
-    options are rejected.
+    Archive mode is enabled by default. Remote operands use rsync's
+    protected-arguments protocol unless ``protect_args=False`` selects a
+    pre-3.0 peer. Local copies already pass paths as distinct argv entries and
+    remain compatible with the system rsync on macOS. Remote paths retain
+    rsync's standard ``host:path`` syntax; remote-shell replacement options are
+    rejected.
 
     ``ssh`` sets the remote shell rsync uses for ``host:path`` operands to the
     system OpenSSH client with BatchMode and the given ``ssh_options``, so
@@ -1581,7 +1583,16 @@ def rsync(
         remote_shell = " ".join(shlex.quote(part) for part in remote_shell_parts)
         arguments = [*arguments, "-e", remote_shell]
     requested_paths = _argv_values(paths, "paths")
-    protected = ["--protect-args"] if protect_args else []
+    has_remote_path = any(
+        path.startswith("rsync://")
+        or (
+            not ntpath.splitdrive(path)[0]
+            and ":" in path
+            and "/" not in path.split(":", maxsplit=1)[0]
+        )
+        for path in requested_paths
+    )
+    protected = ["--protect-args"] if protect_args and has_remote_path else []
     argv = [
         _tool_path("rsync", "PRIME_AGENT_RSYNC"),
         *arguments,

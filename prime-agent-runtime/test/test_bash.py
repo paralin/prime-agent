@@ -597,6 +597,25 @@ pwd
             with self.subTest(options=options), self.assertRaises(ValueError):
                 rsync("source", "target", options=options)
 
+    def test_rsync_local_paths_do_not_require_the_remote_argument_protocol(self):
+        with (
+            mock.patch.object(bash_module, "_tool_path", return_value="/tools/rsync"),
+            mock.patch.object(bash_module, "_argv_handle", return_value=object()) as runner,
+        ):
+            rsync("source dir/", "target dir/", r"C:\source", r"D:\target")
+        runner.assert_called_once_with(
+            [
+                "/tools/rsync",
+                "-a",
+                "--",
+                "source dir/",
+                "target dir/",
+                r"C:\source",
+                r"D:\target",
+            ],
+            None,
+        )
+
     def test_construction_cleanup_uses_windows_signal_without_sigkill(self):
         failure = RuntimeError("task construction failed")
         loop = mock.Mock()

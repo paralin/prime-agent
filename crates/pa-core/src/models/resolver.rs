@@ -31,7 +31,7 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "kimi-coding" => "kimi-for-coding",
         "runinfra" => "deepseek-v4-flash",
         "merge-gateway" => "anthropic/claude-sonnet-4-6",
-        "venice" => "stealth-ox-alpha",
+        "venice" => "inkling",
         "cloudflare-workers-ai" => "@cf/moonshotai/kimi-k2.6",
         "cloudflare-ai-gateway" => "claude-sonnet-4.5",
         "xiaomi" | "xiaomi-token-plan-cn" | "xiaomi-token-plan-ams" | "xiaomi-token-plan-sgp" => {

@@ -17,8 +17,9 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["agents"],
-		usage: "agents",
+		usage: "agents [--show-cli-sessions]",
 		summary: "Search and open sessions",
+		options: ["--show-cli-sessions  Include sessions created by non-interactive commands"],
 	},
 	{
 		path: ["list"],
@@ -216,6 +217,7 @@ const TOP_LEVEL_OPTION_GROUPS: ReadonlyArray<{ heading: string; options: readonl
 		options: [
 			["-c, --continue", "Continue the previous session"],
 			["-r, --resume [path|id]", "Open the agents view, or resume a saved session"],
+			["--show-cli-sessions", "Include non-interactive sessions in the agents view"],
 			["--fork <path|id>", "Fork a saved session into a new session"],
 			["--session-dir <dir>", "Use a custom session directory"],
 			["--no-session", "Do not save the session"],

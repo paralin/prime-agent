@@ -41,6 +41,7 @@ import {
 	readSessionInfo,
 	resolveSessionRlmDepth,
 	SessionManager,
+	sessionOriginForExecutionMode,
 } from "../../src/core/session-manager.js";
 import { sessionUsageSummaryFrom } from "../../src/core/usage.js";
 
@@ -191,6 +192,45 @@ describe("loadEntriesFromFile", () => {
 });
 
 describe("session tree metadata", () => {
+	it("classifies every non-interactive execution mode as CLI origin", () => {
+		expect(sessionOriginForExecutionMode("interactive")).toBe("interactive");
+		for (const mode of ["print", "json", "rpc", "acp"] as const) {
+			expect(sessionOriginForExecutionMode(mode)).toBe("cli");
+		}
+		expect(sessionOriginForExecutionMode(undefined)).toBeUndefined();
+	});
+
+	it("preserves session origin across replacement, materialization, branch, and fork lifecycles", async () => {
+		const tempDir = join(tmpdir(), `session-origin-test-${Date.now()}-${Math.random()}`);
+		mkdirSync(tempDir, { recursive: true });
+		try {
+			const source = SessionManager.create(tempDir, tempDir, { origin: "interactive" });
+			source.newSession();
+			const leafId = source.appendMessage({ role: "user", content: "fork here", timestamp: 1 });
+			source.flushNow();
+			const sourceFile = source.getSessionFile();
+			if (!sourceFile) throw new Error("Missing source session file");
+
+			expect(source.getHeader()?.origin).toBe("interactive");
+			expect(await readSessionInfo(sourceFile)).toMatchObject({ origin: "interactive" });
+
+			const branched = SessionManager.open(sourceFile, tempDir);
+			branched.createBranchedSession(leafId);
+			expect(branched.getHeader()?.origin).toBe("interactive");
+			expect(SessionManager.forkFrom(sourceFile, tempDir, tempDir).getHeader()?.origin).toBe("interactive");
+			expect(SessionManager.forkFrom(sourceFile, tempDir, tempDir, { origin: "cli" }).getHeader()?.origin).toBe(
+				"cli",
+			);
+
+			const materialized = SessionManager.inMemory(tempDir, "", { origin: "cli" });
+			const materializedFile = materialized.materializeSessionFile(tempDir);
+			expect(materialized.getHeader()?.origin).toBe("cli");
+			expect(await readSessionInfo(materializedFile)).toMatchObject({ origin: "cli" });
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it.each(["2.5", "2oops", "9007199254740993"])("rejects invalid RLM_DEPTH value %s", (value) => {
 		const tempDir = join(tmpdir(), `invalid-root-depth-test-${Date.now()}-${Math.random()}`);
 		mkdirSync(tempDir, { recursive: true });

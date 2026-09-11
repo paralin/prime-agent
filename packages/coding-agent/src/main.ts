@@ -74,6 +74,8 @@ import {
 	getDefaultSessionDir,
 	loadEntriesFromFile,
 	SessionManager,
+	type SessionOrigin,
+	sessionOriginForExecutionMode,
 } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { isTelemetryEnabled } from "./core/telemetry.js";
@@ -457,9 +459,14 @@ function validateForkFlags(parsed: Args): void {
 	}
 }
 
-function forkSessionOrExit(sourcePath: string, cwd: string, sessionDir?: string): SessionManager {
+function forkSessionOrExit(
+	sourcePath: string,
+	cwd: string,
+	sessionDir: string | undefined,
+	origin: SessionOrigin | undefined,
+): SessionManager {
 	try {
-		return SessionManager.forkFrom(sourcePath, cwd, sessionDir);
+		return SessionManager.forkFrom(sourcePath, cwd, sessionDir, { origin });
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(chalk.red(`Error: ${message}`));
@@ -487,11 +494,12 @@ export async function createSessionManager(
 	cwd: string,
 	sessionDir: string | undefined,
 	readOnly = false,
+	origin?: SessionOrigin,
 ): Promise<SessionManager> {
 	const explicitCwdOverride = parsed.cwd ? cwd : undefined;
 
 	if (parsed.noSession) {
-		return SessionManager.inMemory();
+		return SessionManager.inMemory(process.cwd(), "", { origin });
 	}
 
 	if (parsed.fork) {
@@ -501,7 +509,7 @@ export async function createSessionManager(
 			case "path":
 			case "local":
 			case "global":
-				return forkSessionOrExit(resolved.path, cwd, sessionDir);
+				return forkSessionOrExit(resolved.path, cwd, sessionDir, origin);
 		}
 	}
 
@@ -523,7 +531,7 @@ export async function createSessionManager(
 					console.log(chalk.dim("Aborted."));
 					process.exit(0);
 				}
-				return forkSessionOrExit(resolved.path, cwd, sessionDir);
+				return forkSessionOrExit(resolved.path, cwd, sessionDir, origin);
 			}
 		}
 	}
@@ -534,10 +542,12 @@ export async function createSessionManager(
 			const path = findMostRecentSessionForCwd(dir, cwd);
 			return path ? readSessionManager(path, dir, cwd) : SessionManager.inMemory(cwd, dir);
 		}
-		return SessionManager.continueRecent(cwd, sessionDir);
+		return SessionManager.continueRecent(cwd, sessionDir, { origin });
 	}
 
-	return readOnly ? SessionManager.inMemory(cwd, sessionDir) : SessionManager.create(cwd, sessionDir);
+	return readOnly
+		? SessionManager.inMemory(cwd, sessionDir, { origin })
+		: SessionManager.create(cwd, sessionDir, { origin });
 }
 
 function buildSessionOptions(
@@ -1360,7 +1370,13 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionManager = SessionManager.inMemory(cwd);
 	} else {
 		try {
-			sessionManager = await createSessionManager(parsed, cwd, sessionDir, useDaemonClient);
+			sessionManager = await createSessionManager(
+				parsed,
+				cwd,
+				sessionDir,
+				useDaemonClient,
+				sessionOriginForExecutionMode(appMode === "daemon" ? undefined : appMode),
+			);
 		} catch (error) {
 			if (!(error instanceof SessionSelectorError)) {
 				throw error;
@@ -1576,6 +1592,7 @@ export async function main(args: string[], options?: MainOptions) {
 				modelFallbackMessage: startupModel.modelFallbackMessage,
 				promptStashStore,
 				startupModelId: startupModel.model?.id,
+				showCliSessions: parsed.showCliSessions,
 				initialSession,
 				initialScopeKey,
 				verbose: parsed.verbose,

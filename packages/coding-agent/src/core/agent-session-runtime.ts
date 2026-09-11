@@ -314,7 +314,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	async createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
-		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
+		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir, {
+			origin: options.parentSession.sessionManager.getHeader()?.origin,
+		});
 		if (options.parentSession.sessionFile) {
 			sessionManager.newSession({
 				parentSession: options.parentSession.sessionFile,
@@ -483,7 +485,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		const previousSessionFile = this.session.sessionFile;
 		const cwd = options?.cwd ?? this.cwd;
 		const sessionDir = this.session.sessionManager.getSessionDir();
-		const sessionManager = SessionManager.create(cwd, sessionDir);
+		const sessionManager = SessionManager.create(cwd, sessionDir, {
+			origin: this.session.sessionManager.getHeader()?.origin,
+		});
 		if (options?.parentSession) {
 			sessionManager.newSession({
 				parentSession: options.parentSession,
@@ -601,7 +605,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			const sessionDir = this.session.sessionManager.getSessionDir();
 			if (!targetLeafId) {
 				const sourceHeader = this.session.sessionManager.getHeader();
-				const sessionManager = SessionManager.create(this.cwd, sessionDir);
+				const sessionManager = SessionManager.create(this.cwd, sessionDir, {
+					origin: sourceHeader?.origin,
+				});
 				sessionManager.newSession({
 					parentSession: currentSessionFile,
 					rlmDepth: sourceHeader?.rlmDepth ?? this.session.rlmDepth,

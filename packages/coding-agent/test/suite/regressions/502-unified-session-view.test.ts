@@ -76,14 +76,17 @@ function privateMethod<T>(name: string): T {
 }
 
 describe("#502 unified session view regressions", () => {
-	test("archived saved sessions stay hidden while resumed runtimes remain visible", () => {
-		const archived = { ...rawSavedSession("archived"), state: { status: "archived" } };
-		const resumed = { ...summary("resumed"), sessionId: "archived", sessionFile: archived.path };
+	test("restores inactive sessions while hiding CLI-only transcripts by default", () => {
+		const interactive = { ...rawSavedSession("interactive"), state: { status: "archived" }, origin: "interactive" };
+		const legacy = { ...rawSavedSession("legacy"), state: { status: "archived" } };
+		const cli = { ...rawSavedSession("cli"), state: { status: "archived" }, origin: "cli" };
+		const resumedCli = { ...summary("resumed-cli"), sessionId: "cli", sessionFile: cli.path };
 		const harness = {
-			lastListedSummaries: [resumed],
+			options: { showCliSessions: false },
+			lastListedSummaries: [resumedCli],
 			inactiveAgentIdentities: new Set(),
 			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
-			savedSessions: [archived, { ...archived, id: "hidden", path: "/tmp/hidden.jsonl" }],
+			savedSessions: [interactive, legacy, cli],
 			heartbeats: [],
 			expandedSubagentParents: new Set(),
 			programShownParents: new Set(),
@@ -93,10 +96,24 @@ describe("#502 unified session view regressions", () => {
 			applyPendingAncestorExpansion: vi.fn(),
 			restoreSelection: vi.fn(),
 			ui: { requestRender: vi.fn() },
-			unifiedRecords: [] as Array<{ daemon?: SessionSummary }>,
+			unifiedRecords: [] as Array<{ daemon?: SessionSummary; saved?: { id: string } }>,
 		};
 		privateMethod<(this: typeof harness) => void>("reconcileCatalogs").call(harness);
-		expect(harness.unifiedRecords.map((record) => record.daemon?.sessionId)).toEqual(["archived"]);
+		expect(harness.unifiedRecords.map((record) => record.saved?.id ?? record.daemon?.sessionId).sort()).toEqual([
+			"cli",
+			"interactive",
+			"legacy",
+		]);
+		expect(harness.unifiedRecords.find((record) => record.daemon?.sessionId === "cli")?.saved).toBeUndefined();
+
+		harness.options = { showCliSessions: true };
+		privateMethod<(this: typeof harness) => void>("reconcileCatalogs").call(harness);
+		expect(
+			harness.unifiedRecords
+				.map((record) => record.saved?.id)
+				.filter(Boolean)
+				.sort(),
+		).toEqual(["cli", "interactive", "legacy"]);
 	});
 
 	test("a burst of saved sessions publishes progressively without rebuilding for each item", async () => {

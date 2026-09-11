@@ -118,6 +118,7 @@ export interface AgentsViewModeOptions {
 	migratedProviders?: string[];
 	modelFallbackMessage?: string;
 	startupModelId?: string;
+	showCliSessions?: boolean;
 	verbose?: boolean;
 	recoverDaemon?: () => Promise<void>;
 	reconnectTimeoutMs?: number;
@@ -2188,9 +2189,9 @@ export class AgentsViewMode implements Component, Focusable {
 			shouldShowAgentsViewSession(summary, this.inactiveAgentIdentities.has(getSummaryIdentity(summary))),
 		);
 		this.lastVisibleSummaries = this.withPendingDeleteSession(visibleSessions);
-		// Archival hides a saved row; a resident runtime remains authoritative if
-		// the user explicitly resumed a transcript carrying an old archive marker.
-		const savedSessions = this.savedSessions.filter((session) => session.state?.status !== "archived");
+		const savedSessions = this.options.showCliSessions
+			? this.savedSessions
+			: this.savedSessions.filter((session) => session.origin !== "cli");
 		this.unifiedRecords = reconcileUnifiedSessions(this.lastVisibleSummaries, savedSessions, this.heartbeats);
 		this.unifiedIndex = buildUnifiedSessionIndex(this.unifiedRecords);
 		migrateAgentsViewIdentitySet(this.expandedSubagentParents, this.unifiedIndex.byKey);

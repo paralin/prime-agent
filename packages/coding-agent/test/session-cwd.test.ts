@@ -227,6 +227,20 @@ describe("session cwd handling", () => {
 		expect(SessionManager.open(manager.getSessionFile()!).getSessionName()).toBe("Writable fork");
 	});
 
+	it("applies the launch origin to fresh sessions and explicit forks", async () => {
+		const dir = createTempDir("pi-session-origin");
+		cleanupPaths.push(dir);
+		const fresh = await createSessionManager(parseArgs([]), dir, dir, false, "cli");
+		expect(fresh.getHeader()?.origin).toBe("cli");
+
+		fresh.appendMessage({ role: "user", content: "fork me", timestamp: 1 });
+		fresh.flushNow();
+		const source = fresh.getSessionFile();
+		if (!source) throw new Error("Missing source session file");
+		const fork = await createSessionManager(parseArgs(["--fork", source]), dir, dir, false, "interactive");
+		expect(fork.getHeader()?.origin).toBe("interactive");
+	});
+
 	it("preserves writer-owned crash repair for default startup", async () => {
 		const dir = createTempDir("pi-writer-resume");
 		cleanupPaths.push(dir);

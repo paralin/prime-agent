@@ -702,6 +702,7 @@ function isDaemonSavedSessionInfo(value: unknown): value is DaemonSavedSessionIn
 		typeof candidate.messageCount === "number" &&
 		typeof candidate.firstMessage === "string" &&
 		typeof candidate.allMessagesText === "string" &&
+		(candidate.origin === undefined || candidate.origin === "interactive" || candidate.origin === "cli") &&
 		(candidate.agentStatus === undefined || isDaemonSavedSessionAgentStatus(candidate.agentStatus))
 	);
 }

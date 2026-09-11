@@ -244,6 +244,13 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--show-cli-sessions flag", () => {
+		test("includes CLI-created sessions in the agents view", () => {
+			const result = parseArgs(["agents", "--show-cli-sessions"]);
+			expect(result.showCliSessions).toBe(true);
+		});
+	});
+
 	describe("--extension flag", () => {
 		test("parses single --extension", () => {
 			const result = parseArgs(["--extension", "./my-extension.ts"]);

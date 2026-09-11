@@ -29,6 +29,7 @@ import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js"
 import { realpathIfPresentSync, writeFileAtomicSync } from "../utils/atomic-file.js";
 import { readBytesSync, readFirstLineSync, readLineContainingSync, readLinesAsBuffers } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
+import type { AgentExecutionMode } from "./agent-session-config.js";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -86,13 +87,26 @@ export interface SessionHeader {
 	cwd: string;
 	parentSession?: string;
 	rlmDepth?: number;
+	origin?: SessionOrigin;
 	git?: GitContext;
+}
+
+export type SessionOrigin = "interactive" | "cli";
+
+export function sessionOriginForExecutionMode(mode: AgentExecutionMode | undefined): SessionOrigin | undefined {
+	if (mode === undefined) return undefined;
+	return mode === "interactive" ? "interactive" : "cli";
+}
+
+function normalizeSessionOrigin(value: unknown): SessionOrigin | undefined {
+	return value === "interactive" || value === "cli" ? value : undefined;
 }
 
 export interface NewSessionOptions {
 	id?: string;
 	parentSession?: string;
 	rlmDepth?: number;
+	origin?: SessionOrigin;
 }
 
 export type SessionPersistListener = (sessionFile: string) => void;
@@ -310,6 +324,7 @@ export interface SessionInfo {
 	model?: SessionModelRef;
 	parentSessionPath?: string;
 	rlmDepth: number;
+	origin?: SessionOrigin;
 	created: Date;
 	modified: Date;
 	messageCount: number;
@@ -1479,6 +1494,7 @@ function snapshotSessionInfo(
 		model: acc.model,
 		parentSessionPath,
 		rlmDepth,
+		origin: normalizeSessionOrigin(header.origin),
 		created: new Date(header.timestamp),
 		modified,
 		messageCount: acc.messageCount,
@@ -1584,6 +1600,7 @@ export class SessionManager {
 		sessionFile: string | undefined,
 		persist: boolean,
 		preloadedEntries?: FileEntry[],
+		newSessionOptions?: NewSessionOptions,
 	) {
 		this.cwd = cwd;
 		this.sessionDir = sessionDir;
@@ -1595,7 +1612,7 @@ export class SessionManager {
 		if (sessionFile) {
 			this.setSessionFile(sessionFile, preloadedEntries);
 		} else {
-			this.newSession();
+			this.newSession(newSessionOptions);
 		}
 	}
 
@@ -1644,6 +1661,7 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
+		const previousOrigin = this.getHeader()?.origin;
 		let sessionId = options?.id ?? createSessionId();
 		let sessionFile: string | undefined;
 		const hasExplicitRlmDepth = options !== undefined && Object.hasOwn(options, "rlmDepth");
@@ -1684,6 +1702,7 @@ export class SessionManager {
 			cwd: this.cwd,
 			parentSession: options?.parentSession,
 			rlmDepth,
+			origin: normalizeSessionOrigin(options?.origin ?? previousOrigin),
 			git,
 		};
 		this.fileEntries = [header];
@@ -1848,6 +1867,7 @@ export class SessionManager {
 			cwd: this.cwd,
 			parentSession: previousHeader?.parentSession,
 			rlmDepth: resolveSessionRlmDepth(previousHeader ?? {}, target.sessionFile),
+			origin: normalizeSessionOrigin(previousHeader?.origin),
 			git,
 		};
 		this.fileEntries = [header, ...this.getEntries()];
@@ -2558,6 +2578,7 @@ export class SessionManager {
 			cwd: this.cwd,
 			parentSession: this.persist ? previousSessionFile : undefined,
 			rlmDepth: resolveSessionRlmDepth(this.getHeader() ?? {}, previousSessionFile ?? newSessionFile ?? ""),
+			origin: this.getHeader()?.origin,
 			git: this.persist ? (captureGitContext(this.cwd) ?? undefined) : undefined,
 		};
 
@@ -2636,9 +2657,9 @@ export class SessionManager {
 		return undefined;
 	}
 
-	static create(cwd: string, sessionDir?: string): SessionManager {
+	static create(cwd: string, sessionDir?: string, options?: NewSessionOptions): SessionManager {
 		const dir = sessionDir ?? getDefaultSessionDir(cwd);
-		return new SessionManager(cwd, dir, undefined, true);
+		return new SessionManager(cwd, dir, undefined, true, undefined, options);
 	}
 
 	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
@@ -2682,20 +2703,25 @@ export class SessionManager {
 		return new SessionManager(cwd ?? process.cwd(), dir, path, true, entries);
 	}
 
-	static continueRecent(cwd: string, sessionDir?: string): SessionManager {
+	static continueRecent(cwd: string, sessionDir?: string, options?: NewSessionOptions): SessionManager {
 		const dir = sessionDir ?? getDefaultSessionDir(cwd);
 		const mostRecent = findMostRecentSessionForCwd(dir, cwd);
 		if (mostRecent) {
 			return new SessionManager(cwd, dir, mostRecent, true);
 		}
-		return new SessionManager(cwd, dir, undefined, true);
+		return new SessionManager(cwd, dir, undefined, true, undefined, options);
 	}
 
-	static inMemory(cwd: string = process.cwd(), sessionDir = ""): SessionManager {
-		return new SessionManager(cwd, sessionDir, undefined, false);
+	static inMemory(cwd: string = process.cwd(), sessionDir = "", options?: NewSessionOptions): SessionManager {
+		return new SessionManager(cwd, sessionDir, undefined, false, undefined, options);
 	}
 
-	static forkFrom(sourcePath: string, targetCwd: string, sessionDir?: string): SessionManager {
+	static forkFrom(
+		sourcePath: string,
+		targetCwd: string,
+		sessionDir?: string,
+		options?: Pick<NewSessionOptions, "origin">,
+	): SessionManager {
 		const sourceEntries = loadEntriesFromFile(sourcePath);
 		if (sourceEntries.length === 0) {
 			throw new Error(`Cannot fork: source session file is empty or invalid: ${sourcePath}`);
@@ -2725,6 +2751,7 @@ export class SessionManager {
 			cwd: targetCwd,
 			parentSession: sourcePath,
 			rlmDepth: resolveSessionRlmDepth(sourceHeader, sourcePath),
+			origin: normalizeSessionOrigin(options?.origin ?? sourceHeader.origin),
 			git: captureGitContext(targetCwd) ?? undefined,
 		};
 		appendFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`);

@@ -11530,7 +11530,9 @@ export class AgentSession {
 	}
 
 	private _createInlineRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): RlmSubagentRuntime {
-		const childSessionManager = SessionManager.create(this._cwd, options.sessionDir);
+		const childSessionManager = SessionManager.create(this._cwd, options.sessionDir, {
+			origin: options.parentSession.sessionManager.getHeader()?.origin,
+		});
 		if (options.parentSession.sessionFile) {
 			childSessionManager.newSession({
 				parentSession: options.parentSession.sessionFile,
@@ -14857,6 +14859,7 @@ export class AgentSession {
 			id: this.sessionManager.getSessionId(),
 			timestamp: new Date().toISOString(),
 			cwd: this.sessionManager.getCwd(),
+			origin: this.sessionManager.getHeader()?.origin,
 		};
 
 		const branchEntries = this.sessionManager.getBranch();

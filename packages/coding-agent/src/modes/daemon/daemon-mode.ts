@@ -129,6 +129,7 @@ import {
 	resolveSessionRlmDepth,
 	type SessionInfo,
 	SessionManager,
+	sessionOriginForExecutionMode,
 } from "../../core/session-manager.js";
 import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
@@ -2089,10 +2090,16 @@ export class AgentDaemon {
 			sessionManager = sessionPath
 				? await SessionManager.openAsync(sessionPath, config.sessionDir, cwdOverride)
 				: command.noSession
-					? SessionManager.inMemory(cwd)
+					? SessionManager.inMemory(cwd, "", {
+							origin: sessionOriginForExecutionMode(config.executionMode),
+						})
 					: command.continueRecent
-						? SessionManager.continueRecent(cwd, config.sessionDir)
-						: SessionManager.create(cwd, config.sessionDir);
+						? SessionManager.continueRecent(cwd, config.sessionDir, {
+								origin: sessionOriginForExecutionMode(config.executionMode),
+							})
+						: SessionManager.create(cwd, config.sessionDir, {
+								origin: sessionOriginForExecutionMode(config.executionMode),
+							});
 		} catch (error) {
 			sessionLease?.release();
 			releaseOpenReservation();
@@ -2999,7 +3006,9 @@ export class AgentDaemon {
 		parentState: ActiveSessionState,
 		options: CreateRlmSubagentRuntimeOptions,
 	): Promise<AgentSessionRuntime> {
-		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
+		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir, {
+			origin: options.parentSession.sessionManager.getHeader()?.origin,
+		});
 		sessionManager.newSession({
 			parentSession: options.parentSession.sessionFile,
 			rlmDepth: options.rlmDepth,

@@ -76,8 +76,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 27 publishes own-session usage totals on session summary and saved-session rows.
 // Revision 28 adds structured session_recovering failure info for known-but-unaddressable sessions.
 // Revision 29 publishes the last recorded model on saved-session rows.
-export const DAEMON_SCHEMA_REVISION = 29;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-29-916a7b91029e";
+// Revision 30 publishes the stored interactive or CLI session origin.
+export const DAEMON_SCHEMA_REVISION = 30;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-30d531e74fa5";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -1122,6 +1123,7 @@ export interface DaemonSavedSessionInfo {
 	state?: AgentConnectionSavedSessionState;
 	parentSessionPath?: string;
 	rlmDepth?: number;
+	origin?: "interactive" | "cli";
 	created: string;
 	modified: string;
 	messageCount: number;

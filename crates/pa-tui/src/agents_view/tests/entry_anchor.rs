@@ -317,6 +317,7 @@ fn nested_anchor_expands_its_ancestors() {
 #[test]
 fn carried_selection_wins_over_the_entry_anchor() {
     let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            show_cli_sessions: false,
         socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,

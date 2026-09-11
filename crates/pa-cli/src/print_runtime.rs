@@ -498,6 +498,10 @@ async fn build_headless_engine_with(
         let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
         pa_core::models::resolve_cli_role(config.provider.as_deref(), selector, &registry, &settings.get_model_roles()).map_err(|error| error.to_string())
     }).transpose()?;
+    let mut session_manager = session_manager;
+    if let Some(manager) = &mut session_manager {
+        if options.session.fork.is_some() || manager.get_entries().is_empty() { manager.set_session_origin("cli").map_err(|error| error.to_string())?; }
+    }
     let model = if let Some(candidates) = &role_models { candidates[0].model.clone() } else { select_model(
         &mut registry,
         config.provider.as_deref(),

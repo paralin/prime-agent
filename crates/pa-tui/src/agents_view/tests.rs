@@ -29,6 +29,7 @@ mod selection_churn;
 /// stay fixed so the expected rows are exact.
 fn mode_with_row(title: &str, model: &str) -> (AgentsViewMode, usize) {
     let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            show_cli_sessions: false,
         socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,
@@ -138,6 +139,7 @@ fn child_summary(id: &str, parent: &str, name: &str) -> serde_json::Value {
 /// A mode over a live parent/child roster, no scope, fresh selection.
 fn mode_with_parent_and_child() -> AgentsViewMode {
     let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            show_cli_sessions: false,
         socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,
@@ -167,6 +169,7 @@ fn mode_with_parent_and_child() -> AgentsViewMode {
 /// handoff state: no carried selection, the session just left).
 fn mode_with_anchor(anchor: Option<&str>, roster: Vec<serde_json::Value>) -> AgentsViewMode {
     let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            show_cli_sessions: false,
         socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,
@@ -198,6 +201,7 @@ fn mode_with_user_bindings(bindings: &[(&str, &str)]) -> AgentsViewMode {
         cfg.insert(id.to_string(), vec![key.to_string()]);
     }
     let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            show_cli_sessions: false,
         socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,
@@ -225,6 +229,7 @@ fn mode_with_user_bindings(bindings: &[(&str, &str)]) -> AgentsViewMode {
 
 fn fresh_mode(roster: Vec<serde_json::Value>) -> AgentsViewMode {
     let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            show_cli_sessions: false,
         socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,

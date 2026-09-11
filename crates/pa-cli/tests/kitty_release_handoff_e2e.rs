@@ -102,6 +102,7 @@ fn kitty_child_mode() {
         if outcome.return_to_agents_view {
             let anchor = (!outcome.session_id.is_empty()).then(|| outcome.session_id.clone());
             let view_options = AgentsViewOptions {
+            show_cli_sessions: false,
                 socket_path: options.socket_path.clone(),
                 cwd: options.cwd.clone(),
                 session_dir: options.session_dir.clone(),

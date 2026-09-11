@@ -236,6 +236,7 @@ pub fn passive_child_summary(child: &PassiveRlmChild) -> Value {
 /// info with the ledger edge as the topology authority (TS
 /// `withPassiveRlmDescendantInfos`).
 pub fn passive_child_info(child: &PassiveRlmChild) -> SessionInfo {
+        origin: None,
     let mut info = child.info.clone();
     info.parent_session_path = Some(child.edge.parent.clone());
     info.rlm_depth = child.edge.depth;

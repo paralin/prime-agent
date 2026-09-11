@@ -272,7 +272,9 @@ fn read_line(reader: &mut BufReader<UnixStream>) -> Option<String> {
 /// One view options set: `anchor` seeds the entry anchor (a session whose
 /// row can only come from the saved catalog).
 fn view_options(socket: &std::path::Path, anchor: Option<&str>) -> AgentsViewOptions {
+            show_cli_sessions: false,
     AgentsViewOptions {
+            show_cli_sessions: false,
         socket_path: socket.to_path_buf(),
         cwd: PathBuf::from("/tmp"),
         session_dir: Some(PathBuf::from("/tmp/sessions")),

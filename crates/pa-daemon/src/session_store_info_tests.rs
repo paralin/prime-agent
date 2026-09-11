@@ -156,6 +156,7 @@ fn legacy_read_session_info(path: &Path) -> Option<SessionInfo> {
         .map(crate::util::iso_from_unix_ms)
         .unwrap_or_default();
     Some(SessionInfo {
+        origin: None,
         path: path.to_path_buf(),
         id: header.id,
         cwd: header.cwd,
@@ -596,6 +597,7 @@ fn a_symlinked_lease_release_persists_a_sidecar_the_next_read_serves() {
     let mut other_version = valid.clone();
     other_version["version"] = json!(valid["version"].as_u64().unwrap() + 1);
     let served = SessionInfo {
+        origin: None,
         name: Some("from the sidecar".to_string()),
         ..cold.clone()
     };

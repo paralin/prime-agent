@@ -258,6 +258,7 @@ async fn the_roundtrip_reentry_renders_the_same_transcript() {
 
     // The agents view anchored on the session just left: Enter opens it.
     let view_options = AgentsViewOptions {
+            show_cli_sessions: false,
         socket_path: supervisor.socket.clone(),
         cwd: dir.path().to_path_buf(),
         session_dir: Some(session_dir.clone()),
@@ -414,6 +415,7 @@ async fn a_post_turn_sojourn_reentry_still_serves_the_held_packs() {
 
     // The agents view anchored on the session just left: Enter opens it.
     let view_options = AgentsViewOptions {
+            show_cli_sessions: false,
         socket_path: supervisor.socket.clone(),
         cwd: dir.path().to_path_buf(),
         session_dir: Some(session_dir.clone()),

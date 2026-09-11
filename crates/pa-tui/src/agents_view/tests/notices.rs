@@ -6,6 +6,7 @@ use super::*;
 /// One mode over the given notice (the previous run's failure).
 fn mode_with_notice(notice: &str) -> AgentsViewMode {
     let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            show_cli_sessions: false,
         socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,

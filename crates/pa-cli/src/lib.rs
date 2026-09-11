@@ -308,6 +308,7 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
             telemetry_disabled,
         ),
         session: mode::SessionOptions {
+            show_cli_sessions: parsed.show_cli_sessions,
             continue_recent: parsed.continue_,
             resume_bare: parsed.resume_bare,
             resume: parsed.resume.clone(),

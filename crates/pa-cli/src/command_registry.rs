@@ -87,6 +87,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         "--from <agent>  Identify the sending agent",
         "--steer         Deliver as steering when the agent is busy",
         "--follow-up     Queue the message after the current turn",
+        "--show-cli-sessions Include command-created sessions in the agents view",
         "--json          Print JSON",
     ]),
     CommandSpec::new(

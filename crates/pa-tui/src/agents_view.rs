@@ -64,6 +64,8 @@ use status::{Status, StatusTone};
 /// Options for one agents-view run.
 #[derive(Debug, Clone)]
 pub struct AgentsViewOptions {
+    /// Include command-created transcripts in the saved-session catalog.
+    pub show_cli_sessions: bool,
     pub socket_path: PathBuf,
     pub cwd: PathBuf,
     pub session_dir: Option<PathBuf>,

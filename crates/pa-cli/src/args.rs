@@ -158,6 +158,7 @@ pub struct Args {
     pub disable_rlm_act: bool,
     pub daemon_socket: Option<String>,
     pub no_session: bool,
+    pub show_cli_sessions: bool,
     pub fork: Option<String>,
     pub session_dir: Option<String>,
     pub models: Option<Vec<String>>,
@@ -329,6 +330,7 @@ pub fn parse_args(args: &[String]) -> Args {
                 result.append_system_prompt.push(value);
             }
             "--no-session" => result.no_session = true,
+            "--show-cli-sessions" => result.show_cli_sessions = true,
             "--fork" => result.fork = Some(require_value!(arg)),
             "--session-dir" => result.session_dir = Some(require_value!(arg)),
             "--models" => {

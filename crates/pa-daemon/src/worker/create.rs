@@ -397,6 +397,11 @@ impl Worker {
             }
         };
 
+        if store.entries.is_empty() {
+            if let Some(mode) = payload.get("executionMode").and_then(Value::as_str) {
+                store.header.rest.insert("origin".into(), json!(if mode == "interactive" { "interactive" } else { "cli" }));
+            }
+        }
         // TS main.ts:838-851: the `models` patterns (else settings
         // `enabledModels`) resolve once into the session's scoped list,
         // which `cycle_model` reads. The resolution sits AFTER the store

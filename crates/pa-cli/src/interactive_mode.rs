@@ -192,7 +192,7 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
             let (anchor, notice) = continue_view.map_or((None, None), |view| {
                 (Some(view.session_id), Some(view.notice))
             });
-            run_agents_view_flow(tui_options, anchor, notice).await
+            run_agents_view_flow(tui_options, anchor, notice, options.session.show_cli_sessions).await
         } else {
             let outcome =
                 pa_tui::interactive::run_interactive(tui_options.clone(), UiMode::Terminal).await?;
@@ -205,7 +205,7 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
                 // identity to anchor on; its notice seeds the view's status
                 // line instead.
                 let anchor = (!outcome.session_id.is_empty()).then(|| outcome.session_id.clone());
-                run_agents_view_flow(tui_options, anchor, outcome.agents_view_notice).await
+                run_agents_view_flow(tui_options, anchor, outcome.agents_view_notice, options.session.show_cli_sessions).await
             } else {
                 print_resume_hint(outcome.resume_hint.as_deref());
                 Ok(())
@@ -250,6 +250,7 @@ async fn run_agents_view_flow(
     base: InteractiveOptions,
     anchor: Option<String>,
     notice: Option<String>,
+    show_cli_sessions: bool,
 ) -> Result<()> {
     let mut anchor = anchor;
     // The flow's roster connection (TS `AgentsViewPersistentState.rosterClient`):
@@ -275,6 +276,7 @@ async fn run_agents_view_flow(
     let mut status_message: Option<String> = notice;
     loop {
         let view_options = pa_tui::agents_view::AgentsViewOptions {
+            show_cli_sessions,
             socket_path: base.socket_path.clone(),
             cwd: base.cwd.clone(),
             session_dir: base.session_dir.clone(),

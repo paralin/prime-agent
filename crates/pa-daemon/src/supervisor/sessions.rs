@@ -845,6 +845,7 @@ pub(super) fn saved_session_summary(info: &crate::session_store::SessionInfo) ->
     });
     // TS `summaryForInactiveSession` publishes the header binding: the
     // parent path only when one is recorded (TS's `undefined` is omitted).
+    if let Some(origin) = &info.origin { object.insert("origin".into(), json!(origin)); }
     if let Some(parent) = &info.parent_session_path {
         if let Some(object) = row.as_object_mut() {
             object.insert("parentSessionPath".to_string(), json!(parent));

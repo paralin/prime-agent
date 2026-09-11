@@ -231,6 +231,7 @@ async fn search_matches_names_ids_and_cwd_never_transcripts() {
     );
 
     let options = AgentsViewOptions {
+            show_cli_sessions: false,
         socket_path: supervisor.socket.clone(),
         cwd: dir.path().to_path_buf(),
         session_dir: Some(session_dir.clone()),
@@ -384,6 +385,7 @@ async fn ranked_hits_sort_by_relevance_then_recency() {
     );
 
     let options = AgentsViewOptions {
+            show_cli_sessions: false,
         socket_path: supervisor.socket.clone(),
         cwd: dir.path().to_path_buf(),
         session_dir: Some(session_dir.clone()),

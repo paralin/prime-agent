@@ -47,16 +47,17 @@ pub(crate) async fn execute_scratch_handoff(
 ) -> anyhow::Result<CompactOutcome> {
     let started = Instant::now();
     pa_agent::abort::throw_if_aborted_signal(abort)?;
-    let (path, history, create) = {
+    let (path, history, create, checkpoint_cwd) = {
         let mut store = session.session.lock().await;
         let branch: Vec<_> = store
             .get_branch(None)
             .into_iter()
             .map(serde_json::to_value)
             .collect::<Result<_, _>>()?;
+        let checkpoint_cwd = store.get_header().map(|header| std::path::PathBuf::from(&header.cwd)).filter(|cwd| !cwd.as_os_str().is_empty()).unwrap_or_else(|| settings.cwd.clone());
         let prior = latest_persisted_scratch_handoff_path(&branch);
         let path = resolve_scratch_handoff_path(
-            &settings.cwd,
+            &checkpoint_cwd,
             Some(&settings.root_dir),
             store.get_session_id(),
             None,
@@ -71,9 +72,9 @@ pub(crate) async fn execute_scratch_handoff(
                 Some(json!({"path":path.display_path})),
             )?;
         }
-        (path, history, create)
+        (path, history, create, checkpoint_cwd)
     };
-    let scratch = super::kernel::ScratchKernel::install(&session.agent, &settings.cwd, &path.absolute_path).await?;
+    let scratch = super::kernel::ScratchKernel::install(&session.agent, &checkpoint_cwd, &path.absolute_path).await?;
     let prompt = format!(
         "{}\n\n{}\n\n{}",
         render_scratch_handoff_closeout_message(&path.display_path, create),

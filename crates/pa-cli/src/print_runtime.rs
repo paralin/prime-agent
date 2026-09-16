@@ -606,7 +606,7 @@ async fn build_headless_engine_with(
             agent_dir: config.agent_dir.clone(),
             mcp_manager: Some(mcp_manager),
             model: Some(agent_model),
-            thinking_level: Some(role_models.as_ref().and_then(|candidates| candidates[0].thinking_level).filter(|_| config.thinking.is_none()).map(map_thinking_level).unwrap_or_else(|| resolve_thinking_level(config, &model))),
+            thinking_level: Some(role_models.as_ref().and_then(|candidates| candidates[0].thinking_level).filter(|_| config.thinking.is_none()).unwrap_or_else(|| resolve_thinking_level(config, &model))),
             stream_fn: Some(stream_fn),
             tools: builtin_tools(&config.cwd),
             custom_system_prompt: config.system_prompt.clone(),

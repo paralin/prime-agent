@@ -53,7 +53,7 @@ impl SessionManager {
         }
     }
 
-    fn try_rewrite_file(&mut self) -> std::io::Result<()> {
+    pub(super) fn try_rewrite_file(&mut self) -> std::io::Result<()> {
         assert!(
             self.window.is_none(),
             "hydrate full session history before this operation"

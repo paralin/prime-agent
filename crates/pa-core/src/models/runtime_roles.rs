@@ -112,7 +112,7 @@ pub fn resolve_cli_role(provider: Option<&str>, selector: &str, registry: &super
     let candidates = resolve_rlm_role_candidates(selector.trim_start_matches('@'), roles)?;
     if candidates[0].runtime != RlmRuntimeKind::Native { bail!("Model role \"{selector}\" requires the Claude Code subagent runtime"); }
     let models: Vec<_> = candidates.into_iter().filter_map(|candidate| {
-        super::find_exact_model_reference_match(&candidate.model_reference, registry.get_all()).map(|model| super::ScopedModel { model: model.clone(), thinking_level: candidate.thinking_level })
+        super::find_exact_model_reference_match(&candidate.model_reference, registry.get_all()).map(|model| super::ScopedModel { model: model.clone(), thinking_level: candidate.thinking_level.map(|level| serde_json::from_value(serde_json::json!(level)).expect("matching thinking level vocabulary")) })
     }).collect();
     let first = models.iter().position(|candidate| registry.has_configured_auth(&candidate.model)).with_context(|| format!("Model role \"{selector}\" has no available candidates"))?;
     Ok(models.into_iter().skip(first).collect())

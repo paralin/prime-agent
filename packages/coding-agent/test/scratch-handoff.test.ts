@@ -113,10 +113,10 @@ describe("scratch handoff messages", () => {
 	});
 	it("uses the exact first and later closeout prompts", () => {
 		expect(renderScratchHandoffCloseoutMessage("agent/x.org", true)).toBe(
-			"Stop working for now; please create a .org file brain-dump of your ongoing work to agent/x.org, use org-todo structure including TODO subheadings, subheadings of subheadings, TODOs on nested subheadings, and so on. It should be detailed enough to hand off this work to a colleague. The file is the handoff itself: a colleague receives it immediately after this turn and continues the work from it, so keep stop, closeout, or end-of-turn instructions out of the file.",
+			"Stop working for now; please create a .org file brain-dump of your ongoing work to agent/x.org, use org-todo structure including TODO subheadings, subheadings of subheadings, TODOs on nested subheadings, and so on. Do not think through the task any further: write immediately from what you already know. The file is a snapshot of your mind on this task — current progress, where things stand, and the thinking and planning done on next steps — so elide outdated or superseded thinking rather than preserving it. It should be detailed enough to hand off this work to a colleague. The file is the handoff itself: a colleague receives it immediately after this turn and continues the work from it, so keep stop, closeout, or end-of-turn instructions out of the file.",
 		);
 		expect(renderScratchHandoffCloseoutMessage("agent/x.org", false)).toBe(
-			"Stop working for now and make any final edits to agent/x.org such that you can hand it to a colleague to continue this work. The file is the handoff itself: a colleague receives it immediately after this turn and continues the work from it, so keep stop, closeout, or end-of-turn instructions out of the file.",
+			"Stop working for now and make any final edits to agent/x.org such that you can hand it to a colleague to continue this work. Do not think through the task any further: write immediately from what you already know. The file is a snapshot of your mind on this task — current progress, where things stand, and the thinking and planning done on next steps — so elide outdated or superseded thinking rather than preserving it. The file is the handoff itself: a colleague receives it immediately after this turn and continues the work from it, so keep stop, closeout, or end-of-turn instructions out of the file.",
 		);
 	});
 

@@ -113,10 +113,10 @@ describe("scratch handoff messages", () => {
 	});
 	it("uses the exact first and later closeout prompts", () => {
 		expect(renderScratchHandoffCloseoutMessage("agent/x.org", true)).toBe(
-			"Stop working for now; please create a .org file brain-dump of your ongoing work to agent/x.org, use org-todo structure including TODO subheadings, subheadings of subheadings, TODOs on nested subheadings, and so on. It should be detailed enough to hand off this work to a colleague.",
+			"Stop working for now; please create a .org file brain-dump of your ongoing work to agent/x.org, use org-todo structure including TODO subheadings, subheadings of subheadings, TODOs on nested subheadings, and so on. It should be detailed enough to hand off this work to a colleague. The file is the handoff itself: a colleague receives it immediately after this turn and continues the work from it, so keep stop, closeout, or end-of-turn instructions out of the file.",
 		);
 		expect(renderScratchHandoffCloseoutMessage("agent/x.org", false)).toBe(
-			"Stop working for now and make any final edits to agent/x.org such that you can hand it to a colleague to continue this work.",
+			"Stop working for now and make any final edits to agent/x.org such that you can hand it to a colleague to continue this work. The file is the handoff itself: a colleague receives it immediately after this turn and continues the work from it, so keep stop, closeout, or end-of-turn instructions out of the file.",
 		);
 	});
 

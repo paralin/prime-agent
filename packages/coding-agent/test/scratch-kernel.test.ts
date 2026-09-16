@@ -66,6 +66,20 @@ describe.skipIf(!python)("scratch closeout kernel (real runtime)", () => {
 		expect(existsSync(resolve(harness.tempDir, "forbidden"))).toBe(false);
 	}, 30_000);
 
+	it("permits harmless display calls alongside scratch calls", async () => {
+		useRuntime();
+		harness = await createHarness({ tools: [] });
+		const path = resolve(harness.tempDir, "scratch/checkpoint.org");
+		scratch = new ScratchKernel(harness.tempDir, path);
+		const execute = (code: string) => scratch!.tool.execute("scratch", { code });
+		expect(await execute('scratch_write("* TODO Active task\\n")\nprint("saved")\nlen("abc")')).toMatchObject({
+			isError: false,
+		});
+		expect((await execute("print(scratch_read())")).content).toEqual([
+			expect.objectContaining({ type: "text", text: expect.stringContaining("* TODO Active task") }),
+		]);
+	}, 30_000);
+
 	it.each(["success", "failure", "cancelled"])(
 		"restores the same working kernel after closeout %s",
 		async (outcome) => {

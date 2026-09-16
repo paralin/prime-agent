@@ -212,6 +212,72 @@ describe("scratch handoff compaction", () => {
 		}
 	});
 
+	it("resolves the checkpoint against the session header cwd when the live cwd differs", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-scratch-header-cwd-"));
+		const otherDir = mkdtempSync(join(tmpdir(), "pi-scratch-live-cwd-"));
+		const faux = registerFauxProvider();
+		try {
+			const rootDir = "agent";
+			let expectedPath = "";
+			let closeoutCalls = 0;
+			faux.setResponses([
+				fauxAssistantMessage("work before the boundary"),
+				() => {
+					closeoutCalls++;
+					mkdirSync(dirname(expectedPath), { recursive: true });
+					writeFileSync(expectedPath, "* TODO Continue from the header cwd checkpoint\n");
+					return fauxAssistantMessage("checkpoint written");
+				},
+			]);
+			const authStorage = AuthStorage.inMemory();
+			authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
+			const settingsManager = SettingsManager.inMemory();
+			settingsManager.applyOverrides({
+				compaction: { enabled: true, strategy: "scratch-handoff" },
+				scratchHandoff: { enabled: true, rootDir },
+			});
+			const { session } = await createAgentSession({
+				model: faux.getModel(),
+				sessionManager: createTestSessionManager(tempDir),
+				settingsManager,
+				resourceLoader: createTestResourceLoader(),
+				authStorage,
+				modelRegistry: ModelRegistry.inMemory(authStorage),
+				noTools: "all",
+				cwd: otherDir,
+			});
+			const resolved = resolveScratchHandoffPath({
+				cwd: tempDir,
+				rootDir,
+				sessionId: session.sessionId,
+			});
+			expectedPath = resolved.absolutePath;
+			const driftedPath = resolveScratchHandoffPath({
+				cwd: otherDir,
+				rootDir,
+				sessionId: session.sessionId,
+			}).absolutePath;
+
+			await session.prompt("do work before the boundary");
+			await session.prompt("/compact");
+			await session.waitForIdle();
+
+			expect(closeoutCalls).toBe(1);
+			expect(existsSync(expectedPath)).toBe(true);
+			expect(existsSync(driftedPath)).toBe(false);
+			assertContinuation(
+				session.agent.state.messages,
+				resolved.displayPath,
+				"* TODO Continue from the header cwd checkpoint",
+			);
+			await session.disposeAsync();
+		} finally {
+			faux.unregister();
+			rmSync(tempDir, { recursive: true, force: true });
+			rmSync(otherDir, { recursive: true, force: true });
+		}
+	});
+
 	it("runs scratch closeout through before_agent_start extensions", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-scratch-extension-"));
 		const faux = registerFauxProvider();

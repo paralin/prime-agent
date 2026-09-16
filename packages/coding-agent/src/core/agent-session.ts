@@ -3852,7 +3852,9 @@ export class AgentSession {
 			if (signal?.aborted || context.message.stopReason !== "stop") {
 				return [];
 			}
-			const scratchText = await readScratchHandoffText(resolveToCwd(closeout.displayPath, this._cwd));
+			const scratchText = await readScratchHandoffText(
+				resolveToCwd(closeout.displayPath, this._scratchHandoffCwd()),
+			);
 			if (scratchText || closeout.reminderSent) return [];
 			closeout.reminderSent = true;
 			return [
@@ -8673,13 +8675,24 @@ export class AgentSession {
 		);
 	}
 
+	/**
+	 * The checkpoint's workspace: the session header's cwd, not the live cwd.
+	 * A daemon restart can re-home a recovered session to the reconnecting
+	 * client's cwd; the checkpoint belongs to the workspace where the session
+	 * was created, so resolving against the live cwd would silently split the
+	 * checkpoint across workspaces.
+	 */
+	private _scratchHandoffCwd(): string {
+		return this.sessionManager.getHeader()?.cwd || this._cwd;
+	}
+
 	/** Scratch checkpoint path for this session; persisted read markers pin it. */
 	private _scratchHandoffDisplayPath(): string | undefined {
 		if (!this.settingsManager.getScratchHandoffSettings().enabled) return undefined;
 		const persisted = latestPersistedScratchHandoffPath(this.sessionManager.getBranch());
 		if (persisted) return persisted;
 		return resolveScratchHandoffPath({
-			cwd: this._cwd,
+			cwd: this._scratchHandoffCwd(),
 			rootDir: this.settingsManager.getScratchHandoffSettings().rootDir,
 			sessionId: this.sessionId,
 		}).displayPath;
@@ -8719,7 +8732,7 @@ export class AgentSession {
 		});
 		const previousSystemPrompt = this.agent.state.systemPrompt;
 		const previousTools = this.agent.state.tools;
-		const scratchKernel = new ScratchKernel(this._cwd, displayPath);
+		const scratchKernel = new ScratchKernel(this._scratchHandoffCwd(), displayPath);
 		try {
 			await this.agent.waitForIdle();
 			if (signal.aborted) throw new Error("Compaction cancelled");
@@ -8766,7 +8779,7 @@ export class AgentSession {
 		}
 		let scratchText: string | undefined;
 		try {
-			scratchText = await readScratchHandoffText(resolveToCwd(displayPath, this._cwd));
+			scratchText = await readScratchHandoffText(resolveToCwd(displayPath, this._scratchHandoffCwd()));
 		} catch (error) {
 			this._scratchCloseout = undefined;
 			throw error;

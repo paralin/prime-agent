@@ -202,6 +202,7 @@ impl Supervisor {
         self: &Arc<Self>,
     ) -> anyhow::Result<(Vec<RlmLedgerEdge>, HashMap<PathBuf, PathBuf>)> {
         let ledger = self.rlm_spawn_ledger_for(None).await?;
+        tokio::task::spawn_blocking(move || {
         let edges = ledger.live_edges()?;
         let parent_by_child = edges
             .iter()
@@ -213,6 +214,7 @@ impl Supervisor {
             })
             .collect();
         Ok((edges, parent_by_child))
+        }).await?
     }
 
     /// The deleted-descendant bucket (the spawn ledger's fold keyed by

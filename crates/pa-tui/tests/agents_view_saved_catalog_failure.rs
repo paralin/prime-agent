@@ -197,7 +197,6 @@ fn read_line(reader: &mut BufReader<UnixStream>) -> Option<String> {
 /// One view options set: anchored on a session whose row can only come from
 /// the saved catalog (the roster carries a different live session).
 fn view_options(socket: &std::path::Path) -> AgentsViewOptions {
-            show_cli_sessions: false,
     AgentsViewOptions {
             show_cli_sessions: false,
         socket_path: socket.to_path_buf(),

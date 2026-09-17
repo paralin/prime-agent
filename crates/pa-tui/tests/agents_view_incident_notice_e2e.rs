@@ -238,7 +238,6 @@ fn worker_crash_line() -> String {
 }
 
 fn view_options(socket: &std::path::Path) -> AgentsViewOptions {
-            show_cli_sessions: false,
     AgentsViewOptions {
             show_cli_sessions: false,
         socket_path: socket.to_path_buf(),

@@ -51,7 +51,7 @@ runtime keeps serving. Closing stdin is equivalent to `shutdown`.
   `id` is the cell whose Python execution context performed the write; asyncio
   tasks inherit the spawning cell's id (even after that cell finished). `null`
   for user threads, raw fd writes (`os.write`, C extensions, subprocesses),
-  and anything else without provable ownership — bytes read from the fd pipes
+  and anything else without a cell attribution. Bytes read from the fd pipes
   are never attributed to a cell. A Python-level write ships at most 64 Ki
   characters per frame; a larger write arrives as multiple events in order.
 - `{"event":"result","id":str,"text":str}` — `repr` of the cell's trailing

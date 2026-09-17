@@ -100,7 +100,6 @@ fn write_fixture(dir: &Path, id: &str, name: &str) -> PathBuf {
 }
 
 fn view_options(socket: &Path, session_dir: &Path, notice: Option<String>) -> AgentsViewOptions {
-            show_cli_sessions: false,
     AgentsViewOptions {
             show_cli_sessions: false,
         socket_path: socket.to_path_buf(),

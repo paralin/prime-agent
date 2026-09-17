@@ -199,7 +199,6 @@ fn view_options(
     selected_row_identity: Option<String>,
     selected_key: Option<pa_tui::agents_view::AgentsViewSelectionKey>,
 ) -> AgentsViewOptions {
-            show_cli_sessions: false,
     AgentsViewOptions {
             show_cli_sessions: false,
         socket_path: socket.to_path_buf(),

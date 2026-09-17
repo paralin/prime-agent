@@ -262,7 +262,6 @@ fn read_line(reader: &mut BufReader<UnixStream>) -> Option<String> {
 
 /// One view options set.
 fn view_options(socket: &std::path::Path) -> AgentsViewOptions {
-            show_cli_sessions: false,
     AgentsViewOptions {
             show_cli_sessions: false,
         socket_path: socket.to_path_buf(),

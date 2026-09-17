@@ -46,7 +46,7 @@ pub fn family_mcp_handler<C: AgentMessageController + 'static>(
                         .filter(|version| PROTOCOL_VERSIONS.contains(version))
                         .unwrap_or(PROTOCOL_VERSIONS[0]);
                     json!({"protocolVersion":version, "capabilities":{"tools":{}}, "serverInfo":{"name":"prime","version":"1.0.0"},
-                        "instructions":"Prime Agent owns family coordination. Use these tools only for your parent and siblings; replies correlate with message id and replyTo."})
+                        "instructions":"Prime Agent coordinates the family. Use these tools only for your parent and siblings; replies correlate with message id and replyTo."})
                 }
                 Some("ping") => json!({}),
                 Some("tools/list") => json!({"tools":tool_definitions()}),

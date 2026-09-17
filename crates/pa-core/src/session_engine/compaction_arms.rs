@@ -310,6 +310,7 @@ impl AgentSession {
             let mut outcome =
                 super::scratch_handoff::execute_scratch_handoff(self, settings, abort).await?;
             self.sync_compaction_context(&mut outcome).await?;
+            self.ensure_harness_digest_context().await?;
             return Ok(outcome);
         }
         if let Some(warning) = scratch_route.and_then(|route| route.warning) {

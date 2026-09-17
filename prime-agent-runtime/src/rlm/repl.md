@@ -49,7 +49,7 @@ runtime keeps serving. Closing stdin is equivalent to `shutdown`.
   `id` is the cell whose Python execution context performed the write; asyncio
   tasks inherit the spawning cell's id (even after that cell finished). `null`
   for user threads, raw fd writes (`os.write`, C extensions, subprocesses),
-  and anything else without provable ownership — bytes read from the fd pipes
+  and anything else without a cell attribution. Bytes read from the fd pipes
   are never attributed to a cell.
 - `{"event":"result","id":str,"text":str}` — `repr` of the cell's trailing
   expression when the body ends in an expression whose value is not `None`.

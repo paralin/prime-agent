@@ -60,7 +60,7 @@ export function createClaudeCodeFamilyMcpServer(
 		name: CLAUDE_CODE_MCP_SERVER_NAME,
 		version: "1.0.0",
 		instructions:
-			"Prime Agent owns family coordination. Use these tools only for your parent and siblings; replies correlate with message id and replyTo.",
+			"Prime Agent coordinates the family. Use these tools only for your parent and siblings; replies correlate with message id and replyTo.",
 		alwaysLoad: true,
 		tools: [
 			tool("family_list", "List this Claude child's parent and siblings.", {}, async () =>

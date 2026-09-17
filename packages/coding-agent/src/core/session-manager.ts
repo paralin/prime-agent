@@ -1205,9 +1205,11 @@ interface SessionScanState {
 
 const SESSION_SCAN_RESUME_TAIL_BYTES = 16;
 const NEWLINE_BUFFER = Buffer.from("\n");
-// Memory bound (~tens of MB): LRU whole-state eviction only while over it, so
-// small states never thrash and an evicted file just pays one full rescan.
-const SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES = 100_000;
+// Memory guard (~hundreds of MB at worst): whole-state LRU eviction only while
+// over it. The bound must exceed the catalog's total assistant-usage entries,
+// or every scan pass evicts the largest states and re-parses their whole files
+// on the next pass (measured 3.3s CPU per full catalog rescan).
+const SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES = 1_000_000;
 
 // Session files are append-only between whole-file rewrites, so scans resume
 // from the last consumed byte offset; rewrites are detected by shrink,

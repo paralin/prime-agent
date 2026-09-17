@@ -795,11 +795,13 @@ describe("scratch handoff compaction", () => {
 });
 
 function assertContinuation(
-	messages: readonly { role: string; content?: unknown }[],
+	messages: readonly { role: string; customType?: string; content?: unknown }[],
 	path: string,
 	orgNeedle: string,
 ): void {
-	expect(messages).toHaveLength(1);
+	// A cold boundary refreshes the harness digest after the continuation.
+	const digestCount = messages.at(-1)?.customType === "harness_digest" ? 1 : 0;
+	expect(messages).toHaveLength(1 + digestCount);
 	const message = messages[0];
 	expect(message?.role).toBe("user");
 	const content = message?.content;

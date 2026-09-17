@@ -4,6 +4,8 @@
 
 - Allowed scratch closeout calls to receive keyword arguments, expressions, and computed strings; the closeout kernel now evaluates ordinary Python instead of rejecting non-literal arguments.
 
+- Fixed reopened scratch-compacted sessions missing the harness digest: scratch compaction now refreshes it at the cold boundary like resume and branch changes, keeping live and reopened contexts identical.
+
 - Restored all inactive interactive sessions in the Agents View, hid transcripts created by non-interactive commands by default, and added `agents --show-cli-sessions` to reveal them. Saved-session updates remain batched to keep large catalogs responsive.
 
 - Fixed cross-worker message compatibility checks across divergent daemon schema revisions.

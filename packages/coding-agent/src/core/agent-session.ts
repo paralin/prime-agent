@@ -8813,6 +8813,8 @@ export class AgentSession {
 			this._scratchCloseout = undefined;
 		}
 		this.agent.state.messages = this.buildSessionContext().messages;
+		// Context rebuild = cold boundary: refresh the digest like resume and branch changes.
+		this._ensureHarnessDigestContext();
 
 		await this._notifyKernelStateAfterCompaction();
 		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();

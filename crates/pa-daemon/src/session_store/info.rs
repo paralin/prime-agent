@@ -127,7 +127,8 @@ impl SessionInfoGeneration {
 /// LRU eviction can force a full catalog rescan every refresh, so keep
 /// large families (~2k sessions, 150k usage entries) and growth headroom
 /// resident (session-manager.ts).
-const SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES: usize = 400_000;
+// A memory guard rather than eviction pressure for real warm catalogs.
+const SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES: usize = 1_000_000;
 
 /// The cached-state count ceiling: files with no usage records never trip
 /// the usage budget, so the state count needs its own cap. The cap must

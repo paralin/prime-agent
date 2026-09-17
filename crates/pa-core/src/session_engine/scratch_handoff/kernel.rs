@@ -6,7 +6,7 @@ use crate::kernel::KernelShutdownOptions;
 use crate::tools::ipython::{create_ipython_tool_definition, IpythonToolOptions};
 use crate::session_engine::tool_bridge::ToolDefinitionBridge;
 
-pub(super) const GUIDANCE: &str = "IPython is temporarily connected to a separate scratch-compaction kernel. The working Python kernel and its variables are retained for after compaction but are unavailable here. Only these calls are allowed: scratch_read(), scratch_write(text), and scratch_replace(old, new). They target only the handoff file named in this notice; do not pass a path. Use literal strings (triple-quoted strings are supported), with one or more calls per cell. scratch_replace requires exactly one occurrence of old. Imports, variables, loops, shell commands, RLM, MCP, skills, and other tools are unavailable during closeout. Use the conversation evidence already available; record uncertainties instead of investigating. Save the checkpoint and finish.";
+pub(super) const GUIDANCE: &str = "IPython is temporarily connected to a separate scratch-compaction kernel. The working Python kernel and its variables are retained for after compaction but are unavailable here. Only these calls are available: scratch_read(), scratch_write(text), and scratch_replace(old, new). They target only the handoff file named in this notice; do not pass a path. scratch_replace requires exactly one occurrence of old. Imports, variables, loops, shell commands, RLM, MCP, skills, and other tools are unavailable during closeout. Use the conversation evidence already available; record uncertainties instead of investigating. Save the checkpoint and finish."; do not pass a path. Use literal strings (triple-quoted strings are supported), with one or more calls per cell. scratch_replace requires exactly one occurrence of old. Imports, variables, loops, shell commands, RLM, MCP, skills, and other tools are unavailable during closeout. Use the conversation evidence already available; record uncertainties instead of investigating. Save the checkpoint and finish.";
 
 pub(super) struct ScratchKernel {
     provisioner: Arc<IpythonKernelProvisioner>,
@@ -21,11 +21,6 @@ impl ScratchKernel {
         }));
         let mut tool = create_ipython_tool_definition(&cwd.to_string_lossy(), IpythonToolOptions { provisioner: provisioner.clone(), ui: None });
         tool.description = GUIDANCE.into();
-        let execute = tool.execute.clone();
-        tool.execute = Arc::new(move |id, params, signal, update| {
-            let code = params.get("code").and_then(serde_json::Value::as_str).unwrap_or_default();
-            execute(id, serde_json::json!({"code":format!("_scratch_execute({})", serde_json::to_string(code).expect("string serialization"))}), signal, update)
-        });
         let prior = agent.state().await.tools;
         agent.set_tools(vec![Arc::new(ToolDefinitionBridge::new(tool))]).await;
         Ok(Self { provisioner, restore: Some((agent.clone(), prior)) })

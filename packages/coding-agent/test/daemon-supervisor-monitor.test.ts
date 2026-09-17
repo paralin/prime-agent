@@ -3032,7 +3032,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const family = vi.fn(async () => [root, child, eventOnly, otherCwd]);
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			defaultSessionConfig: { agentDir: "/agent", sessionDir: "/agent/sessions" },
-			rlmSpawnLedger: () => ({ family }),
+			catalog: { family },
 		}) as {
 			mergeSavedSessionsWithRlmFamily(
 				saved: readonly SessionInfo[],

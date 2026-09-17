@@ -5,11 +5,12 @@ import { createRequire } from "node:module";
 import { join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
-import { getPackageDir, isBunBinary } from "../../config.js";
+import { getPackageDir, getSessionsDir, isBunBinary } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
 import { spawnHidden } from "../../utils/child-process.js";
+import { RlmSpawnLedger } from "./rlm-ledger.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
 const DAEMON_CATALOG_START_TIMEOUT_MS = 30_000;
@@ -38,6 +39,8 @@ interface SessionInfoWire extends Omit<SessionInfo, "created" | "modified"> {
 
 type CatalogRequest =
 	| { type: "request"; id: string; command: "list"; cwd?: string; sessionDir?: string }
+	| { type: "request"; id: string; command: "family"; agentDir: string; sessionDir?: string }
+	| { type: "request"; id: string; command: "siblings"; agentDir: string; sessionPath: string; sessionDir?: string }
 	| { type: "request"; id: string; command: "resolve"; selector: string; cwd: string; sessionDir?: string }
 	| { type: "request"; id: string; command: "rename"; sessionPath: string; name: string }
 	| { type: "request"; id: string; command: "delete"; sessionPath: string }
@@ -112,6 +115,8 @@ function isCatalogRequest(value: unknown): value is CatalogRequest {
 		candidate.type === "request" &&
 		typeof candidate.id === "string" &&
 		(candidate.command === "list" ||
+			candidate.command === "family" ||
+			candidate.command === "siblings" ||
 			candidate.command === "resolve" ||
 			candidate.command === "rename" ||
 			candidate.command === "delete" ||
@@ -161,6 +166,26 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 					id: request.id,
 					success: true,
 					data: { sessions: sessions.map(serializeSessionInfo) },
+				});
+				return;
+			}
+			case "family": {
+				const sessions = await catalogFamilyRows(request.agentDir, request.sessionDir);
+				sendCatalogMessage({
+					type: "response",
+					id: request.id,
+					success: true,
+					data: { sessions: sessions.map(serializeSessionInfo) },
+				});
+				return;
+			}
+			case "siblings": {
+				const rows = await catalogSiblingRows(request.agentDir, request.sessionPath, request.sessionDir);
+				sendCatalogMessage({
+					type: "response",
+					id: request.id,
+					success: true,
+					data: { sessions: rows.map(serializeSessionInfo) },
 				});
 				return;
 			}
@@ -254,6 +279,22 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 	}
 }
 
+/**
+ * Family rows for a sessions dir, computed in this subprocess: the ledger
+ * replay plus the per-file transcript scan fan-out stay off the supervisor's
+ * event loop. A pure reader: seeding a missing ledger stays with the writers.
+ */
+async function catalogFamilyRows(agentDir: string, sessionDir?: string): Promise<SessionInfo[]> {
+	const sessions = sessionDir ?? getSessionsDir(agentDir);
+	return await new RlmSpawnLedger(agentDir, sessions).family();
+}
+
+/** Same-parent rows for one session, computed in this subprocess like family(). */
+async function catalogSiblingRows(agentDir: string, sessionPath: string, sessionDir?: string): Promise<SessionInfo[]> {
+	const sessions = sessionDir ?? getSessionsDir(agentDir);
+	return await new RlmSpawnLedger(agentDir, sessions).siblings(sessionPath);
+}
+
 export class DaemonCatalogClient {
 	private child?: ChildProcess;
 	private starting?: Promise<void>;
@@ -287,6 +328,29 @@ export class DaemonCatalogClient {
 			{ type: "request", id: randomUUID(), command: "list", cwd, sessionDir },
 			callbacks,
 		);
+		return data.sessions.map(deserializeSessionInfo);
+	}
+
+	async family(agentDir: string, sessionDir?: string): Promise<SessionInfo[]> {
+		const data = await this.request<{ sessions: SessionInfoWire[] }>({
+			type: "request",
+			id: randomUUID(),
+			command: "family",
+			agentDir,
+			...(sessionDir ? { sessionDir } : {}),
+		});
+		return data.sessions.map(deserializeSessionInfo);
+	}
+
+	async siblings(agentDir: string, sessionPath: string, sessionDir?: string): Promise<SessionInfo[]> {
+		const data = await this.request<{ sessions: SessionInfoWire[] }>({
+			type: "request",
+			id: randomUUID(),
+			command: "siblings",
+			agentDir,
+			sessionPath,
+			...(sessionDir ? { sessionDir } : {}),
+		});
 		return data.sessions.map(deserializeSessionInfo);
 	}
 

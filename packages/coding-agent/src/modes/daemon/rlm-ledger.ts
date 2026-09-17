@@ -368,6 +368,11 @@ export class RlmSpawnLedger {
 		return this.queue.then(() => undefined);
 	}
 
+	/** Runs one no-op through the queue so lazy seeding has happened before callers proceed. */
+	ensureSeeded(): Promise<void> {
+		return this.enqueue(() => undefined);
+	}
+
 	/**
 	 * Replay edges without liveness reconciliation. Deleted edges are filtered
 	 * by default; `includeDeleted` keeps the tombstones (marked with their

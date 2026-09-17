@@ -1088,7 +1088,12 @@ describe("passive descendants in the saved catalog", () => {
 				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: sessionsDir },
 				descriptorDir: join(tempDir, "workers"),
 			}) as unknown as SupervisorLedgerInternals;
-			Object.assign(supervisor.catalog, { list: vi.fn(async () => [parentInfo]) });
+			Object.assign(supervisor.catalog, {
+				list: vi.fn(async () => [parentInfo]),
+				// The supervisor computes family rows in the catalog subprocess; stub it with the
+				// same ledger-backed computation the subprocess performs.
+				family: () => new RlmSpawnLedger(tempDir, sessionsDir).family(),
+			});
 			const ledger = supervisor.rlmSpawnLedger();
 			await ledger.appendSpawn({
 				childId: "sub-11111111",
@@ -1335,6 +1340,12 @@ describe("rlm spawn ledger supervisor wiring", () => {
 				descriptorDir: join(tempDir, "workers"),
 			}) as unknown as SupervisorLedgerInternals;
 			const ledger = supervisor.rlmSpawnLedger();
+			// The supervisor routes sibling reads through the catalog subprocess; stub it with
+			// the same ledger-backed computation the subprocess performs.
+			Object.assign(supervisor.catalog, {
+				siblings: (_agentDir: string, sessionPath: string) =>
+					new RlmSpawnLedger(tempDir, sessionsDir).siblings(sessionPath),
+			});
 			await ledger.appendSpawn({
 				childId: "sub-11111111",
 				parent: parentFile,
@@ -1382,7 +1393,11 @@ describe("rlm spawn ledger supervisor wiring", () => {
 				descriptorDir: join(tempDir, "workers"),
 			}) as unknown as SupervisorLedgerInternals;
 			const rename = vi.fn(async () => {});
-			Object.assign(supervisor.catalog, { rename });
+			Object.assign(supervisor.catalog, {
+				rename,
+				siblings: (_agentDir: string, sessionPath: string) =>
+					new RlmSpawnLedger(tempDir, sessionsDir).siblings(sessionPath),
+			});
 			const ledger = supervisor.rlmSpawnLedger();
 			await ledger.appendSpawn({
 				childId: "sub-11111111",

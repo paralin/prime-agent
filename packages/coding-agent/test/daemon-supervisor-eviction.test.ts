@@ -52,8 +52,14 @@ interface SupervisorInternals {
 	clients: Set<{ id: string; attachedActiveSessionIds: Set<string> }>;
 	idleEvictionFence?: Promise<void>;
 	mutationDrain: { begin(): void; end(): void };
-	catalog: { resolve: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn>; list?: ReturnType<typeof vi.fn> };
-	rlmSpawnLedgerInstance?: { family: ReturnType<typeof vi.fn>; liveEdges: ReturnType<typeof vi.fn> };
+	catalog: {
+		resolve: ReturnType<typeof vi.fn>;
+		stop: ReturnType<typeof vi.fn>;
+		list?: ReturnType<typeof vi.fn>;
+		family: ReturnType<typeof vi.fn>;
+		siblings?: ReturnType<typeof vi.fn>;
+	};
+	rlmSpawnLedgerInstance?: { liveEdges: ReturnType<typeof vi.fn> };
 	updateRestartPhase?: "draining" | "fencing" | "prepared";
 	createOrReuseWorker: ReturnType<typeof vi.fn>;
 	stopWorker: ReturnType<typeof vi.fn>;
@@ -895,11 +901,11 @@ describe("daemon supervisor scheduled-session wake", () => {
 		const root = makeScheduledSessionFile("wake-root");
 		const child = makeScheduledSessionFile("wake-child");
 		armHeartbeat(child.store, "wake-child", child.sessionFile, now - 10 * 60_000);
+		supervisor.catalog.family = vi.fn(async () => [
+			makeSavedInfo(root.sessionFile, "wake-root"),
+			makeSavedInfo(child.sessionFile, "wake-child", { parentSessionPath: root.sessionFile, rlmDepth: 1 }),
+		]);
 		supervisor.rlmSpawnLedgerInstance = {
-			family: vi.fn(async () => [
-				makeSavedInfo(root.sessionFile, "wake-root"),
-				makeSavedInfo(child.sessionFile, "wake-child", { parentSessionPath: root.sessionFile, rlmDepth: 1 }),
-			]),
 			liveEdges: vi.fn(async () => []),
 		};
 		const woken = makeWorker("woken", [
@@ -926,11 +932,11 @@ describe("daemon supervisor scheduled-session wake", () => {
 		const root = makeScheduledSessionFile("covered-mid-root");
 		const mid = makeScheduledSessionFile("covered-mid");
 		armHeartbeat(mid.store, "covered-mid", mid.sessionFile, now - 10 * 60_000);
+		supervisor.catalog.family = vi.fn(async () => [
+			makeSavedInfo(root.sessionFile, "covered-mid-root"),
+			makeSavedInfo(mid.sessionFile, "covered-mid", { parentSessionPath: root.sessionFile, rlmDepth: 1 }),
+		]);
 		supervisor.rlmSpawnLedgerInstance = {
-			family: vi.fn(async () => [
-				makeSavedInfo(root.sessionFile, "covered-mid-root"),
-				makeSavedInfo(mid.sessionFile, "covered-mid", { parentSessionPath: root.sessionFile, rlmDepth: 1 }),
-			]),
 			liveEdges: vi.fn(async () => []),
 		};
 		const resident = makeWorker("mid-worker", []);
@@ -954,11 +960,11 @@ describe("daemon supervisor scheduled-session wake", () => {
 			join(getSessionArtifactPathForFile(corrupt.sessionFile, "corrupt-root"), SESSION_SCHEDULED_JOBS_FILENAME),
 			"{ not json",
 		);
+		supervisor.catalog.family = vi.fn(async () => [
+			makeSavedInfo(healthy.sessionFile, "healthy-root"),
+			makeSavedInfo(corrupt.sessionFile, "corrupt-root"),
+		]);
 		supervisor.rlmSpawnLedgerInstance = {
-			family: vi.fn(async () => [
-				makeSavedInfo(healthy.sessionFile, "healthy-root"),
-				makeSavedInfo(corrupt.sessionFile, "corrupt-root"),
-			]),
 			liveEdges: vi.fn(async () => []),
 		};
 		supervisor.createOrReuseWorker = vi.fn(async () => makeWorker("woken", []));
@@ -979,8 +985,8 @@ describe("daemon supervisor scheduled-session wake", () => {
 		// Real-clock epochs keep nextRunAt in the future so the armed timer never fires mid-test.
 		const armedAt = Date.now();
 		const job = armHeartbeat(store, "armed-root", sessionFile, armedAt);
+		supervisor.catalog.family = vi.fn(async () => [makeSavedInfo(sessionFile, "armed-root")]);
 		supervisor.rlmSpawnLedgerInstance = {
-			family: vi.fn(async () => [makeSavedInfo(sessionFile, "armed-root")]),
 			liveEdges: vi.fn(async () => []),
 		};
 
@@ -1016,8 +1022,8 @@ describe("daemon supervisor scheduled-session wake", () => {
 		supervisor.createOrReuseWorker = vi.fn();
 		const { sessionFile, store } = makeScheduledSessionFile("restart-root");
 		armHeartbeat(store, "restart-root", sessionFile, now - 10 * 60_000);
+		supervisor.catalog.family = vi.fn(async () => [makeSavedInfo(sessionFile, "restart-root")]);
 		supervisor.rlmSpawnLedgerInstance = {
-			family: vi.fn(async () => [makeSavedInfo(sessionFile, "restart-root")]),
 			liveEdges: vi.fn(async () => []),
 		};
 		supervisor.updateRestartPhase = "prepared";
@@ -1048,14 +1054,14 @@ describe("daemon supervisor scheduled-session wake", () => {
 		owned.descriptor.ownerClientId = "owner";
 		owned.descriptor.rootSessionId = "owned-root";
 		owned.descriptor.sessionFile = root.sessionFile;
+		supervisor.catalog.family = vi.fn(async () => [
+			makeSavedInfo(root.sessionFile, "owned-root"),
+			makeSavedInfo(child.sessionFile, "owned-child-real", {
+				parentSessionPath: root.sessionFile,
+				rlmDepth: 1,
+			}),
+		]);
 		supervisor.rlmSpawnLedgerInstance = {
-			family: vi.fn(async () => [
-				makeSavedInfo(root.sessionFile, "owned-root"),
-				makeSavedInfo(child.sessionFile, "owned-child-real", {
-					parentSessionPath: root.sessionFile,
-					rlmDepth: 1,
-				}),
-			]),
 			liveEdges: vi.fn(async () => []),
 		};
 
@@ -1084,11 +1090,11 @@ describe("daemon supervisor scheduled-session wake", () => {
 		const familyGate = new Promise<void>((resolve) => {
 			releaseFamily = resolve;
 		});
+		supervisor.catalog.family = vi.fn(async () => {
+			await familyGate;
+			return [makeSavedInfo(sessionFile, "promoted-root")];
+		});
 		supervisor.rlmSpawnLedgerInstance = {
-			family: vi.fn(async () => {
-				await familyGate;
-				return [makeSavedInfo(sessionFile, "promoted-root")];
-			}),
 			liveEdges: vi.fn(async () => []),
 		};
 		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-promote-"));
@@ -1118,12 +1124,12 @@ describe("daemon supervisor scheduled-session wake", () => {
 			failFamily = reject;
 		});
 		let familyReads = 0;
+		supervisor.catalog.family = vi.fn(async () => {
+			familyReads += 1;
+			if (familyReads === 1) await familyGate;
+			return [makeSavedInfo(sessionFile, "promoted-parked-root")];
+		});
 		supervisor.rlmSpawnLedgerInstance = {
-			family: vi.fn(async () => {
-				familyReads += 1;
-				if (familyReads === 1) await familyGate;
-				return [makeSavedInfo(sessionFile, "promoted-parked-root")];
-			}),
 			liveEdges: vi.fn(async () => []),
 		};
 		mkdirSync(supervisor.descriptorDir, { recursive: true });
@@ -1157,8 +1163,8 @@ describe("daemon supervisor scheduled-session wake", () => {
 		supervisor.createOrReuseWorker = vi.fn();
 		const { sessionFile, store } = makeScheduledSessionFile("failed-cancel-root");
 		armHeartbeat(store, "failed-cancel-root", sessionFile, now - 10 * 60_000);
+		supervisor.catalog.family = vi.fn(async () => [makeSavedInfo(sessionFile, "failed-cancel-root")]);
 		supervisor.rlmSpawnLedgerInstance = {
-			family: vi.fn(async () => [makeSavedInfo(sessionFile, "failed-cancel-root")]),
 			liveEdges: vi.fn(async () => []),
 		};
 		mkdirSync(supervisor.descriptorDir, { recursive: true });
@@ -1216,8 +1222,8 @@ describe("daemon supervisor scheduled-session wake", () => {
 				descriptorDir: workersDir,
 			}) as unknown as SupervisorInternals;
 			supervisor.log = vi.fn();
+			supervisor.catalog.family = vi.fn(async () => [makeSavedInfo(sessionFile, "durable-cancel-root")]);
 			supervisor.rlmSpawnLedgerInstance = {
-				family: vi.fn(async () => [makeSavedInfo(sessionFile, "durable-cancel-root")]),
 				liveEdges: vi.fn(async () => []),
 			};
 			return supervisor;
@@ -1277,8 +1283,8 @@ describe("daemon supervisor scheduled-session wake", () => {
 		supervisor.createOrReuseWorker = vi.fn();
 		const { sessionFile, store } = makeScheduledSessionFile("managed-root");
 		const job = armHeartbeat(store, "managed-root", sessionFile, now - 10 * 60_000);
+		supervisor.catalog.family = vi.fn(async () => [makeSavedInfo(sessionFile, "managed-root")]);
 		supervisor.rlmSpawnLedgerInstance = {
-			family: vi.fn(async () => [makeSavedInfo(sessionFile, "managed-root")]),
 			liveEdges: vi.fn(async () => []),
 		};
 
@@ -1298,8 +1304,8 @@ describe("daemon supervisor scheduled-session wake", () => {
 		const supervisor = makeSupervisor();
 		const { sessionFile, store } = makeScheduledSessionFile("unscoped-root");
 		const job = armHeartbeat(store, "unscoped-root", sessionFile, now);
+		supervisor.catalog.family = vi.fn(async () => [makeSavedInfo(sessionFile, "unscoped-root")]);
 		supervisor.rlmSpawnLedgerInstance = {
-			family: vi.fn(async () => [makeSavedInfo(sessionFile, "unscoped-root")]),
 			liveEdges: vi.fn(async () => []),
 		};
 		const client = { id: "manager", attachedActiveSessionIds: new Set<string>() };
@@ -1326,8 +1332,8 @@ describe("daemon supervisor scheduled-session wake", () => {
 		const supervisor = makeSupervisor();
 		const { sessionFile, store } = makeScheduledSessionFile("reopened-root");
 		armHeartbeat(store, "reopened-root", sessionFile, now);
+		supervisor.catalog.family = vi.fn(async () => [makeSavedInfo(sessionFile, "reopened-root")]);
 		supervisor.rlmSpawnLedgerInstance = {
-			family: vi.fn(async () => [makeSavedInfo(sessionFile, "reopened-root")]),
 			liveEdges: vi.fn(async () => []),
 		};
 		mkdirSync(supervisor.descriptorDir, { recursive: true });

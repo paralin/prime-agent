@@ -853,6 +853,7 @@ export class DaemonSupervisor {
 			}
 			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
 			this.assertSocketLeaseHeld();
+			await this.seedRlmLedger();
 			await this.seedRosterLedger();
 			let adoptionFailure: unknown;
 			let adoptionFailed = false;
@@ -967,7 +968,7 @@ export class DaemonSupervisor {
 				pendingCancelRoots.add(canonicalSessionPath(context.sessionFile));
 			}
 		}
-		const infos = await this.rlmSpawnLedger().family();
+		const infos = await this.rlmFamily();
 		const infoByPath = new Map(infos.map((info) => [canonicalSessionPath(info.path), info] as const));
 		const storeBySessionId = new Map<string, AgentCronJobStore>();
 		const infoBySessionId = new Map<string, SessionInfo>();
@@ -2769,7 +2770,7 @@ export class DaemonSupervisor {
 		if (resolve(sessionDir ?? defaultSessionDir) !== resolve(defaultSessionDir)) return [...saved];
 
 		const byPath = new Map(saved.map((session) => [canonicalSessionPath(session.path), session]));
-		for (const session of await this.rlmSpawnLedger().family()) {
+		for (const session of await this.rlmFamily()) {
 			if ((session.rlmDepth ?? 0) === 0 || !isSessionVisibleInCatalog(session)) continue;
 			if (cwd !== undefined && !sessionInfoMatchesCwd(session, cwd)) continue;
 			byPath.set(canonicalSessionPath(session.path), session);
@@ -4627,6 +4628,25 @@ export class DaemonSupervisor {
 		return this.roster().entriesForWorker(worker.descriptor.workerId);
 	}
 
+	/**
+	 * Seed a missing ledger from the legacy per-parent registries. The catalog
+	 * subprocess reads the ledger without a seed source, so this writer-side
+	 * boot step is the only seeding path.
+	 */
+	private async seedRlmLedger(): Promise<void> {
+		const agentDir = this.rlmLedgerAgentDir();
+		if (!agentDir) return;
+		try {
+			const sessions = this.defaultSessionConfig.sessionDir ?? getSessionsDir(agentDir);
+			const ledger = new RlmSpawnLedger(agentDir, sessions, createRlmLedgerRegistrySeedSource(), (message) =>
+				this.log(message),
+			);
+			await ledger.ensureSeeded();
+		} catch (error) {
+			this.log(`Could not seed the RLM spawn ledger: ${String(error)}`);
+		}
+	}
+
 	private async seedRosterLedger(): Promise<void> {
 		try {
 			const roots = new Set<string>();
@@ -4900,8 +4920,11 @@ export class DaemonSupervisor {
 	}
 
 	/**
-	 * Supervisor-side view of the spawn ledger for this supervisor's sessions
-	 * dir. Workers hold their own instances over the same file; every read
+	 * Supervisor-side handle over the spawn ledger for this supervisor's
+	 * sessions dir: appends plus cheap stat-only edge reads. The per-file
+	 * transcript fan-out behind family()/siblings() runs in the catalog
+	 * subprocess (see rlmFamily/rlmSiblings), not on this event loop.
+	 * Workers hold their own instances over the same file; every read
 	 * re-reads the file, so cross-process freshness is per-operation.
 	 */
 	private rlmSpawnLedger(): RlmSpawnLedger {
@@ -4912,10 +4935,26 @@ export class DaemonSupervisor {
 		this.rlmSpawnLedgerInstance ??= new RlmSpawnLedger(
 			agentDir,
 			this.defaultSessionConfig.sessionDir ?? getSessionsDir(agentDir),
-			createRlmLedgerRegistrySeedSource(),
+			undefined,
 			(message) => this.log(message),
 		);
 		return this.rlmSpawnLedgerInstance;
+	}
+
+	/** Agent dir for ledger requests, or undefined when this daemon has none. */
+	private rlmLedgerAgentDir(): string | undefined {
+		return this.defaultSessionConfig.agentDir;
+	}
+
+	/**
+	 * Family rows for this supervisor's sessions dir, computed in the catalog
+	 * subprocess: topology from the ledger, display fields from the same warm
+	 * scan cache catalog.list already maintains.
+	 */
+	private rlmFamily(): Promise<SessionInfo[]> {
+		const agentDir = this.rlmLedgerAgentDir();
+		if (!agentDir) return Promise.resolve([]);
+		return this.catalog.family(agentDir, this.defaultSessionConfig.sessionDir);
 	}
 
 	/**
@@ -4924,7 +4963,9 @@ export class DaemonSupervisor {
 	 * only need id/path/name/depth/parent.
 	 */
 	private rlmLedgerSiblings(sessionPath: string): Promise<SessionInfo[]> {
-		return this.rlmSpawnLedger().siblings(sessionPath);
+		const agentDir = this.rlmLedgerAgentDir();
+		if (!agentDir) return Promise.resolve([]);
+		return this.catalog.siblings(agentDir, sessionPath, this.defaultSessionConfig.sessionDir);
 	}
 
 	private async savedSessionNameReservationInput(
@@ -7031,7 +7072,7 @@ export class DaemonSupervisor {
 		const store = AgentCronJobStore.forSessionArtifacts();
 		const sessions = [{ sessionId: rootSessionId, sessionFile: rootSessionFile }];
 		const childrenByParent = new Map<string, SessionInfo[]>();
-		for (const info of await this.rlmSpawnLedger().family()) {
+		for (const info of await this.rlmFamily()) {
 			if (!info.parentSessionPath) continue;
 			const key = canonicalSessionPath(info.parentSessionPath);
 			childrenByParent.set(key, [...(childrenByParent.get(key) ?? []), info]);

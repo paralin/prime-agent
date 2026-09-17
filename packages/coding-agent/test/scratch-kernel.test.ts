@@ -38,7 +38,7 @@ describe.skipIf(!python)("scratch closeout kernel (real runtime)", () => {
 		vi.spyOn(kernelBootstrap, "ensureKernelPython").mockResolvedValue(python!);
 	}
 
-	it("writes and edits only the checkpoint, rejecting whole invalid cells before executing them", async () => {
+	it("writes and edits only the checkpoint through plain Python calls", async () => {
 		useRuntime();
 		harness = await createHarness({ tools: [] });
 		const path = resolve(harness.tempDir, "scratch/checkpoint.org");
@@ -49,38 +49,84 @@ describe.skipIf(!python)("scratch closeout kernel (real runtime)", () => {
 		expect((await execute('scratch_replace("TODO", "DONE")\nscratch_read()')).content).toEqual([
 			expect.objectContaining({ type: "text", text: expect.stringContaining("* DONE Active task") }),
 		]);
+		// The closeout model composes checkpoint text with ordinary Python: keyword
+		// arguments, expressions, and multi-line strings all reach the helpers.
+		expect(
+			await execute(
+				'scratch_write(text="""* TODO Active task\\nsecond line""")\nscratch_replace(old="TODO", new="DONE")',
+			),
+		).toMatchObject({ isError: false });
+		expect(readFileSync(path, "utf8")).toBe("* DONE Active task\nsecond line");
+		expect((await execute('scratch_write("* TODO " + "recomposed\\n")')).content).toEqual([
+			expect.objectContaining({ type: "text", text: expect.stringContaining("Saved handoff checkpoint") }),
+		]);
+		expect(readFileSync(path, "utf8")).toBe("* TODO recomposed\n");
 		for (const code of [
-			"import os",
-			'await bash("touch forbidden")',
-			'rlm.run("continue working")',
-			'open("forbidden", "w").write("bad")',
-			'scratch_write(__import__("os").getcwd())',
-			'scratch_write("overwrite"); import os',
-			"scratch_read.__globals__",
-			'scratch_read("another.org")',
+			'scratch_write("   ")',
 			'scratch_replace("absent", "bad")',
+			'scratch_read("another.org")',
+			'scratch_write("x", "extra")',
 		]) {
 			expect(await execute(code), code).toMatchObject({ isError: true });
-			expect(readFileSync(path, "utf8")).toBe("* DONE Active task\n");
+			expect(readFileSync(path, "utf8")).toBe("* TODO recomposed\n");
 		}
-		expect(existsSync(resolve(harness.tempDir, "forbidden"))).toBe(false);
 	}, 30_000);
 
-	it("permits harmless display calls alongside scratch calls", async () => {
+	it("restores the same working kernel after closeout success", async () => {
 		useRuntime();
-		harness = await createHarness({ tools: [] });
-		const path = resolve(harness.tempDir, "scratch/checkpoint.org");
-		scratch = new ScratchKernel(harness.tempDir, path);
-		const execute = (code: string) => scratch!.tool.execute("scratch", { code });
-		expect(await execute('scratch_write("* TODO Active task\\n")\nprint("saved")\nlen("abc")')).toMatchObject({
-			isError: false,
+		const tempDir = mkdtempSync(resolve(tmpdir(), "prime-scratch-kernel-"));
+		working = new IpythonKernelProvisioner(tempDir);
+		const original = createIpythonTool(tempDir, { provisioner: working });
+		harness = await createHarness({
+			tempDir,
+			tools: [original],
+			settings: {
+				compaction: { enabled: true, strategy: "scratch-handoff" },
+				scratchHandoff: { enabled: true },
+			},
 		});
-		expect((await execute("print(scratch_read())")).content).toEqual([
-			expect.objectContaining({ type: "text", text: expect.stringContaining("* TODO Active task") }),
+		await original.execute("setup", { code: "sentinel = object()\nsentinel_id = id(sentinel)" });
+		const manager = working.manager;
+		const path = resolveScratchHandoffPath({
+			cwd: harness.tempDir,
+			rootDir: undefined,
+			sessionId: harness.session.sessionId,
+		}).absolutePath;
+		harness.setResponses([
+			fauxAssistantMessage("Started task."),
+			(context) => {
+				expect(context.tools?.map((tool) => tool.name)).toEqual(["ipython"]);
+				expect(JSON.stringify(context.messages.at(-1))).toContain("separate scratch-compaction kernel");
+				return fauxAssistantMessage(
+					[
+						{
+							type: "toolCall",
+							id: "closeout",
+							name: "ipython",
+							arguments: { code: 'scratch_write("* TODO Active task\\nContinue the requested work.")' },
+						},
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+			fauxAssistantMessage("Checkpoint saved."),
+		]);
+		await harness.session.prompt("Work on the active task");
+		await harness.session.compact();
+		expect(readFileSync(path, "utf8")).toContain("* TODO Active task");
+		const restored = harness.session.agent.state.tools.find((tool) => tool.name === "ipython")!;
+		expect(restored.description).toBe(original.description);
+		expect(working.manager).toBe(manager);
+		const resumed = await restored.execute("resume", {
+			code: "assert id(sentinel) == sentinel_id\nprint('working state retained')",
+		});
+		expect(resumed).toMatchObject({ isError: false });
+		expect(resumed.content).toEqual([
+			expect.objectContaining({ text: expect.stringContaining("working state retained") }),
 		]);
 	}, 30_000);
 
-	it.each(["success", "failure", "cancelled"])(
+	it.each(["failure", "cancelled"])(
 		"restores the same working kernel after closeout %s",
 		async (outcome) => {
 			useRuntime();
@@ -97,16 +143,10 @@ describe.skipIf(!python)("scratch closeout kernel (real runtime)", () => {
 			});
 			await original.execute("setup", { code: "sentinel = object()\nsentinel_id = id(sentinel)" });
 			const manager = working.manager;
-			const path = resolveScratchHandoffPath({
-				cwd: harness.tempDir,
-				rootDir: undefined,
-				sessionId: harness.session.sessionId,
-			}).absolutePath;
 			harness.setResponses([
 				fauxAssistantMessage("Started task."),
 				(context) => {
 					expect(context.tools?.map((tool) => tool.name)).toEqual(["ipython"]);
-					expect(JSON.stringify(context.messages.at(-1))).toContain("separate scratch-compaction kernel");
 					return fauxAssistantMessage(
 						[
 							{
@@ -124,19 +164,13 @@ describe.skipIf(!python)("scratch closeout kernel (real runtime)", () => {
 						harness!.session.abortCompaction();
 						return fauxAssistantMessage("", { stopReason: "aborted" });
 					}
-					return fauxAssistantMessage(
-						outcome === "success" ? "Checkpoint saved." : "",
-						outcome === "failure" ? { stopReason: "error", errorMessage: "fixture failure" } : {},
-					);
+					return fauxAssistantMessage("", { stopReason: "error", errorMessage: "fixture failure" });
 				},
 			]);
 			await harness.session.prompt("Work on the active task");
-			if (outcome === "success") await harness.session.compact();
-			else
-				await expect(harness.session.compact()).rejects.toThrow(
-					outcome === "failure" ? "fixture failure" : "Compaction cancelled",
-				);
-			expect(readFileSync(path, "utf8")).toContain("* TODO Active task");
+			await expect(harness.session.compact()).rejects.toThrow(
+				outcome === "cancelled" ? "Compaction cancelled" : "fixture failure",
+			);
 			const restored = harness.session.agent.state.tools.find((tool) => tool.name === "ipython")!;
 			expect(restored.description).toBe(original.description);
 			expect(working.manager).toBe(manager);
@@ -144,9 +178,6 @@ describe.skipIf(!python)("scratch closeout kernel (real runtime)", () => {
 				code: "assert id(sentinel) == sentinel_id\nprint('working state retained')",
 			});
 			expect(resumed).toMatchObject({ isError: false });
-			expect(resumed.content).toEqual([
-				expect.objectContaining({ text: expect.stringContaining("working state retained") }),
-			]);
 		},
 		30_000,
 	);

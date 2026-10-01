@@ -247,11 +247,13 @@ pub fn open_pidfd(pid: u32) -> Option<i32> {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))
 ))]
+#[must_use]
 pub fn open_pidfd(_pid: u32) -> Option<i32> {
     None
 }
 
 #[cfg(not(unix))]
+#[must_use]
 pub fn open_pidfd(_pid: u32) -> Option<i32> {
     None
 }
@@ -288,11 +290,13 @@ pub fn pidfd_signal(fd: i32, signal: Signal) -> bool {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))
 ))]
+#[must_use]
 pub fn pidfd_signal(_fd: i32, _signal: Signal) -> bool {
     false
 }
 
 #[cfg(not(unix))]
+#[must_use]
 pub fn pidfd_signal(_fd: i32, _signal: Signal) -> bool {
     false
 }

@@ -200,3 +200,11 @@ features = [
     "winerror",
 ]
 optional = true
+
+# The upstream compatibility guards retain legacy dependency cfg names.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(winapi)',
+    'cfg(crossterm_winapi)',
+    'cfg(feature, values("winapi", "crossterm_winapi"))',
+] }

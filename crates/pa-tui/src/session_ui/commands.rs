@@ -57,7 +57,7 @@ impl SessionUi {
         match name.as_str() {
             "help" => {
                 self.note(
-                    "/help           this list\n/list           live sessions\n/switch <n|id>  switch to a session from /list\n/new            start a new session\n/exit           detach and exit",
+                    "/help           this list\n/list           live sessions\n/switch [search] choose a model for this session\n/new            start a new session\n/exit           detach and exit",
                     view,
                 );
                 return Ok(());
@@ -68,13 +68,6 @@ impl SessionUi {
             }
             "watches" => {
                 self.open_watches_panel(view);
-            }
-            "switch" => {
-                if args.is_empty() {
-                    self.note("usage: /switch <n|id> (run /list first)", view);
-                } else {
-                    self.switch_to(&args, view).await?;
-                }
                 return Ok(());
             }
             "exit" => {
@@ -174,6 +167,28 @@ impl SessionUi {
                     self.exit_requested = true;
                 } else {
                     match self.resolve_resume_selector(&resolved.args) {
+                        Some(crate::interactive::SessionSelection::Attach(id)) => {
+                            if id != self.active_session_id {
+                                if let Some(draft) =
+                                    self.snapshot_prompt_stash(view, /*restore_on_open*/ true)
+                                {
+                                    self.prompt_stash
+                                        .lock()
+                                        .expect("prompt stash store poisoned")
+                                        .for_session(&self.stash_session_id)
+                                        .stash_draft_head(draft);
+                                    view.editor.set_text("");
+                                }
+                                self.attach_session(&id, super::DockFold::FirstFrame)
+                                    .await?;
+                                self.refresh_stats().await;
+                                self.rebuild_view(view, &super::RebuildKind::Rebind);
+                                self.note(&format!("switched to session {id}"), view);
+                                self.restore_prompt_stash_if_editor_empty(
+                                    view, /*auto_restore_only*/ true,
+                                );
+                            }
+                        }
                         Some(selection) => {
                             self.pending_selection = Some(selection);
                             self.exit_requested = true;
@@ -187,20 +202,10 @@ impl SessionUi {
                     }
                 }
             }
-            // `/model` opens the model picker (menu-only: the TS
-            // `handleModelCommand` inline-arg form — an exact match applies
-            // directly, anything else prefills the search — is deliberately
-            // removed; a partial + Tab opens the picker filtered instead,
-            // and a submitted argument is the usage error).
-            "model" => {
-                self.track_command_used("model");
-                if !resolved.args.trim().is_empty() {
-                    view.editor
-                        .set_text(&format!("/{} {}", resolved.original_name, resolved.args));
-                    self.error_row("Usage: /model (Tab filters the picker)", view);
-                    return Ok(());
-                }
-                self.open_model_picker(view, "").await?;
+            "model" | "switch" => {
+                self.track_command_used(resolved.name);
+                self.model_persist_default = resolved.name == "model";
+                self.open_model_picker(view, resolved.args.trim()).await?;
                 self.track_menu_opened("model", "command");
                 self.track_feature_outcome("model", "initiated", None);
             }

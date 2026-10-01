@@ -208,6 +208,27 @@ impl TurnBoundary {
         api_key: Option<String>,
         global_harness_dir: PathBuf,
     ) -> Result<(), String> {
+        while engine
+            .session
+            .advance_cli_role_candidate()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            if let Some(target) = engine.session.cli_role_target() {
+                engine.update_model_facts(&target.model);
+            }
+            engine
+                .session
+                .agent()
+                .continue_run()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let role_target = engine.session.cli_role_target();
+        let model = role_target.as_ref().map_or(model, |target| &target.model);
+        let api_key = role_target
+            .as_ref()
+            .map_or(api_key, |target| target.api_key.clone());
         if engine
             .session
             .recover_reasoning_exhaustion(model, api_key.clone())

@@ -45,18 +45,27 @@ pub fn read_piped_stdin(idle_timeout_ms: u64) -> Option<String> {
     }
     #[cfg(unix)]
     {
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // fstat initializes this buffer on success and does not consume stdin.
-        if unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) } != 0 { return None; }
-        let mode = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
-        if mode != libc::S_IFIFO && mode != libc::S_IFREG { return None; }
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::FileTypeExt;
+        // Borrow fd 0 for metadata; ManuallyDrop keeps process stdin open.
+        let stdin = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
+        if !stdin
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() || metadata.file_type().is_fifo())
+        {
+            return None;
+        }
     }
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_DISK, FILE_TYPE_PIPE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileType, FILE_TYPE_DISK, FILE_TYPE_PIPE,
+        };
         let kind = unsafe { GetFileType(std::io::stdin().as_raw_handle()) };
-        if kind != FILE_TYPE_DISK && kind != FILE_TYPE_PIPE { return None; }
+        if kind != FILE_TYPE_DISK && kind != FILE_TYPE_PIPE {
+            return None;
+        }
     }
     let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {

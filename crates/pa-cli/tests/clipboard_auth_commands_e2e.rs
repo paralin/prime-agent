@@ -66,38 +66,29 @@ fn kill_worker(pid: u32) {
 }
 
 fn process_alive(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        let rest = stat
-            .rsplit_once(')')
-            .map(|(_, rest)| rest)
-            .unwrap_or_default();
-        !rest.starts_with('Z')
-    })
+    Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|output| {
+            let state = String::from_utf8_lossy(&output.stdout);
+            !state.trim().is_empty() && !state.trim().starts_with('Z')
+        })
 }
 
-fn child_pids_of(ppid: u32) -> Vec<u32> {
-    let mut pids = Vec::new();
-    let entries = std::fs::read_dir("/proc").expect("read /proc");
-    for entry in entries.flatten() {
-        let Ok(entry_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{entry_pid}/stat")) else {
-            continue;
-        };
-        let Some((_, rest)) = stat.rsplit_once(')') else {
-            continue;
-        };
-        let mut fields = rest.split_whitespace();
-        fields.next(); // process state
-        let Ok(parent) = fields.next().unwrap_or_default().parse::<u32>() else {
-            continue;
-        };
-        if parent == ppid {
-            pids.push(entry_pid);
-        }
-    }
-    pids
+fn child_pids_of(supervisor_pid: u32) -> Vec<u32> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .expect("read process table");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace();
+            let pid = columns.next()?.parse().ok()?;
+            let parent: u32 = columns.next()?.parse().ok()?;
+            (parent == supervisor_pid).then_some(pid)
+        })
+        .collect()
 }
 
 fn graceful_shutdown(socket: &Path) {

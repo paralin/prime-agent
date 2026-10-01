@@ -318,6 +318,16 @@ impl Worker {
                     parent_session_path.as_deref(),
                     rlm_depth.unwrap_or(0),
                 );
+                if let Some(mode) = payload.get("executionMode").and_then(Value::as_str) {
+                    created.header.rest.insert(
+                        "origin".into(),
+                        json!(if mode == "interactive" {
+                            "interactive"
+                        } else {
+                            "cli"
+                        }),
+                    );
+                }
                 created.set_path(path.clone());
                 let acquired = {
                     let path = path.clone();
@@ -356,6 +366,16 @@ impl Worker {
                     rlm_depth.unwrap_or(0),
                 );
                 let path = session_dir.join(session_file_name(created.session_id()));
+                if let Some(mode) = payload.get("executionMode").and_then(Value::as_str) {
+                    created.header.rest.insert(
+                        "origin".into(),
+                        json!(if mode == "interactive" {
+                            "interactive"
+                        } else {
+                            "cli"
+                        }),
+                    );
+                }
                 created.set_path(path.clone());
                 let acquired = {
                     let path = path.clone();
@@ -399,7 +419,14 @@ impl Worker {
 
         if store.entries.is_empty() {
             if let Some(mode) = payload.get("executionMode").and_then(Value::as_str) {
-                store.header.rest.insert("origin".into(), json!(if mode == "interactive" { "interactive" } else { "cli" }));
+                store.header.rest.insert(
+                    "origin".into(),
+                    json!(if mode == "interactive" {
+                        "interactive"
+                    } else {
+                        "cli"
+                    }),
+                );
             }
         }
         // TS main.ts:838-851: the `models` patterns (else settings

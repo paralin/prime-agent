@@ -641,7 +641,12 @@ impl SessionScanState {
             .map(crate::util::iso_from_unix_ms)
             .unwrap_or_default();
         Some(SessionInfo {
-            origin: header.rest.get("origin").and_then(Value::as_str).filter(|origin| matches!(*origin, "interactive" | "cli")).map(str::to_string),
+            origin: header
+                .rest
+                .get("origin")
+                .and_then(Value::as_str)
+                .filter(|origin| matches!(*origin, "interactive" | "cli"))
+                .map(str::to_string),
             path: path.to_path_buf(),
             id: header.id.clone(),
             cwd: header.cwd.clone(),

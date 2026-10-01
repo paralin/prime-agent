@@ -216,7 +216,9 @@ pub fn custom_message_entries(message: &Value) -> Vec<ChatEntry> {
         ASYNC_BASH_COMPLETION_CUSTOM_TYPE => vec![ChatEntry::ShellCompletion(Box::new(
             shell_completion_row(message, details),
         ))],
-        HEARTBEAT_PROMPT_CUSTOM_TYPE
+        "scratch-handoff-read"
+        | "reasoning_output_nudge"
+        | HEARTBEAT_PROMPT_CUSTOM_TYPE
         | GOAL_CONTEXT_CUSTOM_TYPE
         | IPYTHON_STATE_RESTORED_CUSTOM_TYPE
         | PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE

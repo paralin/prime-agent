@@ -198,7 +198,7 @@ fn read_line(reader: &mut BufReader<UnixStream>) -> Option<String> {
 /// the saved catalog (the roster carries a different live session).
 fn view_options(socket: &std::path::Path) -> AgentsViewOptions {
     AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: socket.to_path_buf(),
         cwd: PathBuf::from("/tmp"),
         session_dir: Some(PathBuf::from("/tmp/none-such-sessions")),

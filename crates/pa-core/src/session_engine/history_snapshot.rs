@@ -119,6 +119,13 @@ pub fn serialize_session_history(entries: &[Value]) -> String {
                         if matches!(message["stopReason"].as_str(), Some("error" | "aborted")) {
                             continue;
                         }
+                        if serde_json::from_value::<pa_types::ai::AssistantMessage>(message.clone())
+                            .is_ok_and(|message| {
+                                pa_ai::utils::diagnostics::is_reasoning_exhausted_response(&message)
+                            })
+                        {
+                            continue;
+                        }
                         let mut blocks = Vec::new();
                         for block in message["content"].as_array().into_iter().flatten() {
                             match block["type"].as_str() {
@@ -410,7 +417,7 @@ mod tests {
         assert_eq!(layout.pages.join("").find('Y'), Some(128));
         let snapshot = build_history_snapshot(&"x".repeat(100_000), 1).unwrap();
         assert!(snapshot.truncated);
-        assert!(snapshot.text.contains("characters elided"));
+        assert_eq!(snapshot.text, "x".repeat(100_000));
         assert_eq!(snapshot.images.len(), 8);
     }
 

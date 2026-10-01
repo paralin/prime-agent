@@ -19,7 +19,9 @@ use crate::session_engine::{compaction, provider_adapter, AgentSession};
 
 struct CloseoutGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
 impl Drop for CloseoutGuard {
-    fn drop(&mut self) { self.0.store(false, std::sync::atomic::Ordering::Release); }
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 fn local_date() -> anyhow::Result<String> {
@@ -40,6 +42,7 @@ fn local_date() -> anyhow::Result<String> {
     ))
 }
 
+#[tracing::instrument(skip_all)]
 pub(crate) async fn execute_scratch_handoff(
     session: &AgentSession,
     settings: &ScratchHandoffRuntimeSettings,
@@ -54,7 +57,11 @@ pub(crate) async fn execute_scratch_handoff(
             .into_iter()
             .map(serde_json::to_value)
             .collect::<Result<_, _>>()?;
-        let checkpoint_cwd = store.get_header().map(|header| std::path::PathBuf::from(&header.cwd)).filter(|cwd| !cwd.as_os_str().is_empty()).unwrap_or_else(|| settings.cwd.clone());
+        let checkpoint_cwd = store
+            .get_header()
+            .map(|header| std::path::PathBuf::from(&header.cwd))
+            .filter(|cwd| !cwd.as_os_str().is_empty())
+            .unwrap_or_else(|| settings.cwd.clone());
         let prior = latest_persisted_scratch_handoff_path(&branch);
         let path = resolve_scratch_handoff_path(
             &checkpoint_cwd,
@@ -74,7 +81,9 @@ pub(crate) async fn execute_scratch_handoff(
         }
         (path, history, create, checkpoint_cwd)
     };
-    let scratch = super::kernel::ScratchKernel::install(&session.agent, &checkpoint_cwd, &path.absolute_path).await?;
+    let scratch =
+        super::kernel::ScratchKernel::install(&session.agent, &checkpoint_cwd, &path.absolute_path)
+            .await?;
     let prompt = format!(
         "{}\n\n{}\n\n{}",
         render_scratch_handoff_closeout_message(&path.display_path, create),
@@ -86,27 +95,34 @@ pub(crate) async fn execute_scratch_handoff(
         payload: json!({"customType":SCRATCH_HANDOFF_CLOSEOUT_CUSTOM_TYPE,"content":prompt,"display":true,
             "details":{"path":path.display_path,"phase":if create {"create"} else {"update"}},"timestamp":super::super::now_millis()}),
     });
-    session.scratch_closeout_active.store(true, std::sync::atomic::Ordering::Release);
+    session
+        .scratch_closeout_active
+        .store(true, std::sync::atomic::Ordering::Release);
     let _closeout_guard = CloseoutGuard(session.scratch_closeout_active.clone());
     let _suppression = session.agent.suppress_continuations();
-    let closeout = session
-        .agent
-        .prompt(AgentPromptInput::Messages(vec![message]));
-    tokio::pin!(closeout);
-    if let Some(abort) = abort {
-        tokio::select! {
-            biased;
-            () = abort.aborted() => {
-                session.agent.abort();
-                let _ = closeout.await;
-                return Err(pa_agent::abort::aborted_error());
+    let closeout_result = async {
+        let closeout = session
+            .agent
+            .prompt(AgentPromptInput::Messages(vec![message]));
+        tokio::pin!(closeout);
+        if let Some(abort) = abort {
+            tokio::select! {
+                biased;
+                () = abort.aborted() => {
+                    session.agent.abort();
+                    let _ = closeout.await;
+                    return Err(pa_agent::abort::aborted_error());
+                }
+                result = &mut closeout => result?,
             }
-            result = &mut closeout => result?,
+        } else {
+            closeout.await?;
         }
-    } else {
-        closeout.await?;
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
     scratch.finish().await;
+    closeout_result?;
     pa_agent::abort::throw_if_aborted_signal(abort)?;
     let state = session.agent.state().await;
     let final_assistant = state

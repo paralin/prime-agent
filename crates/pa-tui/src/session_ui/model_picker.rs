@@ -332,7 +332,12 @@ impl SessionUi {
                     active_session_id: self.active_session_id.clone(),
                     provider: provider.to_string(),
                     model_id: model_id.to_string(),
-                    rest: Map::default(),
+                    rest: [(
+                        "persistDefault".into(),
+                        serde_json::json!(self.model_persist_default),
+                    )]
+                    .into_iter()
+                    .collect(),
                 },
             )
             .await;
@@ -340,8 +345,10 @@ impl SessionUi {
             Ok(_) => {
                 // The create path's runtime config carries the picked model,
                 // so `/new` sessions start on it too (TS settings default).
-                self.model_selection.provider = Some(provider.to_string());
-                self.model_selection.model = Some(model_id.to_string());
+                if self.model_persist_default {
+                    self.model_selection.provider = Some(provider.to_string());
+                    self.model_selection.model = Some(model_id.to_string());
+                }
                 self.refresh_model_label(provider, model_id, view).await;
                 self.note(&format!("Model: {model_id}"), view);
                 self.maybe_warn_anthropic_subscription_auth_if_subscribed(Some(provider), view)

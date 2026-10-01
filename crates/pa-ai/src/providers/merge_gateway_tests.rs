@@ -55,7 +55,7 @@ fn gateway_catalog_and_credentials_match_the_provider_contract() {
 }
 
 #[tokio::test]
-async fn selected_effort_sends_budget_and_exact_affinity_headers() {
+async fn selected_effort_and_exact_affinity_headers_survive_budget_preferences() {
     for (reasoning, budget, effort) in [
         (ModelThinkingLevel::Low, 1024, "low"),
         (ModelThinkingLevel::High, 4096, "high"),
@@ -109,10 +109,7 @@ async fn selected_effort_sends_budget_and_exact_affinity_headers() {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["store"], false);
         assert_eq!(body["reasoning_effort"], effort);
-        assert_eq!(
-            body["thinking"],
-            json!({"type":"enabled","budget_tokens":budget})
-        );
+        assert_eq!(body["include_routing_metadata"], true);
     }
 }
 
@@ -188,13 +185,15 @@ async fn signed_thinking_tools_usage_and_terminal_warnings_survive_streaming() {
     assert_eq!(message.usage.output, 5);
     assert_eq!(message.usage.cache_read, 2);
     assert_eq!(message.usage.total_tokens, 15);
+    let warning = value["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|diagnostic| diagnostic["type"] == "provider_warning")
+        .unwrap();
     assert_eq!(
-        value["diagnostics"][0]["error"]["code"],
-        "reasoning_exhausted"
-    );
-    assert_eq!(
-        value["diagnostics"][0]["details"]["detail"],
-        json!({"model":"glm"})
+        json!({"code":warning["error"]["code"],"detail":warning["details"]["detail"]}),
+        json!({"code":"reasoning_exhausted","detail":{"model":"glm"}})
     );
     let requests = server.requests.lock().unwrap();
     let body = &requests[0].1;

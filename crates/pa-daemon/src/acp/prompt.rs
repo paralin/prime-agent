@@ -237,6 +237,39 @@ async fn run_prompt_turn(
         if boundary.contains_wire(&final_message) {
             break;
         }
+        let recovery = async {
+            if mode.engine.session.advance_cli_role_candidate().await? {
+                return Ok::<_, anyhow::Error>(true);
+            }
+            let (model, api_key) = mode.model_and_api_key().await;
+            if let Some(model) = model {
+                return mode
+                    .engine
+                    .session
+                    .recover_reasoning_exhaustion(&model, api_key)
+                    .await;
+            }
+            Ok(false)
+        }
+        .await;
+        match recovery {
+            Ok(true) => {
+                if let Some(target) = mode.engine.session.cli_role_target() {
+                    mode.engine.update_model_facts(&target.model);
+                }
+                if let Err(error) = mode.engine.session.agent().continue_run().await {
+                    turn_failure = Some(format!("{error:#}"));
+                    break;
+                }
+                mode.engine.session.agent().wait_for_idle().await;
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                turn_failure = Some(format!("{error:#}"));
+                break;
+            }
+        }
         // An aborted turn never services its boundary requests (TS
         // `_checkCompaction`'s abort arm): drop the pending compaction
         // and refine requests, reset the overflow machine, and settle.

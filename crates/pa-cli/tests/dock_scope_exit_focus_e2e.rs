@@ -307,7 +307,7 @@ async fn scope_exit_keeps_the_subagents_item(exit_key: &'static str) {
     // carries `scope_back` (the flag the flow wires into the reopened
     // run's options).
     let view_options = AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: supervisor.socket.clone(),
         cwd: PathBuf::from("/tmp"),
         session_dir: Some(session_dir.clone()),

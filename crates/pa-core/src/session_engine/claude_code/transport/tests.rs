@@ -208,14 +208,19 @@ async fn aborting_transport_task_kills_the_spawned_process_group() {
     )
     .unwrap();
     let pid_path = dir.path().join("pid");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !pid_path.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    let pid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
     task.abort();
     let _ = task.await;
     tokio::time::timeout(Duration::from_secs(5), async {

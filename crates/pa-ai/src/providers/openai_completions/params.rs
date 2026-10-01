@@ -110,6 +110,7 @@ pub(crate) fn build_params(
                         json!({"type":"enabled", "budget_tokens":budget}),
                     );
                 } else if options.reasoning_enabled == Some(false)
+                    && (options.reasoning_effort.is_none() || !compat.supports_reasoning_effort)
                     && !model
                         .thinking_level_map
                         .as_ref()

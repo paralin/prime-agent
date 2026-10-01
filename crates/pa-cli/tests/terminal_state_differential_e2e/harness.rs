@@ -695,7 +695,7 @@ pub(crate) fn child_options(socket: PathBuf) -> InteractiveOptions {
 
 pub(crate) fn view_options(socket: PathBuf, anchor: Option<String>) -> AgentsViewOptions {
     AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: socket,
         cwd: PathBuf::from("/tmp"),
         session_dir: None,

@@ -244,7 +244,7 @@ impl SessionUi {
     /// switch) stash a restore-on-open head (TS `restoreOnOpen`); the
     /// manual `app.prompt.stash` capture does not (TS `handlePromptStash`'s
     /// plain assignment) — that draft returns only on its own key.
-    fn snapshot_prompt_stash(
+    pub(super) fn snapshot_prompt_stash(
         &self,
         view: &AgentView,
         restore_on_open: bool,
@@ -293,31 +293,6 @@ impl SessionUi {
         store
             .for_session(&self.stash_session_id)
             .stash_draft_head(draft);
-    }
-
-    /// The in-place `/switch` capture: the draft belongs to the session
-    /// being left, so it is stashed as that session's restore head and the
-    /// editor clears — the switched-to session starts from an empty prompt
-    /// and the draft returns on a switch back.
-    pub(super) fn stash_draft_for_switch(&mut self, view: &mut AgentView) {
-        let Some(draft) = self.snapshot_prompt_stash(view, true) else {
-            return;
-        };
-        if let Some(telemetry) = self.telemetry.clone() {
-            let had_images = !draft.images.is_empty();
-            tokio::spawn(async move {
-                telemetry.prompt_stash("session_switch", had_images).await;
-            });
-        }
-        let mut store = self
-            .prompt_stash
-            .lock()
-            .expect("prompt stash store poisoned");
-        store
-            .for_session(&self.stash_session_id)
-            .stash_draft_head(draft);
-        view.editor.set_text("");
-        self.dirty = true;
     }
 
     /// TS `restorePromptStashOnOpen`: the opening restore of the session's

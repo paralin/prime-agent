@@ -675,7 +675,10 @@ async fn start_kernel_impl(
         gate().await;
     }
     let snapshot_dir = options.snapshot_dir.clone();
-    let bootstrap_code = options.bootstrap_code.clone().unwrap_or_else(|| build_rlm_bootstrap_code(&options.python_skills));
+    let bootstrap_code = options
+        .bootstrap_code
+        .clone()
+        .unwrap_or_else(|| build_rlm_bootstrap_code(&options.python_skills));
     let mut env = options.env.clone();
     if let Some(shell_path) = &options.shell_path {
         env.insert(

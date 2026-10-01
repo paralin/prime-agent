@@ -575,6 +575,16 @@ impl ActLane {
                 let Some(configuration) = lock(&self.compaction_context).clone() else {
                     break Some(Ok(()));
                 };
+                if retained
+                    .core
+                    .recover_reasoning_exhaustion(&configuration.model, None)
+                    .await?
+                {
+                    if let Err(error) = agent.continue_run().await {
+                        break Some(Err(error));
+                    }
+                    continue;
+                }
                 let state = agent.state().await;
                 let fallback = lock(&self.role_fallback).clone();
                 let failed = state

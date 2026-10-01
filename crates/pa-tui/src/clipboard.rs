@@ -197,6 +197,13 @@ pub(crate) fn copy_to_clipboard(text: &str, sink: &mut OscSink) -> Result<(), St
 }
 
 fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<(), String> {
+    // A headless capture verifies OSC 52 without changing the desktop clipboard.
+    if matches!(sink, OscSink::Buffer(_)) {
+        let sequence = crate::osc52::sequence(text)
+            .ok_or_else(|| "Failed to copy to clipboard".to_string())?;
+        sink.write_sequence(&sequence);
+        return Ok(());
+    }
     let mut copied = false;
     if !copied {
         copied = match std::env::consts::OS {

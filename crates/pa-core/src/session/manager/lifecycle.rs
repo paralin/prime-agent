@@ -256,7 +256,15 @@ impl SessionManager {
             parent_session: Some(source_path.display().to_string()),
             rlm_depth: Some(rlm_depth),
         });
-        if let Some(origin) = source_header.rest.get("origin").and_then(serde_json::Value::as_str) { forked.set_session_origin(origin).map_err(|error| error.to_string())?; }
+        if let Some(origin) = source_header
+            .rest
+            .get("origin")
+            .and_then(serde_json::Value::as_str)
+        {
+            forked
+                .set_session_origin(origin)
+                .map_err(|error| error.to_string())?;
+        }
         let branch = forked_branch_entries(entries);
         // The copied rows' assistant entries keep the append path durable
         // from the first new entry (TS writes the whole fork synchronously):
@@ -404,7 +412,10 @@ impl SessionManager {
     /// Panics when an explicit session id is requested while persisting and
     /// a session file for that id already exists.
     pub fn new_session(&mut self, options: &NewSessionOptions) -> Option<PathBuf> {
-        let origin = self.get_header().and_then(|header| header.rest.get("origin")).cloned();
+        let origin = self
+            .get_header()
+            .and_then(|header| header.rest.get("origin"))
+            .cloned();
         let mut session_id = options.id.clone().unwrap_or_else(create_session_id);
         let mut session_file: Option<PathBuf> = None;
         if self.persist {
@@ -452,7 +463,9 @@ impl SessionManager {
                 parent_session: options.parent_session.clone(),
                 rlm_depth,
                 git,
-                rest: origin.map(|value| [("origin".into(), value)].into_iter().collect()).unwrap_or_default(),
+                rest: origin
+                    .map(|value| [("origin".into(), value)].into_iter().collect())
+                    .unwrap_or_default(),
             },
         };
         self.file_entries = vec![header];
@@ -514,7 +527,12 @@ impl SessionManager {
                         .unwrap_or(0),
                 ),
                 git,
-                rest: previous_header.as_ref().and_then(|header| header.rest.get("origin")).cloned().map(|value| [("origin".into(), value)].into_iter().collect()).unwrap_or_default(),
+                rest: previous_header
+                    .as_ref()
+                    .and_then(|header| header.rest.get("origin"))
+                    .cloned()
+                    .map(|value| [("origin".into(), value)].into_iter().collect())
+                    .unwrap_or_default(),
             },
         };
         let rest = std::mem::take(&mut self.file_entries);

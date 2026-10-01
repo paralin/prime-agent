@@ -599,7 +599,7 @@ async fn tui_attaches_prompts_streams_lists_and_switches() {
                 crossterm::event::KeyCode::Esc,
                 crossterm::event::KeyModifiers::NONE,
             )),
-            pa_tui::interactive::HeadlessStep::Submit(format!("/switch {second}")),
+            pa_tui::interactive::HeadlessStep::Submit(format!("/resume {second}")),
             pa_tui::interactive::HeadlessStep::Submit("third".to_string()),
             pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
         ],
@@ -3693,7 +3693,7 @@ async fn tui_esc_closes_the_completion_menu_without_interrupting_the_turn() {
 
 /// Prompt-stash verifier (TS `prompt-stash-state.ts` + the
 /// interactive-mode stash call sites): a draft in the editor belongs to
-/// the session it was typed in. The in-place `/switch` stashes it for the
+/// the session it was typed in. The in-place `/resume` stashes it for the
 /// outgoing session and clears the editor (Enter after the switch submits
 /// nothing), and a switch back restores it — the restored draft is a live
 /// editor draft (Enter submits it, and only to the session it belongs to).
@@ -3771,13 +3771,13 @@ async fn tui_prompt_stash_round_trips_across_in_place_switch() {
             // A draft for session A, never submitted.
             pa_tui::interactive::HeadlessStep::Type("f24 stash draft hello".to_string()),
             // The switch stashes the draft for A and clears the editor.
-            pa_tui::interactive::HeadlessStep::Submit(format!("/switch {second}")),
+            pa_tui::interactive::HeadlessStep::Submit(format!("/resume {second}")),
             // The editor must be empty now: Enter submits nothing, and the
             // draft never bleeds into session B.
             enter(),
             pa_tui::interactive::HeadlessStep::WaitMs(500),
             // Switch back: the stashed draft returns to the editor.
-            pa_tui::interactive::HeadlessStep::Submit(format!("/switch {first}")),
+            pa_tui::interactive::HeadlessStep::Submit(format!("/resume {first}")),
             // The restored draft is live: Enter submits it — to session A.
             enter(),
             pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
@@ -4101,9 +4101,9 @@ async fn tui_prompt_stash_restores_a_pasted_image_with_the_draft() {
             pa_tui::interactive::HeadlessStep::WaitMs(300),
             pa_tui::interactive::HeadlessStep::Type(" f24 image draft".to_string()),
             // Stash on switch, restore on switch back.
-            pa_tui::interactive::HeadlessStep::Submit(format!("/switch {second}")),
+            pa_tui::interactive::HeadlessStep::Submit(format!("/resume {second}")),
             pa_tui::interactive::HeadlessStep::WaitMs(300),
-            pa_tui::interactive::HeadlessStep::Submit(format!("/switch {first}")),
+            pa_tui::interactive::HeadlessStep::Submit(format!("/resume {first}")),
             pa_tui::interactive::HeadlessStep::WaitMs(300),
             // Submit the restored draft: the marker must resolve to the
             // stashed image bytes.
@@ -5596,7 +5596,7 @@ async fn tui_submit_outlived_by_switch_stays_silent_on_the_new_session() {
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
             pa_tui::interactive::HeadlessStep::Submit("for a".to_string()),
-            pa_tui::interactive::HeadlessStep::Submit(format!("/switch {second}")),
+            pa_tui::interactive::HeadlessStep::Submit(format!("/resume {second}")),
             pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
             pa_tui::interactive::HeadlessStep::Submit("for b".to_string()),
             pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },

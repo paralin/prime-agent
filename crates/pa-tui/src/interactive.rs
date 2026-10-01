@@ -442,7 +442,8 @@ impl InteractiveOptions {
     /// `AgentsViewModeOptions.config`).
     #[must_use]
     pub fn create_config(&self) -> Value {
-        let mut config = json!({ "cwd": self.cwd.display().to_string() });
+        let mut config =
+            json!({ "cwd": self.cwd.display().to_string(), "executionMode":"interactive" });
         if let Some(session_dir) = &self.session_dir {
             config["sessionDir"] = json!(session_dir.display().to_string());
         }

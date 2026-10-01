@@ -13,3 +13,5 @@ No agent loop, no tool execution, no session state, no UI. Receives/returns `pa-
 
 ## Depends on
 pa-types (one-way).
+
+The diagnostic API classifies reasoning exhaustion for context replay and recovery; it returns a verdict without owning recovery or session state. Merge routing diagnostics contain only routing/configuration primitives.

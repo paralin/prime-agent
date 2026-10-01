@@ -99,6 +99,7 @@ impl Worker {
         let agent_dir = self.config.agent_dir.clone();
         let provider = provider.to_string();
         let model_id = model_id.to_string();
+        let persist_default = payload.get("persistDefault").and_then(Value::as_bool) != Some(false);
         let switched = tokio::task::spawn_blocking(move || {
             if !engine.switch_model(EngineModelSelection {
                 provider: Some(provider.clone()),
@@ -123,7 +124,9 @@ impl Worker {
             // TS `session.setModel` persists the default provider/model so
             // the next session starts on the switched model.
             let mut settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
-            let _ = settings.set_default_model_and_provider(&provider, &model_id);
+            if persist_default {
+                let _ = settings.set_default_model_and_provider(&provider, &model_id);
+            }
             Some(())
         })
         .await

@@ -179,7 +179,7 @@ async fn entry_anchor_selects_the_left_session() {
     );
 
     let options = AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: supervisor.socket.clone(),
         cwd: dir.path().to_path_buf(),
         session_dir: Some(session_dir.clone()),
@@ -270,7 +270,7 @@ async fn continue_recent_view_preselects_the_candidate_and_renders_the_notice() 
         "bbbb-candidate"
     );
     let options = AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: supervisor.socket.clone(),
         cwd: dir.path().to_path_buf(),
         session_dir: Some(session_dir.clone()),
@@ -345,7 +345,7 @@ async fn rename_saved_session_renames_the_row_and_the_file() {
     );
 
     let options = AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: supervisor.socket.clone(),
         cwd: dir.path().to_path_buf(),
         session_dir: Some(session_dir.clone()),

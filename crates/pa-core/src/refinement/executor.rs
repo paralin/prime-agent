@@ -38,7 +38,7 @@ pub fn generate_refinement_id() -> String {
 }
 
 /// Harness overview section for the refine prompt (per-kind, 40-entry cap,
-/// 240-char content/ref/args snippets).
+/// full content, references, and arguments).
 #[must_use]
 pub fn overview_for_prompt(state: &HarnessState) -> String {
     let mut lines: Vec<String> = Vec::new();
@@ -518,7 +518,7 @@ mod tests {
             );
         let overview = overview_for_prompt(&state);
         assert!(overview.contains("memory: 1"));
-        assert!(overview.contains("- [local:m1] Fact (/m/m1, v0): builds are green"));
+        assert!(overview.contains("- [local:m1] Fact (/m/m1, v0): builds are   green"));
         assert_eq!(history_for_prompt(&[]), "No prior refinement history.");
     }
 

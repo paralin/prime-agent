@@ -81,6 +81,9 @@ async fn run_async(command: &str, args: &[String]) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
         let mut child = std::process::Command::new(&command);
         child.args(&args).stdin(Stdio::null());
+        if std::env::var("PI_OFFLINE").is_ok_and(|value| value == "1" || value == "true") {
+            child.env("UV_OFFLINE", "1");
+        }
         // Hidden window on Windows (TS `spawnHidden`).
         crate::platform::process::set_no_window(&mut child);
         let status = child

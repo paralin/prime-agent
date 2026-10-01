@@ -1,10 +1,10 @@
 //! The sessions concern: the `/tree` and `/fork` selectors and the tree
 //! navigation, `/clone`, and the session resume/list/switch surfaces.
 use super::{
-    anyhow, info_commands, key_event_to_id, AgentView, DaemonClient, DaemonCommand, DockFold,
-    Duration, InfoContent, InteractiveOptions, KeyEvent, Map, RebuildKind, Result,
-    SessionSelection, SessionUi, TreeSelector, TreeSelectorAction, UserMessageSelector,
-    UserMessageSelectorAction, Value, UI_REQUEST_TIMEOUT_MS,
+    anyhow, info_commands, key_event_to_id, AgentView, DaemonClient, DaemonCommand, Duration,
+    InfoContent, InteractiveOptions, KeyEvent, Map, Result, SessionSelection, SessionUi,
+    TreeSelector, TreeSelectorAction, UserMessageSelector, UserMessageSelectorAction, Value,
+    UI_REQUEST_TIMEOUT_MS,
 };
 
 impl SessionUi {
@@ -426,52 +426,9 @@ impl SessionUi {
                 index + 1
             )));
         }
-        rows.push(raw("switch with /switch <n|id>".to_string()));
+        rows.push(raw("resume with /resume <id>".to_string()));
         self.open_info_panel(view, Some("Sessions".to_string()), InfoContent::Rows(rows));
         self.track_menu_opened("list", "command");
-        Ok(())
-    }
-
-    /// `/switch`: resolve the argument against the cached `/list` rows (1-based
-    /// index or session id), then reattach.
-    pub(super) async fn switch_to(&mut self, target: &str, view: &mut AgentView) -> Result<()> {
-        let id = match target.parse::<usize>() {
-            Ok(index) => self
-                .list_rows
-                .get(index.wrapping_sub(1))
-                .and_then(|row| row.get("id").and_then(Value::as_str).map(str::to_string))
-                .unwrap_or_else(|| target.to_string()),
-            Err(_) => target.to_string(),
-        };
-        if id == self.active_session_id {
-            self.note("already attached to that session", view);
-            return Ok(());
-        }
-        // The draft in the editor belongs to the session being left: stash
-        // it as that session's restore-on-reopen head and clear the editor,
-        // so the switch lands on an empty prompt (the draft returns on a
-        // switch back).
-        self.stash_draft_for_switch(view);
-        match self.attach_session(&id, DockFold::FirstFrame).await {
-            Ok(()) => {
-                // Session-scoped stats again: the rebuilt tray must show
-                // the switched-to session's context usage, not the one
-                // being left.
-                self.refresh_stats().await;
-                self.rebuild_view(view, &RebuildKind::Rebind);
-                self.note(&format!("switched to session {id}"), view);
-                // The switched-to session's own restore head (if one was
-                // stashed earlier) lands after the switch note, so the
-                // restore status is the row the back-to-back rewrite keeps
-                // (TS `showStatus` last-wins). Like a chat's opening
-                // restore, only an auto restore-on-open head lands here —
-                // a manually stashed draft waits for its own key.
-                self.restore_prompt_stash_if_editor_empty(view, true);
-            }
-            Err(error) => {
-                self.note(&format!("switch to {id} failed: {error:#}"), view);
-            }
-        }
         Ok(())
     }
 }

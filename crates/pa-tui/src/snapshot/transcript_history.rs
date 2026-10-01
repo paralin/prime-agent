@@ -77,3 +77,28 @@ pub(crate) fn transcript_history(tree: &Value, live: &[Value]) -> Vec<Value> {
     );
     messages
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn scratch_checkpoint_preserves_its_selected_branch_and_live_tail() {
+        let original = json!({"role":"user","content":"active request","timestamp":1});
+        let continuation = json!({"role":"user","content":"Earlier history\n<scratch-handoff-file path=\"agent/work.org\">\n* TODO next action\n</scratch-handoff-file>","timestamp":2});
+        let live = json!({"role":"assistant","content":[{"type":"text","text":"continuing"}],"timestamp":4});
+        let tree = json!({"leafId":"boundary","flatNodes":[
+            {"entry":{"id":"first","parentId":null,"type":"message","message":original}},
+            {"entry":{"id":"other","parentId":"first","type":"message","message":{"role":"user","content":"other branch","timestamp":10}}},
+            {"entry":{"id":"checkpoint","parentId":"first","type":"message","message":continuation}},
+            {"entry":{"id":"boundary","parentId":"checkpoint","type":"compaction","summary":"","firstKeptEntryId":"checkpoint","details":{"scratchHandoff":{"version":1,"path":"agent/work.org"}}}}
+        ]});
+        assert_eq!(
+            transcript_history(&tree, &[continuation, live.clone()]),
+            vec![
+                original,
+                json!({"role":"custom","customType":"scratch-handoff-read","content":"* TODO next action","display":true,"details":{"path":"agent/work.org"},"timestamp":2}),
+                live
+            ]
+        );
+    }
+}

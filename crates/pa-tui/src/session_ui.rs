@@ -156,6 +156,7 @@ pub(crate) struct SessionUi {
     session_dir: Option<PathBuf>,
     script_path: Option<PathBuf>,
     model_selection: ModelSelection,
+    model_persist_default: bool,
     /// The `--models` scope patterns carried into every `create` config
     /// (TS `runtimeConfigFromArgs.models`): the daemon resolves them per
     /// create into the session's scoped list, so a `/new` session keeps

@@ -134,6 +134,9 @@ impl AcpModeState {
     /// model and the switched provider's key (a torn pair).
     pub(super) async fn model_and_api_key(&self) -> (Option<pa_types::ai::Model>, Option<String>) {
         let _guard = self.config_queue.lock().await;
+        if let Some(target) = self.engine.session.cli_role_target() {
+            return (Some(target.model), target.api_key);
+        }
         (
             self.model.lock().await.clone(),
             self.api_key.lock().await.clone(),

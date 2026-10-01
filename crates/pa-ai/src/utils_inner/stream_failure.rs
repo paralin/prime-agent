@@ -569,7 +569,9 @@ pub fn classify_stream_failure(
     status: Option<u16>,
 ) -> StreamFailureKind {
     // Rate limits remain retryable even when a gateway attaches a refusal or safety label.
-    if status == Some(429) { return StreamFailureKind::RateLimit; }
+    if status == Some(429) {
+        return StreamFailureKind::RateLimit;
+    }
     let type_lower = provider_error_type.unwrap_or("").to_lowercase();
     // A 402 is a payment failure regardless of the body's `error.type`
     // text: gateways surface wallet drains as `insufficient_credits`,

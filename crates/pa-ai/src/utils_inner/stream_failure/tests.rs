@@ -460,7 +460,15 @@ fn http_error_records_sdk_name() {
 
 #[test]
 fn http_rate_limit_overrides_gateway_safety_labels() {
-    for label in ["refusal", "safety", "prohibited_content", "insufficient_credits"] {
-        assert_eq!(classify_stream_failure(Some(label), Some(429)), StreamFailureKind::RateLimit);
+    for label in [
+        "refusal",
+        "safety",
+        "prohibited_content",
+        "insufficient_credits",
+    ] {
+        assert_eq!(
+            classify_stream_failure(Some(label), Some(429)),
+            StreamFailureKind::RateLimit
+        );
     }
 }

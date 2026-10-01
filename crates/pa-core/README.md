@@ -84,3 +84,10 @@ ownership boundary, with no new dependency or reverse dependency edge.
 
 ## Depends on
 pa-types, pa-ai, pa-agent (one-way).
+
+The runtime role resolver exposes credentialed native CLI candidates through `models::resolve_cli_role`; session origin is persisted by the session manager. Scratch closeout and bounded reasoning recovery remain session-engine concerns. The working kernel is retained while a separate ephemeral checkpoint kernel runs. No dependency direction changes.
+
+Named CLI role continuation belongs to the session engine: `configure_cli_role_candidates`,
+`cli_role_target`, and `advance_cli_role_candidate` retain the serving cursor,
+resolve credentials, enforce the allowlist, and persist model and effort changes.
+The CLI supplies the provider target and drives the settled-turn boundary.

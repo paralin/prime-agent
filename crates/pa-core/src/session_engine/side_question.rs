@@ -209,6 +209,11 @@ pub async fn run_side_question(
         stream_fn: Some(stream_fn),
         before_tool_call: Some(before_tool_call),
         should_stop_after_turn: Some(should_stop_after_turn),
+        // The side lane owns a strict turn cap; repetition recovery must not admit extra requests.
+        repetition_loop: Some(pa_agent::agent_loop::RepetitionLoopConfig {
+            enabled: Some(false),
+            threshold: None,
+        }),
         ..Default::default()
     }));
 

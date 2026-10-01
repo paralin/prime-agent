@@ -23,7 +23,8 @@ pub mod codex_catalog;
 pub mod merge_gateway;
 pub mod runtime_roles;
 pub use runtime_roles::{
-    parse_rlm_runtime_candidate, resolve_cli_role, resolve_rlm_role_candidates, RlmRuntimeCandidate, RlmRuntimeKind,
+    parse_rlm_runtime_candidate, resolve_cli_role, resolve_rlm_role_candidates,
+    RlmRuntimeCandidate, RlmRuntimeKind,
 };
 pub(crate) mod catalog_chain;
 pub(crate) mod custom;

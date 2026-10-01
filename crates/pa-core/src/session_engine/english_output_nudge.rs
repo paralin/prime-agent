@@ -22,14 +22,18 @@ pub fn text_has_chinese(text: &str) -> bool {
 
 #[must_use]
 pub fn needs_english_output_nudge(message: &AssistantMessage) -> bool {
-    message
-        .content
-        .iter()
-        .any(|block| match block {
-            AssistantContent::Text(text) => text_has_chinese(&text.text),
-            AssistantContent::Thinking(thinking) => text_has_chinese(&thinking.thinking),
-            AssistantContent::ToolCall(call) => call.name == "ipython" && call.arguments.get("code").and_then(serde_json::Value::as_str).is_some_and(|code| code.lines().any(text_has_chinese)),
-        })
+    message.content.iter().any(|block| match block {
+        AssistantContent::Text(text) => text_has_chinese(&text.text),
+        AssistantContent::Thinking(thinking) => text_has_chinese(&thinking.thinking),
+        AssistantContent::ToolCall(call) => {
+            call.name == "ipython"
+                && call
+                    .arguments
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|code| code.lines().any(text_has_chinese))
+        }
+    })
 }
 
 #[derive(Default)]
@@ -131,12 +135,20 @@ mod tests {
 
     #[tokio::test]
     async fn live_session_preserves_output_and_continues_after_language_notice() {
-        let provider = Arc::new(ScriptedProvider::new(Model::unknown()));
+        let model = Model {
+            api: "openai-completions".into(),
+            provider: "english-nudge-test".into(),
+            ..Model::unknown()
+        };
+        let provider = Arc::new(ScriptedProvider::new(model.clone()));
         provider.push_text_turn("中文回答");
         provider.push_text_turn("English answer");
         let runtime = Arc::new(EnglishOutputNudgeRuntime::default());
         let agent = Arc::new(Agent::new(AgentOptions {
-            initial_state: AgentInitialState::default(),
+            initial_state: AgentInitialState {
+                model: Some(model),
+                ..Default::default()
+            },
             filter_assistant_message: Some(runtime.filter_hook()),
             stream_fn: Some(provider.stream_fn()),
             convert_to_llm: Some(super::super::messages::engine_convert_to_llm()),
@@ -164,9 +176,11 @@ mod tests {
                 .count(),
             2
         );
-        assert!(serde_json::to_string(&session.entries().await)
-            .unwrap()
-            .contains("中文回答"));
+        let persisted = serde_json::to_string(&session.entries().await).unwrap();
+        assert!(
+            persisted.contains("中文回答"),
+            "durable messages: {persisted}"
+        );
         let calls = provider.calls();
         assert_eq!(calls.len(), 2);
         let context = serde_json::to_string(&calls[1].messages).unwrap();

@@ -152,7 +152,8 @@ async fn try_daemon_attached_acp(options: &RunOptions) -> Option<i32> {
         // The session flags the in-process engine honors, under the TS
         // `runtimeConfigFromArgs` names. `--api-key` stays off: the
         // in-process path ignores it too, and the create config is persisted.
-        let mut create_config = serde_json::json!({ "cwd": config.cwd.display().to_string() });
+        let mut create_config =
+            serde_json::json!({ "cwd": config.cwd.display().to_string(), "executionMode":"acp" });
         if let Some(ceiling) = config.runtime_policy.rlm_max_depth_ceiling {
             create_config["rlmMaxDepthCeiling"] = serde_json::json!(ceiling);
         }
@@ -494,19 +495,39 @@ async fn build_headless_engine_with(
     let mut registry =
         pa_core::models::ModelRegistry::create(auth, config.agent_dir.join("models.json"));
     registry.load_private_authorization_from_cache();
-    let role_models = config.model.as_deref().filter(|name| name.starts_with('@')).map(|selector| {
-        let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
-        pa_core::models::resolve_cli_role(config.provider.as_deref(), selector, &registry, &settings.get_model_roles()).map_err(|error| error.to_string())
-    }).transpose()?;
+    let role_models = config
+        .model
+        .as_deref()
+        .filter(|name| name.starts_with('@'))
+        .map(|selector| {
+            let settings =
+                pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
+            pa_core::models::resolve_cli_role(
+                config.provider.as_deref(),
+                selector,
+                &registry,
+                &settings.get_model_roles(),
+            )
+            .map_err(|error| error.to_string())
+        })
+        .transpose()?;
     let mut session_manager = session_manager;
     if let Some(manager) = &mut session_manager {
-        if options.session.fork.is_some() || manager.get_entries().is_empty() { manager.set_session_origin("cli").map_err(|error| error.to_string())?; }
+        if options.session.fork.is_some() || manager.get_entries().is_empty() {
+            manager
+                .set_session_origin("cli")
+                .map_err(|error| error.to_string())?;
+        }
     }
-    let model = if let Some(candidates) = &role_models { candidates[0].model.clone() } else { select_model(
-        &mut registry,
-        config.provider.as_deref(),
-        config.model.as_deref(),
-    )? };
+    let model = if let Some(candidates) = &role_models {
+        candidates[0].model.clone()
+    } else {
+        select_model(
+            &mut registry,
+            config.provider.as_deref(),
+            config.model.as_deref(),
+        )?
+    };
 
     // Resolve request auth once (single-shot mode): the merged headers
     // ship on the request (the TS `getApiKeyAndHeaders` single-owner path;
@@ -606,7 +627,13 @@ async fn build_headless_engine_with(
             agent_dir: config.agent_dir.clone(),
             mcp_manager: Some(mcp_manager),
             model: Some(agent_model),
-            thinking_level: Some(role_models.as_ref().and_then(|candidates| candidates[0].thinking_level).filter(|_| config.thinking.is_none()).unwrap_or_else(|| resolve_thinking_level(config, &model))),
+            thinking_level: Some(
+                role_models
+                    .as_ref()
+                    .and_then(|candidates| candidates[0].thinking_level)
+                    .filter(|_| config.thinking.is_none())
+                    .unwrap_or_else(|| resolve_thinking_level(config, &model)),
+            ),
             stream_fn: Some(stream_fn),
             tools: builtin_tools(&config.cwd),
             custom_system_prompt: config.system_prompt.clone(),
@@ -644,6 +671,11 @@ async fn build_headless_engine_with(
     )
     .await
     .map_err(|error| format!("{error:#}"))?;
+    if let Some(candidates) = role_models {
+        engine
+            .session
+            .configure_cli_role_candidates(candidates, provider_target.clone());
+    }
     Ok(HeadlessEngine {
         engine,
         model,

@@ -13,3 +13,7 @@ No tool implementations (pa-core), no providers (pa-ai), no session persistence,
 
 ## Depends on
 pa-types, pa-ai (one-way).
+
+`AgentOptions::repetition_loop` forwards the existing loop repetition policy.
+A caller with its own bounded turn policy may disable repetition detection;
+ordinary sessions keep the default detection behavior. This adds no dependencies.

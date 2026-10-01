@@ -326,17 +326,42 @@ impl AgentSessionEngine {
         // visible to the worker, and the turn's run-start auth validation
         // reports the missing credential with the TS message instead.
         if model_name.starts_with('@') {
-            let settings = pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
-            let candidates = pa_core::models::resolve_cli_role(selection.provider.as_deref(), model_name, &registry, &settings.get_model_roles())?;
-            self.create_resources.write().expect("create resources lock").rlm_model_candidates = candidates.iter().map(|candidate| {
-                let reference = format!("{}/{}", candidate.model.provider, candidate.model.id);
-                candidate.thinking_level.map_or(reference.clone(), |level| format!("{reference}:{}", serde_json::to_value(level).expect("thinking level").as_str().expect("thinking level string")))
-            }).collect();
+            let settings =
+                pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
+            let candidates = pa_core::models::resolve_cli_role(
+                selection.provider.as_deref(),
+                model_name,
+                &registry,
+                &settings.get_model_roles(),
+            )?;
+            self.create_resources
+                .write()
+                .expect("create resources lock")
+                .rlm_model_candidates = candidates
+                .iter()
+                .map(|candidate| {
+                    let reference = format!("{}/{}", candidate.model.provider, candidate.model.id);
+                    candidate.thinking_level.map_or(reference.clone(), |level| {
+                        format!(
+                            "{reference}:{}",
+                            serde_json::to_value(level)
+                                .expect("thinking level")
+                                .as_str()
+                                .expect("thinking level string")
+                        )
+                    })
+                })
+                .collect();
             let first = &candidates[0];
             let mut selection = self.selection.write().expect("model selection lock");
             selection.provider = Some(first.model.provider.clone());
             selection.model = Some(first.model.id.clone());
-            if selection.thinking.is_none() { selection.thinking = first.thinking_level.map(|level| serde_json::from_value(serde_json::json!(level)).expect("matching thinking level vocabulary")); }
+            if selection.thinking.is_none() {
+                selection.thinking = first.thinking_level.map(|level| {
+                    serde_json::from_value(serde_json::json!(level))
+                        .expect("matching thinking level vocabulary")
+                });
+            }
             return Ok(first.model.clone());
         }
         let all: Vec<Model> = registry.get_all().to_vec();

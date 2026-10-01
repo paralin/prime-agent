@@ -440,8 +440,17 @@ fn parse_send_args(args: &[String]) -> Result<ParsedSendArgs> {
             continue;
         }
         if parse_options && matches!(arg, "--steer" | "--follow-up") {
-            let mode = Value::String(if arg == "--steer" { "steer" } else { "follow_up" }.into());
-            if delivery_mode.as_ref().is_some_and(|prior| *prior != mode) { bail!("--steer and --follow-up cannot be used together"); }
+            let mode = Value::String(
+                if arg == "--steer" {
+                    "steer"
+                } else {
+                    "follow_up"
+                }
+                .into(),
+            );
+            if delivery_mode.as_ref().is_some_and(|prior| *prior != mode) {
+                bail!("--steer and --follow-up cannot be used together");
+            }
             delivery_mode = Some(mode);
             continue;
         }
@@ -735,6 +744,25 @@ mod tests {
             parse_send_args(&args(&["target", "--message", "queued", "extra"]));
         assert!(explicit_and_positional.is_err());
 
+        let steer = parse_send_args(&args(&["--steer", "target", "hello"])).unwrap();
+        assert_eq!(
+            (
+                steer.target_active_session_id,
+                steer.message,
+                steer.delivery_mode
+            ),
+            (
+                "target".into(),
+                "hello".into(),
+                Some(Value::String("steer".into()))
+            )
+        );
+        let literal = parse_send_args(&args(&["target", "--", "--follow-up"])).unwrap();
+        assert_eq!(
+            (literal.message, literal.delivery_mode),
+            ("--follow-up".into(), None)
+        );
+        assert!(parse_send_args(&args(&["target", "--steer", "--follow-up", "hello"])).is_err());
         let unknown = parse_send_args(&args(&["target", "--bogus"]));
         assert!(unknown.is_err());
 

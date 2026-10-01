@@ -9,7 +9,7 @@ use super::*;
 #[test]
 fn scoped_view_keeps_the_first_row_default() {
     let mut mode = AgentsViewMode::new(AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,
@@ -56,7 +56,7 @@ fn scoped_view_keeps_the_first_row_default() {
 /// Subagents destination): the roster carries the root alone.
 fn childless_scope() -> AgentsViewMode {
     let mut mode = AgentsViewMode::new(AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,
@@ -176,7 +176,7 @@ fn alt_right_toggles_the_subagent_list() {
 /// operator's mixed roster).
 fn mode_with_mixed_children() -> AgentsViewMode {
     let mut mode = AgentsViewMode::new(AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,

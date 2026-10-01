@@ -40,21 +40,31 @@ pub struct InjectedPromptRow {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InjectedPromptKind {
+    ScratchCompacted {
+        path: String,
+    },
+    ReasoningRecovery,
     /// `◷ Heartbeat prompt · <schedule>` (error pulse, muted label; the
     /// clock glyph is the dock's Heartbeats icon — the operator-directed
     /// divergence in the module docs).
-    Heartbeat { schedule: Option<String> },
+    Heartbeat {
+        schedule: Option<String>,
+    },
     /// `<goal label>[ · <objective preview>]` (muted; TS `goalLabel`/`metaText`).
     Goal {
         kind: Option<String>,
         objective: Option<String>,
     },
     /// `◆ Restored Python kernel state` / `◆ Started fresh Python kernel`.
-    KernelRestored { restored: bool },
+    KernelRestored {
+        restored: bool,
+    },
     /// `Python skills unavailable · <skill names>` (muted label, dim
     /// names; TS PR #2381's header — no marker glyph), expandable to the
     /// full report.
-    PythonSkillsUnavailable { skills: Vec<String> },
+    PythonSkillsUnavailable {
+        skills: Vec<String>,
+    },
     /// `◆ Subagent <name> finished|failed|cancelled` (the diamond and the
     /// label share the row's semantic color; failed/cancelled rows expand
     /// to the reason).
@@ -85,6 +95,14 @@ pub(crate) fn injected_prompt_row(
 ) -> InjectedPromptRow {
     let content = custom_content_text(message);
     let kind = match custom_type {
+        "scratch-handoff-read" => InjectedPromptKind::ScratchCompacted {
+            path: details
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .into(),
+        },
+        "reasoning_output_nudge" => InjectedPromptKind::ReasoningRecovery,
         HEARTBEAT_PROMPT_CUSTOM_TYPE => InjectedPromptKind::Heartbeat {
             schedule: details
                 .get("schedule")
@@ -218,6 +236,12 @@ fn prompt_header(row: &InjectedPromptRow, theme: &Theme) -> Line {
     // renders; the expanded form adds the markdown body below it (the
     // kernel-state row stays header-only).
     let header: Line = match &row.kind {
+        InjectedPromptKind::ScratchCompacted { path } => {
+            vec![Span::styled(format!("◆ Scratch compacted · {path}"), muted)]
+        }
+        InjectedPromptKind::ReasoningRecovery => {
+            vec![Span::styled("◆ Reasoning recovery", muted)]
+        }
         InjectedPromptKind::Heartbeat { schedule } => vec![
             // The ◷ clock (the dock's Heartbeats icon), not the TS ♥ heart:
             // the operator-directed divergence in the module docs.

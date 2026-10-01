@@ -58,6 +58,7 @@ impl SessionUi {
             session_dir: options.session_dir.clone(),
             script_path: options.script_path.clone(),
             model_selection: options.model_selection.clone(),
+            model_persist_default: true,
             models: options.models.clone(),
             model_catalog: options.model_catalog.clone(),
             model_configured_providers: options.model_configured_providers.clone(),
@@ -525,7 +526,32 @@ impl SessionUi {
                 _ => None,
             });
         self.pending_queue = Some(reconstructed.queued);
-        self.pending_snapshot = Some(reconstructed.chat);
+        let history = attach
+            .snapshot
+            .get("messages")
+            .and_then(Value::as_array)
+            .filter(|messages| {
+                messages.iter().any(|message| {
+                    crate::snapshot::message_text(message).contains("<scratch-handoff-file ")
+                })
+            });
+        self.pending_snapshot = if let Some(messages) = history {
+            let tree = self
+                .bounded_request(
+                    Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                    DaemonCommand::GetSessionTree {
+                        id: None,
+                        active_session_id: self.active_session_id.clone(),
+                        rest: Map::default(),
+                    },
+                )
+                .await?;
+            Some(crate::snapshot::transcript_to_entries(
+                &crate::snapshot::transcript_history(&tree, messages),
+            ))
+        } else {
+            Some(reconstructed.chat)
+        };
         self.loader_anchor_ms = reconstructed.last_user_prompt_ms;
         self.goal_view.seed(reconstructed.goal.unwrap_or_default());
         // The resynced state owns the loader (TS `renderResyncedSession`

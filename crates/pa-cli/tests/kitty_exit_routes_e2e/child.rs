@@ -33,7 +33,7 @@ pub(super) fn child_run(route: &str, socket: PathBuf) {
                     .expect("the chat surface ran");
                 assert!(outcome.return_to_agents_view, "the dock-esc detached");
                 let view_options = AgentsViewOptions {
-            show_cli_sessions: false,
+                    show_cli_sessions: false,
                     socket_path: options.socket_path.clone(),
                     cwd: options.cwd.clone(),
                     session_dir: options.session_dir.clone(),
@@ -71,7 +71,7 @@ pub(super) fn child_run(route: &str, socket: PathBuf) {
                 // the row's selection hands the pane to the chat, and the
                 // chat's parity exit ends the whole app.
                 let view_options = AgentsViewOptions {
-            show_cli_sessions: false,
+                    show_cli_sessions: false,
                     socket_path: options.socket_path.clone(),
                     cwd: options.cwd.clone(),
                     session_dir: options.session_dir.clone(),

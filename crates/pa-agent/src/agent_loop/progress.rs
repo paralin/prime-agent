@@ -36,7 +36,11 @@ impl TurnProgress {
         }
         self.result_signature = Some(signature);
     }
-    pub fn finalize(&mut self, mut message: AssistantMessage) -> AssistantMessage {
+    pub fn finalize(
+        &mut self,
+        mut message: AssistantMessage,
+        repetition: Option<&super::RepetitionLoopConfig>,
+    ) -> AssistantMessage {
         let calls = message.tool_calls();
         if calls.is_empty() {
             self.signature = None;
@@ -54,7 +58,7 @@ impl TurnProgress {
                 self.batches = 1;
                 self.signature = Some(signature);
             }
-            if self.batches >= 3 {
+            if self.batches >= 3 && repetition.is_none_or(|policy| policy.enabled != Some(false)) {
                 let error = "Repetition loop detected: the model repeated the same tool call batch 3 times; the repeated tools were not executed";
                 message.stop_reason = StopReason::Error;
                 message.error_message = Some(error.into());

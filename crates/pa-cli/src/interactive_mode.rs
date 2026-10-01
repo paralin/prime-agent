@@ -192,7 +192,13 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
             let (anchor, notice) = continue_view.map_or((None, None), |view| {
                 (Some(view.session_id), Some(view.notice))
             });
-            run_agents_view_flow(tui_options, anchor, notice, options.session.show_cli_sessions).await
+            run_agents_view_flow(
+                tui_options,
+                anchor,
+                notice,
+                options.session.show_cli_sessions,
+            )
+            .await
         } else {
             let outcome =
                 pa_tui::interactive::run_interactive(tui_options.clone(), UiMode::Terminal).await?;
@@ -205,7 +211,13 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
                 // identity to anchor on; its notice seeds the view's status
                 // line instead.
                 let anchor = (!outcome.session_id.is_empty()).then(|| outcome.session_id.clone());
-                run_agents_view_flow(tui_options, anchor, outcome.agents_view_notice, options.session.show_cli_sessions).await
+                run_agents_view_flow(
+                    tui_options,
+                    anchor,
+                    outcome.agents_view_notice,
+                    options.session.show_cli_sessions,
+                )
+                .await
             } else {
                 print_resume_hint(outcome.resume_hint.as_deref());
                 Ok(())

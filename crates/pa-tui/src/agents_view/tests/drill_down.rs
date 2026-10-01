@@ -40,7 +40,7 @@ fn pending_ancestors_expand_and_selection_restores_after_reentry() {
     // A fresh run carrying the drilled-in child's return state (TS
     // `pendingExpandedAncestorSessionIds` + the persisted selection).
     let mut mode = AgentsViewMode::new(AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,
@@ -76,7 +76,7 @@ fn pending_ancestors_expand_and_selection_restores_after_reentry() {
 #[test]
 fn scoped_left_returns_the_root_and_pops_the_scope() {
     let mut mode = AgentsViewMode::new(AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,

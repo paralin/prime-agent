@@ -146,8 +146,10 @@ fn standard_message(message: &pa_agent::types::AgentMessage) -> Option<&pa_agent
     Some(message)
 }
 
+mod cli_role_selection;
 /// The session-bound agent: admission rules + persistence over the loop.
 mod reasoning_recovery;
+mod request_metrics;
 
 pub struct AgentSession {
     reasoning_recovery_attempted: Arc<std::sync::atomic::AtomicBool>,
@@ -221,6 +223,7 @@ pub struct AgentSession {
     /// summarizer completion — no deltas, no broadcast, no behavior
     /// change.
     compaction_summary_sink: std::sync::Mutex<Option<compaction_exec::SummaryDeltaSink>>,
+    cli_role_selection: std::sync::Mutex<Option<cli_role_selection::CliRoleSelection>>,
     native_compaction: std::sync::atomic::AtomicBool,
     foreground: Arc<root_foreground_lease::RootForegroundLease>,
     scratch_handoff: std::sync::RwLock<Option<scratch_handoff::ScratchHandoffRuntimeSettings>>,
@@ -268,8 +271,15 @@ impl AgentSession {
         let scratch_closeout_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let recovery = reasoning_recovery_attempted.clone();
         let closeout = scratch_closeout_active.clone();
+        let metrics = Arc::new(std::sync::Mutex::new(
+            request_metrics::RequestMetrics::default(),
+        ));
+        let live_agent = Arc::downgrade(&agent);
         agent
-            .subscribe(move |event, _signal| {
+            .subscribe(move |mut event, _signal| {
+                let phase = if closeout.load(std::sync::atomic::Ordering::Acquire) { "scratch_closeout" } else if recovery.load(std::sync::atomic::Ordering::Acquire) { "recovery" } else { "normal" };
+                let replacement = metrics.lock().unwrap_or_else(std::sync::PoisonError::into_inner).observe(&mut event, phase);
+                let live_agent = live_agent.clone();
                 if !closeout.load(std::sync::atomic::Ordering::Acquire) {
                     let progress = match &event {
                         AgentEvent::MessageEnd { message, .. } => match standard_message(message) {
@@ -278,13 +288,22 @@ impl AgentSession {
                             Some(pa_agent::types::Message::User(_)) | None => false,
                         },
                         AgentEvent::MessageStart { message } => matches!(standard_message(message), Some(pa_agent::types::Message::User(_))),
-                        _ => false,
+                        AgentEvent::AgentStart | AgentEvent::AgentEnd { .. } | AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } | AgentEvent::MessageUpdate { .. } | AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionUpdate { .. } | AgentEvent::ToolExecutionEnd { .. } => false,
                     };
                     if progress { recovery.store(false, std::sync::atomic::Ordering::Release); }
                 }
 
                 let persistence = persistence.clone();
                 Box::pin(async move {
+                    if let (Some(agent), Some((prior, updated))) = (live_agent.upgrade(), replacement) {
+                        agent.mutate_messages(|messages| {
+                            for message in messages.iter_mut() {
+                                if let AgentMessage::Standard(pa_agent::types::Message::Assistant(assistant)) = message {
+                                    if *assistant == prior { assistant.clone_from(&updated); }
+                                }
+                            }
+                        }).await;
+                    }
                     persist_event(&persistence, event).await?;
                     Ok(())
                 })
@@ -310,6 +329,7 @@ impl AgentSession {
             compaction_summary_sink: std::sync::Mutex::new(None),
             reasoning_recovery_attempted,
             scratch_closeout_active,
+            cli_role_selection: std::sync::Mutex::new(None),
             native_compaction: std::sync::atomic::AtomicBool::new(true),
             foreground,
             scratch_handoff: std::sync::RwLock::new(None),

@@ -324,8 +324,14 @@ fn text_delta_steps(base: &AssistantMessage, content_index: usize, text: &str) -
             partial: partial.clone(),
         },
     )));
-    for chunk in text.as_bytes().chunks(8) {
-        let delta = String::from_utf8_lossy(chunk).to_string();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        let mut end = remaining.len().min(8);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        let delta = remaining[..end].to_string();
+        remaining = &remaining[end..];
         if let Some(AssistantContent::Text(text_content)) = partial.content.get_mut(content_index) {
             text_content.text.push_str(&delta);
         }

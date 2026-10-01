@@ -365,7 +365,7 @@ async fn down_arrow_focuses_the_dock_and_enter_opens_the_scoped_agents_view() {
     // Run 2 — the scoped agents view: the child lists as the root's direct
     // child, and Enter drills into its transcript.
     let view_options = AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: supervisor.socket.clone(),
         cwd: PathBuf::from("/tmp"),
         session_dir: Some(session_dir.clone()),

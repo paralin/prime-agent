@@ -114,6 +114,8 @@ pub struct AgentOptions {
     pub convert_to_llm: Option<ConvertToLlmFn>,
     pub transform_context: Option<TransformContextFn>,
     pub filter_assistant_message: Option<FilterAssistantMessageFn>,
+    /// Repetition detection policy; bounded callers may disable it and own their turn cap.
+    pub repetition_loop: Option<crate::agent_loop::RepetitionLoopConfig>,
     pub stream_fn: Option<StreamFn>,
     pub get_api_key: Option<crate::agent_loop::GetApiKeyFn>,
     pub before_tool_call: Option<BeforeToolCallFn>,
@@ -380,6 +382,7 @@ struct AgentInner {
     convert_to_llm: ConvertToLlmFn,
     transform_context: Option<TransformContextFn>,
     filter_assistant_message: Option<FilterAssistantMessageFn>,
+    repetition_loop: Option<crate::agent_loop::RepetitionLoopConfig>,
     stream_fn: Option<StreamFn>,
     get_api_key: Option<crate::agent_loop::GetApiKeyFn>,
     run_scope: Mutex<Option<AgentRunScopeFn>>,
@@ -469,6 +472,9 @@ impl AgentInner {
             .iter()
             .map(|(_, listener)| Arc::clone(listener))
             .collect();
+        // Listeners may inspect or update the reduced state. Keep event delivery
+        // ordered without holding the state lock across their callbacks.
+        drop(shared);
         for listener in listeners {
             listener(event.clone(), signal.clone()).await?;
         }
@@ -620,6 +626,7 @@ impl AgentInner {
         };
         let mut config = AgentLoopConfig::new(model, Arc::clone(&self.convert_to_llm));
         config.api_key = None;
+        config.repetition_loop.clone_from(&self.repetition_loop);
         config.temperature = None;
         config.max_tokens = None;
         config.reasoning = reasoning;
@@ -914,6 +921,7 @@ impl Agent {
                 .unwrap_or_else(AgentLoopConfig::default_convert_to_llm),
             transform_context: options.transform_context,
             filter_assistant_message: options.filter_assistant_message,
+            repetition_loop: options.repetition_loop,
             stream_fn: options.stream_fn,
             get_api_key: options.get_api_key,
             run_scope: Mutex::new(None),
@@ -1476,6 +1484,43 @@ impl Clone for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn listeners_can_read_and_mutate_reduced_state() {
+        let agent = Arc::new(Agent::new(AgentOptions::default()));
+        let (idle_tx, _) = watch::channel(false);
+        let model = agent.state().await.model;
+        *agent.inner.run.lock().unwrap() = Some(ActiveRun {
+            controller: AbortController::new(),
+            idle_tx,
+            model,
+        });
+        let weak = Arc::downgrade(&agent);
+        let message = AgentMessage::user("hello");
+        let expected = message.clone();
+        agent
+            .subscribe(move |_, _| {
+                let weak = weak.clone();
+                let expected = expected.clone();
+                Box::pin(async move {
+                    let agent = weak.upgrade().unwrap();
+                    assert_eq!(agent.state().await.messages, vec![expected]);
+                    agent.mutate_messages(Vec::clear).await;
+                    Ok(())
+                })
+            })
+            .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent
+                .inner
+                .process_events(AgentEvent::MessageEnd { message }),
+        )
+        .await
+        .expect("listener must not deadlock on the state lock")
+        .unwrap();
+        assert!(agent.state().await.messages.is_empty());
+    }
 
     #[test]
     fn pending_message_queue_all_mode_flattens() {

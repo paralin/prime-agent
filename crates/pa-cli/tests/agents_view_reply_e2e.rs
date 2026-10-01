@@ -195,7 +195,7 @@ fn faux_engine_config(dir: &Path, responses: &[&str]) -> serde_json::Value {
 
 fn view_options(socket: &Path, session_dir: &Path, config: serde_json::Value) -> AgentsViewOptions {
     AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: socket.to_path_buf(),
         cwd: std::env::temp_dir(),
         session_dir: Some(session_dir.to_path_buf()),

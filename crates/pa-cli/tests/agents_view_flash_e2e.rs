@@ -328,7 +328,7 @@ fn frame_of(frames: &[String], marker: &str) -> String {
 
 fn view_options(socket: &Path, session_dir: &Path) -> AgentsViewOptions {
     AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: socket.to_path_buf(),
         cwd: PathBuf::from("/tmp"),
         session_dir: Some(session_dir.to_path_buf()),

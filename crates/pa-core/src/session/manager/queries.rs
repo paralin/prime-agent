@@ -480,12 +480,24 @@ impl SessionManager {
     }
 
     /// Stamp the origin of a fresh runtime without changing an existing transcript's origin.
+    /// # Errors
+    /// Returns an invalid-origin or session-file persistence error.
     pub fn set_session_origin(&mut self, origin: &str) -> std::io::Result<()> {
-        if !matches!(origin, "interactive" | "cli") { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid session origin")); }
-        if let Some(pa_types::session::FileEntry::Header { header }) = self.file_entries.first_mut() {
-            header.rest.insert("origin".into(), serde_json::Value::String(origin.into()));
+        if !matches!(origin, "interactive" | "cli") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid session origin",
+            ));
         }
-        if self.flushed { self.try_rewrite_file()?; }
+        if let Some(pa_types::session::FileEntry::Header { header }) = self.file_entries.first_mut()
+        {
+            header
+                .rest
+                .insert("origin".into(), serde_json::Value::String(origin.into()));
+        }
+        if self.flushed {
+            self.try_rewrite_file()?;
+        }
         Ok(())
     }
 

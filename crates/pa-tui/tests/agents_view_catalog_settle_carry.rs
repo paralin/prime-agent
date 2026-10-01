@@ -273,7 +273,7 @@ fn read_line(reader: &mut BufReader<UnixStream>) -> Option<String> {
 /// row can only come from the saved catalog).
 fn view_options(socket: &std::path::Path, anchor: Option<&str>) -> AgentsViewOptions {
     AgentsViewOptions {
-            show_cli_sessions: false,
+        show_cli_sessions: false,
         socket_path: socket.to_path_buf(),
         cwd: PathBuf::from("/tmp"),
         session_dir: Some(PathBuf::from("/tmp/sessions")),

@@ -14,7 +14,15 @@ impl AgentsViewMode {
     /// The unified records the view runs on (reconciled from the live
     /// roster and the saved catalog).
     pub(super) fn records(&self) -> Vec<crate::agents_view_state::UnifiedRecord> {
-        let saved: Vec<_> = self.saved.iter().filter(|row| self.options.show_cli_sessions || row.get("origin").and_then(Value::as_str) != Some("cli")).cloned().collect();
+        let saved: Vec<_> = self
+            .saved
+            .iter()
+            .filter(|row| {
+                self.options.show_cli_sessions
+                    || row.get("origin").and_then(Value::as_str) != Some("cli")
+            })
+            .cloned()
+            .collect();
         reconcile_unified_sessions(&self.roster, &saved)
     }
 

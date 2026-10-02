@@ -72,6 +72,8 @@ ln -sf "$PWD/target/release/prime-agent" ~/.local/bin/prime-agent
 
 Add `~/.local/bin` to `PATH`. The native executable locates its bundled Python runtime independently of the caller's working directory.
 
+For development, `./prime-agent.sh` builds and runs the native release binary through Cargo. It preserves the current working directory and forwards arguments to Prime Agent. Point a local launcher at this script to keep running the current checkout. Pass `--no-env` before `--` to clear provider environment credentials; saved credentials remain available.
+
 ## Getting Started
 
 Start Prime Agent from the repository or directory you want it to work in:
